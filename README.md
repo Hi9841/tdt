@@ -37,10 +37,10 @@ cargo build --release --manifest-path .\desktop\Cargo.toml
 ```
 
 The first short hotkey tap starts recording and the second stops it. Holding
-the hotkey records until release. The Settings button opens the settings page;
-the tray menu controls auto-paste. Auto-paste writes the result to the
-clipboard and injects Unicode text directly into the previously focused
-application.
+the hotkey records until release. Default shortcut is `Ctrl+;`. Change it in
+Settings by clicking the shortcut chip, then press the new combo. The tray
+menu controls auto-paste. Auto-paste writes the result to the clipboard and
+injects Unicode text directly into the previously focused application.
 
 ```powershell
 cargo fmt --manifest-path .\desktop\Cargo.toml -- --check

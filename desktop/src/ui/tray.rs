@@ -8,6 +8,7 @@ pub struct SystemTray {
     pub settings_item: MenuItem,
     pub updates_item: MenuItem,
     pub quit_item: MenuItem,
+    pub shortcut_item: MenuItem,
 }
 
 impl SystemTray {
@@ -71,7 +72,9 @@ impl SystemTray {
 
         let tray_icon = TrayIconBuilder::new()
             .with_menu(Box::new(tray_menu))
-            .with_tooltip("TDT - Talk Don't Type. Tap or hold Ctrl+; to talk.")
+            .with_tooltip(format!(
+                "TDT - Talk Don't Type. Tap or hold {hotkey_label} to talk."
+            ))
             .with_icon(icon)
             .build()
             .map_err(|e| format!("Failed to build tray icon: {}", e))?;
@@ -82,6 +85,7 @@ impl SystemTray {
             settings_item,
             updates_item,
             quit_item,
+            shortcut_item,
         })
     }
 }

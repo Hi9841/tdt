@@ -1,5 +1,10 @@
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
+#[cfg(not(target_os = "windows"))]
+compile_error!(
+    "TDT desktop is a Windows-only build. Build the Android app from the `mobile` folder instead."
+);
+
 mod audio;
 mod config;
 mod hotkey;
@@ -8,10 +13,12 @@ mod stt;
 mod ui;
 mod update;
 
-use audio::{play_sound, AudioRecorder, SoundEffect};
+use audio::{play_sound, AudioRecorder, SoundEffect, VIS_BARS};
 use config::{AppConfig, AppStats};
 use gpui::*;
-use hotkey::{tap_should_stop, HotkeyAction, HotkeyListener};
+use hotkey::{
+    poll_capture_timeout, set_binding, tap_should_stop, HotkeyAction, HotkeyBinding, HotkeyListener,
+};
 use parking_lot::Mutex;
 use paste::PasteInjector;
 use std::fs::OpenOptions;
@@ -23,8 +30,8 @@ use std::time::{Duration, Instant};
 use stt::SttEngine;
 use tray_icon::menu::MenuEvent;
 use ui::window_util::{
-    follow_current_virtual_desktop, position_bubble_on_preferred_monitor, BUBBLE_HEIGHT,
-    BUBBLE_WIDTH,
+    find_app_hwnd, follow_current_virtual_desktop, lock_overlay_chrome,
+    position_bubble_on_preferred_monitor, BUBBLE_HEIGHT, BUBBLE_WIDTH,
 };
 use ui::{HudStatus, HudView, SystemTray};
 use update::UpdatePhase;
@@ -58,7 +65,9 @@ fn main() {
 
     let config = AppConfig::load();
     let auto_paste = config.auto_paste;
-    let hotkey_label = config.hotkey.clone();
+    let hotkey_binding = HotkeyBinding::parse(&config.hotkey).unwrap_or_default();
+    set_binding(hotkey_binding);
+    let hotkey_label = hotkey_binding.display();
 
     // 1. Initialize audio recorder
     let recorder = match AudioRecorder::new() {
@@ -149,53 +158,30 @@ fn main() {
         // Background thread to apply Win32 WS_EX_TOPMOST & WS_EX_NOACTIVATE & WS_EX_TOOLWINDOW
         #[cfg(target_os = "windows")]
         std::thread::spawn(move || {
-            use windows::Win32::Foundation::{BOOL, HWND, LPARAM};
             use windows::Win32::UI::WindowsAndMessaging::{
-                EnumWindows, GetWindowLongW, GetWindowThreadProcessId, IsWindowVisible,
-                SetWindowLongW, GWL_EXSTYLE, GWL_STYLE, WS_CAPTION, WS_EX_NOACTIVATE,
-                WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+                GetWindowLongW, SetWindowLongW, GWL_EXSTYLE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+                WS_EX_TOPMOST,
             };
 
             std::thread::sleep(Duration::from_millis(300));
 
-            struct Context {
-                pid: u32,
-                found: Option<HWND>,
-            }
-
-            unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
-                let ctx = &mut *(lparam.0 as *mut Context);
-                let mut pid = 0;
-                let _ = GetWindowThreadProcessId(hwnd, Some(&mut pid));
-                if pid == ctx.pid && IsWindowVisible(hwnd).as_bool() {
-                    ctx.found = Some(hwnd);
-                    return BOOL(0);
-                }
-                BOOL(1)
-            }
-
-            let mut ctx = Context {
-                pid: std::process::id(),
-                found: None,
+            let Some(hwnd) = find_app_hwnd() else {
+                return;
             };
 
             unsafe {
-                let _ = EnumWindows(Some(enum_proc), LPARAM(&mut ctx as *mut _ as isize));
-                if let Some(hwnd) = ctx.found {
-                    let style = GetWindowLongW(hwnd, GWL_STYLE);
-                    let _ = SetWindowLongW(hwnd, GWL_STYLE, style & !(WS_CAPTION.0 as i32));
-
-                    let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE);
-                    let _ = SetWindowLongW(
-                        hwnd,
-                        GWL_EXSTYLE,
-                        ex_style | (WS_EX_TOPMOST.0 | WS_EX_NOACTIVATE.0 | WS_EX_TOOLWINDOW.0) as i32,
-                    );
-
-                    position_bubble_on_preferred_monitor(hwnd);
-                    follow_current_virtual_desktop();
-                }
+                let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE);
+                let _ = SetWindowLongW(
+                    hwnd,
+                    GWL_EXSTYLE,
+                    ex_style | (WS_EX_TOPMOST.0 | WS_EX_NOACTIVATE.0 | WS_EX_TOOLWINDOW.0) as i32,
+                );
             }
+
+            position_bubble_on_preferred_monitor(hwnd);
+            follow_current_virtual_desktop();
+            // Strips caption and resize handles and snaps the pill back to size.
+            lock_overlay_chrome();
         });
 
         match cx.open_window(window_options, move |_window, cx| {
@@ -222,18 +208,22 @@ fn main() {
                             .timer(poll_interval)
                             .await;
                         follow_current_virtual_desktop();
+                        lock_overlay_chrome();
+                        poll_capture_timeout();
                         while update_ping_rx.try_recv().is_ok() {
                             let _ = this.update(cx, |_, cx| cx.notify());
                         }
 
-                        // 1. Process Menu Events from tray
-                        if let Ok(event) = MenuEvent::receiver().try_recv() {
+                        // 1. Process Menu Events from tray. Drain every queued
+                        // event so quick tray clicks are never dropped.
+                        let mut quitting = false;
+                        while let Ok(event) = MenuEvent::receiver().try_recv() {
                             if let Some(ref tray) = tray {
                                 if event.id == tray.quit_item.id() {
                                     let _ = this.update(cx, |_, cx| {
                                         cx.quit();
                                     });
-                                    break;
+                                    quitting = true;
                                 } else if event.id == tray.auto_paste_item.id() {
                                     let mut flag = auto_paste_flag.lock();
                                     *flag = !*flag;
@@ -255,6 +245,18 @@ fn main() {
                                         view.open_settings(cx);
                                     });
                                 }
+                            }
+                        }
+                        if quitting {
+                            break;
+                        }
+
+                        // The settings panel can change auto-paste too, so keep the
+                        // tray checkmark in sync with the single source of truth.
+                        if let Some(ref tray) = tray {
+                            let current = *auto_paste_flag.lock();
+                            if tray.auto_paste_item.is_checked() != current {
+                                tray.auto_paste_item.set_checked(current);
                             }
                         }
 
@@ -287,7 +289,7 @@ fn main() {
                                             let latency_ms = start_t.elapsed().as_millis() as u64;
                                             if !text.is_empty() {
                                                 let mut stats = AppStats::load();
-                                                stats.record(&text, duration_secs, latency_ms);
+                                                stats.record_and_save(&text, duration_secs, latency_ms);
 
                                                 let paste_result = if should_paste {
                                                     inj_worker.auto_paste(&text, target)
@@ -324,9 +326,37 @@ fn main() {
                         // 2. Process Hotkey Events
                         while let Ok(action) = hotkey_rx.try_recv() {
                             match action {
+                                HotkeyAction::Captured(binding) => {
+                                    let label = binding.display();
+                                    set_binding(binding);
+                                    let mut cfg = AppConfig::load();
+                                    cfg.hotkey = label.clone();
+                                    let _ = cfg.save();
+                                    if let Some(ref tray) = tray {
+                                        tray.shortcut_item
+                                            .set_text(format!("Shortcut: {label}"));
+                                        let _ = tray.tray_icon.set_tooltip(Some(format!(
+                                            "TDT - Talk Don't Type. Tap or hold {label} to talk."
+                                        )));
+                                    }
+                                    let _ = this.update(cx, |view, cx| {
+                                        view.hotkey_label = label;
+                                        view.hotkey_capturing = false;
+                                        cx.notify();
+                                    });
+                                }
+                                HotkeyAction::CaptureCancelled => {
+                                    let _ = this.update(cx, |view, cx| {
+                                        view.hotkey_capturing = false;
+                                        cx.notify();
+                                    });
+                                }
                                 HotkeyAction::PressStarted => {
                                     recording_before_press = is_recording_state;
-                                    if !is_recording_state {
+                                    // Do not overlap recordings with an in-flight
+                                    // transcription. The current recorder and STT
+                                    // engine are single-session by design.
+                                    if !is_recording_state && !is_processing_state {
                                         *target_hwnd.lock() = capture_fg();
                                         rec.start();
                                         if let Some(engine) = stt.clone() {
@@ -348,13 +378,26 @@ fn main() {
                                         });
                                     }
                                 }
-                                HotkeyAction::HoldReleased(_) => {
-                                    if is_recording_state {
+                                HotkeyAction::HoldReleased | HotkeyAction::Toggled => {
+                                    // A hold always stops; a tap only stops a session it
+                                    // started, otherwise it has just started one.
+                                    let should_stop = if matches!(action, HotkeyAction::Toggled)
+                                    {
+                                        let stop = tap_should_stop(recording_before_press);
+                                        recording_before_press = false;
+                                        stop
+                                    } else {
+                                        true
+                                    };
+                                    if should_stop && is_recording_state {
                                         is_recording_state = false;
                                         is_processing_state = true;
                                         let samples = rec.stop();
                                         play_sound(SoundEffect::StopListening);
                                         let _ = this.update(cx, |view, cx| {
+                                            // Recording is over; drop the live
+                                            // waveform here rather than in render.
+                                            view.wave_peaks = [0.0; VIS_BARS];
                                             let recorded_for = match &view.status {
                                                 HudStatus::Listening { started_at, .. } => {
                                                     started_at.elapsed()
@@ -374,34 +417,6 @@ fn main() {
                                             *target_hwnd.lock(),
                                         );
                                     }
-                                }
-                                HotkeyAction::Toggled => {
-                                    if tap_should_stop(recording_before_press) && is_recording_state {
-                                        is_recording_state = false;
-                                        is_processing_state = true;
-                                        let samples = rec.stop();
-                                        play_sound(SoundEffect::StopListening);
-                                        let _ = this.update(cx, |view, cx| {
-                                            let recorded_for = match &view.status {
-                                                HudStatus::Listening { started_at, .. } => {
-                                                    started_at.elapsed()
-                                                }
-                                                _ => Duration::from_secs(0),
-                                            };
-                                            view.status = HudStatus::Transcribing { recorded_for };
-                                            cx.notify();
-                                        });
-
-                                        dispatch_transcribe(
-                                            samples,
-                                            stt.clone(),
-                                            Arc::clone(&inj),
-                                            internal_tx.clone(),
-                                            *auto_paste_flag.lock(),
-                                            *target_hwnd.lock(),
-                                        );
-                                    }
-                                    recording_before_press = false;
                                 }
                             }
                         }
@@ -446,7 +461,7 @@ fn main() {
                         let _ = this.update(cx, |view, cx| {
                             if let Some(copied_at) = view.copied_at {
                                 if copied_at.elapsed() > Duration::from_millis(1400) {
-                                    view.copied_index = None;
+                                    view.copied_key = None;
                                     view.copied_at = None;
                                     cx.notify();
                                 }
@@ -493,14 +508,19 @@ fn main() {
                     if update::updates_disabled() {
                         return;
                     }
+                    let ticket = update::begin_update_check();
                     *update_for_boot.lock() = UpdatePhase::Checking;
                     let _ = update_ping_boot.send(());
                     let next = match update::check_latest() {
                         Ok(phase) => phase,
                         Err(error) => UpdatePhase::Failed(error),
                     };
-                    *update_for_boot.lock() = next;
-                    let _ = update_ping_boot.send(());
+                    // A user-initiated check superseded this boot check; do not
+                    // clobber its result.
+                    if update::update_check_is_current(ticket) {
+                        *update_for_boot.lock() = next;
+                        let _ = update_ping_boot.send(());
+                    }
                 });
 
                 HudView::new(

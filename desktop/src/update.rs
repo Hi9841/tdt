@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use sha2::Digest;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -12,9 +13,15 @@ pub enum UpdatePhase {
     Idle,
     Checking,
     UpToDate,
-    Available { version: String, asset_url: String },
+    Available {
+        version: String,
+        asset_url: String,
+        sums_url: Option<String>,
+    },
     Downloading,
-    Ready { installer: PathBuf },
+    Ready {
+        installer: PathBuf,
+    },
     Failed(String),
 }
 
@@ -45,6 +52,20 @@ pub fn updates_disabled() -> bool {
     )
 }
 
+static UPDATE_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Start a new update-check generation and return its ticket. Any thread
+/// holding a superseded ticket must drop its result instead of writing it,
+/// so a slow boot-time check can never overwrite a newer user-initiated one.
+pub fn begin_update_check() -> u64 {
+    UPDATE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
+}
+
+/// True when the caller's ticket is still the newest update-check generation.
+pub fn update_check_is_current(ticket: u64) -> bool {
+    UPDATE_EPOCH.load(std::sync::atomic::Ordering::SeqCst) == ticket
+}
+
 pub fn version_newer(latest: &str, current: &str) -> bool {
     match (parse_semver(latest), parse_semver(current)) {
         (Some(left), Some(right)) => left > right,
@@ -72,25 +93,113 @@ pub fn check_latest() -> Result<UpdatePhase, String> {
     }
     let asset = pick_setup_asset(&release.assets)
         .ok_or_else(|| "Latest release has no TDT-Setup.exe asset".to_string())?;
+    let sums_url = release
+        .assets
+        .iter()
+        .find(|asset| asset.name.eq_ignore_ascii_case("SHA256SUMS.txt"))
+        .map(|asset| asset.browser_download_url.clone());
     Ok(UpdatePhase::Available {
         version: latest,
         asset_url: asset.browser_download_url.clone(),
+        sums_url,
     })
 }
 
-pub fn download_installer(asset_url: &str) -> Result<PathBuf, String> {
-    let bytes = http_get_bytes(asset_url)?;
-    if bytes.len() < 64 {
+/// Download the setup installer, streaming to a temp file, and verify its
+/// SHA256 against the release's published `SHA256SUMS.txt` when available.
+/// Returns the verified installer path.
+pub fn download_installer(asset_url: &str, sums_url: Option<&str>) -> Result<PathBuf, String> {
+    let path = std::env::temp_dir().join("TDT-Setup.exe.download");
+    let mut file = File::create(&path).map_err(|e| format!("Could not write installer: {e}"))?;
+    let mut hasher = sha2::Sha256::new();
+
+    let response = download_agent()
+        .get(asset_url)
+        .set("Accept", "application/octet-stream")
+        .call()
+        .map_err(|e| format!("Download failed: {e}"))?;
+    let mut reader = response.into_reader();
+    let mut chunk = [0u8; 64 * 1024];
+    let mut total: u64 = 0;
+    loop {
+        let read = reader
+            .read(&mut chunk)
+            .map_err(|e| format!("Download failed: {e}"))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&chunk[..read]);
+        file.write_all(&chunk[..read])
+            .map_err(|e| format!("Could not write installer: {e}"))?;
+        total += read as u64;
+    }
+    drop(file);
+
+    if total < 64 {
+        let _ = std::fs::remove_file(&path);
         return Err("Downloaded installer was empty".to_string());
     }
-    if !looks_like_pe(&bytes) {
+
+    let mut head = [0u8; 2];
+    File::open(&path)
+        .and_then(|mut f| f.read_exact(&mut head))
+        .map_err(|e| format!("Could not read installer: {e}"))?;
+    if !looks_like_pe(&head) {
+        let _ = std::fs::remove_file(&path);
         return Err("Downloaded file is not a Windows installer".to_string());
     }
-    let path = std::env::temp_dir().join("TDT-Setup.exe");
-    let mut file = File::create(&path).map_err(|e| format!("Could not write installer: {e}"))?;
-    file.write_all(&bytes)
-        .map_err(|e| format!("Could not write installer: {e}"))?;
-    Ok(path)
+
+    if let Some(sums_url) = sums_url {
+        let sums = http_get_string(sums_url)?;
+        let expected = expected_hash_for(&sums, "TDT-Setup.exe")
+            .or_else(|| expected_hash_for(&sums, &download_file_name(asset_url)));
+        match expected {
+            Some(expected) => {
+                let actual = format!("{:x}", hasher.finalize());
+                if actual != expected {
+                    let _ = std::fs::remove_file(&path);
+                    return Err(
+                        "Downloaded installer failed SHA256 verification; update aborted"
+                            .to_string(),
+                    );
+                }
+            }
+            None => {
+                // Sums file exists but lists no installer entry; do not run
+                // an unverifiable executable.
+                let _ = std::fs::remove_file(&path);
+                return Err(
+                    "Release checksums do not list the installer; update aborted".to_string(),
+                );
+            }
+        }
+    } else {
+        let _ = std::fs::remove_file(&path);
+        return Err(
+            "Release has no SHA256SUMS.txt; refusing to run an unverified installer".to_string(),
+        );
+    }
+
+    let final_path = std::env::temp_dir().join("TDT-Setup.exe");
+    std::fs::rename(&path, &final_path)
+        .map_err(|e| format!("Could not finalize installer download: {e}"))?;
+    Ok(final_path)
+}
+
+fn download_file_name(url: &str) -> String {
+    url.rsplit('/').next().unwrap_or_default().to_string()
+}
+
+fn expected_hash_for(sums: &str, file_name: &str) -> Option<String> {
+    for line in sums.lines() {
+        let mut parts = line.split_whitespace();
+        let hash = parts.next()?;
+        let name = parts.next()?;
+        if name.eq_ignore_ascii_case(file_name) {
+            return Some(hash.to_ascii_lowercase());
+        }
+    }
+    None
 }
 
 pub fn launch_installer(path: &Path) -> Result<(), String> {
@@ -187,20 +296,6 @@ fn http_get_string(url: &str) -> Result<String, String> {
     }
 }
 
-fn http_get_bytes(url: &str) -> Result<Vec<u8>, String> {
-    let response = download_agent()
-        .get(url)
-        .set("Accept", "application/octet-stream")
-        .call()
-        .map_err(|e| format!("Download failed: {e}"))?;
-    let mut bytes = Vec::new();
-    response
-        .into_reader()
-        .read_to_end(&mut bytes)
-        .map_err(|e| format!("Download failed: {e}"))?;
-    Ok(bytes)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,8 +323,31 @@ mod tests {
     }
 
     #[test]
+    fn sums_parsing_matches_name_case_insensitively() {
+        let sums = "abc123  TDT-0.1.0-windows-x64.zip\ndef456  tdt-setup.exe\n";
+        assert_eq!(
+            expected_hash_for(sums, "TDT-Setup.exe"),
+            Some("def456".to_string())
+        );
+        assert_eq!(
+            expected_hash_for(sums, "TDT-0.1.0-windows-x64.zip"),
+            Some("abc123".to_string())
+        );
+        assert_eq!(expected_hash_for(sums, "missing.zip"), None);
+    }
+
+    #[test]
     fn missing_release_is_not_an_error() {
         assert!(is_no_release("404 Not Found"));
         assert!(!is_no_release("Update check failed: timed out"));
+    }
+
+    #[test]
+    fn superseded_check_ticket_is_not_current() {
+        let first = begin_update_check();
+        assert!(update_check_is_current(first));
+        let second = begin_update_check();
+        assert!(!update_check_is_current(first));
+        assert!(update_check_is_current(second));
     }
 }

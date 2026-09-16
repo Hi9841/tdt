@@ -3,6 +3,7 @@ use std::fs;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AppConfig {
     pub auto_paste: bool,
     pub hotkey: String,
@@ -100,6 +101,7 @@ pub struct HistoryItem {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AppStats {
     pub total_words: usize,
     pub total_seconds: f32,
@@ -107,6 +109,9 @@ pub struct AppStats {
     pub last_latency_ms: u64,
     pub history: Vec<HistoryItem>,
 }
+
+/// How many recent transcripts stay visible in the stats tab.
+pub const MAX_HISTORY: usize = 10;
 
 impl AppStats {
     pub fn stats_path() -> PathBuf {
@@ -128,6 +133,8 @@ impl AppStats {
         Self::default()
     }
 
+    /// Update the running totals in memory. Callers decide when to persist, so
+    /// this stays pure and testable.
     pub fn record(&mut self, text: &str, duration_secs: f32, latency_ms: u64) {
         let words = text.split_whitespace().count();
         self.total_words += words;
@@ -146,10 +153,19 @@ impl AppStats {
             },
         );
 
-        if self.history.len() > 10 {
-            self.history.truncate(10);
+        if self.history.len() > MAX_HISTORY {
+            self.history.truncate(MAX_HISTORY);
         }
+    }
 
+    /// Record a transcript and persist the result.
+    pub fn record_and_save(&mut self, text: &str, duration_secs: f32, latency_ms: u64) {
+        self.record(text, duration_secs, latency_ms);
+        let _ = self.save();
+    }
+
+    pub fn clear_history(&mut self) {
+        self.history.clear();
         let _ = self.save();
     }
 
@@ -213,5 +229,62 @@ pub(crate) fn local_hms() -> String {
             (secs / 60) % 60,
             secs % 60
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AppConfig, AppStats, MAX_HISTORY};
+
+    #[test]
+    fn record_counts_words_and_sessions() {
+        let mut stats = AppStats::default();
+        stats.record("hello there world", 2.5, 120);
+        stats.record("bye", 0.5, 80);
+
+        assert_eq!(stats.total_words, 4);
+        assert_eq!(stats.total_transcriptions, 2);
+        assert_eq!(stats.last_latency_ms, 80);
+        assert!((stats.total_seconds - 3.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn newest_transcript_is_first_and_history_is_bounded() {
+        let mut stats = AppStats::default();
+        for index in 0..MAX_HISTORY + 5 {
+            stats.record(&format!("entry {index}"), 0.1, 50);
+        }
+
+        assert_eq!(stats.history.len(), MAX_HISTORY);
+        assert_eq!(stats.history[0].text, format!("entry {}", MAX_HISTORY + 4));
+    }
+
+    #[test]
+    fn record_does_not_touch_the_config_dir() {
+        let mut stats = AppStats::default();
+        stats.record("keep this in memory", 1.0, 42);
+        assert_eq!(stats.total_transcriptions, 1);
+    }
+
+    #[test]
+    fn partial_config_json_keeps_defaults_for_missing_fields() {
+        let config: AppConfig = serde_json::from_str(r#"{"auto_paste": false}"#).unwrap();
+        assert!(!config.auto_paste);
+        assert_eq!(config.hotkey, AppConfig::default().hotkey);
+        assert_eq!(config.language, "auto");
+    }
+
+    #[test]
+    fn stats_round_trip_keeps_history() {
+        let mut stats = AppStats::default();
+        stats.record("first", 1.0, 10);
+        stats.record("second", 2.0, 20);
+
+        let json = serde_json::to_string(&stats).unwrap();
+        let restored: AppStats = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored.history.len(), 2);
+        assert_eq!(restored.history[0].text, "second");
+        assert_eq!(restored.total_words, 2);
     }
 }

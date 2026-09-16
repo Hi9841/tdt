@@ -13,42 +13,113 @@ use windows::Win32::System::Com::{
 use windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
 use windows::Win32::UI::Shell::{IVirtualDesktopManager, VirtualDesktopManager};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetForegroundWindow, GetWindowRect, GetWindowThreadProcessId, IsWindowVisible,
-    PostMessageW, SetWindowPos, SystemParametersInfoW, HTCAPTION, HWND_TOPMOST,
-    SPI_GETCLIENTAREAANIMATION, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOZORDER,
-    SWP_SHOWWINDOW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WM_NCLBUTTONDOWN,
+    EnumWindows, GetForegroundWindow, GetWindowLongW, GetWindowRect, GetWindowThreadProcessId,
+    IsWindowVisible, PostMessageW, SetWindowLongW, SetWindowPos, SystemParametersInfoW, GWL_STYLE,
+    HTCAPTION, HWND_TOPMOST, SPI_GETCLIENTAREAANIMATION, SWP_FRAMECHANGED, SWP_NOACTIVATE,
+    SWP_NOCOPYBITS, SWP_NOZORDER, SWP_SHOWWINDOW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+    WM_NCLBUTTONDOWN, WS_CAPTION, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_THICKFRAME,
 };
 
 pub const BUBBLE_WIDTH: f32 = 340.0;
 pub const BUBBLE_HEIGHT: f32 = 44.0;
-pub const PANEL_WIDTH: i32 = 360;
+pub const PANEL_WIDTH: i32 = 340;
 pub const PANEL_HEIGHT: i32 = 528;
-pub const PANEL_MIN_WIDTH: i32 = 320;
-pub const PANEL_MAX_WIDTH: i32 = 400;
 pub const PANEL_MIN_HEIGHT: i32 = 460;
 pub const PANEL_MAX_HEIGHT: i32 = 600;
 pub const PANEL_OPEN_MS: u64 = 240;
 pub const PANEL_CLOSE_MS: u64 = 180;
 
-fn bubble_anchor() -> &'static parking_lot::Mutex<Option<(i32, i32)>> {
-    static POS: parking_lot::Mutex<Option<(i32, i32)>> = parking_lot::Mutex::new(None);
+fn overlay_expanded() -> &'static std::sync::atomic::AtomicBool {
+    static FLAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    &FLAG
+}
+
+fn overlay_animating() -> &'static std::sync::atomic::AtomicBool {
+    static FLAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    &FLAG
+}
+
+/// Strip resize handles and snap the collapsed overlay back to 340x44.
+pub fn lock_overlay_chrome() {
+    #[cfg(target_os = "windows")]
+    {
+        let Some(hwnd) = find_app_hwnd() else {
+            return;
+        };
+        unsafe {
+            let style = GetWindowLongW(hwnd, GWL_STYLE);
+            let blocked =
+                (WS_CAPTION.0 | WS_THICKFRAME.0 | WS_MAXIMIZEBOX.0 | WS_MINIMIZEBOX.0) as i32;
+            if style & blocked != 0 {
+                let _ = SetWindowLongW(hwnd, GWL_STYLE, style & !blocked);
+                let _ = SetWindowPos(
+                    hwnd,
+                    HWND::default(),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOACTIVATE
+                        | SWP_NOZORDER
+                        | SWP_NOCOPYBITS
+                        | SWP_FRAMECHANGED
+                        | windows::Win32::UI::WindowsAndMessaging::SWP_NOMOVE
+                        | windows::Win32::UI::WindowsAndMessaging::SWP_NOSIZE,
+                );
+            }
+            if overlay_expanded().load(std::sync::atomic::Ordering::SeqCst)
+                || overlay_animating().load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return;
+            }
+            let mut rect = RECT::default();
+            let _ = GetWindowRect(hwnd, &mut rect);
+            let want_w = BUBBLE_WIDTH as i32;
+            let want_h = BUBBLE_HEIGHT as i32;
+            let w = rect.right - rect.left;
+            let h = rect.bottom - rect.top;
+            if w != want_w || h != want_h {
+                let bottom = rect.bottom;
+                let _ = SetWindowPos(
+                    hwnd,
+                    HWND::default(),
+                    rect.left,
+                    bottom - want_h,
+                    want_w,
+                    want_h,
+                    SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOCOPYBITS,
+                );
+            }
+        }
+    }
+}
+
+fn bubble_anchor() -> &'static parking_lot::Mutex<Option<(i32, i32, i32)>> {
+    static POS: parking_lot::Mutex<Option<(i32, i32, i32)>> = parking_lot::Mutex::new(None);
     &POS
 }
 
-/// Size the expanded panel from the monitor work area so it stays on-screen
-/// without clipping controls.
-pub fn panel_size_for_work(work_w: i32, work_h: i32) -> (i32, i32) {
-    if work_w <= 0 || work_h <= 0 {
-        return (PANEL_WIDTH, PANEL_HEIGHT);
+fn save_bubble_rect(left: i32, top: i32, width: i32) {
+    let mut saved = bubble_anchor().lock();
+    if saved.is_none() {
+        *saved = Some((left, top, width.max(1)));
     }
-    (
-        (work_w - 40).clamp(PANEL_MIN_WIDTH, PANEL_MAX_WIDTH),
-        (work_h - 48).clamp(PANEL_MIN_HEIGHT, PANEL_MAX_HEIGHT),
-    )
+}
+
+/// Size the expanded panel. Width matches the closed pill so the morph
+/// does not grow sideways.
+pub fn panel_size_for_work(_work_w: i32, work_h: i32) -> (i32, i32) {
+    let height = if work_h <= 0 {
+        PANEL_HEIGHT
+    } else {
+        (work_h - 48).clamp(PANEL_MIN_HEIGHT, PANEL_MAX_HEIGHT)
+    };
+    (PANEL_WIDTH, height)
 }
 
 /// Clamp the expanded panel to a monitor work area. Origins may be negative
 /// or beyond the primary width when the overlay lives on a second display.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn panel_origin(
     bubble: (i32, i32),
     work: (i32, i32, i32, i32),
@@ -101,12 +172,10 @@ pub fn lerp_i32(a: i32, b: i32, t: f32) -> i32 {
     (a as f32 + (b - a) as f32 * t).round() as i32
 }
 
-/// Keep the bottom edge stable while height changes, so the pill does not bounce
-/// against the taskbar.
-pub fn lerp_pinned_bottom(from_y: i32, from_h: i32, to_y: i32, to_h: i32, t: f32) -> (i32, i32) {
-    let from_bottom = from_y + from_h;
-    let to_bottom = to_y + to_h;
-    let bottom = lerp_i32(from_bottom, to_bottom, t);
+/// Keep the bottom edge where it is while height changes. `to_y` is ignored so
+/// a clamped panel origin cannot drag the pill off the taskbar.
+pub fn lerp_pinned_bottom(from_y: i32, from_h: i32, _to_y: i32, to_h: i32, t: f32) -> (i32, i32) {
+    let bottom = from_y + from_h;
     let h = lerp_i32(from_h, to_h, t).max(1);
     (bottom - h, h)
 }
@@ -248,16 +317,15 @@ fn preferred_startup_work_area() -> Option<(i32, i32, i32, i32)> {
 pub fn set_window_mode(is_expanded: bool) {
     #[cfg(target_os = "windows")]
     {
+        overlay_animating().store(true, std::sync::atomic::Ordering::SeqCst);
         if is_expanded {
+            overlay_expanded().store(true, std::sync::atomic::Ordering::SeqCst);
             if let Some(hwnd) = find_app_hwnd() {
                 let mut rect = RECT::default();
                 unsafe {
                     let _ = GetWindowRect(hwnd, &mut rect);
                 }
-                let mut saved = bubble_anchor().lock();
-                if saved.is_none() {
-                    *saved = Some((rect.left, rect.top));
-                }
+                save_bubble_rect(rect.left, rect.top, BUBBLE_WIDTH as i32);
             }
         }
 
@@ -277,46 +345,44 @@ pub fn set_window_mode(is_expanded: bool) {
                     rect.bottom,
                 ));
 
-                let (to_x, to_y, to_w, to_h) = if is_expanded {
-                    let (orig_left, orig_top) = {
-                        let mut saved = bubble_anchor().lock();
-                        if saved.is_none() {
-                            *saved = Some((rect.left, rect.top));
-                        }
-                        (*saved).expect("bubble origin")
-                    };
-                    let panel = panel_size_for_work(work.2 - work.0, work.3 - work.1);
-                    let (left, top) = panel_origin((orig_left, orig_top), work, panel);
-                    (left, top, panel.0, panel.1)
-                } else {
-                    let (left, top) = (*bubble_anchor().lock()).unwrap_or((rect.left, rect.top));
-                    (left, top, BUBBLE_WIDTH as i32, BUBBLE_HEIGHT as i32)
-                };
-
                 let from_x = rect.left;
                 let from_y = rect.top;
-                let from_w = rect.right - rect.left;
                 let from_h = rect.bottom - rect.top;
+                let bottom = from_y + from_h;
+                let locked_w = BUBBLE_WIDTH as i32;
 
-                let apply = |x, y, w, h| {
+                let (to_x, to_y, to_h) = if is_expanded {
+                    save_bubble_rect(rect.left, rect.top, locked_w);
+                    let (_, panel_h) = panel_size_for_work(work.2 - work.0, work.3 - work.1);
+                    let max_h = (bottom - work.1 - 20).max(BUBBLE_HEIGHT as i32);
+                    let to_h = panel_h.min(max_h);
+                    (from_x, bottom - to_h, to_h)
+                } else {
+                    let to_h = BUBBLE_HEIGHT as i32;
+                    (from_x, bottom - to_h, to_h)
+                };
+
+                let apply = |x, y, h| {
                     let _ = SetWindowPos(
                         hwnd,
                         HWND::default(),
                         x,
                         y,
-                        w,
+                        locked_w,
                         h,
                         SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOCOPYBITS,
                     );
                 };
 
                 if !client_animations_enabled()
-                    || (from_x == to_x && from_y == to_y && from_w == to_w && from_h == to_h)
+                    || (from_x == to_x && from_y == to_y && from_h == to_h)
                 {
-                    apply(to_x, to_y, to_w, to_h);
+                    apply(to_x, to_y, to_h);
                     if !is_expanded {
                         bubble_anchor().lock().take();
+                        overlay_expanded().store(false, std::sync::atomic::Ordering::SeqCst);
                     }
+                    overlay_animating().store(false, std::sync::atomic::Ordering::SeqCst);
                     return;
                 }
 
@@ -333,16 +399,18 @@ pub fn set_window_mode(is_expanded: bool) {
                     let t = (started.elapsed().as_secs_f32() / duration.as_secs_f32()).min(1.0);
                     let e = ease_drawer(t);
                     let (y, h) = lerp_pinned_bottom(from_y, from_h, to_y, to_h, e);
-                    apply(lerp_i32(from_x, to_x, e), y, lerp_i32(from_w, to_w, e), h);
+                    apply(lerp_i32(from_x, to_x, e), y, h);
                     if t >= 1.0 {
                         break;
                     }
                     std::thread::sleep(std::time::Duration::from_millis(10));
                 }
-                apply(to_x, to_y, to_w, to_h);
+                apply(to_x, to_y, to_h);
                 if !is_expanded {
                     bubble_anchor().lock().take();
+                    overlay_expanded().store(false, std::sync::atomic::Ordering::SeqCst);
                 }
+                overlay_animating().store(false, std::sync::atomic::Ordering::SeqCst);
             }
         });
     }
@@ -441,10 +509,11 @@ mod tests {
 
     #[test]
     fn panel_size_fits_small_and_large_work_areas() {
-        assert_eq!(panel_size_for_work(1920, 1080), (400, 600));
+        assert_eq!(panel_size_for_work(1920, 1080).0, BUBBLE_WIDTH as i32);
+        assert_eq!(panel_size_for_work(1920, 1080), (PANEL_WIDTH, 600));
         assert_eq!(
             panel_size_for_work(300, 400),
-            (PANEL_MIN_WIDTH, PANEL_MIN_HEIGHT)
+            (PANEL_WIDTH, PANEL_MIN_HEIGHT)
         );
     }
 
