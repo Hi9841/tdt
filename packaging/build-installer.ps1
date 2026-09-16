@@ -1,0 +1,94 @@
+# Build a portable zip and a self-contained TDT-Setup.exe (no Inno Setup required).
+[CmdletBinding()]
+param(
+    [string]$RepoRoot = "",
+    [string]$Version = "0.1.0"
+)
+
+$ErrorActionPreference = "Stop"
+if (-not $PSScriptRoot) {
+    $PSScriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+}
+if (-not $RepoRoot) {
+    $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+}
+$Version = $Version.TrimStart("vV")
+$Desktop = Join-Path $RepoRoot "desktop"
+$SetupCrate = Join-Path $PSScriptRoot "tdt-setup"
+$Stage = Join-Path $PSScriptRoot "stage"
+$Dist = Join-Path $RepoRoot "dist"
+$ModelSrc = Join-Path $RepoRoot "models\sensevoice"
+$ReleaseExe = Join-Path $Desktop "target\release\voice-stt-desktop.exe"
+$StubExe = Join-Path $SetupCrate "target\release\tdt-setup.exe"
+
+Write-Host "Building TDT $Version..."
+cargo build --release --manifest-path (Join-Path $Desktop "Cargo.toml")
+if ($LASTEXITCODE -ne 0) { throw "cargo build --release failed" }
+
+cargo build --release --manifest-path (Join-Path $SetupCrate "Cargo.toml")
+if ($LASTEXITCODE -ne 0) { throw "tdt-setup build failed" }
+
+if (-not (Test-Path $ReleaseExe)) {
+    throw "Missing $ReleaseExe"
+}
+if (-not (Test-Path $StubExe)) {
+    throw "Missing $StubExe"
+}
+if (-not (Test-Path (Join-Path $ModelSrc "model.int8.onnx"))) {
+    Write-Host "Downloading SenseVoice model..."
+    powershell -ExecutionPolicy Bypass -File (Join-Path $RepoRoot "models\download-models.ps1")
+}
+
+if (Test-Path $Stage) { Remove-Item $Stage -Recurse -Force }
+New-Item -ItemType Directory -Path (Join-Path $Stage "models\sensevoice") -Force | Out-Null
+New-Item -ItemType Directory -Path $Dist -Force | Out-Null
+
+Copy-Item $ReleaseExe (Join-Path $Stage "TDT.exe")
+Copy-Item (Join-Path $RepoRoot "LICENSE") $Stage
+Copy-Item (Join-Path $RepoRoot "NOTICE") $Stage
+Copy-Item (Join-Path $RepoRoot "THIRD_PARTY_NOTICES.md") $Stage
+Copy-Item (Join-Path $RepoRoot "README.md") $Stage
+Copy-Item (Join-Path $PSScriptRoot "tdt-setup.ps1") (Join-Path $Stage "Install-TDT.ps1")
+Set-Content -LiteralPath (Join-Path $Stage "VERSION") -Value $Version -NoNewline
+Copy-Item (Join-Path $ModelSrc "*") (Join-Path $Stage "models\sensevoice") -Force
+
+$portable = Join-Path $Dist "TDT-$Version-windows-x64.zip"
+if (Test-Path $portable) { Remove-Item $portable -Force }
+Compress-Archive -Path (Join-Path $Stage "*") -DestinationPath $portable -Force
+Write-Host "Wrote $portable"
+
+$payload = Join-Path $PSScriptRoot "payload.zip"
+if (Test-Path $payload) { Remove-Item $payload -Force }
+Compress-Archive -Path (Join-Path $Stage "*") -DestinationPath $payload -Force
+
+$setup = Join-Path $Dist "TDT-Setup.exe"
+if (Test-Path $setup) { Remove-Item $setup -Force }
+$setupStream = [System.IO.File]::Open($setup, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write)
+try {
+    $stubStream = [System.IO.File]::OpenRead($StubExe)
+    try { $stubStream.CopyTo($setupStream) } finally { $stubStream.Dispose() }
+    $zipStream = [System.IO.File]::OpenRead($payload)
+    try {
+        $zipLen = $zipStream.Length
+        $zipStream.CopyTo($setupStream)
+    } finally { $zipStream.Dispose() }
+    $sizeBytes = [BitConverter]::GetBytes([int64]$zipLen)
+    $setupStream.Write($sizeBytes, 0, 8)
+    $magic = [byte[]](0x54, 0x44, 0x54, 0x5A, 0x49, 0x50, 0x31, 0x00)
+    $setupStream.Write($magic, 0, 8)
+} finally {
+    $setupStream.Dispose()
+}
+Remove-Item $payload -Force
+Write-Host "Wrote $setup"
+
+Copy-Item (Join-Path $Stage "Install-TDT.ps1") (Join-Path $Dist "Install-TDT.ps1") -Force
+
+$sums = Join-Path $Dist "SHA256SUMS.txt"
+$lines = @()
+Get-ChildItem $Dist -File | Where-Object { $_.Name -ne "SHA256SUMS.txt" } | ForEach-Object {
+    $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant()
+    $lines += "$hash  $($_.Name)"
+}
+Set-Content -LiteralPath $sums -Value $lines
+Write-Host "Wrote $sums"

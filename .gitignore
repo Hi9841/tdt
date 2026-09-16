@@ -1,0 +1,33 @@
+# Build
+desktop/target/
+mobile/**/build/
+mobile/**/.gradle/
+mobile/local.properties
+dist/
+packaging/stage/
+packaging/.cache/
+packaging/Output/
+packaging/payload.zip
+packaging/tdt-setup/target/
+*.pdb
+
+# Models (download with models/download-models.ps1)
+models/sensevoice/*.onnx
+models/sensevoice/tokens.txt
+models/sensevoice/*.download
+
+# Prebuilt Android AAR (place in mobile/app/libs/)
+*.aar
+
+# Logs and local captures
+*.log
+desktop/*.log
+overlay-*.png
+verification-*.png
+settings-page.png
+stats-page.png
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store

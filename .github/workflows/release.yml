@@ -1,0 +1,27 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Download SenseVoice model
+        run: powershell -ExecutionPolicy Bypass -File models/download-models.ps1
+      - name: Build installer
+        run: powershell -ExecutionPolicy Bypass -File packaging/build-installer.ps1 -Version "${{ github.ref_name }}"
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/TDT-Setup.exe
+            dist/TDT-*-windows-x64.zip
+            dist/SHA256SUMS.txt
+          generate_release_notes: true
