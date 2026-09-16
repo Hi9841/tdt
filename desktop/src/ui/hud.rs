@@ -5,7 +5,8 @@ use crate::paste::PasteInjector;
 use crate::stt::SttEngine;
 use crate::ui::text::{clip_text, format_mmss};
 use crate::ui::window_util::{
-    set_window_mode, start_window_drag, BUBBLE_HEIGHT, BUBBLE_WIDTH, PANEL_CLOSE_MS, PANEL_OPEN_MS,
+    client_animations_enabled, set_window_mode, start_window_drag, BUBBLE_HEIGHT, BUBBLE_WIDTH,
+    PANEL_CLOSE_MS, PANEL_OPEN_MS,
 };
 use crate::update::{self, UpdatePhase};
 use gpui::prelude::FluentBuilder;
@@ -31,7 +32,11 @@ const PILL_BG: u32 = 0x232136f5;
 const PANEL_BG: u32 = 0x232136fa;
 const HOVER: u32 = 0xc4a7e73d;
 const SELECTED_FILL: u32 = 0xc4a7e740;
-const SIDE_W: f32 = 96.0;
+const PILL_OUTLINE: u32 = 0xffffff1a;
+/// Settings control: the 44px hit target paints nothing; the visible
+/// highlight is an inset child so it never collides with the pill border.
+const SETTINGS_HIT_HEIGHT: f32 = 44.0;
+const SETTINGS_SURFACE_HEIGHT: f32 = 30.0;
 const WAVE_BARS: usize = VIS_BARS;
 const WAVE_BAR_W: f32 = 3.0;
 const WAVE_GAP: f32 = 2.0;
@@ -280,6 +285,25 @@ impl HudView {
         self.copied_at = Some(Instant::now());
     }
 
+    fn select_language(&mut self, code: &str) {
+        self.selected_language = code.to_string();
+        if let Some(engine) = &self.stt_engine {
+            let _ = engine.set_language(code);
+        }
+        let mut cfg = AppConfig::load();
+        cfg.language = code.to_string();
+        let _ = cfg.save();
+    }
+
+    fn toggle_auto_paste(&mut self) {
+        self.auto_paste_enabled = !self.auto_paste_enabled;
+        self.toggle_epoch = self.toggle_epoch.wrapping_add(1);
+        let mut cfg = AppConfig::load();
+        cfg.auto_paste = self.auto_paste_enabled;
+        let _ = cfg.save();
+        *self.auto_paste_state.lock() = self.auto_paste_enabled;
+    }
+
     fn clear_recents(&mut self) {
         self.stats.clear_history();
         self.copied_key = None;
@@ -340,13 +364,13 @@ impl HudView {
 
         // Static bars during transcription read as frozen, so pulse them while
         // the model is working.
-        let waveform: AnyElement = if released {
+        let waveform: AnyElement = if released && client_animations_enabled() {
             waveform
                 .with_animation(
                     "transcribe_pulse",
-                    Animation::new(Duration::from_millis(700))
+                    Animation::new(Duration::from_millis(1100))
                         .repeat()
-                        .with_easing(ease_in_out),
+                        .with_easing(pulse_curve),
                     |this, delta| this.opacity(0.45 + 0.55 * delta),
                 )
                 .into_any_element()
@@ -355,15 +379,58 @@ impl HudView {
         };
 
         let center_child = match &self.status {
+            HudStatus::Idle => div()
+                .flex_1()
+                .min_w(px(0.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .overflow_hidden()
+                .child(
+                    div()
+                        .px(px(8.0))
+                        .py(px(4.0))
+                        .rounded(px(6.0))
+                        .bg(rgba(0xffffff0a))
+                        .text_size(px(12.0))
+                        .text_color(rgb(TEXT_SECONDARY))
+                        .whitespace_nowrap()
+                        .child(format!("Press {}", self.hotkey_label)),
+                )
+                .into_any_element(),
             HudStatus::Success { text, .. } => overlay_snippet(text, rgb(TEXT)),
             HudStatus::Error { message, .. } => overlay_snippet(message, rgb(LOVE)),
             _ => waveform,
         };
 
+        let state_key = match &self.status {
+            HudStatus::Idle => "bubble_ready",
+            HudStatus::Listening { .. } => "bubble_listening",
+            HudStatus::Transcribing { .. } => "bubble_transcribing",
+            HudStatus::Success { .. } => "bubble_success",
+            HudStatus::Error { .. } => "bubble_error",
+        };
+        let center_child = div()
+            .flex_1()
+            .min_w(px(0.0))
+            .overflow_hidden()
+            .child(center_child);
+        let center_child = if client_animations_enabled() {
+            center_child
+                .with_animation(
+                    state_key,
+                    Animation::new(Duration::from_millis(160)).with_easing(ease_out_quint()),
+                    |element, progress| element.opacity(0.65 + 0.35 * progress),
+                )
+                .into_any_element()
+        } else {
+            center_child.into_any_element()
+        };
+
         let (status_label, status_color, status_pulse) = match &self.status {
             HudStatus::Idle => ("Ready", rgb(FOAM), false),
-            HudStatus::Listening { .. } => ("Listening...", rgb(HOLD_COLOR), true),
-            HudStatus::Transcribing { .. } => ("Processing...", rgb(RELEASE_COLOR), true),
+            HudStatus::Listening { .. } => ("Listening", rgb(HOLD_COLOR), true),
+            HudStatus::Transcribing { .. } => ("Transcribing", rgb(RELEASE_COLOR), true),
             HudStatus::Success { auto_pasted, .. } => (
                 if *auto_pasted { "Pasted" } else { "Copied" },
                 rgb(SUCCESS),
@@ -377,8 +444,6 @@ impl HudView {
             .flex_none()
             .items_center()
             .gap(px(8.0))
-            .w(px(SIDE_W))
-            .min_w(px(SIDE_W))
             .child(phase_indicator(
                 "status_indicator",
                 true,
@@ -387,8 +452,9 @@ impl HudView {
             ))
             .child(
                 div()
-                    .text_size(px(11.0))
-                    .text_color(status_color)
+                    .text_size(px(13.0))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(rgb(TEXT))
                     .whitespace_nowrap()
                     .child(status_label),
             );
@@ -404,8 +470,7 @@ impl HudView {
             .flex_none()
             .items_center()
             .justify_end()
-            .w(px(SIDE_W))
-            .min_w(px(SIDE_W));
+            .min_w(px(44.0));
 
         let right_section = if matches!(&self.status, HudStatus::Idle) {
             right_section.child(
@@ -414,17 +479,40 @@ impl HudView {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .h(px(36.0))
-                    .px(px(10.0))
-                    .rounded_lg()
-                    .text_size(px(11.0))
+                    // Keep the hit target tall, but inset its painted surface.
+                    .h(px(SETTINGS_HIT_HEIGHT))
+                    .group("pill_settings")
+                    .tab_index(0)
+                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                        if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                            cx.stop_propagation();
+                            this.open_settings(cx);
+                            cx.notify();
+                        }
+                    }))
+                    .text_size(px(12.0))
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(rgb(TEXT))
                     .whitespace_nowrap()
                     .cursor_pointer()
-                    .hover(|style| style.bg(rgba(HOVER)))
-                    .active(|style| style.opacity(0.92))
-                    .child("Settings")
+                    .child(
+                        div()
+                            .id("pill_settings_surface")
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .h(px(SETTINGS_SURFACE_HEIGHT))
+                            .px(px(10.0))
+                            .rounded(px(8.0))
+                            // Reserve the focus border so focus never shifts text.
+                            .border_2()
+                            .border_color(rgba(0x00000000))
+                            .group_hover("pill_settings", |style| style.bg(rgba(0xffffff12)))
+                            .group_active("pill_settings", |style| style.bg(rgba(0xffffff20)))
+                            .focusable()
+                            .in_focus(|style| style.border_color(rgb(FOAM)))
+                            .child("Settings"),
+                    )
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|_, _, _, cx| cx.stop_propagation()),
@@ -459,10 +547,11 @@ impl HudView {
             .w(px(BUBBLE_WIDTH))
             .h(px(BUBBLE_HEIGHT))
             .px(px(12.0))
-            .rounded_lg()
+            .gap(px(8.0))
+            .rounded(px(14.0))
             .bg(rgba(PILL_BG))
             .border_1()
-            .border_color(rgba(HAIRLINE))
+            .border_color(rgba(PILL_OUTLINE))
             .shadow_xs()
             .overflow_hidden()
             .cursor_move()
@@ -486,14 +575,25 @@ impl HudView {
                        cx: &mut Context<'_, Self>| {
             div()
                 .id(id)
+                .tab_index(0)
+                .border_2()
+                .border_color(rgba(0x00000000))
+                .focus(|style| style.border_color(rgb(FOAM)))
+                .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                    if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                        this.active_tab = tab;
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
+                }))
                 .flex_none()
-                .h(px(32.0))
+                .h(px(44.0))
                 .px(px(10.0))
                 .rounded_lg()
                 .flex()
                 .items_center()
                 .justify_center()
-                .text_size(px(11.0))
+                .text_size(px(12.0))
                 .font_weight(if active {
                     FontWeight::MEDIUM
                 } else {
@@ -591,10 +691,22 @@ impl HudView {
                             .flex_none()
                             .items_center()
                             .justify_center()
-                            .h(px(32.0))
+                            .h(px(44.0))
+                            .min_w(px(44.0))
                             .px(px(8.0))
                             .rounded_lg()
-                            .text_size(px(11.0))
+                            .tab_index(0)
+                            .border_2()
+                            .border_color(rgba(0x00000000))
+                            .focus(|style| style.border_color(rgb(FOAM)))
+                            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                                    this.close_stats_settings(cx);
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                }
+                            }))
+                            .text_size(px(12.0))
                             .font_weight(FontWeight::MEDIUM)
                             .text_color(rgb(TEXT_SECONDARY))
                             .whitespace_nowrap()
@@ -630,12 +742,18 @@ impl HudView {
             .w_full()
             .min_h(px(0.0))
             .overflow_y_scroll()
-            .child(content)
-            .with_animation(
-                tab_id,
-                Animation::new(Duration::from_millis(150)).with_easing(ease_out_quint()),
-                |this, delta| this.opacity(0.82 + 0.18 * delta),
-            );
+            .child(content);
+        let faded_content = if client_animations_enabled() {
+            faded_content
+                .with_animation(
+                    tab_id,
+                    Animation::new(Duration::from_millis(180)).with_easing(ease_out_quint()),
+                    |this, delta| this.opacity(0.82 + 0.18 * delta),
+                )
+                .into_any_element()
+        } else {
+            faded_content.into_any_element()
+        };
 
         div()
             .id("stats_settings_container")
@@ -649,9 +767,16 @@ impl HudView {
             .bg(rgba(PANEL_BG))
             .border_1()
             .border_color(rgba(HAIRLINE))
-            .rounded_lg()
+            .rounded(px(14.0))
             .shadow_xs()
             .overflow_hidden()
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if event.keystroke.key == "escape" && !this.hotkey_capturing {
+                    this.close_stats_settings(cx);
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            }))
             .child(header)
             .child(faded_content)
             .into_any_element()
@@ -961,7 +1086,7 @@ impl HudView {
                         .flex_col()
                         .gap(px(3.0))
                         .flex_1()
-                        .min_w(px(148.0))
+                        .min_w(px(128.0))
                         .child(
                             div()
                                 .text_size(px(12.0))
@@ -983,6 +1108,18 @@ impl HudView {
 
         let on = is_auto_paste;
         let epoch = self.toggle_epoch;
+        let animate_toggle = epoch > 0 && client_animations_enabled();
+        let knob = div().w(px(16.0)).h(px(16.0)).rounded_full().bg(rgb(TEXT));
+        let knob = if animate_toggle {
+            knob.with_animation(
+                ElementId::NamedInteger("toggle_knob".into(), epoch),
+                Animation::new(Duration::from_millis(140)).with_easing(ease_out_quint()),
+                move |knob, progress| knob.ml(px(toggle_offset(on, progress))),
+            )
+            .into_any_element()
+        } else {
+            knob.ml(px(toggle_offset(on, 1.0))).into_any_element()
+        };
         let toggle_track = div()
             .id("auto_paste_toggle")
             .flex()
@@ -998,34 +1135,41 @@ impl HudView {
             })
             .cursor_pointer()
             .overflow_hidden()
-            .child(
-                div()
-                    .w(px(16.0))
-                    .h(px(16.0))
-                    .rounded_full()
-                    .bg(rgb(TEXT))
-                    .with_animation(
-                        ElementId::NamedInteger("toggle_knob".into(), epoch),
-                        Animation::new(Duration::from_millis(140)).with_easing(ease_out_quint()),
-                        move |knob, delta| {
-                            let offset = if on {
-                                2.0 + 16.0 * delta
-                            } else {
-                                18.0 - 16.0 * delta
-                            };
-                            knob.ml(px(offset))
-                        },
-                    ),
-            )
+            .child(knob)
             .on_click(cx.listener(|this, _, _, cx| {
-                this.auto_paste_enabled = !this.auto_paste_enabled;
-                this.toggle_epoch = this.toggle_epoch.wrapping_add(1);
-                let mut cfg = AppConfig::load();
-                cfg.auto_paste = this.auto_paste_enabled;
-                let _ = cfg.save();
-                *this.auto_paste_state.lock() = this.auto_paste_enabled;
+                cx.stop_propagation();
+                this.toggle_auto_paste();
                 cx.notify();
             }));
+
+        let toggle_track = div()
+            .id("auto_paste_hit_target")
+            .group("auto_paste")
+            .tab_index(0)
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(44.0))
+            .h(px(44.0))
+            .rounded(px(10.0))
+            .border_2()
+            .border_color(rgba(0x00000000))
+            .focus(|style| style.border_color(rgb(FOAM)))
+            .hover(|style| style.bg(rgba(0xffffff0a)))
+            .active(|style| style.bg(rgba(0xffffff14)))
+            .cursor_pointer()
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                    this.toggle_auto_paste();
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            }))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.toggle_auto_paste();
+                cx.notify();
+            }))
+            .child(toggle_track);
 
         let auto_paste_row = settings_card(
             "Auto-paste",
@@ -1046,6 +1190,7 @@ impl HudView {
         for (i, (code, label)) in languages.iter().enumerate() {
             let is_selected = self.selected_language == *code;
             let code_str = code.to_string();
+            let key_code = code_str.clone();
 
             lang_buttons.push(
                 div()
@@ -1054,11 +1199,19 @@ impl HudView {
                     .flex_1()
                     .items_center()
                     .justify_center()
-                    .h(px(32.0))
-                    .px(px(6.0))
-                    .min_w(px(88.0))
+                    .h(px(44.0))
+                    .px(px(4.0))
+                    .min_w(px(0.0))
                     .rounded_lg()
-                    .text_size(px(11.0))
+                    .border_2()
+                    .border_color(if is_selected {
+                        rgba(0xc4a7e780)
+                    } else {
+                        rgba(0x00000000)
+                    })
+                    .tab_index(0)
+                    .focus(|style| style.border_color(rgb(FOAM)))
+                    .text_size(px(12.0))
                     .font_weight(if is_selected {
                         FontWeight::MEDIUM
                     } else {
@@ -1085,14 +1238,15 @@ impl HudView {
                     })
                     .active(|style| style.opacity(0.92))
                     .child(*label)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.selected_language = code_str.clone();
-                        if let Some(engine) = &this.stt_engine {
-                            let _ = engine.set_language(&code_str);
+                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                        if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                            this.select_language(&key_code);
+                            cx.stop_propagation();
+                            cx.notify();
                         }
-                        let mut cfg = AppConfig::load();
-                        cfg.language = code_str.clone();
-                        let _ = cfg.save();
+                    }))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.select_language(&code_str);
                         cx.notify();
                     })),
             );
@@ -1199,13 +1353,13 @@ impl HudView {
 
         // Pulse only while listening for keys, so the chip advertises the state
         // that is swallowing the keyboard.
-        let hotkey_chip: AnyElement = if capturing {
+        let hotkey_chip: AnyElement = if capturing && client_animations_enabled() {
             hotkey_chip
                 .with_animation(
                     "hotkey_capture_pulse",
                     Animation::new(Duration::from_millis(1100))
                         .repeat()
-                        .with_easing(ease_in_out),
+                        .with_easing(pulse_curve),
                     |this, delta| this.opacity(0.72 + 0.28 * delta),
                 )
                 .into_any_element()
@@ -1350,6 +1504,20 @@ impl HudView {
     }
 }
 
+// A full cosine cycle has matching values and slopes at the repeat boundary.
+fn pulse_curve(delta: f32) -> f32 {
+    0.5 - 0.5 * (std::f32::consts::TAU * delta).cos()
+}
+
+fn toggle_offset(on: bool, progress: f32) -> f32 {
+    let progress = progress.clamp(0.0, 1.0);
+    if on {
+        2.0 + 16.0 * progress
+    } else {
+        18.0 - 16.0 * progress
+    }
+}
+
 fn wave_height(peak: f32) -> f32 {
     let driven = (1.0 - (-peak * 16.0).exp()).clamp(0.0, 1.0);
     WAVE_FLAT + (WAVE_MAX - WAVE_FLAT) * driven
@@ -1364,22 +1532,13 @@ fn phase_indicator(id: &'static str, on: bool, color: impl Into<Hsla>, pulse: bo
         .h(px(8.0))
         .rounded_full()
         .bg(if on { color } else { rgba(0x6e6a8688).into() });
-    if on && pulse {
+    if on && pulse && client_animations_enabled() {
         dot.with_animation(
             id,
-            Animation::new(Duration::from_millis(900))
+            Animation::new(Duration::from_millis(1200))
                 .repeat()
-                .with_easing(ease_in_out),
+                .with_easing(pulse_curve),
             |this, delta| this.opacity(0.55 + 0.45 * delta),
-        )
-        .into_any_element()
-    } else if on {
-        dot.with_animation(
-            id,
-            Animation::new(Duration::from_millis(700))
-                .repeat()
-                .with_easing(ease_in_out),
-            |this, delta| this.opacity(0.65 + 0.35 * delta),
         )
         .into_any_element()
     } else {
@@ -1409,4 +1568,37 @@ fn overlay_snippet(text: &str, color: impl Into<Hsla>) -> AnyElement {
                 .child(clip_text(text, 22)),
         )
         .into_any_element()
+}
+
+// Compile-time invariant: the painted settings surface must stay inset within
+// the pill so its highlight never collides with the border and 14px corners.
+const _: () = assert!(SETTINGS_SURFACE_HEIGHT < SETTINGS_HIT_HEIGHT);
+const _: () = assert!(SETTINGS_SURFACE_HEIGHT <= BUBBLE_HEIGHT - 14.0);
+
+#[cfg(test)]
+mod motion_tests {
+    use super::{pulse_curve, toggle_offset};
+
+    #[test]
+    fn pulse_is_continuous_at_repeat_boundary() {
+        assert!((pulse_curve(0.0) - pulse_curve(1.0)).abs() < 1e-6);
+        assert!((pulse_curve(0.5) - 1.0).abs() < 1e-6);
+        for step in 0..=100 {
+            assert!((0.0..=1.0).contains(&pulse_curve(step as f32 / 100.0)));
+        }
+    }
+
+    #[test]
+    fn toggle_finishes_inside_track_in_both_directions() {
+        assert_eq!(toggle_offset(true, 0.0), 2.0);
+        assert_eq!(toggle_offset(true, 1.0), 18.0);
+        assert_eq!(toggle_offset(false, 0.0), 18.0);
+        assert_eq!(toggle_offset(false, 1.0), 2.0);
+        for step in 0..=100 {
+            let progress = step as f32 / 100.0;
+            for on in [true, false] {
+                assert!((2.0..=18.0).contains(&toggle_offset(on, progress)));
+            }
+        }
+    }
 }

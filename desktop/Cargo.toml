@@ -12,6 +12,10 @@ authors = ["Hi9841"]
 keywords = ["speech-to-text", "dictation", "sensevoice", "offline"]
 categories = ["accessibility", "multimedia::audio", "os::windows-apis"]
 
+[[bin]]
+name = "TDT"
+path = "src/main.rs"
+
 [dependencies]
 gpui = "0.2.2"
 sherpa-onnx = "1.13.8"

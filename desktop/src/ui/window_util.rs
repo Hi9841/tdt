@@ -212,7 +212,7 @@ fn anim_generation() -> &'static std::sync::atomic::AtomicU64 {
 }
 
 #[cfg(target_os = "windows")]
-fn client_animations_enabled() -> bool {
+pub fn client_animations_enabled() -> bool {
     let mut enabled = BOOL(1);
     unsafe {
         let _ = SystemParametersInfoW(
@@ -223,6 +223,11 @@ fn client_animations_enabled() -> bool {
         );
     }
     enabled.as_bool()
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn client_animations_enabled() -> bool {
+    false
 }
 
 #[cfg(target_os = "windows")]

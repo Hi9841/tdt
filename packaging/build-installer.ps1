@@ -18,7 +18,7 @@ $SetupCrate = Join-Path $PSScriptRoot "tdt-setup"
 $Stage = Join-Path $PSScriptRoot "stage"
 $Dist = Join-Path $RepoRoot "dist"
 $ModelSrc = Join-Path $RepoRoot "models\sensevoice"
-$ReleaseExe = Join-Path $Desktop "target\release\voice-stt-desktop.exe"
+$ReleaseExe = Join-Path $Desktop "target\release\TDT.exe"
 $StubExe = Join-Path $SetupCrate "target\release\tdt-setup.exe"
 
 Write-Host "Building TDT $Version..."
