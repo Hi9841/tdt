@@ -13,11 +13,12 @@ use windows::Win32::System::Com::{
 use windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
 use windows::Win32::UI::Shell::{IVirtualDesktopManager, VirtualDesktopManager};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetForegroundWindow, GetWindowLongW, GetWindowRect, GetWindowThreadProcessId,
-    IsWindowVisible, PostMessageW, SetWindowLongW, SetWindowPos, SystemParametersInfoW, GWL_STYLE,
-    HTCAPTION, HWND_TOPMOST, SPI_GETCLIENTAREAANIMATION, SWP_FRAMECHANGED, SWP_NOACTIVATE,
-    SWP_NOCOPYBITS, SWP_NOZORDER, SWP_SHOWWINDOW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
-    WM_NCLBUTTONDOWN, WS_CAPTION, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_THICKFRAME,
+    EnumWindows, GetClientRect, GetForegroundWindow, GetWindowLongW, GetWindowRect,
+    GetWindowThreadProcessId, IsWindowVisible, PostMessageW, SetWindowLongW, SetWindowPos,
+    SystemParametersInfoW, GWL_STYLE, HTCAPTION, HWND_TOPMOST, SPI_GETCLIENTAREAANIMATION,
+    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOZORDER, SWP_SHOWWINDOW,
+    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WM_NCLBUTTONDOWN, WS_CAPTION, WS_MAXIMIZEBOX,
+    WS_MINIMIZEBOX, WS_THICKFRAME,
 };
 
 pub const BUBBLE_WIDTH: f32 = 340.0;
@@ -39,7 +40,33 @@ fn overlay_animating() -> &'static std::sync::atomic::AtomicBool {
     &FLAG
 }
 
-/// Strip resize handles and snap the collapsed overlay back to 340x44.
+/// Window-chrome insets GPUI reserves on the borderless overlay: the delta
+/// between the outer window rect and its client rect. Sizing the window with
+/// the raw bubble constants leaves the client area smaller than the UI
+/// expects, clipping the pill's right and bottom edges.
+#[cfg(target_os = "windows")]
+fn chrome_inset(hwnd: HWND) -> (i32, i32) {
+    unsafe {
+        let mut outer = RECT::default();
+        let mut client = RECT::default();
+        if GetWindowRect(hwnd, &mut outer).is_ok() && GetClientRect(hwnd, &mut client).is_ok() {
+            let w = (outer.right - outer.left) - (client.right - client.left);
+            let h = (outer.bottom - outer.top) - (client.bottom - client.top);
+            return (w.max(0), h.max(0));
+        }
+    }
+    (0, 0)
+}
+
+/// Outer window size that yields the intended bubble client area at 96 DPI.
+#[cfg(target_os = "windows")]
+fn bubble_outer_size(hwnd: HWND) -> (i32, i32) {
+    let (dw, dh) = chrome_inset(hwnd);
+    (BUBBLE_WIDTH as i32 + dw, BUBBLE_HEIGHT as i32 + dh)
+}
+
+/// Strip resize handles and snap the collapsed overlay so its client area is
+/// exactly 340x44 logical pixels (outer size includes chrome insets).
 pub fn lock_overlay_chrome() {
     #[cfg(target_os = "windows")]
     {
@@ -74,8 +101,7 @@ pub fn lock_overlay_chrome() {
             }
             let mut rect = RECT::default();
             let _ = GetWindowRect(hwnd, &mut rect);
-            let want_w = BUBBLE_WIDTH as i32;
-            let want_h = BUBBLE_HEIGHT as i32;
+            let (want_w, want_h) = bubble_outer_size(hwnd);
             let w = rect.right - rect.left;
             let h = rect.bottom - rect.top;
             if w != want_w || h != want_h {
@@ -349,16 +375,17 @@ pub fn set_window_mode(is_expanded: bool) {
                 let from_y = rect.top;
                 let from_h = rect.bottom - rect.top;
                 let bottom = from_y + from_h;
-                let locked_w = BUBBLE_WIDTH as i32;
+                let (locked_w, bubble_h) = bubble_outer_size(hwnd);
+                let (_, inset_h) = chrome_inset(hwnd);
 
                 let (to_x, to_y, to_h) = if is_expanded {
                     save_bubble_rect(rect.left, rect.top, locked_w);
                     let (_, panel_h) = panel_size_for_work(work.2 - work.0, work.3 - work.1);
-                    let max_h = (bottom - work.1 - 20).max(BUBBLE_HEIGHT as i32);
-                    let to_h = panel_h.min(max_h);
+                    let max_h = (bottom - work.1 - 20).max(bubble_h);
+                    let to_h = (panel_h + inset_h).min(max_h);
                     (from_x, bottom - to_h, to_h)
                 } else {
-                    let to_h = BUBBLE_HEIGHT as i32;
+                    let to_h = bubble_h;
                     (from_x, bottom - to_h, to_h)
                 };
 
@@ -462,8 +489,7 @@ pub fn follow_current_virtual_desktop() {
 #[cfg(target_os = "windows")]
 pub fn position_bubble_on_preferred_monitor(hwnd: HWND) {
     if let Some((left, top, right, bottom)) = preferred_startup_work_area() {
-        let w = BUBBLE_WIDTH as i32;
-        let h = BUBBLE_HEIGHT as i32;
+        let (w, h) = bubble_outer_size(hwnd);
         let x = left + ((right - left - w) / 2).max(0);
         let y = (bottom - h - 70).max(top + 20);
         unsafe {
