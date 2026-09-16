@@ -17,7 +17,7 @@ gpui = "0.2.2"
 sherpa-onnx = "1.13.8"
 cpal = "0.15"
 arboard = "3.4"
-enigo = { version = "0.3", default-features = false }
+enigo = { version = "0.6", default-features = false }
 tray-icon = "0.19"
 crossbeam-channel = "0.5"
 parking_lot = "0.12"
