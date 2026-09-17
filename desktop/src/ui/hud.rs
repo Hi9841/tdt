@@ -3,11 +3,17 @@ use crate::config::{AppConfig, AppStats};
 use crate::hotkey;
 use crate::paste::PasteInjector;
 use crate::stt::{models, DownloadPhase, SharedEngine, SttEngine, CATALOG, DEFAULT_MODEL_ID};
+use crate::ui::controls;
 use crate::ui::preview::{self, Spec as PreviewSpec};
-use crate::ui::text::{clip_text, format_mmss};
+use crate::ui::text::{clip_text, format_mmss, format_time_saved};
+use crate::ui::theme::{
+    self, accent, foam, focus_ring, gold, hairline, hover, love, muted, pad, panel_bg, pill_bg,
+    r_chip, r_section, r_window, selected, success, text, well, GAP_SECTION, H_CTRL, H_TAB,
+    MOTION_MS, MUTED, TAB_FADE_MS, TEXT, TYPE_DESC, TYPE_LABEL, TYPE_META, TYPE_TITLE,
+};
 use crate::ui::window_util::{
-    client_animations_enabled, set_window_mode, start_window_drag, BUBBLE_HEIGHT, BUBBLE_WIDTH,
-    PANEL_CLOSE_MS, PANEL_OPEN_MS,
+    client_animations_enabled, set_overlay_hidden, set_window_mode, start_window_drag,
+    BUBBLE_HEIGHT, BUBBLE_WIDTH, PANEL_CLOSE_MS, PANEL_OPEN_MS,
 };
 use crate::update::{self, UpdatePhase};
 use gpui::prelude::FluentBuilder;
@@ -16,34 +22,15 @@ use parking_lot::Mutex;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-// Rosé Pine Moon
-const IRIS: u32 = 0xc4a7e7;
-const FOAM: u32 = 0x9ccfd8;
-const GOLD: u32 = 0xf6c177;
-const LOVE: u32 = 0xeb6f92;
-const PINE: u32 = 0x3e8fb0;
-const ACCENT: u32 = IRIS;
-const SUCCESS: u32 = PINE;
-const TEXT: u32 = 0xe0def4;
-const TEXT_SECONDARY: u32 = 0xcecae6;
-const TEXT_MUTED: u32 = 0xc4bfdb;
-const HAIRLINE: u32 = 0xc4a7e73d;
-const PILL_BG: u32 = 0x232136f5;
-const PANEL_BG: u32 = 0x232136fa;
-const HOVER: u32 = 0xc4a7e73d;
-const SELECTED_FILL: u32 = 0xc4a7e740;
-const PILL_OUTLINE: u32 = 0xffffff1a;
-/// Settings control: the 44px hit target paints nothing; the visible
+/// Settings control: the hit target paints nothing; the visible
 /// highlight is an inset child so it never collides with the pill border.
-const SETTINGS_HIT_HEIGHT: f32 = 44.0;
-const SETTINGS_SURFACE_HEIGHT: f32 = 30.0;
+const SETTINGS_HIT_HEIGHT: f32 = 40.0;
+const SETTINGS_SURFACE_HEIGHT: f32 = 28.0;
 const WAVE_BARS: usize = VIS_BARS;
 const WAVE_BAR_W: f32 = 3.0;
 const WAVE_GAP: f32 = 2.0;
 const WAVE_FLAT: f32 = 2.0;
-const WAVE_MAX: f32 = 28.0;
-const HOLD_COLOR: u32 = FOAM;
-const RELEASE_COLOR: u32 = GOLD;
+const WAVE_MAX: f32 = 22.0;
 /// Two clamped lines at 12px in this panel hold about this many characters.
 const HISTORY_EXPAND_CHARS: usize = 88;
 
@@ -306,7 +293,7 @@ impl HudView {
         // shared phase cell has a single writer at a time.
         if matches!(
             &*self.update.lock(),
-            UpdatePhase::Checking | UpdatePhase::Downloading
+            UpdatePhase::Checking | UpdatePhase::Downloading { .. }
         ) {
             return;
         }
@@ -340,9 +327,20 @@ impl HudView {
                 let ping = self.update_ping.clone();
                 let ticket = update::begin_update_check();
                 std::thread::spawn(move || {
-                    *cell.lock() = UpdatePhase::Downloading;
+                    *cell.lock() = UpdatePhase::Downloading { done: 0, total: 1 };
                     let _ = ping.send(());
-                    let next = match update::download_installer(&asset_url, sums_url.as_deref()) {
+                    let mut last_ping = Instant::now();
+                    let next = match update::download_installer(
+                        &asset_url,
+                        sums_url.as_deref(),
+                        |done, total| {
+                            *cell.lock() = UpdatePhase::Downloading { done, total };
+                            if last_ping.elapsed() >= Duration::from_millis(100) {
+                                let _ = ping.send(());
+                                last_ping = Instant::now();
+                            }
+                        },
+                    ) {
                         Ok(path) => match update::launch_installer(&path) {
                             Ok(()) => UpdatePhase::Ready { installer: path },
                             Err(error) => UpdatePhase::Failed(error),
@@ -394,7 +392,24 @@ impl HudView {
         .detach();
     }
 
+    pub fn hide_overlay(&mut self, cx: &mut Context<Self>) {
+        if self.hotkey_capturing {
+            self.hotkey_capturing = false;
+            hotkey::end_capture();
+        }
+        self.mode = WindowViewMode::Bubble;
+        self.panel_motion = None;
+        set_window_mode(false);
+        set_overlay_hidden(true);
+        cx.notify();
+    }
+
+    pub fn reveal_overlay(&mut self) {
+        set_overlay_hidden(false);
+    }
+
     pub fn open_settings(&mut self, cx: &mut Context<Self>) {
+        self.reveal_overlay();
         self.stats = AppStats::load();
         self.mode = WindowViewMode::StatsAndSettings;
         self.active_tab = SettingsTab::Settings;
@@ -507,23 +522,37 @@ impl HudView {
         let id = spec.id.to_string();
         let phase = Arc::clone(&self.model_phase);
         let ping = self.update_ping.clone();
+        let first_file = spec
+            .files
+            .first()
+            .map(|file| file.name.to_string())
+            .unwrap_or_default();
         *phase.lock() = DownloadPhase::Downloading {
             id: id.clone(),
             done: 0,
             total: spec.size_bytes.max(1),
+            file: first_file,
+            file_index: 1,
+            file_count: spec.files.len().max(1),
         };
         std::thread::spawn(move || {
             let spec = models::resolve(&id);
             let mut last_ping = Instant::now();
-            let result = models::download(spec, &dest, |done, total| {
+            let mut last_pct = 255u8;
+            let result = models::download(spec, &dest, |progress| {
+                let pct = models::percent(progress.done, progress.total);
                 *phase.lock() = DownloadPhase::Downloading {
                     id: spec.id.to_string(),
-                    done,
-                    total,
+                    done: progress.done,
+                    total: progress.total,
+                    file: progress.file,
+                    file_index: progress.file_index,
+                    file_count: progress.file_count,
                 };
-                if last_ping.elapsed() >= Duration::from_millis(200) {
+                if last_ping.elapsed() >= Duration::from_millis(100) || pct != last_pct {
                     let _ = ping.send(());
                     last_ping = Instant::now();
+                    last_pct = pct;
                 }
             });
             match result {
@@ -601,26 +630,17 @@ impl Render for HudView {
 
 impl HudView {
     fn render_bubble(&mut self, cx: &mut Context<'_, Self>) -> AnyElement {
-        let waveform_w = WAVE_BARS as f32 * WAVE_BAR_W + (WAVE_BARS as f32 - 1.0) * WAVE_GAP;
         let holding = matches!(&self.status, HudStatus::Listening { .. });
         let released = matches!(&self.status, HudStatus::Transcribing { .. });
 
-        // Idle, success and error show text, not bars. Do not build an unused
-        // waveform subtree on every hover or state-fade frame.
         let waveform = if holding || released {
             let mut bars = Vec::with_capacity(WAVE_BARS);
-            let bar_color = if holding {
-                rgb(HOLD_COLOR)
-            } else if released {
-                rgba(0xf6c17799)
-            } else {
-                rgba(0x9ccfd899)
-            };
+            let bar_color = if holding { foam() } else { gold() };
             for peak in self.wave_peaks {
                 let height = if holding {
                     wave_height(peak)
                 } else {
-                    WAVE_FLAT
+                    WAVE_FLAT + 2.0
                 };
                 bars.push(
                     div()
@@ -630,26 +650,20 @@ impl HudView {
                         .bg(bar_color),
                 );
             }
-
             let waveform = div()
                 .flex()
-                .flex_1()
-                .min_w(px(0.0))
+                .flex_none()
                 .items_center()
                 .justify_center()
                 .gap(px(WAVE_GAP))
-                .w(px(waveform_w))
-                .h(px(32.0))
+                .h(px(28.0))
                 .overflow_hidden()
                 .children(bars);
-
-            // Static bars during transcription read as frozen, so pulse them while
-            // the model is working.
-            let waveform: AnyElement = if released && client_animations_enabled() {
+            if released && client_animations_enabled() {
                 waveform
                     .with_animation(
                         "transcribe_pulse",
-                        Animation::new(Duration::from_millis(1100))
+                        Animation::new(Duration::from_millis(1000))
                             .repeat()
                             .with_easing(pulse_curve),
                         |this, delta| this.opacity(0.45 + 0.55 * delta),
@@ -657,34 +671,24 @@ impl HudView {
                     .into_any_element()
             } else {
                 waveform.into_any_element()
-            };
-            waveform
+            }
         } else {
             div().into_any_element()
         };
 
         let center_child = match &self.status {
             HudStatus::Idle => div()
-                .flex_1()
-                .min_w(px(0.0))
                 .flex()
+                .flex_none()
                 .items_center()
                 .justify_center()
                 .overflow_hidden()
-                .child(
-                    div()
-                        .px(px(8.0))
-                        .py(px(4.0))
-                        .rounded(px(6.0))
-                        .bg(rgba(0xffffff0a))
-                        .text_size(px(12.0))
-                        .text_color(rgb(TEXT_SECONDARY))
-                        .whitespace_nowrap()
-                        .child(format!("Press {}", self.hotkey_label)),
-                )
+                .child(controls::shortcut_keys(&self.hotkey_label))
                 .into_any_element(),
-            HudStatus::Success { text, .. } => overlay_snippet(text, rgb(TEXT)),
-            HudStatus::Error { message, .. } => overlay_snippet(message, rgb(LOVE)),
+            HudStatus::Success { auto_pasted, .. } => {
+                overlay_snippet(if *auto_pasted { "Pasted" } else { "Copied" }, success())
+            }
+            HudStatus::Error { message, .. } => overlay_snippet(message, love()),
             _ => waveform,
         };
 
@@ -696,16 +700,15 @@ impl HudView {
             HudStatus::Error { .. } => "bubble_error",
         };
         let center_child = div()
-            .flex_1()
-            .min_w(px(0.0))
+            .flex_none()
             .overflow_hidden()
             .child(center_child);
         let center_child = if client_animations_enabled() {
             center_child
                 .with_animation(
                     state_key,
-                    Animation::new(Duration::from_millis(160)).with_easing(ease_out_quint()),
-                    |element, progress| element.opacity(0.65 + 0.35 * progress),
+                    Animation::new(Duration::from_millis(MOTION_MS)).with_easing(ease_out_quint()),
+                    |element, progress| element.opacity(0.7 + 0.3 * progress),
                 )
                 .into_any_element()
         } else {
@@ -713,20 +716,21 @@ impl HudView {
         };
 
         let (status_label, status_color, status_pulse) = match &self.status {
-            HudStatus::Idle => ("Ready", rgb(FOAM), false),
-            HudStatus::Listening { .. } => ("Listening", rgb(HOLD_COLOR), true),
-            HudStatus::Transcribing { .. } => ("Transcribing", rgb(RELEASE_COLOR), true),
+            HudStatus::Idle => ("Ready", muted(), false),
+            HudStatus::Listening { .. } => ("Listening", foam(), true),
+            HudStatus::Transcribing { .. } => ("Transcribing", gold(), true),
             HudStatus::Success { auto_pasted, .. } => (
                 if *auto_pasted { "Pasted" } else { "Copied" },
-                rgb(SUCCESS),
+                success(),
                 false,
             ),
-            HudStatus::Error { .. } => ("Error", rgb(LOVE), false),
+            HudStatus::Error { .. } => ("Error", love(), false),
         };
 
         let left_section = div()
             .flex()
-            .flex_none()
+            .flex_1()
+            .min_w(px(0.0))
             .items_center()
             .gap(px(8.0))
             .child(phase_indicator(
@@ -737,9 +741,9 @@ impl HudView {
             ))
             .child(
                 div()
-                    .text_size(px(13.0))
+                    .text_size(px(TYPE_LABEL))
                     .font_weight(FontWeight::MEDIUM)
-                    .text_color(rgb(TEXT))
+                    .text_color(status_color)
                     .whitespace_nowrap()
                     .child(status_label),
             );
@@ -750,67 +754,62 @@ impl HudView {
             _ => String::new(),
         };
 
-        let right_section = div().flex().flex_none().items_center().justify_end();
+        let right_section = div()
+            .flex()
+            .flex_1()
+            .min_w(px(0.0))
+            .items_center()
+            .justify_end()
+            .gap(px(4.0));
 
         let right_section = if matches!(&self.status, HudStatus::Idle) {
-            right_section.min_w(px(44.0)).child(
-                div()
-                    .id("open_settings_btn")
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    // Keep the hit target tall, but inset its painted surface.
-                    .h(px(SETTINGS_HIT_HEIGHT))
-                    .group("pill_settings")
-                    .tab_index(0)
-                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                        if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+            right_section
+                .child(
+                    controls::ghost_button("hide_overlay_btn", "Hide")
+                        .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                            if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                                cx.stop_propagation();
+                                this.hide_overlay(cx);
+                                cx.notify();
+                            }
+                        }))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.hide_overlay(cx);
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    controls::ghost_button("open_settings_btn", "Settings")
+                        .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                            if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                                cx.stop_propagation();
+                                this.open_settings(cx);
+                                cx.notify();
+                            }
+                        }))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
                             cx.stop_propagation();
                             this.open_settings(cx);
                             cx.notify();
-                        }
-                    }))
-                    .text_size(px(12.0))
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(rgb(TEXT))
-                    .whitespace_nowrap()
-                    .cursor_pointer()
-                    .child(
-                        div()
-                            .id("pill_settings_surface")
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .h(px(SETTINGS_SURFACE_HEIGHT))
-                            .px(px(10.0))
-                            .rounded(px(8.0))
-                            // Reserve the focus border so focus never shifts text.
-                            .border_2()
-                            .border_color(rgba(0x00000000))
-                            .group_hover("pill_settings", |style| style.bg(rgba(0xffffff12)))
-                            .group_active("pill_settings", |style| style.bg(rgba(0xffffff20)))
-                            .focusable()
-                            .in_focus(|style| style.border_color(rgb(FOAM)))
-                            .child("Settings"),
-                    )
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|_, _, _, cx| cx.stop_propagation()),
-                    )
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.open_settings(cx);
-                        cx.notify();
-                    })),
-            )
+                        })),
+                )
         } else if !timer_str.is_empty() {
-            right_section.min_w(px(44.0)).child(
+            right_section.child(
                 div()
-                    .text_size(px(11.0))
-                    .line_height(px(13.0))
+                    .text_size(px(TYPE_META))
+                    .line_height(px(14.0))
                     .font_family("Consolas")
-                    .font_weight(FontWeight::NORMAL)
-                    .text_color(rgb(TEXT_SECONDARY))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(muted())
                     .text_right()
                     .whitespace_nowrap()
                     .child(timer_str),
@@ -828,10 +827,10 @@ impl HudView {
             .h(px(BUBBLE_HEIGHT))
             .px(px(12.0))
             .gap(px(8.0))
-            .rounded(px(14.0))
-            .bg(rgba(PILL_BG))
+            .rounded(r_window())
+            .bg(pill_bg())
             .border_1()
-            .border_color(rgba(PILL_OUTLINE))
+            .border_color(hairline())
             .shadow_xs()
             .overflow_hidden()
             .cursor_move()
@@ -856,9 +855,9 @@ impl HudView {
             div()
                 .id(id)
                 .tab_index(0)
-                .border_2()
-                .border_color(rgba(0x00000000))
-                .focus(|style| style.border_color(rgb(FOAM)))
+                .border_1()
+                .border_color(theme::transparent())
+                .focus(|style| style.border_color(focus_ring()))
                 .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
                     if matches!(event.keystroke.key.as_str(), "enter" | "space") {
                         this.active_tab = tab;
@@ -867,28 +866,34 @@ impl HudView {
                     }
                 }))
                 .flex_none()
-                .h(px(44.0))
+                .h(px(H_TAB))
                 .px(px(10.0))
-                .rounded_lg()
+                .rounded(r_chip())
                 .flex()
                 .items_center()
                 .justify_center()
-                .text_size(px(12.0))
+                .text_size(px(TYPE_DESC))
                 .font_weight(if active {
                     FontWeight::MEDIUM
                 } else {
                     FontWeight::NORMAL
                 })
                 .bg(if active {
-                    rgba(0x393552cc)
+                    selected()
                 } else {
-                    rgba(0x00000000)
+                    theme::transparent()
                 })
-                .text_color(if active { rgb(TEXT) } else { rgb(TEXT_MUTED) })
+                .text_color(if active { accent() } else { muted() })
                 .whitespace_nowrap()
                 .cursor_pointer()
-                .hover(|style| if active { style } else { style.bg(rgba(HOVER)) })
-                .active(|style| style.opacity(0.92))
+                .hover(|style| {
+                    if active {
+                        style
+                    } else {
+                        style.bg(hover()).text_color(text())
+                    }
+                })
+                .active(|style| style.opacity(0.9))
                 .child(label)
                 .on_mouse_down(
                     MouseButton::Left,
@@ -907,7 +912,7 @@ impl HudView {
             .w_full()
             .min_w(px(0.0))
             .gap(px(8.0))
-            .pb(px(12.0))
+            .pb(px(8.0))
             .child(
                 div()
                     .flex()
@@ -924,12 +929,12 @@ impl HudView {
                             }
                         }),
                     )
-                    .child(div().w(px(7.0)).h(px(7.0)).rounded_full().bg(rgb(ACCENT)))
+                    .child(div().w(px(6.0)).h(px(6.0)).rounded_full().bg(accent()))
                     .child(
                         div()
-                            .text_size(px(13.0))
+                            .text_size(px(TYPE_TITLE))
                             .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(TEXT))
+                            .text_color(text())
                             .whitespace_nowrap()
                             .child("TDT"),
                     ),
@@ -939,15 +944,16 @@ impl HudView {
                     .flex()
                     .flex_none()
                     .items_center()
-                    .gap(px(6.0))
+                    .gap(px(8.0))
                     .child(
                         div()
                             .flex()
                             .flex_none()
                             .items_center()
                             .gap(px(2.0))
-                            .p(px(3.0))
-                            .rounded_lg()
+                            .p(px(2.0))
+                            .rounded(r_section())
+                            .bg(well())
                             .child(tab_btn(
                                 "tab_stats",
                                 "Stats",
@@ -965,42 +971,45 @@ impl HudView {
                     )
                     .child(
                         div()
-                            .id("close_settings_btn")
                             .flex()
                             .flex_none()
                             .items_center()
-                            .justify_center()
-                            .h(px(44.0))
-                            .min_w(px(44.0))
-                            .px(px(8.0))
-                            .rounded_lg()
-                            .tab_index(0)
-                            .border_2()
-                            .border_color(rgba(0x00000000))
-                            .focus(|style| style.border_color(rgb(FOAM)))
-                            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                                    this.close_stats_settings(cx);
-                                    cx.stop_propagation();
-                                    cx.notify();
-                                }
-                            }))
-                            .text_size(px(12.0))
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(rgb(TEXT_SECONDARY))
-                            .whitespace_nowrap()
-                            .cursor_pointer()
-                            .hover(|style| style.bg(rgba(HOVER)).text_color(rgb(TEXT)))
-                            .active(|style| style.opacity(0.92))
-                            .child("Close")
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                            .gap(px(2.0))
+                            .child(
+                                controls::ghost_button("hide_panel_btn", "Hide")
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                                    )
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.hide_overlay(cx);
+                                        cx.notify();
+                                    })),
                             )
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.close_stats_settings(cx);
-                                cx.notify();
-                            })),
+                            .child(
+                                controls::ghost_button("close_settings_btn", "Close")
+                                    .on_key_down(cx.listener(
+                                        |this, event: &KeyDownEvent, _, cx| {
+                                            if matches!(
+                                                event.keystroke.key.as_str(),
+                                                "enter" | "space"
+                                            ) {
+                                                this.close_stats_settings(cx);
+                                                cx.stop_propagation();
+                                                cx.notify();
+                                            }
+                                        },
+                                    ))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                                    )
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.close_stats_settings(cx);
+                                        cx.notify();
+                                    })),
+                            ),
                     ),
             );
 
@@ -1019,14 +1028,18 @@ impl HudView {
             .flex_col()
             .flex_1()
             .w_full()
-            .min_h(px(0.0))
-            .overflow_y_scroll()
-            .child(content);
+            .min_h(px(0.0));
+        let faded_content = if self.active_tab == SettingsTab::Stats {
+            faded_content.overflow_y_scroll()
+        } else {
+            faded_content.overflow_hidden()
+        };
+        let faded_content = faded_content.child(content);
         let faded_content = if client_animations_enabled() {
             faded_content
                 .with_animation(
                     tab_id,
-                    Animation::new(Duration::from_millis(180)).with_easing(ease_out_quint()),
+                    Animation::new(Duration::from_millis(TAB_FADE_MS)).with_easing(ease_out_quint()),
                     |this, delta| this.opacity(0.82 + 0.18 * delta),
                 )
                 .into_any_element()
@@ -1040,13 +1053,13 @@ impl HudView {
             .flex_col()
             .w_full()
             .h_full()
-            .px(px(12.0))
-            .pt(px(12.0))
-            .pb(px(12.0))
-            .bg(rgba(PANEL_BG))
+            .px(pad())
+            .pt(pad())
+            .pb(pad())
+            .bg(panel_bg())
             .border_1()
-            .border_color(rgba(HAIRLINE))
-            .rounded(px(14.0))
+            .border_color(hairline())
+            .rounded(r_window())
             .shadow_xs()
             .overflow_hidden()
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
@@ -1062,59 +1075,24 @@ impl HudView {
     }
 
     fn render_stats_tab(&mut self, cx: &mut Context<'_, Self>) -> AnyElement {
-        let make_tile = |label: &'static str, value: String| {
-            div()
-                .flex()
-                .flex_col()
-                .flex_1()
-                .min_w(px(0.0))
-                .gap(px(4.0))
-                .px(px(8.0))
-                .py(px(8.0))
-                .child(
-                    div()
-                        .text_size(px(11.0))
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(rgb(TEXT_MUTED))
-                        .child(label),
-                )
-                .child(
-                    div()
-                        .text_size(px(18.0))
-                        .line_height(px(22.0))
-                        .font_family("Consolas")
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(TEXT))
-                        .child(value),
-                )
-        };
-
-        let tile_words = make_tile("Words", format!("{}", self.stats.total_words));
-        let tile_time = make_tile("Spoken", format!("{:.1}s", self.stats.total_seconds));
-        let tile_lat = make_tile("Latency", format!("{}ms", self.stats.last_latency_ms));
-        let tile_count = make_tile("Sessions", format!("{}", self.stats.total_transcriptions));
-
         let grid = div()
             .flex()
-            .flex_col()
             .w_full()
-            .gap(px(4.0))
-            .child(
-                div()
-                    .flex()
-                    .w_full()
-                    .gap(px(8.0))
-                    .child(tile_words)
-                    .child(tile_time),
-            )
-            .child(
-                div()
-                    .flex()
-                    .w_full()
-                    .gap(px(8.0))
-                    .child(tile_lat)
-                    .child(tile_count),
-            );
+            .gap(px(12.0))
+            .px(px(2.0))
+            .pt(px(4.0))
+            .child(controls::stat_block(
+                "Transcriptions",
+                format!("{}", self.stats.total_transcriptions),
+            ))
+            .child(controls::stat_block(
+                "Words",
+                format!("{}", self.stats.total_words),
+            ))
+            .child(controls::stat_block(
+                "Time saved",
+                format_time_saved(self.stats.total_seconds),
+            ));
 
         let mut history_items = Vec::new();
         if self.stats.history.is_empty() {
@@ -1124,21 +1102,21 @@ impl HudView {
                     .flex_col()
                     .items_center()
                     .justify_center()
-                    .gap(px(4.0))
+                    .gap(px(6.0))
                     .px(px(12.0))
-                    .py(px(24.0))
+                    .py(px(32.0))
                     .child(
                         div()
-                            .text_size(px(12.0))
+                            .text_size(px(TYPE_LABEL))
                             .font_weight(FontWeight::MEDIUM)
-                            .text_color(rgb(TEXT_SECONDARY))
-                            .child("No transcripts yet"),
+                            .text_color(text())
+                            .child("No transcriptions yet"),
                     )
                     .child(
                         div()
-                            .text_size(px(11.0))
-                            .text_color(rgb(TEXT_MUTED))
-                            .child(format!("Press or hold {} to talk.", self.hotkey_label)),
+                            .text_size(px(TYPE_DESC))
+                            .text_color(muted())
+                            .child("Your recent transcriptions will appear here."),
                     )
                     .into_any_element(),
             );
@@ -1162,36 +1140,32 @@ impl HudView {
                     div()
                         .id(ElementId::NamedInteger(anim_key.into(), idx as u64))
                         .tab_index(0)
-                        .focus(|style| style.bg(rgba(HOVER)))
+                        .focus(|style| style.bg(hover()))
                         .flex_none()
-                        .h(px(44.0))
-                        .px(px(10.0))
-                        .rounded_lg()
+                        .h(px(H_CTRL))
+                        .px(px(8.0))
+                        .rounded(r_chip())
                         .flex()
                         .items_center()
                         .justify_center()
-                        .text_size(px(11.0))
+                        .text_size(px(TYPE_META))
                         .font_weight(FontWeight::MEDIUM)
                         .whitespace_nowrap()
                         .bg(if is_copied {
-                            rgba(0x3e8fb033)
+                            rgba(0x3e8fb033).into()
                         } else {
-                            rgba(0xe0def412)
+                            theme::transparent()
                         })
-                        .text_color(if is_copied {
-                            rgb(SUCCESS)
-                        } else {
-                            rgb(TEXT_SECONDARY)
-                        })
+                        .text_color(if is_copied { success() } else { muted() })
                         .cursor_pointer()
                         .hover(|style| {
                             if is_copied {
                                 style
                             } else {
-                                style.bg(rgba(SELECTED_FILL)).text_color(rgb(TEXT))
+                                style.bg(hover()).text_color(text())
                             }
                         })
-                        .active(|style| style.opacity(0.92))
+                        .active(|style| style.opacity(0.9))
                         .child(btn_text)
                         .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
                             if matches!(event.keystroke.key.as_str(), "enter" | "space") {
@@ -1234,12 +1208,12 @@ impl HudView {
                         .w_full()
                         .gap(px(4.0))
                         .px(px(10.0))
-                        .py(px(8.0))
-                        .rounded_lg()
+                        .py(px(10.0))
+                        .rounded(r_chip())
                         .tab_index(0)
                         .cursor_pointer()
-                        .focus(|style| style.bg(rgba(HOVER)))
-                        .hover(|style| style.bg(rgba(HOVER)))
+                        .focus(|style| style.bg(hover()))
+                        .hover(|style| style.bg(hover()))
                         .active(|style| style.opacity(0.92))
                         .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
                             if matches!(event.keystroke.key.as_str(), "enter" | "space") {
@@ -1265,7 +1239,7 @@ impl HudView {
                                         .min_w(px(0.0))
                                         .text_size(px(11.0))
                                         .font_family("Consolas")
-                                        .text_color(rgb(TEXT_MUTED))
+                                        .text_color(rgb(MUTED))
                                         .whitespace_nowrap()
                                         .child(format!(
                                             "{}  ·  {}ms",
@@ -1284,7 +1258,7 @@ impl HudView {
                                 .child(text_val),
                         )
                         .when(can_expand, |row| {
-                            row.child(div().text_size(px(11.0)).text_color(rgb(TEXT_MUTED)).child(
+                            row.child(div().text_size(px(11.0)).text_color(rgb(MUTED)).child(
                                 if expanded {
                                     "Collapse text"
                                 } else {
@@ -1314,41 +1288,25 @@ impl HudView {
                         div()
                             .text_size(px(11.0))
                             .font_weight(FontWeight::MEDIUM)
-                            .text_color(rgb(TEXT_MUTED))
+                            .text_color(rgb(MUTED))
                             .child("Recent"),
                     )
                     .child(
                         div()
                             .text_size(px(11.0))
                             .font_family("Consolas")
-                            .text_color(rgb(TEXT_MUTED))
+                            .text_color(rgb(MUTED))
                             .child(recents_count),
                     ),
             );
         if has_recents {
             history_header = history_header.child(
-                div()
-                    .id("clear_recents_btn")
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .justify_center()
-                    .h(px(44.0))
-                    .px(px(10.0))
-                    .rounded_lg()
-                    .text_size(px(11.0))
-                    .font_weight(FontWeight::MEDIUM)
-                    .whitespace_nowrap()
-                    .bg(rgba(0xe0def412))
-                    .text_color(rgb(TEXT_SECONDARY))
-                    .cursor_pointer()
-                    .hover(|style| style.bg(rgba(HOVER)).text_color(rgb(TEXT)))
-                    .active(|style| style.opacity(0.92))
-                    .child("Clear recents")
-                    .on_click(cx.listener(|this, _, _, cx| {
+                controls::ghost_button("clear_recents_btn", "Clear").on_click(cx.listener(
+                    |this, _, _, cx| {
                         this.clear_recents();
                         cx.notify();
-                    })),
+                    },
+                )),
             );
         }
 
@@ -1356,14 +1314,13 @@ impl HudView {
             .flex()
             .flex_col()
             .gap(px(8.0))
-            .pt(px(8.0))
-            .pb(px(4.0))
             .child(history_header)
             .children(history_items);
 
         div()
             .flex()
             .flex_col()
+            .gap(px(GAP_SECTION))
             .child(grid)
             .child(history_section)
             .into_any_element()
@@ -1374,103 +1331,38 @@ impl HudView {
         let hotkey_str = self.hotkey_label.clone();
 
         let settings_row = |title: &'static str, subtitle: String, trailing: AnyElement| {
-            div()
-                .flex()
-                .flex_wrap()
-                .items_center()
-                .justify_between()
-                .gap(px(10.0))
-                .w_full()
-                .px(px(8.0))
-                .py(px(6.0))
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap(px(3.0))
-                        .flex_1()
-                        .min_w(px(128.0))
-                        .child(
-                            div()
-                                .text_size(px(12.0))
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(rgb(TEXT))
-                                .child(title),
-                        )
-                        .child(
-                            div()
-                                .text_size(px(11.0))
-                                .line_height(px(14.0))
-                                .text_color(rgb(TEXT_MUTED))
-                                .line_clamp(2)
-                                .child(subtitle),
-                        ),
-                )
-                .child(div().flex_none().child(trailing))
+            controls::setting_row(title, subtitle, trailing)
         };
 
         let on = is_auto_paste;
         let epoch = self.toggle_epoch;
         let animate_toggle = epoch > 0 && client_animations_enabled();
-        let knob = div().w(px(16.0)).h(px(16.0)).rounded_full().bg(rgb(TEXT));
+        let knob = controls::toggle_knob();
         let knob = if animate_toggle {
             knob.with_animation(
                 ElementId::NamedInteger("toggle_knob".into(), epoch),
-                Animation::new(Duration::from_millis(140)).with_easing(ease_out_quint()),
+                Animation::new(Duration::from_millis(MOTION_MS)).with_easing(ease_out_quint()),
                 move |knob, progress| knob.ml(px(toggle_offset(on, progress))),
             )
             .into_any_element()
         } else {
             knob.ml(px(toggle_offset(on, 1.0))).into_any_element()
         };
-        let toggle_track = div()
-            .id("auto_paste_toggle")
-            .flex()
-            .flex_none()
-            .items_center()
-            .w(px(36.0))
-            .h(px(20.0))
-            .rounded_full()
-            .bg(if is_auto_paste {
-                rgb(ACCENT)
-            } else {
-                rgb(0x393552)
-            })
-            .cursor_pointer()
-            .overflow_hidden()
-            .child(knob)
-            .on_click(cx.listener(|this, _, _, cx| {
+        let toggle_track = controls::toggle_hit(
+            "auto_paste_hit_target",
+            controls::toggle_track(is_auto_paste, knob),
+        )
+        .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+            if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                this.toggle_auto_paste();
                 cx.stop_propagation();
-                this.toggle_auto_paste();
                 cx.notify();
-            }));
-
-        let toggle_track = div()
-            .id("auto_paste_hit_target")
-            .group("auto_paste")
-            .tab_index(0)
-            .flex()
-            .items_center()
-            .justify_center()
-            .w(px(44.0))
-            .h(px(44.0))
-            .rounded(px(10.0))
-            .focus(|style| style.bg(rgba(HOVER)))
-            .hover(|style| style.bg(rgba(HOVER)))
-            .active(|style| style.bg(rgba(0xffffff14)))
-            .cursor_pointer()
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                    this.toggle_auto_paste();
-                    cx.stop_propagation();
-                    cx.notify();
-                }
-            }))
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.toggle_auto_paste();
-                cx.notify();
-            }))
-            .child(toggle_track);
+            }
+        }))
+        .on_click(cx.listener(|this, _, _, cx| {
+            this.toggle_auto_paste();
+            cx.notify();
+        }));
 
         let auto_paste_row = settings_row(
             "Auto-paste",
@@ -1478,51 +1370,26 @@ impl HudView {
             toggle_track.into_any_element(),
         );
 
-        let startup_toggle = div()
-            .id("autostart_hit_target")
-            .tab_index(0)
-            .flex()
-            .items_center()
-            .justify_center()
-            .w(px(44.0))
-            .h(px(44.0))
-            .rounded(px(10.0))
-            .focus(|style| style.bg(rgba(HOVER)))
-            .hover(|style| style.bg(rgba(HOVER)))
-            .active(|style| style.bg(rgba(0xffffff14)))
-            .cursor_pointer()
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                    this.toggle_autostart();
-                    cx.stop_propagation();
-                    cx.notify();
-                }
-            }))
-            .on_click(cx.listener(|this, _, _, cx| {
+        let startup_toggle = controls::toggle_hit(
+            "autostart_hit_target",
+            controls::toggle_track(
+                self.autostart_enabled,
+                controls::toggle_knob()
+                    .ml(px(toggle_offset(self.autostart_enabled, 1.0)))
+                    .into_any_element(),
+            ),
+        )
+        .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+            if matches!(event.keystroke.key.as_str(), "enter" | "space") {
                 this.toggle_autostart();
+                cx.stop_propagation();
                 cx.notify();
-            }))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .w(px(36.0))
-                    .h(px(20.0))
-                    .rounded_full()
-                    .bg(rgb(if self.autostart_enabled {
-                        ACCENT
-                    } else {
-                        0x393552
-                    }))
-                    .child(
-                        div()
-                            .w(px(16.0))
-                            .h(px(16.0))
-                            .rounded_full()
-                            .bg(rgb(TEXT))
-                            .ml(px(toggle_offset(self.autostart_enabled, 1.0))),
-                    ),
-            );
+            }
+        }))
+        .on_click(cx.listener(|this, _, _, cx| {
+            this.toggle_autostart();
+            cx.notify();
+        }));
         let startup_row = settings_row(
             "Start with Windows",
             "Launch TDT when you sign in".to_string(),
@@ -1545,156 +1412,77 @@ impl HudView {
             let key_code = code_str.clone();
 
             lang_buttons.push(
-                div()
-                    .id(ElementId::NamedInteger("lang_btn".into(), i as u64))
-                    .flex()
-                    .flex_1()
-                    .items_center()
-                    .justify_center()
-                    .h(px(44.0))
-                    .px(px(6.0))
-                    .min_w(px(0.0))
-                    .rounded_lg()
-                    .border_2()
-                    .border_color(if is_selected {
-                        rgba(0xc4a7e780)
-                    } else {
-                        rgba(0x00000000)
-                    })
-                    .tab_index(0)
-                    .focus(|style| style.border_color(rgb(FOAM)))
-                    .text_size(px(12.0))
-                    .font_weight(if is_selected {
-                        FontWeight::MEDIUM
-                    } else {
-                        FontWeight::NORMAL
-                    })
-                    .bg(if is_selected {
-                        rgba(SELECTED_FILL)
-                    } else {
-                        rgba(0x00000000)
-                    })
-                    .text_color(if is_selected {
-                        rgb(IRIS)
-                    } else {
-                        rgb(TEXT_SECONDARY)
-                    })
-                    .whitespace_nowrap()
-                    .cursor_pointer()
-                    .hover(|style| {
-                        if is_selected {
-                            style
-                        } else {
-                            style.bg(rgba(HOVER))
-                        }
-                    })
-                    .active(|style| style.opacity(0.92))
-                    .child(*label)
-                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
-                        if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                            this.select_language(&key_code);
-                            cx.stop_propagation();
-                            cx.notify();
-                        }
-                    }))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.select_language(&code_str);
+                controls::choice_chip(
+                    ElementId::NamedInteger("lang_btn".into(), i as u64),
+                    *label,
+                    is_selected,
+                )
+                .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                    if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                        this.select_language(&key_code);
+                        cx.stop_propagation();
                         cx.notify();
-                    })),
+                    }
+                }))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.select_language(&code_str);
+                    cx.notify();
+                })),
             );
         }
 
-        let language_row = div()
-            .flex()
-            .flex_col()
-            .w_full()
-            .gap(px(8.0))
-            .px(px(8.0))
-            .py(px(8.0))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(3.0))
-                    .child(
-                        div()
-                            .text_size(px(12.0))
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(rgb(TEXT))
-                            .child("Language"),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(11.0))
-                            .text_color(rgb(TEXT_MUTED))
-                            .child("Auto-detect, or lock to one language"),
-                    ),
+        let language_row = {
+            let mut rows = Vec::new();
+            let mut row = Vec::new();
+            for button in lang_buttons {
+                row.push(button.into_any_element());
+                if row.len() == 3 {
+                    rows.push(controls::chip_row(std::mem::take(&mut row)));
+                }
+            }
+            if !row.is_empty() {
+                rows.push(controls::chip_row(row));
+            }
+            controls::labeled_block(
+                "Language",
+                "Auto-detect, or lock to one language",
+                [controls::chip_well(rows).into_any_element()],
             )
-            .child({
-                let mut rows = Vec::new();
-                let mut row = Vec::new();
-                for button in lang_buttons {
-                    row.push(button);
-                    if row.len() == 3 {
-                        rows.push(
-                            div()
-                                .flex()
-                                .w_full()
-                                .gap(px(8.0))
-                                .children(std::mem::take(&mut row))
-                                .into_any_element(),
-                        );
-                    }
-                }
-                if !row.is_empty() {
-                    rows.push(
-                        div()
-                            .flex()
-                            .w_full()
-                            .gap(px(8.0))
-                            .children(row)
-                            .into_any_element(),
-                    );
-                }
-                div().flex().flex_col().w_full().gap(px(8.0)).children(rows)
-            });
+        };
 
         let capturing = self.hotkey_capturing;
         let hotkey_sub = if capturing {
             "Press the new shortcut. Esc cancels.".to_string()
         } else {
-            "Click the shortcut to change it.".to_string()
+            "Click the keys to change it.".to_string()
         };
         let hotkey_chip = div()
             .id("hotkey_bind_btn")
             .flex()
             .items_center()
             .justify_center()
-            .h(px(44.0))
-            .px(px(10.0))
-            .rounded_lg()
+            .h(px(H_CTRL))
+            .px(px(8.0))
+            .rounded(r_chip())
             .border_1()
-            .border_color(rgba(0x00000000))
-            .when(capturing, |chip| chip.border_color(rgba(0xc4a7e7aa)))
-            .bg(rgba(if capturing { SELECTED_FILL } else { 0x393552cc }))
-            .text_size(px(11.0))
-            .font_family("Consolas")
-            .font_weight(FontWeight::MEDIUM)
-            .text_color(rgb(if capturing { IRIS } else { FOAM }))
-            .whitespace_nowrap()
-            .cursor_pointer()
-            .hover(|style| {
-                if capturing {
-                    style
-                } else {
-                    style.bg(rgba(SELECTED_FILL))
-                }
-            })
-            .active(|style| style.opacity(0.92))
-            .child(if capturing {
-                "Press shortcut".to_string()
+            .border_color(if capturing {
+                rgba(0x9ccfd8aa).into()
             } else {
-                hotkey_str
+                theme::transparent()
+            })
+            .bg(if capturing { selected() } else { theme::transparent() })
+            .cursor_pointer()
+            .hover(|style| if capturing { style } else { style })
+            .active(|style| style.opacity(0.9))
+            .child(if capturing {
+                div()
+                    .text_size(px(TYPE_META))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(accent())
+                    .child("Press shortcut...")
+                    .into_any_element()
+            } else {
+                controls::shortcut_keys(&hotkey_str)
             })
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.toggle_hotkey_capture();
@@ -1720,95 +1508,132 @@ impl HudView {
         let hotkey_row = settings_row("Hotkey", hotkey_sub, hotkey_chip);
 
         let phase = self.update.lock().clone();
-        let (update_title, update_sub, update_action, update_busy) = match &phase {
+        let (_update_title, update_sub, update_action, update_busy) = match &phase {
             UpdatePhase::Idle => (
                 "Updates",
-                "Checks GitHub when you ask".to_string(),
-                "Check for updates",
+                format!("Current version v{}", update::current_version()),
+                "Check for updates".to_string(),
                 false,
             ),
             UpdatePhase::Checking => (
                 "Updates",
-                "Checking GitHub...".to_string(),
-                "Checking",
+                "Checking for updates...".to_string(),
+                "Checking".to_string(),
                 true,
             ),
             UpdatePhase::UpToDate => (
                 "Updates",
-                "You are on the latest version".to_string(),
-                "Check again",
+                format!("You're up to date · v{}", update::current_version()),
+                "Check again".to_string(),
                 false,
             ),
             UpdatePhase::Available { version, .. } => (
                 "Updates",
-                format!("Version {version} is available"),
-                "Install update",
+                format!("v{version} is ready to download"),
+                "Download update".to_string(),
                 false,
             ),
-            UpdatePhase::Downloading => (
-                "Updates",
-                "Downloading installer...".to_string(),
-                "Downloading",
-                true,
-            ),
+            UpdatePhase::Downloading { done, total } => {
+                let pct = models::percent(*done, *total);
+                (
+                    "Updates",
+                    format!(
+                        "{}% · {} of {}",
+                        pct,
+                        models::format_mb(*done),
+                        models::format_mb(*total)
+                    ),
+                    format!("{pct}%"),
+                    true,
+                )
+            }
             UpdatePhase::Ready { .. } => (
                 "Updates",
-                "Installer ready".to_string(),
-                "Install update",
+                "Update downloaded. Install when ready.".to_string(),
+                "Install update".to_string(),
                 false,
             ),
-            UpdatePhase::Failed(error) => ("Updates", clip_text(error, 48), "Try again", false),
+            UpdatePhase::Failed(error) => (
+                "Updates",
+                clip_text(error, 48),
+                "Try again".to_string(),
+                false,
+            ),
         };
 
-        let update_row = settings_row(
-            update_title,
-            update_sub,
-            div()
-                .id("check_updates_btn")
-                .flex()
-                .items_center()
-                .justify_center()
-                .h(px(44.0))
-                .px(px(10.0))
-                .rounded_lg()
-                .bg(rgba(if update_busy { 0x39355299 } else { 0x393552cc }))
-                .text_size(px(11.0))
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(rgb(TEXT))
-                .whitespace_nowrap()
-                .cursor_pointer()
-                .hover(|style| {
-                    if update_busy {
-                        style
-                    } else {
-                        style.bg(rgba(SELECTED_FILL))
-                    }
-                })
-                .active(|style| style.opacity(0.92))
-                .child(update_action)
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    if matches!(
-                        *this.update.lock(),
-                        UpdatePhase::Checking | UpdatePhase::Downloading
-                    ) {
-                        return;
-                    }
-                    this.start_update_install();
-                    cx.notify();
-                }))
-                .into_any_element(),
-        );
+        let update_btn = if matches!(
+            phase,
+            UpdatePhase::Available { .. } | UpdatePhase::Ready { .. }
+        ) {
+            controls::primary_button("check_updates_btn", update_action)
+        } else {
+            controls::secondary_button("check_updates_btn", update_action)
+        };
+        let update_meter = match &phase {
+            UpdatePhase::Downloading { done, total } => Some(controls::progress_bar(*done, *total)),
+            _ => None,
+        };
+        let update_row = div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .pt(px(10.0))
+            .gap(px(10.0))
+            .child(controls::section_label("Updates"))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(12.0))
+                    .w_full()
+                    .px(px(2.0))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .text_size(px(TYPE_DESC))
+                            .line_height(px(16.0))
+                            .text_color(muted())
+                            .child(update_sub),
+                    )
+                    .child(
+                        update_btn
+                            .when(update_busy, |btn| btn.opacity(0.7))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if matches!(
+                                    *this.update.lock(),
+                                    UpdatePhase::Checking | UpdatePhase::Downloading { .. }
+                                ) {
+                                    return;
+                                }
+                                this.start_update_install();
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .when_some(update_meter, |row, meter| {
+                row.child(div().px(px(2.0)).pt(px(6.0)).child(meter))
+            });
 
         let spec = models::resolve(&self.selected_model);
         let installed = models::find_dir(spec, None).is_some();
         let phase = match &*self.model_phase.lock() {
-            DownloadPhase::Downloading { id, done, total } if id == spec.id => {
-                DownloadPhase::Downloading {
-                    id: id.clone(),
-                    done: *done,
-                    total: *total,
-                }
-            }
+            DownloadPhase::Downloading {
+                id,
+                done,
+                total,
+                file,
+                file_index,
+                file_count,
+            } if id == spec.id => DownloadPhase::Downloading {
+                id: id.clone(),
+                done: *done,
+                total: *total,
+                file: file.clone(),
+                file_index: *file_index,
+                file_count: *file_count,
+            },
             DownloadPhase::Failed { id, message } if id == spec.id => DownloadPhase::Failed {
                 id: id.clone(),
                 message: message.clone(),
@@ -1818,8 +1643,19 @@ impl HudView {
         };
         let downloading = matches!(phase, DownloadPhase::Downloading { .. });
         let model_sub = match &phase {
-            DownloadPhase::Downloading { done, total, .. } => format!(
-                "Downloading {} of {}",
+            DownloadPhase::Downloading {
+                done,
+                total,
+                file,
+                file_index,
+                file_count,
+                ..
+            } => format!(
+                "{}% · {} of {} · {} · {} of {}",
+                models::percent(*done, *total),
+                file_index,
+                file_count,
+                models::file_label(file),
                 models::format_mb(*done),
                 models::format_mb(*total)
             ),
@@ -1827,284 +1663,145 @@ impl HudView {
             _ if installed => format!("{}, {}", spec.label, spec.blurb),
             _ => format!("{}, not downloaded, {}", spec.label, spec.size_label),
         };
-        let status_label = if downloading {
-            "Downloading"
-        } else if installed {
-            "On demand"
-        } else {
-            "Not on disk"
-        };
-        let status_color = if downloading {
-            GOLD
-        } else if installed {
-            SUCCESS
-        } else {
-            TEXT_MUTED
+        let status_label = match &phase {
+            DownloadPhase::Downloading { done, total, .. } => {
+                format!("{}%", models::percent(*done, *total))
+            }
+            _ if installed => "On demand".to_string(),
+            _ => "Not on disk".to_string(),
         };
         let mut model_buttons = Vec::new();
         for (i, option) in CATALOG.iter().enumerate() {
             let is_selected = self.selected_model == option.id;
             let option_id = option.id;
             model_buttons.push(
-                div()
-                    .id(ElementId::NamedInteger("model_btn".into(), i as u64))
-                    .flex()
-                    .flex_1()
-                    .items_center()
-                    .justify_center()
-                    .h(px(44.0))
-                    .px(px(6.0))
-                    .min_w(px(0.0))
-                    .rounded_lg()
-                    .border_2()
-                    .border_color(if is_selected {
-                        rgba(0xc4a7e780)
-                    } else {
-                        rgba(0x00000000)
-                    })
-                    .tab_index(0)
-                    .focus(|style| style.border_color(rgb(FOAM)))
-                    .text_size(px(12.0))
-                    .font_weight(if is_selected {
-                        FontWeight::MEDIUM
-                    } else {
-                        FontWeight::NORMAL
-                    })
-                    .bg(if is_selected {
-                        rgba(SELECTED_FILL)
-                    } else {
-                        rgba(0x00000000)
-                    })
-                    .text_color(if is_selected {
-                        rgb(IRIS)
-                    } else {
-                        rgb(TEXT_SECONDARY)
-                    })
-                    .whitespace_nowrap()
-                    .cursor_pointer()
-                    .hover(|style| {
-                        if is_selected {
-                            style
-                        } else {
-                            style.bg(rgba(HOVER))
-                        }
-                    })
-                    .active(|style| style.opacity(0.92))
-                    .child(option.chip)
-                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
-                        if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                            this.select_model(option_id);
-                            cx.stop_propagation();
-                            cx.notify();
-                        }
-                    }))
-                    .on_click(cx.listener(move |this, _, _, cx| {
+                controls::choice_chip(
+                    ElementId::NamedInteger("model_btn".into(), i as u64),
+                    option.chip,
+                    is_selected,
+                )
+                .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                    if matches!(event.keystroke.key.as_str(), "enter" | "space") {
                         this.select_model(option_id);
+                        cx.stop_propagation();
                         cx.notify();
-                    })),
+                    }
+                }))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.select_model(option_id);
+                    cx.notify();
+                })),
             );
         }
         let mut model_rows = Vec::new();
         let mut row = Vec::new();
         for button in model_buttons {
-            row.push(button);
+            row.push(button.into_any_element());
             if row.len() == 2 {
-                model_rows.push(
-                    div()
-                        .flex()
-                        .w_full()
-                        .gap(px(8.0))
-                        .children(std::mem::take(&mut row))
-                        .into_any_element(),
-                );
+                model_rows.push(controls::chip_row(std::mem::take(&mut row)));
             }
         }
         if !row.is_empty() {
-            model_rows.push(
+            model_rows.push(controls::chip_row(row));
+        }
+        let download_action = match &phase {
+            DownloadPhase::Downloading { done, total, .. } => {
+                format!("{}%", models::percent(*done, *total))
+            }
+            DownloadPhase::Failed { .. } => "Try again".to_string(),
+            _ => format!("Download model · {}", spec.size_label),
+        };
+        let show_download = !installed || matches!(phase, DownloadPhase::Failed { .. });
+        let model_meter = match &phase {
+            DownloadPhase::Downloading { done, total, .. } => {
+                Some(controls::progress_bar(*done, *total))
+            }
+            _ => None,
+        };
+        let model_sub = format!("{model_sub} · {} · {status_label}", update::current_version());
+        let mut model_body = vec![controls::chip_well(model_rows).into_any_element()];
+        if let Some(meter) = model_meter {
+            model_body.push(meter);
+        }
+        if show_download {
+            model_body.push(
                 div()
+                    .id("download_model_btn")
                     .flex()
-                    .w_full()
-                    .gap(px(8.0))
-                    .children(row)
+                    .items_center()
+                    .justify_center()
+                    .h(px(H_CTRL))
+                    .px(px(10.0))
+                    .rounded(r_chip())
+                    .tab_index(0)
+                    .border_1()
+                    .border_color(theme::transparent())
+                    .focus(|style| style.border_color(focus_ring()))
+                    .text_size(px(TYPE_META))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(if downloading { muted() } else { foam() })
+                    .whitespace_nowrap()
+                    .cursor_pointer()
+                    .hover(|style| {
+                        if downloading {
+                            style
+                        } else {
+                            style.text_color(text())
+                        }
+                    })
+                    .active(|style| style.opacity(0.92))
+                    .child(download_action)
+                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                        if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                            this.start_model_download();
+                            cx.stop_propagation();
+                            cx.notify();
+                        }
+                    }))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.start_model_download();
+                        cx.notify();
+                    }))
                     .into_any_element(),
             );
         }
-        let download_action = if downloading {
-            "Downloading"
-        } else if matches!(phase, DownloadPhase::Failed { .. }) {
-            "Try again"
-        } else {
-            "Download model"
-        };
-        let show_download = !installed || matches!(phase, DownloadPhase::Failed { .. });
-        let model_row = div()
-            .flex()
-            .flex_col()
-            .w_full()
-            .gap(px(8.0))
-            .px(px(8.0))
-            .py(px(8.0))
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .justify_between()
-                    .gap(px(10.0))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap(px(3.0))
-                            .flex_1()
-                            .min_w(px(128.0))
-                            .child(
-                                div()
-                                    .text_size(px(12.0))
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(rgb(TEXT))
-                                    .child("Model"),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(11.0))
-                                    .line_height(px(14.0))
-                                    .text_color(rgb(TEXT_MUTED))
-                                    .line_clamp(2)
-                                    .child(model_sub),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(8.0))
-                            .child(
-                                div()
-                                    .px(px(8.0))
-                                    .py(px(5.0))
-                                    .rounded_lg()
-                                    .bg(rgba(0x393552cc))
-                                    .text_size(px(11.0))
-                                    .font_family("Consolas")
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(rgb(FOAM))
-                                    .whitespace_nowrap()
-                                    .child(update::current_version()),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(8.0))
-                                    .px(px(8.0))
-                                    .py(px(5.0))
-                                    .rounded_lg()
-                                    .bg(rgba(if installed && !downloading {
-                                        0x3e8fb022
-                                    } else {
-                                        0x393552cc
-                                    }))
-                                    .child(
-                                        div()
-                                            .w(px(6.0))
-                                            .h(px(6.0))
-                                            .rounded_full()
-                                            .bg(rgb(status_color)),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(11.0))
-                                            .font_weight(FontWeight::MEDIUM)
-                                            .text_color(rgb(status_color))
-                                            .whitespace_nowrap()
-                                            .child(status_label),
-                                    ),
-                            ),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .w_full()
-                    .gap(px(8.0))
-                    .children(model_rows),
-            )
-            .when(show_download, |block| {
-                block.child(
-                    div()
-                        .id("download_model_btn")
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .h(px(44.0))
-                        .px(px(10.0))
-                        .rounded_lg()
-                        .tab_index(0)
-                        .border_2()
-                        .border_color(rgba(0x00000000))
-                        .focus(|style| style.border_color(rgb(FOAM)))
-                        .bg(rgba(if downloading { 0x39355299 } else { 0x393552cc }))
-                        .text_size(px(11.0))
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(rgb(TEXT))
-                        .whitespace_nowrap()
-                        .cursor_pointer()
-                        .hover(|style| {
-                            if downloading {
-                                style
-                            } else {
-                                style.bg(rgba(SELECTED_FILL))
-                            }
-                        })
-                        .active(|style| style.opacity(0.92))
-                        .child(if downloading {
-                            download_action.to_string()
-                        } else {
-                            format!("{download_action} · {}", spec.size_label)
-                        })
-                        .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                            if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                                this.start_model_download();
-                                cx.stop_propagation();
-                                cx.notify();
-                            }
-                        }))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.start_model_download();
-                            cx.notify();
-                        })),
-                )
-            });
+        let model_row = controls::labeled_block("Model", model_sub, model_body);
 
         div()
             .flex()
             .flex_col()
             .w_full()
-            .gap(px(6.0))
-            .child(auto_paste_row)
-            .child(startup_row)
+            .gap(px(GAP_SECTION))
+            .child(controls::grouped_section(
+                "General",
+                [
+                    auto_paste_row.into_any_element(),
+                    startup_row.into_any_element(),
+                ],
+            ))
             .when_some(self.autostart_error.clone(), |view, error| {
                 view.child(
                     div()
-                        .px(px(8.0))
-                        .text_size(px(11.0))
-                        .line_height(px(14.0))
-                        .text_color(rgb(LOVE))
+                        .px(px(10.0))
+                        .text_size(px(TYPE_DESC))
+                        .line_height(px(15.0))
+                        .text_color(love())
                         .child(error),
                 )
             })
             .child(language_row)
-            .child(hotkey_row)
+            .child(controls::grouped_section(
+                "Shortcut",
+                [hotkey_row.into_any_element()],
+            ))
             .child(model_row)
             .when_some(self.model_error.clone(), |view, error| {
                 view.child(
                     div()
-                        .px(px(8.0))
-                        .text_size(px(11.0))
-                        .line_height(px(14.0))
-                        .text_color(rgb(LOVE))
+                        .px(px(10.0))
+                        .text_size(px(TYPE_DESC))
+                        .line_height(px(15.0))
+                        .text_color(love())
                         .child(error),
                 )
             })
@@ -2120,10 +1817,11 @@ fn pulse_curve(delta: f32) -> f32 {
 
 fn toggle_offset(on: bool, progress: f32) -> f32 {
     let progress = progress.clamp(0.0, 1.0);
+    let travel = 16.0;
     if on {
-        2.0 + 16.0 * progress
+        travel * progress
     } else {
-        18.0 - 16.0 * progress
+        travel * (1.0 - progress)
     }
 }
 
@@ -2173,15 +1871,14 @@ fn overlay_snippet(text: &str, color: impl Into<Hsla>) -> AnyElement {
     let color = color.into();
     div()
         .flex()
-        .flex_1()
-        .min_w(px(0.0))
+        .flex_none()
         .items_center()
-        .h(px(32.0))
+        .justify_center()
+        .h(px(28.0))
         .overflow_hidden()
         .child(
             div()
-                .w_full()
-                .text_size(px(11.0))
+                .text_size(px(TYPE_META))
                 .line_height(px(14.0))
                 .text_color(color)
                 .whitespace_nowrap()
@@ -2215,14 +1912,14 @@ mod motion_tests {
 
     #[test]
     fn toggle_finishes_inside_track_in_both_directions() {
-        assert_eq!(toggle_offset(true, 0.0), 2.0);
-        assert_eq!(toggle_offset(true, 1.0), 18.0);
-        assert_eq!(toggle_offset(false, 0.0), 18.0);
-        assert_eq!(toggle_offset(false, 1.0), 2.0);
+        assert_eq!(toggle_offset(true, 0.0), 0.0);
+        assert_eq!(toggle_offset(true, 1.0), 16.0);
+        assert_eq!(toggle_offset(false, 0.0), 16.0);
+        assert_eq!(toggle_offset(false, 1.0), 0.0);
         for step in 0..=100 {
             let progress = step as f32 / 100.0;
             for on in [true, false] {
-                assert!((2.0..=18.0).contains(&toggle_offset(on, progress)));
+                assert!((0.0..=16.0).contains(&toggle_offset(on, progress)));
             }
         }
     }

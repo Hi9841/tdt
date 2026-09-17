@@ -34,6 +34,7 @@ class MainActivity : ComponentActivity() {
     private var isOverlayServiceRunning by mutableStateOf(false)
     private var uiState by mutableStateOf<VoiceSttState>(VoiceSttState.Idle)
     private val historyItems = mutableStateListOf<TranscriptionItem>()
+    private var previewLocked = false
 
     private val requestPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -43,7 +44,14 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        checkPermissions()
+        val preview = intent.getStringExtra("tdt.preview")
+        if (preview.isNullOrBlank()) {
+            checkPermissions()
+        } else {
+            hasMicPermission = true
+            previewLocked = true
+            applyPreview(preview)
+        }
 
         sttEngine = SherpaSenseVoiceEngine(this)
 
@@ -52,6 +60,7 @@ class MainActivity : ComponentActivity() {
 
             // Sync audio level into state when recording
             LaunchedEffect(audioRecorder.isRecording) {
+                if (previewLocked) return@LaunchedEffect
                 if (audioRecorder.isRecording) {
                     audioRecorder.audioLevel.collect { level ->
                         uiState = VoiceSttState.Recording(audioLevel = level)
@@ -112,6 +121,67 @@ class MainActivity : ComponentActivity() {
                 }
             )
         }
+    }
+
+    private fun applyPreview(name: String) {
+        when (name) {
+            "idle" -> {
+                uiState = VoiceSttState.Idle
+                historyItems.clear()
+                isOverlayServiceRunning = false
+            }
+            "recording" -> {
+                uiState = VoiceSttState.Recording(audioLevel = 0.72f, durationSecs = 8)
+                historyItems.clear()
+            }
+            "transcribing" -> {
+                uiState = VoiceSttState.Transcribing
+                historyItems.clear()
+            }
+            "success" -> {
+                uiState = VoiceSttState.Success("this is a sample transcript", copied = true)
+                seedHistory()
+            }
+            "error" -> {
+                uiState = VoiceSttState.Error("Microphone was disconnected")
+                historyItems.clear()
+            }
+            "history" -> {
+                uiState = VoiceSttState.Idle
+                seedHistory()
+            }
+            "overlay-on" -> {
+                uiState = VoiceSttState.Idle
+                isOverlayServiceRunning = true
+                seedHistory()
+            }
+        }
+    }
+
+    private fun seedHistory() {
+        historyItems.clear()
+        historyItems.addAll(
+            listOf(
+                TranscriptionItem(
+                    id = "1",
+                    text = "This is a longer transcript that wraps onto a second line.",
+                    timestamp = System.currentTimeMillis(),
+                    durationMs = 1800
+                ),
+                TranscriptionItem(
+                    id = "2",
+                    text = "Short transcript 1: ready when you are",
+                    timestamp = System.currentTimeMillis() - 4_000,
+                    durationMs = 900
+                ),
+                TranscriptionItem(
+                    id = "3",
+                    text = "Short transcript 2: copied to clipboard",
+                    timestamp = System.currentTimeMillis() - 8_000,
+                    durationMs = 600
+                )
+            )
+        )
     }
 
     private fun checkPermissions() {

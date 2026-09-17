@@ -18,7 +18,10 @@ pub enum UpdatePhase {
         asset_url: String,
         sums_url: Option<String>,
     },
-    Downloading,
+    Downloading {
+        done: u64,
+        total: u64,
+    },
     Ready {
         installer: PathBuf,
     },
@@ -108,7 +111,11 @@ pub fn check_latest() -> Result<UpdatePhase, String> {
 /// Download the setup installer, streaming to a temp file, and verify its
 /// SHA256 against the release's published `SHA256SUMS.txt` when available.
 /// Returns the verified installer path.
-pub fn download_installer(asset_url: &str, sums_url: Option<&str>) -> Result<PathBuf, String> {
+pub fn download_installer(
+    asset_url: &str,
+    sums_url: Option<&str>,
+    mut on_progress: impl FnMut(u64, u64),
+) -> Result<PathBuf, String> {
     let path = std::env::temp_dir().join("TDT-Setup.exe.download");
     let mut file = File::create(&path).map_err(|e| format!("Could not write installer: {e}"))?;
     let mut hasher = sha2::Sha256::new();
@@ -118,6 +125,11 @@ pub fn download_installer(asset_url: &str, sums_url: Option<&str>) -> Result<Pat
         .set("Accept", "application/octet-stream")
         .call()
         .map_err(|e| format!("Download failed: {e}"))?;
+    let content_len = response
+        .header("Content-Length")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    on_progress(0, content_len.max(1));
     let mut reader = response.into_reader();
     let mut chunk = [0u8; 64 * 1024];
     let mut total: u64 = 0;
@@ -132,6 +144,7 @@ pub fn download_installer(asset_url: &str, sums_url: Option<&str>) -> Result<Pat
         file.write_all(&chunk[..read])
             .map_err(|e| format!("Could not write installer: {e}"))?;
         total += read as u64;
+        on_progress(total, content_len.max(total).max(1));
     }
     drop(file);
 
@@ -275,7 +288,7 @@ fn check_agent() -> ureq::Agent {
 fn download_agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(20))
-        .timeout_read(Duration::from_secs(120))
+        .timeout_read(Duration::from_secs(7200))
         .timeout_write(Duration::from_secs(60))
         .user_agent(&user_agent())
         .build()

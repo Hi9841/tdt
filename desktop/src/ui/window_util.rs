@@ -14,19 +14,19 @@ use windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
 use windows::Win32::UI::Shell::{IVirtualDesktopManager, VirtualDesktopManager};
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetClientRect, GetForegroundWindow, GetWindowLongW, GetWindowRect,
-    GetWindowThreadProcessId, IsWindowVisible, PostMessageW, SetWindowLongW, SetWindowPos,
-    SystemParametersInfoW, GWL_STYLE, HTCAPTION, HWND_TOPMOST, SPI_GETCLIENTAREAANIMATION,
-    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOZORDER, SWP_SHOWWINDOW,
-    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WM_NCLBUTTONDOWN, WS_CAPTION, WS_MAXIMIZEBOX,
-    WS_MINIMIZEBOX, WS_THICKFRAME,
+    GetWindowThreadProcessId, IsWindow, IsWindowVisible, PostMessageW, SetWindowLongW,
+    SetWindowPos, ShowWindow, SystemParametersInfoW, GWL_STYLE, HTCAPTION, HWND_TOPMOST,
+    SPI_GETCLIENTAREAANIMATION, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOZORDER,
+    SWP_SHOWWINDOW, SW_HIDE, SW_SHOWNOACTIVATE, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+    WM_NCLBUTTONDOWN, WS_CAPTION, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_THICKFRAME,
 };
 
-pub const BUBBLE_WIDTH: f32 = 340.0;
-pub const BUBBLE_HEIGHT: f32 = 44.0;
-pub const PANEL_WIDTH: i32 = 340;
-pub const PANEL_HEIGHT: i32 = 528;
-pub const PANEL_MIN_HEIGHT: i32 = 460;
-pub const PANEL_MAX_HEIGHT: i32 = 600;
+pub const BUBBLE_WIDTH: f32 = 400.0;
+pub const BUBBLE_HEIGHT: f32 = 42.0;
+pub const PANEL_WIDTH: i32 = 400;
+pub const PANEL_HEIGHT: i32 = 540;
+pub const PANEL_MIN_HEIGHT: i32 = 480;
+pub const PANEL_MAX_HEIGHT: i32 = 620;
 pub const PANEL_OPEN_MS: u64 = 240;
 pub const PANEL_CLOSE_MS: u64 = 180;
 
@@ -38,6 +38,33 @@ fn overlay_expanded() -> &'static std::sync::atomic::AtomicBool {
 fn overlay_animating() -> &'static std::sync::atomic::AtomicBool {
     static FLAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     &FLAG
+}
+
+fn overlay_hidden() -> &'static std::sync::atomic::AtomicBool {
+    static FLAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    &FLAG
+}
+
+fn remembered_hwnd() -> &'static parking_lot::Mutex<Option<isize>> {
+    static HWND: parking_lot::Mutex<Option<isize>> = parking_lot::Mutex::new(None);
+    &HWND
+}
+
+pub fn is_overlay_hidden() -> bool {
+    overlay_hidden().load(std::sync::atomic::Ordering::SeqCst)
+}
+
+pub fn set_overlay_hidden(hidden: bool) {
+    overlay_hidden().store(hidden, std::sync::atomic::Ordering::SeqCst);
+    #[cfg(target_os = "windows")]
+    {
+        let Some(hwnd) = find_app_hwnd() else {
+            return;
+        };
+        unsafe {
+            let _ = ShowWindow(hwnd, if hidden { SW_HIDE } else { SW_SHOWNOACTIVATE });
+        }
+    }
 }
 
 /// Window-chrome insets GPUI reserves on the borderless overlay: the delta
@@ -66,10 +93,13 @@ fn bubble_outer_size(hwnd: HWND) -> (i32, i32) {
 }
 
 /// Strip resize handles and snap the collapsed overlay so its client area is
-/// exactly 340x44 logical pixels (outer size includes chrome insets).
+/// exactly 400x42 logical pixels (outer size includes chrome insets).
 pub fn lock_overlay_chrome() {
     #[cfg(target_os = "windows")]
     {
+        if is_overlay_hidden() {
+            return;
+        }
         let Some(hwnd) = find_app_hwnd() else {
             return;
         };
@@ -234,6 +264,7 @@ pub fn client_animations_enabled() -> bool {
 pub fn find_app_hwnd() -> Option<HWND> {
     struct Context {
         pid: u32,
+        visible_only: bool,
         found: Option<HWND>,
     }
 
@@ -241,7 +272,11 @@ pub fn find_app_hwnd() -> Option<HWND> {
         let ctx = &mut *(lparam.0 as *mut Context);
         let mut pid = 0;
         let _ = GetWindowThreadProcessId(hwnd, Some(&mut pid));
-        if pid == ctx.pid && IsWindowVisible(hwnd).as_bool() {
+        if pid != ctx.pid {
+            return BOOL(1);
+        }
+        let visible_ok = !ctx.visible_only || IsWindowVisible(hwnd).as_bool();
+        if visible_ok {
             ctx.found = Some(hwnd);
             return BOOL(0);
         }
@@ -250,6 +285,7 @@ pub fn find_app_hwnd() -> Option<HWND> {
 
     let mut ctx = Context {
         pid: std::process::id(),
+        visible_only: true,
         found: None,
     };
 
@@ -257,7 +293,29 @@ pub fn find_app_hwnd() -> Option<HWND> {
         let _ = EnumWindows(Some(enum_proc), LPARAM(&mut ctx as *mut _ as isize));
     }
 
-    ctx.found
+    if ctx.found.is_none() {
+        ctx.visible_only = false;
+        unsafe {
+            let _ = EnumWindows(Some(enum_proc), LPARAM(&mut ctx as *mut _ as isize));
+        }
+    }
+
+    if let Some(hwnd) = ctx.found {
+        *remembered_hwnd().lock() = Some(hwnd.0 as isize);
+        return Some(hwnd);
+    }
+
+    let stored = *remembered_hwnd().lock();
+    stored.and_then(|raw| {
+        let hwnd = HWND(raw as _);
+        unsafe {
+            if IsWindow(hwnd).as_bool() {
+                Some(hwnd)
+            } else {
+                None
+            }
+        }
+    })
 }
 
 pub fn start_window_drag() {
@@ -451,6 +509,9 @@ pub fn set_window_mode(is_expanded: bool) {
 pub fn follow_current_virtual_desktop() {
     #[cfg(target_os = "windows")]
     {
+        if is_overlay_hidden() {
+            return;
+        }
         use std::time::{Duration, Instant};
         static LAST: parking_lot::Mutex<Option<Instant>> = parking_lot::Mutex::new(None);
         {
@@ -541,7 +602,10 @@ mod tests {
     #[test]
     fn panel_size_fits_small_and_large_work_areas() {
         assert_eq!(panel_size_for_work(1920, 1080).0, BUBBLE_WIDTH as i32);
-        assert_eq!(panel_size_for_work(1920, 1080), (PANEL_WIDTH, 600));
+        assert_eq!(
+            panel_size_for_work(1920, 1080),
+            (PANEL_WIDTH, PANEL_MAX_HEIGHT)
+        );
         assert_eq!(
             panel_size_for_work(300, 400),
             (PANEL_WIDTH, PANEL_MIN_HEIGHT)
@@ -553,6 +617,15 @@ mod tests {
         assert!((ease_drawer(0.0) - 0.0).abs() < 1e-5);
         assert!((ease_drawer(1.0) - 1.0).abs() < 1e-5);
         assert!(ease_drawer(0.2) > 0.2);
+    }
+
+    #[test]
+    fn overlay_hidden_flag_round_trips() {
+        assert!(!is_overlay_hidden());
+        set_overlay_hidden(true);
+        assert!(is_overlay_hidden());
+        set_overlay_hidden(false);
+        assert!(!is_overlay_hidden());
     }
 
     #[test]

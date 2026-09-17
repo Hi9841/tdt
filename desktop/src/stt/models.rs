@@ -35,9 +35,30 @@ pub struct ModelSpec {
 #[derive(Debug, Clone, PartialEq)]
 pub enum DownloadPhase {
     Idle,
-    Downloading { id: String, done: u64, total: u64 },
-    Ready { id: String },
-    Failed { id: String, message: String },
+    Downloading {
+        id: String,
+        done: u64,
+        total: u64,
+        file: String,
+        file_index: usize,
+        file_count: usize,
+    },
+    Ready {
+        id: String,
+    },
+    Failed {
+        id: String,
+        message: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct DownloadProgress {
+    pub done: u64,
+    pub total: u64,
+    pub file: String,
+    pub file_index: usize,
+    pub file_count: usize,
 }
 
 pub const DEFAULT_MODEL_ID: &str = "sensevoice-small";
@@ -247,6 +268,27 @@ pub fn format_mb(bytes: u64) -> String {
     format!("{} MB", (bytes + 512 * 1024) / (1024 * 1024))
 }
 
+pub fn percent(done: u64, total: u64) -> u8 {
+    if total == 0 {
+        0
+    } else {
+        done.saturating_mul(100)
+            .checked_div(total)
+            .unwrap_or(0)
+            .min(100) as u8
+    }
+}
+
+pub fn file_label(name: &str) -> String {
+    name.rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(name)
+        .trim_end_matches(".onnx")
+        .trim_end_matches(".txt")
+        .replace(".int8", "")
+        .to_string()
+}
+
 pub fn whisper_language(language: &str) -> Option<String> {
     match language.trim() {
         "" | "auto" => None,
@@ -257,20 +299,34 @@ pub fn whisper_language(language: &str) -> Option<String> {
 pub fn download(
     spec: &ModelSpec,
     dest_dir: &Path,
-    mut on_progress: impl FnMut(u64, u64),
+    mut on_progress: impl FnMut(DownloadProgress),
 ) -> Result<(), String> {
     fs::create_dir_all(dest_dir)
         .map_err(|error| format!("Could not create model folder: {error}"))?;
 
     let total = spec.size_bytes.max(1);
+    let file_count = spec.files.len().max(1);
     let mut done = 0u64;
-    on_progress(0, total);
 
-    for file in spec.files {
+    for (index, file) in spec.files.iter().enumerate() {
+        let file_index = index + 1;
+        on_progress(DownloadProgress {
+            done,
+            total,
+            file: file.name.to_string(),
+            file_index,
+            file_count,
+        });
         let dest = dest_dir.join(file.name);
         if dest.is_file() && file_sha256(&dest)?.eq_ignore_ascii_case(file.sha256) {
             done = (done + file_len(&dest)).min(total);
-            on_progress(done, total);
+            on_progress(DownloadProgress {
+                done,
+                total,
+                file: file.name.to_string(),
+                file_index,
+                file_count,
+            });
             continue;
         }
 
@@ -280,13 +336,25 @@ pub fn download(
         );
         download_file(&url, &dest, file.sha256, |chunk| {
             done = (done + chunk).min(total);
-            on_progress(done, total);
+            on_progress(DownloadProgress {
+                done,
+                total,
+                file: file.name.to_string(),
+                file_index,
+                file_count,
+            });
         })?;
-        on_progress(done, total);
     }
 
     spec.require_installed(dest_dir)?;
-    on_progress(total, total);
+    let last = spec.files.last().map(|file| file.name).unwrap_or("");
+    on_progress(DownloadProgress {
+        done: total,
+        total,
+        file: last.to_string(),
+        file_index: file_count,
+        file_count,
+    });
     Ok(())
 }
 
@@ -417,8 +485,8 @@ fn canonicalize_or_clone(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        by_id, format_mb, resolve, whisper_language, ModelFamily, ModelSpec, CATALOG,
-        DEFAULT_MODEL_ID,
+        by_id, file_label, format_mb, percent, resolve, whisper_language, ModelFamily, ModelSpec,
+        CATALOG, DEFAULT_MODEL_ID,
     };
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -488,5 +556,20 @@ mod tests {
     fn format_mb_rounds_known_sizes() {
         assert_eq!(format_mb(239_549_735), "228 MB");
         assert_eq!(format_mb(946_072_270), "902 MB");
+    }
+
+    #[test]
+    fn percent_hits_zero_and_one_hundred() {
+        assert_eq!(percent(0, 100), 0);
+        assert_eq!(percent(50, 100), 50);
+        assert_eq!(percent(100, 100), 100);
+        assert_eq!(percent(1, 0), 0);
+    }
+
+    #[test]
+    fn file_label_drops_weight_suffixes() {
+        assert_eq!(file_label("medium-decoder.int8.onnx"), "medium-decoder");
+        assert_eq!(file_label("tokens.txt"), "tokens");
+        assert_eq!(file_label("model.onnx"), "model");
     }
 }

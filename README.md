@@ -19,7 +19,7 @@ powershell -ExecutionPolicy Bypass -File .\packaging\build-installer.ps1
 That writes:
 
 - `dist/TDT-Setup.exe` self-contained per-user installer
-- `dist/TDT-0.1.4-windows-x64.zip` portable copy
+- `dist/TDT-0.1.5-windows-x64.zip` portable copy
 - `dist/SHA256SUMS.txt`
 
 The installer copies TDT, SenseVoice Small, and the license files into

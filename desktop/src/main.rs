@@ -30,10 +30,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use stt::{models, SharedEngine, SttEngine};
 use tray_icon::menu::MenuEvent;
+use tray_icon::{MouseButton, MouseButtonState, TrayIconEvent};
 use ui::preview;
+use ui::tray::tooltip_text;
 use ui::window_util::{
     find_app_hwnd, follow_current_virtual_desktop, lock_overlay_chrome,
-    position_bubble_on_preferred_monitor, BUBBLE_HEIGHT, BUBBLE_WIDTH,
+    position_bubble_on_preferred_monitor, set_overlay_hidden, BUBBLE_HEIGHT, BUBBLE_WIDTH,
 };
 use ui::{HudStatus, HudView, SystemTray};
 use update::UpdatePhase;
@@ -254,12 +256,38 @@ fn main() {
                                     let _ = this.update(cx, |view, cx| {
                                         view.open_settings(cx);
                                     });
+                                } else if event.id == tray.show_item.id() {
+                                    set_overlay_hidden(false);
+                                    let _ = this.update(cx, |view, cx| {
+                                        view.reveal_overlay();
+                                        cx.notify();
+                                    });
                                 } else if event.id == tray.updates_item.id() {
                                     let _ = this.update(cx, |view, cx| {
                                         view.start_update_check();
                                         view.open_settings(cx);
                                     });
                                 }
+                            }
+                        }
+                        while let Ok(event) = TrayIconEvent::receiver().try_recv() {
+                            match event {
+                                TrayIconEvent::Click {
+                                    button: MouseButton::Left,
+                                    button_state: MouseButtonState::Up,
+                                    ..
+                                }
+                                | TrayIconEvent::DoubleClick {
+                                    button: MouseButton::Left,
+                                    ..
+                                } => {
+                                    set_overlay_hidden(false);
+                                    let _ = this.update(cx, |view, cx| {
+                                        view.reveal_overlay();
+                                        cx.notify();
+                                    });
+                                }
+                                _ => {}
                             }
                         }
                         if quitting {
@@ -356,11 +384,9 @@ fn main() {
                                     cfg.hotkey = label.clone();
                                     let _ = cfg.save();
                                     if let Some(ref tray) = tray {
-                                        tray.shortcut_item
-                                            .set_text(format!("Shortcut: {label}"));
-                                        let _ = tray.tray_icon.set_tooltip(Some(format!(
-                                            "TDT - Talk Don't Type. Tap or hold {label} to talk."
-                                        )));
+                                        let _ = tray
+                                            .tray_icon
+                                            .set_tooltip(Some(tooltip_text(&label)));
                                     }
                                     let _ = this.update(cx, |view, cx| {
                                         view.hotkey_label = label;
@@ -380,6 +406,7 @@ fn main() {
                                     // transcription. The current recorder and STT
                                     // engine are single-session by design.
                                     if !is_recording_state && !is_processing_state {
+                                        set_overlay_hidden(false);
                                         *target_hwnd.lock() = capture_fg();
                                         rec.start();
                                         if let Some(engine) = stt.lock().clone() {

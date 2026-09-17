@@ -147,7 +147,10 @@ pub fn update_phase(spec: &Spec) -> Option<UpdatePhase> {
             asset_url: "https://example.invalid/TDT-Setup.exe".into(),
             sums_url: None,
         },
-        Spec::PanelSettingsUpdateDownloading => UpdatePhase::Downloading,
+        Spec::PanelSettingsUpdateDownloading => UpdatePhase::Downloading {
+            done: 42_000_000,
+            total: 160_000_000,
+        },
         Spec::PanelSettingsUpdateReady => UpdatePhase::Ready {
             installer: PathBuf::from(r"C:\TDT-Setup.exe"),
         },
