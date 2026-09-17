@@ -6,6 +6,7 @@ compile_error!(
 );
 
 mod audio;
+mod autostart;
 mod config;
 mod hotkey;
 mod paste;
@@ -29,6 +30,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use stt::SttEngine;
 use tray_icon::menu::MenuEvent;
+use ui::preview;
 use ui::window_util::{
     find_app_hwnd, follow_current_virtual_desktop, lock_overlay_chrome,
     position_bubble_on_preferred_monitor, BUBBLE_HEIGHT, BUBBLE_WIDTH,
@@ -324,7 +326,13 @@ fn main() {
                         };
 
                         // 2. Process Hotkey Events
+                        if preview::is_active() {
+                            while hotkey_rx.try_recv().is_ok() {}
+                        }
                         while let Ok(action) = hotkey_rx.try_recv() {
+                            if preview::is_active() {
+                                continue;
+                            }
                             match action {
                                 HotkeyAction::Captured(binding) => {
                                     let label = binding.display();
@@ -461,40 +469,52 @@ fn main() {
                         let vis_peaks = is_recording_state.then(|| rec.vis_peaks());
 
                         let _ = this.update(cx, |view, cx| {
-                            if let Some(copied_at) = view.copied_at {
-                                if copied_at.elapsed() > Duration::from_millis(1400) {
-                                    view.copied_key = None;
-                                    view.copied_at = None;
-                                    cx.notify();
+                            if !preview::is_active() {
+                                if let Some(copied_at) = view.copied_at {
+                                    if copied_at.elapsed() > Duration::from_millis(1400) {
+                                        view.copied_key = None;
+                                        view.copied_at = None;
+                                        cx.notify();
+                                    }
                                 }
                             }
 
                             match &mut view.status {
                                 HudStatus::Listening { audio_level, .. } => {
-                                    *audio_level = current_level;
-                                    for (slot, target) in
-                                        view.wave_peaks.iter_mut().zip(vis_peaks.into_iter().flatten())
-                                    {
-                                        if target > *slot {
-                                            *slot += (target - *slot) * 0.58;
-                                        } else {
-                                            *slot += (target - *slot) * 0.24;
+                                    if preview::is_active() {
+                                        cx.notify();
+                                    } else {
+                                        *audio_level = current_level;
+                                        for (slot, target) in view
+                                            .wave_peaks
+                                            .iter_mut()
+                                            .zip(vis_peaks.into_iter().flatten())
+                                        {
+                                            if target > *slot {
+                                                *slot += (target - *slot) * 0.58;
+                                            } else {
+                                                *slot += (target - *slot) * 0.24;
+                                            }
                                         }
+                                        cx.notify();
                                     }
-                                    cx.notify();
                                 }
                                 // GPUI's pulse requests its own animation frames.
                                 // A second 40Hz redraw loop is redundant, and keeps
                                 // repainting even when reduced motion is enabled.
                                 HudStatus::Transcribing { .. } => {}
                                 HudStatus::Success { finished_at, .. } => {
-                                    if finished_at.elapsed() > Duration::from_millis(1800) {
+                                    if !preview::is_active()
+                                        && finished_at.elapsed() > Duration::from_millis(1800)
+                                    {
                                         view.status = HudStatus::Idle;
                                         cx.notify();
                                     }
                                 }
                                 HudStatus::Error { occurred_at, .. } => {
-                                    if occurred_at.elapsed() > Duration::from_millis(2400) {
+                                    if !preview::is_active()
+                                        && occurred_at.elapsed() > Duration::from_millis(2400)
+                                    {
                                         view.status = HudStatus::Idle;
                                         cx.notify();
                                     }
@@ -508,7 +528,7 @@ fn main() {
 
                 std::thread::spawn(move || {
                     std::thread::sleep(Duration::from_secs(8));
-                    if update::updates_disabled() {
+                    if preview::is_active() || update::updates_disabled() {
                         return;
                     }
                     let ticket = update::begin_update_check();

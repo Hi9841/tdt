@@ -3,6 +3,7 @@ use crate::config::{AppConfig, AppStats};
 use crate::hotkey;
 use crate::paste::PasteInjector;
 use crate::stt::SttEngine;
+use crate::ui::preview::{self, Spec as PreviewSpec};
 use crate::ui::text::{clip_text, format_mmss};
 use crate::ui::window_util::{
     client_animations_enabled, set_window_mode, start_window_drag, BUBBLE_HEIGHT, BUBBLE_WIDTH,
@@ -43,8 +44,8 @@ const WAVE_FLAT: f32 = 2.0;
 const WAVE_MAX: f32 = 28.0;
 const HOLD_COLOR: u32 = FOAM;
 const RELEASE_COLOR: u32 = GOLD;
-/// Recent transcripts shown in the stats tab before it scrolls.
-const HISTORY_ROWS: usize = 3;
+/// Two clamped lines at 12px in this panel hold about this many characters.
+const HISTORY_EXPAND_CHARS: usize = 88;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum HudStatus {
@@ -88,6 +89,8 @@ enum PanelMotion {
 pub struct HudView {
     pub status: HudStatus,
     pub auto_paste_enabled: bool,
+    autostart_enabled: bool,
+    autostart_error: Option<String>,
     pub hotkey_label: String,
     pub wave_peaks: [f32; WAVE_BARS],
     pub mode: WindowViewMode,
@@ -97,6 +100,7 @@ pub struct HudView {
     /// row's timestamp, not its index, so a new transcript landing mid-view
     /// cannot move the checkmark to the wrong row.
     pub copied_key: Option<String>,
+    expanded_history_key: Option<String>,
     pub copied_at: Option<Instant>,
     /// Bumped on each auto-paste toggle so the knob animation restarts.
     pub toggle_epoch: u64,
@@ -120,7 +124,8 @@ impl HudView {
         update: Arc<Mutex<UpdatePhase>>,
         update_ping: crossbeam_channel::Sender<()>,
     ) -> Self {
-        let open_panel = std::env::var_os("VOICE_STT_OPEN_PANEL").is_some();
+        let open_panel =
+            std::env::var_os("VOICE_STT_OPEN_PANEL").is_some() || preview::wants_panel();
         if open_panel {
             std::thread::spawn(|| {
                 std::thread::sleep(Duration::from_millis(450));
@@ -128,9 +133,11 @@ impl HudView {
             });
         }
 
-        Self {
+        let mut view = Self {
             status: HudStatus::Idle,
             auto_paste_enabled,
+            autostart_enabled: crate::autostart::is_enabled(),
+            autostart_error: None,
             hotkey_label,
             wave_peaks: [0.0; WAVE_BARS],
             mode: if open_panel {
@@ -141,6 +148,7 @@ impl HudView {
             active_tab: SettingsTab::Stats,
             stats: AppStats::load(),
             copied_key: None,
+            expanded_history_key: None,
             copied_at: None,
             toggle_epoch: 0,
             injector: PasteInjector::new(),
@@ -151,6 +159,126 @@ impl HudView {
             update,
             update_ping,
             hotkey_capturing: false,
+        };
+        view.apply_preview_state();
+        view
+    }
+
+    fn apply_preview_state(&mut self) {
+        let Some(spec) = preview::parse() else {
+            return;
+        };
+        let is_panel = preview::wants_panel();
+        if is_panel {
+            self.mode = WindowViewMode::StatsAndSettings;
+        } else {
+            self.mode = WindowViewMode::Bubble;
+        }
+
+        self.auto_paste_enabled = true;
+        self.autostart_enabled = false;
+        self.autostart_error = None;
+        self.selected_language = "auto".into();
+        self.hotkey_capturing = false;
+        self.copied_key = None;
+        self.expanded_history_key = None;
+        self.copied_at = None;
+        self.wave_peaks = [0.0; WAVE_BARS];
+        self.status = HudStatus::Idle;
+        self.active_tab = if is_panel {
+            SettingsTab::Settings
+        } else {
+            SettingsTab::Stats
+        };
+        self.stats = AppStats::default();
+
+        match spec {
+            PreviewSpec::BubbleIdle => {}
+            PreviewSpec::BubbleListening { loud } => {
+                self.status = HudStatus::Listening {
+                    audio_level: if loud { 0.8 } else { 0.12 },
+                    started_at: Instant::now() - Duration::from_secs(12),
+                };
+                self.wave_peaks = preview_wave(loud);
+            }
+            PreviewSpec::BubbleTranscribing => {
+                self.status = HudStatus::Transcribing {
+                    recorded_for: Duration::from_secs(8),
+                };
+                self.wave_peaks = [0.08; WAVE_BARS];
+            }
+            PreviewSpec::BubbleSuccess { pasted } => {
+                self.status = HudStatus::Success {
+                    text: "this is a sample transcript".into(),
+                    auto_pasted: pasted,
+                    finished_at: Instant::now(),
+                };
+            }
+            PreviewSpec::BubbleError => {
+                self.status = HudStatus::Error {
+                    message: "Microphone was disconnected".into(),
+                    occurred_at: Instant::now(),
+                };
+            }
+            PreviewSpec::PanelStatsEmpty => {
+                self.active_tab = SettingsTab::Stats;
+            }
+            PreviewSpec::PanelStatsHistory => {
+                self.active_tab = SettingsTab::Stats;
+                self.stats = preview::fixture_stats(3);
+            }
+            PreviewSpec::PanelStatsOverflow => {
+                self.active_tab = SettingsTab::Stats;
+                self.stats = preview::fixture_stats(8);
+            }
+            PreviewSpec::PanelStatsExpanded => {
+                self.active_tab = SettingsTab::Stats;
+                self.stats = preview::fixture_stats(3);
+                self.expanded_history_key = self
+                    .stats
+                    .history
+                    .first()
+                    .map(|item| item.timestamp.clone());
+            }
+            PreviewSpec::PanelStatsCopied => {
+                self.active_tab = SettingsTab::Stats;
+                self.stats = preview::fixture_stats(3);
+                self.copied_key = self
+                    .stats
+                    .history
+                    .first()
+                    .map(|item| item.timestamp.clone());
+                self.copied_at = Some(Instant::now());
+            }
+            PreviewSpec::PanelSettingsDefaults => {}
+            PreviewSpec::PanelSettingsAutoPasteOff => {
+                self.auto_paste_enabled = false;
+            }
+            PreviewSpec::PanelSettingsStartupOn => {
+                self.autostart_enabled = true;
+            }
+            PreviewSpec::PanelSettingsStartupError => {
+                self.autostart_error = Some(
+                    "Could not change startup. Check Windows startup permissions and try again."
+                        .into(),
+                );
+            }
+            PreviewSpec::PanelSettingsLang(code) => {
+                self.selected_language = code.to_string();
+            }
+            PreviewSpec::PanelSettingsHotkeyCapture => {
+                self.hotkey_capturing = true;
+            }
+            PreviewSpec::PanelSettingsUpdateChecking
+            | PreviewSpec::PanelSettingsUpdateUpToDate
+            | PreviewSpec::PanelSettingsUpdateAvailable
+            | PreviewSpec::PanelSettingsUpdateDownloading
+            | PreviewSpec::PanelSettingsUpdateReady
+            | PreviewSpec::PanelSettingsUpdateFailed => {}
+        }
+
+        if let Some(phase) = preview::update_phase(&spec) {
+            *self.update.lock() = phase;
         }
     }
 
@@ -303,8 +431,34 @@ impl HudView {
         *self.auto_paste_state.lock() = self.auto_paste_enabled;
     }
 
+    fn toggle_autostart(&mut self) {
+        let enabled = !crate::autostart::is_enabled();
+        match crate::autostart::set_enabled(enabled) {
+            Ok(()) => {
+                self.autostart_enabled = enabled;
+                self.autostart_error = None;
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                self.autostart_error = Some(
+                    "Could not change startup. Check Windows startup permissions and try again."
+                        .into(),
+                );
+            }
+        }
+    }
+
+    fn toggle_history_preview(&mut self, key: &str) {
+        self.expanded_history_key = if self.expanded_history_key.as_deref() == Some(key) {
+            None
+        } else {
+            Some(key.to_owned())
+        };
+    }
+
     fn clear_recents(&mut self) {
         self.stats.clear_history();
+        self.expanded_history_key = None;
         self.copied_key = None;
         self.copied_at = None;
     }
@@ -471,15 +625,10 @@ impl HudView {
             _ => String::new(),
         };
 
-        let right_section = div()
-            .flex()
-            .flex_none()
-            .items_center()
-            .justify_end()
-            .min_w(px(44.0));
+        let right_section = div().flex().flex_none().items_center().justify_end();
 
         let right_section = if matches!(&self.status, HudStatus::Idle) {
-            right_section.child(
+            right_section.min_w(px(44.0)).child(
                 div()
                     .id("open_settings_btn")
                     .flex()
@@ -530,7 +679,7 @@ impl HudView {
                     })),
             )
         } else if !timer_str.is_empty() {
-            right_section.child(
+            right_section.min_w(px(44.0)).child(
                 div()
                     .text_size(px(11.0))
                     .line_height(px(13.0))
@@ -794,9 +943,9 @@ impl HudView {
                 .flex_col()
                 .flex_1()
                 .min_w(px(0.0))
-                .gap(px(6.0))
+                .gap(px(4.0))
                 .px(px(8.0))
-                .py(px(12.0))
+                .py(px(8.0))
                 .child(
                     div()
                         .text_size(px(11.0))
@@ -824,7 +973,7 @@ impl HudView {
             .flex()
             .flex_col()
             .w_full()
-            .gap(px(8.0))
+            .gap(px(4.0))
             .child(
                 div()
                     .flex()
@@ -864,45 +1013,131 @@ impl HudView {
                         div()
                             .text_size(px(11.0))
                             .text_color(rgb(TEXT_MUTED))
-                            .child(format!("Tap or hold {} to talk.", self.hotkey_label)),
+                            .child(format!("Press or hold {} to talk.", self.hotkey_label)),
                     )
                     .into_any_element(),
             );
         } else {
-            for (idx, item) in self.stats.history.iter().take(HISTORY_ROWS).enumerate() {
+            for (idx, item) in self.stats.history.iter().enumerate() {
                 let text_val = item.text.clone();
                 let is_copied = self.copied_key.as_deref() == Some(item.timestamp.as_str());
                 let btn_text = if is_copied { "Copied" } else { "Copy" };
                 let copy_tx = text_val.clone();
-                let row_tx = text_val.clone();
+                let keyboard_copy_tx = text_val.clone();
                 let click_key = item.timestamp.clone();
                 let btn_key = click_key.clone();
+                let keyboard_key = click_key.clone();
+                let keyboard_copy_key = click_key.clone();
+                let expanded =
+                    self.expanded_history_key.as_deref() == Some(item.timestamp.as_str());
+                let can_expand = history_text_overflows(&text_val);
+
+                let copy_btn = {
+                    let anim_key = if is_copied { "copied_btn" } else { "copy_btn" };
+                    div()
+                        .id(ElementId::NamedInteger(anim_key.into(), idx as u64))
+                        .tab_index(0)
+                        .focus(|style| style.bg(rgba(HOVER)))
+                        .flex_none()
+                        .h(px(44.0))
+                        .px(px(10.0))
+                        .rounded_lg()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_size(px(11.0))
+                        .font_weight(FontWeight::MEDIUM)
+                        .whitespace_nowrap()
+                        .bg(if is_copied {
+                            rgba(0x3e8fb033)
+                        } else {
+                            rgba(0xe0def412)
+                        })
+                        .text_color(if is_copied {
+                            rgb(SUCCESS)
+                        } else {
+                            rgb(TEXT_SECONDARY)
+                        })
+                        .cursor_pointer()
+                        .hover(|style| {
+                            if is_copied {
+                                style
+                            } else {
+                                style.bg(rgba(SELECTED_FILL)).text_color(rgb(TEXT))
+                            }
+                        })
+                        .active(|style| style.opacity(0.92))
+                        .child(btn_text)
+                        .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                            if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                                cx.stop_propagation();
+                                this.copy_history(&keyboard_copy_key, &keyboard_copy_tx);
+                                cx.notify();
+                            }
+                        }))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.copy_history(&btn_key, &copy_tx);
+                            cx.notify();
+                        }))
+                        .with_animation(
+                            ElementId::NamedInteger(
+                                if is_copied {
+                                    "copied_fade"
+                                } else {
+                                    "copy_fade"
+                                }
+                                .into(),
+                                idx as u64,
+                            ),
+                            Animation::new(Duration::from_millis(120))
+                                .with_easing(ease_out_quint()),
+                            |this, delta| this.opacity(0.35 + 0.65 * delta),
+                        )
+                        .into_any_element()
+                };
 
                 history_items.push(
                     div()
                         .id(ElementId::NamedInteger("history_row".into(), idx as u64))
                         .flex()
-                        .items_center()
-                        .justify_between()
-                        .gap(px(10.0))
+                        .flex_col()
+                        .w_full()
+                        .gap(px(4.0))
                         .px(px(10.0))
                         .py(px(8.0))
                         .rounded_lg()
+                        .tab_index(0)
                         .cursor_pointer()
+                        .focus(|style| style.bg(rgba(HOVER)))
                         .hover(|style| style.bg(rgba(HOVER)))
+                        .active(|style| style.opacity(0.92))
+                        .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                            if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                                this.toggle_history_preview(&keyboard_key);
+                                cx.stop_propagation();
+                                cx.notify();
+                            }
+                        }))
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.copy_history(&click_key, &row_tx);
+                            this.toggle_history_preview(&click_key);
                             cx.notify();
                         }))
                         .child(
                             div()
                                 .flex()
-                                .flex_col()
-                                .gap(px(4.0))
-                                .flex_1()
-                                .min_w(px(0.0))
+                                .items_center()
+                                .justify_between()
+                                .w_full()
+                                .gap(px(8.0))
                                 .child(
                                     div()
+                                        .flex_1()
+                                        .min_w(px(0.0))
                                         .text_size(px(11.0))
                                         .font_family("Consolas")
                                         .text_color(rgb(TEXT_MUTED))
@@ -912,74 +1147,25 @@ impl HudView {
                                             item.timestamp, item.latency_ms
                                         )),
                                 )
-                                .child(
-                                    div()
-                                        .w_full()
-                                        .text_size(px(12.0))
-                                        .line_height(px(16.0))
-                                        .text_color(rgb(TEXT))
-                                        .line_clamp(2)
-                                        .child(text_val),
-                                ),
+                                .child(copy_btn),
                         )
-                        .child({
-                            let anim_key = if is_copied { "copied_btn" } else { "copy_btn" };
+                        .child(
                             div()
-                                .id(ElementId::NamedInteger(anim_key.into(), idx as u64))
-                                .flex_none()
-                                .h(px(30.0))
-                                .px(px(10.0))
-                                .rounded_lg()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .text_size(px(11.0))
-                                .font_weight(FontWeight::MEDIUM)
-                                .whitespace_nowrap()
-                                .bg(if is_copied {
-                                    rgba(0x3e8fb033)
+                                .w_full()
+                                .text_size(px(12.0))
+                                .line_height(px(16.0))
+                                .text_color(rgb(TEXT))
+                                .when(!expanded, |text| text.line_clamp(2))
+                                .child(text_val),
+                        )
+                        .when(can_expand, |row| {
+                            row.child(div().text_size(px(11.0)).text_color(rgb(TEXT_MUTED)).child(
+                                if expanded {
+                                    "Collapse text"
                                 } else {
-                                    rgba(0xe0def412)
-                                })
-                                .text_color(if is_copied {
-                                    rgb(SUCCESS)
-                                } else {
-                                    rgb(TEXT_SECONDARY)
-                                })
-                                .cursor_pointer()
-                                .hover(|style| {
-                                    if is_copied {
-                                        style
-                                    } else {
-                                        style.bg(rgba(0xe0def418))
-                                    }
-                                })
-                                .active(|style| style.opacity(0.92))
-                                .child(btn_text)
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|_, _, _, cx| cx.stop_propagation()),
-                                )
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    cx.stop_propagation();
-                                    this.copy_history(&btn_key, &copy_tx);
-                                    cx.notify();
-                                }))
-                                .with_animation(
-                                    ElementId::NamedInteger(
-                                        if is_copied {
-                                            "copied_fade"
-                                        } else {
-                                            "copy_fade"
-                                        }
-                                        .into(),
-                                        idx as u64,
-                                    ),
-                                    Animation::new(Duration::from_millis(120))
-                                        .with_easing(ease_out_quint()),
-                                    |this, delta| this.opacity(0.35 + 0.65 * delta),
-                                )
-                                .into_any_element()
+                                    "Expand text"
+                                },
+                            ))
                         })
                         .into_any_element(),
                 );
@@ -987,13 +1173,7 @@ impl HudView {
         }
 
         let has_recents = !self.stats.history.is_empty();
-        let total_recents = self.stats.history.len();
-        let shown_recents = total_recents.min(HISTORY_ROWS);
-        let recents_count = if total_recents > shown_recents {
-            format!("{shown_recents} of {total_recents}")
-        } else {
-            total_recents.to_string()
-        };
+        let recents_count = self.stats.history.len().to_string();
         let mut history_header = div()
             .flex()
             .items_center()
@@ -1028,7 +1208,7 @@ impl HudView {
                     .flex_none()
                     .items_center()
                     .justify_center()
-                    .h(px(30.0))
+                    .h(px(44.0))
                     .px(px(10.0))
                     .rounded_lg()
                     .text_size(px(11.0))
@@ -1051,7 +1231,7 @@ impl HudView {
             .flex()
             .flex_col()
             .gap(px(8.0))
-            .pt(px(16.0))
+            .pt(px(8.0))
             .pb(px(4.0))
             .child(history_header)
             .children(history_items);
@@ -1077,7 +1257,7 @@ impl HudView {
                 .gap(px(10.0))
                 .w_full()
                 .px(px(8.0))
-                .py(px(10.0))
+                .py(px(6.0))
                 .child(
                     div()
                         .flex()
@@ -1150,10 +1330,8 @@ impl HudView {
             .w(px(44.0))
             .h(px(44.0))
             .rounded(px(10.0))
-            .border_2()
-            .border_color(rgba(0x00000000))
-            .focus(|style| style.border_color(rgb(FOAM)))
-            .hover(|style| style.bg(rgba(0xffffff0a)))
+            .focus(|style| style.bg(rgba(HOVER)))
+            .hover(|style| style.bg(rgba(HOVER)))
             .active(|style| style.bg(rgba(0xffffff14)))
             .cursor_pointer()
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
@@ -1173,6 +1351,57 @@ impl HudView {
             "Auto-paste",
             "Insert text into the focused app".to_string(),
             toggle_track.into_any_element(),
+        );
+
+        let startup_toggle = div()
+            .id("autostart_hit_target")
+            .tab_index(0)
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(44.0))
+            .h(px(44.0))
+            .rounded(px(10.0))
+            .focus(|style| style.bg(rgba(HOVER)))
+            .hover(|style| style.bg(rgba(HOVER)))
+            .active(|style| style.bg(rgba(0xffffff14)))
+            .cursor_pointer()
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                    this.toggle_autostart();
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            }))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.toggle_autostart();
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .w(px(36.0))
+                    .h(px(20.0))
+                    .rounded_full()
+                    .bg(rgb(if self.autostart_enabled {
+                        ACCENT
+                    } else {
+                        0x393552
+                    }))
+                    .child(
+                        div()
+                            .w(px(16.0))
+                            .h(px(16.0))
+                            .rounded_full()
+                            .bg(rgb(TEXT))
+                            .ml(px(toggle_offset(self.autostart_enabled, 1.0))),
+                    ),
+            );
+        let startup_row = settings_row(
+            "Start with Windows",
+            "Launch TDT when you sign in".to_string(),
+            startup_toggle.into_any_element(),
         );
 
         let languages = [
@@ -1198,7 +1427,7 @@ impl HudView {
                     .items_center()
                     .justify_center()
                     .h(px(44.0))
-                    .px(px(4.0))
+                    .px(px(6.0))
                     .min_w(px(0.0))
                     .rounded_lg()
                     .border_2()
@@ -1254,9 +1483,9 @@ impl HudView {
             .flex()
             .flex_col()
             .w_full()
-            .gap(px(12.0))
+            .gap(px(8.0))
             .px(px(8.0))
-            .py(px(12.0))
+            .py(px(8.0))
             .child(
                 div()
                     .flex()
@@ -1309,14 +1538,14 @@ impl HudView {
         let hotkey_sub = if capturing {
             "Press the new shortcut. Esc cancels.".to_string()
         } else {
-            "Click the chip to change it.".to_string()
+            "Click the shortcut to change it.".to_string()
         };
         let hotkey_chip = div()
             .id("hotkey_bind_btn")
             .flex()
             .items_center()
             .justify_center()
-            .h(px(32.0))
+            .h(px(44.0))
             .px(px(10.0))
             .rounded_lg()
             .border_1()
@@ -1333,7 +1562,7 @@ impl HudView {
                 if capturing {
                     style
                 } else {
-                    style.bg(rgba(HOVER))
+                    style.bg(rgba(SELECTED_FILL))
                 }
             })
             .active(|style| style.opacity(0.92))
@@ -1364,23 +1593,6 @@ impl HudView {
         };
 
         let hotkey_row = settings_row("Hotkey", hotkey_sub, hotkey_chip);
-
-        let version_row = settings_row(
-            "TDT",
-            "Talk Don't Type".to_string(),
-            div()
-                .px(px(8.0))
-                .py(px(5.0))
-                .rounded_lg()
-                .bg(rgba(0x393552cc))
-                .text_size(px(11.0))
-                .font_family("Consolas")
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(rgb(FOAM))
-                .whitespace_nowrap()
-                .child(update::current_version())
-                .into_any_element(),
-        );
 
         let phase = self.update.lock().clone();
         let (update_title, update_sub, update_action, update_busy) = match &phase {
@@ -1431,10 +1643,10 @@ impl HudView {
                 .flex()
                 .items_center()
                 .justify_center()
-                .h(px(30.0))
+                .h(px(44.0))
                 .px(px(10.0))
                 .rounded_lg()
-                .bg(rgba(if update_busy { 0x39355299 } else { HOVER }))
+                .bg(rgba(if update_busy { 0x39355299 } else { 0x393552cc }))
                 .text_size(px(11.0))
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(rgb(TEXT))
@@ -1464,23 +1676,42 @@ impl HudView {
 
         let engine_row = settings_row(
             "Model",
-            "SenseVoice Small".to_string(),
+            "SenseVoice Small, loaded while you talk".to_string(),
             div()
                 .flex()
                 .items_center()
                 .gap(px(8.0))
-                .px(px(8.0))
-                .py(px(5.0))
-                .rounded_lg()
-                .bg(rgba(0x3e8fb022))
-                .child(div().w(px(6.0)).h(px(6.0)).rounded_full().bg(rgb(SUCCESS)))
                 .child(
                     div()
+                        .px(px(8.0))
+                        .py(px(5.0))
+                        .rounded_lg()
+                        .bg(rgba(0x393552cc))
                         .text_size(px(11.0))
+                        .font_family("Consolas")
                         .font_weight(FontWeight::MEDIUM)
-                        .text_color(rgb(SUCCESS))
+                        .text_color(rgb(FOAM))
                         .whitespace_nowrap()
-                        .child("On demand"),
+                        .child(update::current_version()),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.0))
+                        .px(px(8.0))
+                        .py(px(5.0))
+                        .rounded_lg()
+                        .bg(rgba(0x3e8fb022))
+                        .child(div().w(px(6.0)).h(px(6.0)).rounded_full().bg(rgb(SUCCESS)))
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(rgb(SUCCESS))
+                                .whitespace_nowrap()
+                                .child("On demand"),
+                        ),
                 )
                 .into_any_element(),
         );
@@ -1489,12 +1720,22 @@ impl HudView {
             .flex()
             .flex_col()
             .w_full()
-            .gap(px(8.0))
+            .gap(px(6.0))
             .child(auto_paste_row)
+            .child(startup_row)
+            .when_some(self.autostart_error.clone(), |view, error| {
+                view.child(
+                    div()
+                        .px(px(8.0))
+                        .text_size(px(11.0))
+                        .line_height(px(14.0))
+                        .text_color(rgb(LOVE))
+                        .child(error),
+                )
+            })
             .child(language_row)
             .child(hotkey_row)
             .child(engine_row)
-            .child(version_row)
             .child(update_row)
             .into_any_element()
     }
@@ -1514,8 +1755,22 @@ fn toggle_offset(on: bool, progress: f32) -> f32 {
     }
 }
 
+fn preview_wave(loud: bool) -> [f32; WAVE_BARS] {
+    let mut peaks = [0.0; WAVE_BARS];
+    for (index, slot) in peaks.iter_mut().enumerate() {
+        let t = index as f32 / WAVE_BARS as f32;
+        let wave = (t * std::f32::consts::PI * 3.0).sin().abs();
+        *slot = if loud {
+            0.35 + 0.6 * wave
+        } else {
+            0.04 + 0.12 * wave
+        };
+    }
+    peaks
+}
+
 fn wave_height(peak: f32) -> f32 {
-    let driven = (1.0 - (-peak * 16.0).exp()).clamp(0.0, 1.0);
+    let driven = peak.clamp(0.0, 1.0);
     WAVE_FLAT + (WAVE_MAX - WAVE_FLAT) * driven
 }
 
@@ -1546,11 +1801,9 @@ fn overlay_snippet(text: &str, color: impl Into<Hsla>) -> AnyElement {
     let color = color.into();
     div()
         .flex()
-        .flex_none()
+        .flex_1()
+        .min_w(px(0.0))
         .items_center()
-        .w(px(
-            WAVE_BARS as f32 * WAVE_BAR_W + (WAVE_BARS as f32 - 1.0) * WAVE_GAP
-        ))
         .h(px(32.0))
         .overflow_hidden()
         .child(
@@ -1561,9 +1814,13 @@ fn overlay_snippet(text: &str, color: impl Into<Hsla>) -> AnyElement {
                 .text_color(color)
                 .whitespace_nowrap()
                 .overflow_hidden()
-                .child(clip_text(text, 22)),
+                .child(clip_text(text, 40)),
         )
         .into_any_element()
+}
+
+fn history_text_overflows(text: &str) -> bool {
+    text.chars().count() > HISTORY_EXPAND_CHARS
 }
 
 // Compile-time invariant: the painted settings surface must stay inset within
@@ -1573,7 +1830,7 @@ const _: () = assert!(SETTINGS_SURFACE_HEIGHT <= BUBBLE_HEIGHT - 14.0);
 
 #[cfg(test)]
 mod motion_tests {
-    use super::{pulse_curve, toggle_offset};
+    use super::{history_text_overflows, pulse_curve, toggle_offset, HISTORY_EXPAND_CHARS};
 
     #[test]
     fn pulse_is_continuous_at_repeat_boundary() {
@@ -1596,5 +1853,14 @@ mod motion_tests {
                 assert!((2.0..=18.0).contains(&toggle_offset(on, progress)));
             }
         }
+    }
+
+    #[test]
+    fn short_history_text_does_not_offer_expand() {
+        assert!(!history_text_overflows(
+            "Short transcript 1: ready when you are"
+        ));
+        let long = "word ".repeat(HISTORY_EXPAND_CHARS);
+        assert!(history_text_overflows(&long));
     }
 }

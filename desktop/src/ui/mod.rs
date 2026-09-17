@@ -1,4 +1,5 @@
 pub mod hud;
+pub mod preview;
 pub mod text;
 pub mod tray;
 pub mod window_util;
