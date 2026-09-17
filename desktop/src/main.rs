@@ -456,7 +456,9 @@ fn main() {
 
                         // 4. Animation frame & audio level updates
                         let current_level = if is_recording_state { rec.audio_level() } else { 0.0 };
-                        let vis_peaks = rec.vis_peaks();
+                        // Avoid locking the audio visualization buffer when it
+                        // cannot be displayed.
+                        let vis_peaks = is_recording_state.then(|| rec.vis_peaks());
 
                         let _ = this.update(cx, |view, cx| {
                             if let Some(copied_at) = view.copied_at {
@@ -471,7 +473,7 @@ fn main() {
                                 HudStatus::Listening { audio_level, .. } => {
                                     *audio_level = current_level;
                                     for (slot, target) in
-                                        view.wave_peaks.iter_mut().zip(vis_peaks)
+                                        view.wave_peaks.iter_mut().zip(vis_peaks.into_iter().flatten())
                                     {
                                         if target > *slot {
                                             *slot += (target - *slot) * 0.58;
@@ -481,9 +483,10 @@ fn main() {
                                     }
                                     cx.notify();
                                 }
-                                HudStatus::Transcribing { .. } => {
-                                    cx.notify();
-                                }
+                                // GPUI's pulse requests its own animation frames.
+                                // A second 40Hz redraw loop is redundant, and keeps
+                                // repainting even when reduced motion is enabled.
+                                HudStatus::Transcribing { .. } => {}
                                 HudStatus::Success { finished_at, .. } => {
                                     if finished_at.elapsed() > Duration::from_millis(1800) {
                                         view.status = HudStatus::Idle;

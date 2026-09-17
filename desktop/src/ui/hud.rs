@@ -27,7 +27,6 @@ const TEXT: u32 = 0xe0def4;
 const TEXT_SECONDARY: u32 = 0xcecae6;
 const TEXT_MUTED: u32 = 0xc4bfdb;
 const HAIRLINE: u32 = 0xc4a7e73d;
-const CARD: u32 = 0x2a283ef0;
 const PILL_BG: u32 = 0x232136f5;
 const PANEL_BG: u32 = 0x232136fa;
 const HOVER: u32 = 0xc4a7e73d;
@@ -327,55 +326,62 @@ impl HudView {
         let holding = matches!(&self.status, HudStatus::Listening { .. });
         let released = matches!(&self.status, HudStatus::Transcribing { .. });
 
-        let mut bars = Vec::with_capacity(WAVE_BARS);
-        let bar_color = if holding {
-            rgb(HOLD_COLOR)
-        } else if released {
-            rgba(0xf6c17799)
-        } else {
-            rgba(0x9ccfd899)
-        };
-        for peak in self.wave_peaks {
-            let height = if holding {
-                wave_height(peak)
+        // Idle, success and error show text, not bars. Do not build an unused
+        // waveform subtree on every hover or state-fade frame.
+        let waveform = if holding || released {
+            let mut bars = Vec::with_capacity(WAVE_BARS);
+            let bar_color = if holding {
+                rgb(HOLD_COLOR)
+            } else if released {
+                rgba(0xf6c17799)
             } else {
-                WAVE_FLAT
+                rgba(0x9ccfd899)
             };
-            bars.push(
-                div()
-                    .w(px(WAVE_BAR_W))
-                    .h(px(height))
-                    .rounded_full()
-                    .bg(bar_color),
-            );
-        }
+            for peak in self.wave_peaks {
+                let height = if holding {
+                    wave_height(peak)
+                } else {
+                    WAVE_FLAT
+                };
+                bars.push(
+                    div()
+                        .w(px(WAVE_BAR_W))
+                        .h(px(height))
+                        .rounded_full()
+                        .bg(bar_color),
+                );
+            }
 
-        let waveform = div()
-            .flex()
-            .flex_1()
-            .min_w(px(0.0))
-            .items_center()
-            .justify_center()
-            .gap(px(WAVE_GAP))
-            .w(px(waveform_w))
-            .h(px(32.0))
-            .overflow_hidden()
-            .children(bars);
+            let waveform = div()
+                .flex()
+                .flex_1()
+                .min_w(px(0.0))
+                .items_center()
+                .justify_center()
+                .gap(px(WAVE_GAP))
+                .w(px(waveform_w))
+                .h(px(32.0))
+                .overflow_hidden()
+                .children(bars);
 
-        // Static bars during transcription read as frozen, so pulse them while
-        // the model is working.
-        let waveform: AnyElement = if released && client_animations_enabled() {
+            // Static bars during transcription read as frozen, so pulse them while
+            // the model is working.
+            let waveform: AnyElement = if released && client_animations_enabled() {
+                waveform
+                    .with_animation(
+                        "transcribe_pulse",
+                        Animation::new(Duration::from_millis(1100))
+                            .repeat()
+                            .with_easing(pulse_curve),
+                        |this, delta| this.opacity(0.45 + 0.55 * delta),
+                    )
+                    .into_any_element()
+            } else {
+                waveform.into_any_element()
+            };
             waveform
-                .with_animation(
-                    "transcribe_pulse",
-                    Animation::new(Duration::from_millis(1100))
-                        .repeat()
-                        .with_easing(pulse_curve),
-                    |this, delta| this.opacity(0.45 + 0.55 * delta),
-                )
-                .into_any_element()
         } else {
-            waveform.into_any_element()
+            div().into_any_element()
         };
 
         let center_child = match &self.status {
@@ -666,7 +672,6 @@ impl HudView {
                             .flex_none()
                             .items_center()
                             .gap(px(2.0))
-                            .bg(rgba(0x2a283ecc))
                             .p(px(3.0))
                             .rounded_lg()
                             .child(tab_btn(
@@ -790,10 +795,8 @@ impl HudView {
                 .flex_1()
                 .min_w(px(0.0))
                 .gap(px(6.0))
-                .px(px(12.0))
+                .px(px(8.0))
                 .py(px(12.0))
-                .bg(rgba(CARD))
-                .rounded_lg()
                 .child(
                     div()
                         .text_size(px(11.0))
@@ -850,8 +853,6 @@ impl HudView {
                     .gap(px(4.0))
                     .px(px(12.0))
                     .py(px(24.0))
-                    .rounded_lg()
-                    .bg(rgba(CARD))
                     .child(
                         div()
                             .text_size(px(12.0))
@@ -886,7 +887,6 @@ impl HudView {
                         .gap(px(10.0))
                         .px(px(10.0))
                         .py(px(8.0))
-                        .bg(rgba(CARD))
                         .rounded_lg()
                         .cursor_pointer()
                         .hover(|style| style.bg(rgba(HOVER)))
@@ -1068,7 +1068,7 @@ impl HudView {
         let is_auto_paste = self.auto_paste_enabled;
         let hotkey_str = self.hotkey_label.clone();
 
-        let settings_card = |title: &'static str, subtitle: String, trailing: AnyElement| {
+        let settings_row = |title: &'static str, subtitle: String, trailing: AnyElement| {
             div()
                 .flex()
                 .flex_wrap()
@@ -1076,10 +1076,8 @@ impl HudView {
                 .justify_between()
                 .gap(px(10.0))
                 .w_full()
-                .px(px(12.0))
+                .px(px(8.0))
                 .py(px(10.0))
-                .bg(rgba(CARD))
-                .rounded_lg()
                 .child(
                     div()
                         .flex()
@@ -1171,7 +1169,7 @@ impl HudView {
             }))
             .child(toggle_track);
 
-        let auto_paste_row = settings_card(
+        let auto_paste_row = settings_row(
             "Auto-paste",
             "Insert text into the focused app".to_string(),
             toggle_track.into_any_element(),
@@ -1220,7 +1218,7 @@ impl HudView {
                     .bg(if is_selected {
                         rgba(SELECTED_FILL)
                     } else {
-                        rgba(0x39355299)
+                        rgba(0x00000000)
                     })
                     .text_color(if is_selected {
                         rgb(IRIS)
@@ -1256,11 +1254,9 @@ impl HudView {
             .flex()
             .flex_col()
             .w_full()
-            .gap(px(10.0))
-            .px(px(12.0))
+            .gap(px(12.0))
+            .px(px(8.0))
             .py(px(12.0))
-            .bg(rgba(CARD))
-            .rounded_lg()
             .child(
                 div()
                     .flex()
@@ -1367,9 +1363,9 @@ impl HudView {
             hotkey_chip.into_any_element()
         };
 
-        let hotkey_row = settings_card("Hotkey", hotkey_sub, hotkey_chip);
+        let hotkey_row = settings_row("Hotkey", hotkey_sub, hotkey_chip);
 
-        let version_row = settings_card(
+        let version_row = settings_row(
             "TDT",
             "Talk Don't Type".to_string(),
             div()
@@ -1427,7 +1423,7 @@ impl HudView {
             UpdatePhase::Failed(error) => ("Updates", clip_text(error, 48), "Try again", false),
         };
 
-        let update_row = settings_card(
+        let update_row = settings_row(
             update_title,
             update_sub,
             div()
@@ -1466,7 +1462,7 @@ impl HudView {
                 .into_any_element(),
         );
 
-        let engine_row = settings_card(
+        let engine_row = settings_row(
             "Model",
             "SenseVoice Small".to_string(),
             div()
