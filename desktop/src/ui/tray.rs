@@ -112,7 +112,15 @@ fn render_tray_icon() -> Vec<u8> {
     pixels
 }
 
-fn inside_round_rect(x: f32, y: f32, left: f32, top: f32, right: f32, bottom: f32, radius: f32) -> bool {
+fn inside_round_rect(
+    x: f32,
+    y: f32,
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+    radius: f32,
+) -> bool {
     let cx = x.clamp(left + radius, right - radius);
     let cy = y.clamp(top + radius, bottom - radius);
     let dx = x - cx;
@@ -149,8 +157,14 @@ mod tests {
                 foam += 1;
             }
         }
-        assert!(opaque > 500, "tile should fill most of the 32px icon, got {opaque}");
-        assert!(foam > 40, "waveform should be visible, got {foam} foam pixels");
+        assert!(
+            opaque > 500,
+            "tile should fill most of the 32px icon, got {opaque}"
+        );
+        assert!(
+            foam > 40,
+            "waveform should be visible, got {foam} foam pixels"
+        );
         assert_eq!(pixels[0..4], [0, 0, 0, 0]);
     }
 

@@ -164,13 +164,7 @@ pub fn grouped_section(title: &'static str, rows: impl IntoIterator<Item = AnyEl
         .w_full()
         .gap(px(4.0))
         .child(section_label(title))
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .w_full()
-                .children(rows),
-        )
+        .child(div().flex().flex_col().w_full().children(rows))
 }
 
 pub fn labeled_block(
@@ -228,25 +222,14 @@ pub fn choice_chip(id: ElementId, label: impl Into<SharedString>, is_on: bool) -
         .text_color(if is_on { accent() } else { muted() })
         .whitespace_nowrap()
         .cursor_pointer()
-        .hover(|s| {
-            if is_on {
-                s
-            } else {
-                s.text_color(text())
-            }
-        })
+        .hover(|s| if is_on { s } else { s.text_color(text()) })
         .active(|s| s.opacity(0.9))
         .focus(|s| s.border_color(focus_ring()))
         .child(label.into())
 }
 
 pub fn chip_well(rows: impl IntoIterator<Item = AnyElement>) -> Div {
-    div()
-        .flex()
-        .flex_col()
-        .w_full()
-        .gap(px(4.0))
-        .children(rows)
+    div().flex().flex_col().w_full().gap(px(4.0)).children(rows)
 }
 
 pub fn progress_bar(done: u64, total: u64) -> AnyElement {

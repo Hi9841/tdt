@@ -699,10 +699,7 @@ impl HudView {
             HudStatus::Success { .. } => "bubble_success",
             HudStatus::Error { .. } => "bubble_error",
         };
-        let center_child = div()
-            .flex_none()
-            .overflow_hidden()
-            .child(center_child);
+        let center_child = div().flex_none().overflow_hidden().child(center_child);
         let center_child = if client_animations_enabled() {
             center_child
                 .with_animation(
@@ -1039,7 +1036,8 @@ impl HudView {
             faded_content
                 .with_animation(
                     tab_id,
-                    Animation::new(Duration::from_millis(TAB_FADE_MS)).with_easing(ease_out_quint()),
+                    Animation::new(Duration::from_millis(TAB_FADE_MS))
+                        .with_easing(ease_out_quint()),
                     |this, delta| this.opacity(0.82 + 0.18 * delta),
                 )
                 .into_any_element()
@@ -1470,7 +1468,11 @@ impl HudView {
             } else {
                 theme::transparent()
             })
-            .bg(if capturing { selected() } else { theme::transparent() })
+            .bg(if capturing {
+                selected()
+            } else {
+                theme::transparent()
+            })
             .cursor_pointer()
             .hover(|style| if capturing { style } else { style })
             .active(|style| style.opacity(0.9))
@@ -1718,7 +1720,10 @@ impl HudView {
             }
             _ => None,
         };
-        let model_sub = format!("{model_sub} · {} · {status_label}", update::current_version());
+        let model_sub = format!(
+            "{model_sub} · {} · {status_label}",
+            update::current_version()
+        );
         let mut model_body = vec![controls::chip_well(model_rows).into_any_element()];
         if let Some(meter) = model_meter {
             model_body.push(meter);
