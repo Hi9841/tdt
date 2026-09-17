@@ -1474,7 +1474,6 @@ impl HudView {
                 theme::transparent()
             })
             .cursor_pointer()
-            .hover(|style| if capturing { style } else { style })
             .active(|style| style.opacity(0.9))
             .child(if capturing {
                 div()

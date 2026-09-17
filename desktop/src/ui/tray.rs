@@ -102,7 +102,7 @@ fn render_tray_icon() -> Vec<u8> {
         let bottom = top + height;
         for y in top..=bottom {
             for x in (cx - 1)..=cx {
-                if y >= 4 && y <= 27 {
+                if (4..=27).contains(&y) {
                     put_pixel(&mut pixels, x, y, foam.0, foam.1, foam.2, 255);
                 }
             }
@@ -149,7 +149,7 @@ mod tests {
         assert_eq!(pixels.len(), (ICON_SIZE * ICON_SIZE * 4) as usize);
         let mut opaque = 0usize;
         let mut foam = 0usize;
-        for px in pixels.chunks_exact(4) {
+        for px in pixels.as_chunks::<4>().0 {
             if px[3] == 255 {
                 opaque += 1;
             }
