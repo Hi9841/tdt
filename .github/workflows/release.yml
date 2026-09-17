@@ -24,7 +24,7 @@ jobs:
           $script = Join-Path $pwd "packaging/build-installer.ps1"
           & $script -Version "${{ github.ref_name }}"
       - name: Publish GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             dist/TDT-Setup.exe
