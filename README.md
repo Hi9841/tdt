@@ -1,9 +1,11 @@
 # TDT (Talk Don't Type)
 
 TDT is an offline speech-to-text app for Windows and Android. Audio is
-processed locally with Sherpa-ONNX SenseVoice and recognized text is copied to
-the system clipboard. The model is loaded on demand and released after each
-transcription, so idle memory stays low.
+processed locally with Sherpa-ONNX and recognized text is copied to
+the system clipboard. The default model is SenseVoice Small. Settings can
+switch to SenseVoice Full, Whisper Small, or Whisper Medium. Extra models
+download on demand and stay on disk. The selected model is loaded while you
+talk and released after each transcription, so idle memory stays low.
 
 License: Apache-2.0. Source: https://github.com/Hi9841/tdt
 
@@ -17,10 +19,10 @@ powershell -ExecutionPolicy Bypass -File .\packaging\build-installer.ps1
 That writes:
 
 - `dist/TDT-Setup.exe` self-contained per-user installer
-- `dist/TDT-0.1.0-windows-x64.zip` portable copy
+- `dist/TDT-0.1.4-windows-x64.zip` portable copy
 - `dist/SHA256SUMS.txt`
 
-The installer copies TDT, the SenseVoice model, and the license files into
+The installer copies TDT, SenseVoice Small, and the license files into
 `%LOCALAPPDATA%\TDT`, adds a Start Menu shortcut, and opens the app. No admin
 rights. Uninstall from Settings > Apps, or:
 
@@ -41,6 +43,14 @@ the hotkey records until release. Default shortcut is `Ctrl+;`. Change it in
 Settings by clicking the shortcut chip, then press the new combo. The tray
 menu controls auto-paste. Auto-paste writes the result to the clipboard and
 injects Unicode text directly into the previously focused application.
+
+In Settings, pick Small, Full, Whisper, or Medium. Missing models show
+Download model. Whisper Medium is about 902 MB. To fetch one from a
+terminal:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\models\download-models.ps1 -Model whisper-medium
+```
 
 ```powershell
 cargo fmt --manifest-path .\desktop\Cargo.toml -- --check
@@ -78,7 +88,8 @@ Grant microphone, notification, and overlay permissions when prompted.
 - `desktop/`: Rust + GPUI Windows app with global `Ctrl + ;` tap or hold-to-talk.
 - `mobile/`: Kotlin Multiplatform Android app with push-to-talk and an optional
   floating overlay bubble.
-- `models/`: downloader for the SenseVoice model used by both targets.
+- `models/`: downloader for SenseVoice and Whisper models used by desktop.
+  Android still bundles SenseVoice Small.
 - `packaging/`: Windows installer stub and build script.
 - `THIRD_PARTY_NOTICES.md`: upstream license and attribution information.
 

@@ -8,6 +8,7 @@ pub struct AppConfig {
     pub auto_paste: bool,
     pub hotkey: String,
     pub model_dir: Option<PathBuf>,
+    pub model_id: String,
     pub language: String,
 }
 
@@ -17,6 +18,7 @@ impl Default for AppConfig {
             auto_paste: true,
             hotkey: "Ctrl+;".to_string(),
             model_dir: None,
+            model_id: crate::stt::DEFAULT_MODEL_ID.to_string(),
             language: "auto".to_string(),
         }
     }
@@ -50,46 +52,6 @@ impl AppConfig {
         let json = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
         fs::write(path, json)?;
         Ok(())
-    }
-
-    pub fn find_model_dir(&self) -> Option<PathBuf> {
-        if let Some(ref dir) = self.model_dir {
-            if dir.join("model.onnx").exists() || dir.join("model.int8.onnx").exists() {
-                return Some(dir.clone());
-            }
-        }
-
-        let mut candidates = Vec::new();
-
-        if let Some(dir) = std::env::var_os("VOICE_STT_MODEL_DIR") {
-            candidates.push(PathBuf::from(dir));
-        }
-
-        if let Ok(current_dir) = std::env::current_dir() {
-            candidates.push(current_dir.join("models/sensevoice"));
-            candidates.push(current_dir.join("../models/sensevoice"));
-            candidates.push(current_dir.join("sensevoice"));
-        }
-
-        if let Ok(exe_path) = std::env::current_exe() {
-            if let Some(exe_dir) = exe_path.parent() {
-                candidates.push(exe_dir.join("models/sensevoice"));
-                candidates.push(exe_dir.join("../models/sensevoice"));
-                candidates.push(exe_dir.join("../../models/sensevoice"));
-                candidates.push(exe_dir.join("../../../models/sensevoice"));
-            }
-        }
-
-        for candidate in &candidates {
-            if candidate.join("model.onnx").exists() || candidate.join("model.int8.onnx").exists() {
-                if let Ok(canon) = candidate.canonicalize() {
-                    return Some(canon);
-                }
-                return Some(candidate.clone());
-            }
-        }
-
-        None
     }
 }
 
@@ -272,6 +234,7 @@ mod tests {
         assert!(!config.auto_paste);
         assert_eq!(config.hotkey, AppConfig::default().hotkey);
         assert_eq!(config.language, "auto");
+        assert_eq!(config.model_id, crate::stt::DEFAULT_MODEL_ID);
     }
 
     #[test]

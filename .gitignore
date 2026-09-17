@@ -14,7 +14,9 @@ packaging/tdt-setup/target/
 # Models (download with models/download-models.ps1)
 models/sensevoice/*.onnx
 models/sensevoice/tokens.txt
-models/sensevoice/*.download
+models/**/*.download
+models/whisper-small/
+models/whisper-medium/
 
 # Prebuilt Android AAR (place in mobile/app/libs/)
 *.aar

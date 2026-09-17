@@ -1,33 +1,38 @@
+use super::models::{whisper_language, ModelFamily, ModelSpec};
 use parking_lot::Mutex;
 use sherpa_onnx::{
     OfflineModelConfig, OfflineRecognizer, OfflineRecognizerConfig, OfflineSenseVoiceModelConfig,
+    OfflineWhisperModelConfig,
 };
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+enum ModelPaths {
+    SenseVoice { model: PathBuf },
+    Whisper { encoder: PathBuf, decoder: PathBuf },
+}
+
 pub struct SttEngine {
     recognizer: Arc<Mutex<Option<OfflineRecognizer>>>,
-    model_dir: PathBuf,
+    paths: ModelPaths,
+    tokens_path: PathBuf,
+    label: String,
     current_language: Arc<Mutex<String>>,
 }
 
 impl SttEngine {
-    pub fn new(model_dir: &Path, language: &str) -> Result<Self, String> {
-        let model_path = Self::model_path(model_dir);
-        let tokens_path = model_dir.join("tokens.txt");
-
-        if !model_path.exists() {
-            return Err(format!(
-                "SenseVoice model file not found at: {} (or model.int8.onnx)",
-                model_path.display()
-            ));
-        }
-        if !tokens_path.exists() {
-            return Err(format!(
-                "SenseVoice tokens file not found at: {}",
-                tokens_path.display()
-            ));
-        }
+    pub fn new(spec: &ModelSpec, model_dir: &Path, language: &str) -> Result<Self, String> {
+        spec.require_installed(model_dir)?;
+        let tokens_path = spec.tokens_path(model_dir);
+        let paths = match spec.family {
+            ModelFamily::SenseVoice => ModelPaths::SenseVoice {
+                model: spec.sense_voice_model(model_dir),
+            },
+            ModelFamily::Whisper => ModelPaths::Whisper {
+                encoder: spec.whisper_encoder(model_dir),
+                decoder: spec.whisper_decoder(model_dir),
+            },
+        };
 
         let lang_str = if language.is_empty() {
             "auto".to_string()
@@ -36,41 +41,49 @@ impl SttEngine {
         };
 
         Ok(Self {
-            // The 228 MB model is loaded when recording starts, then released after
-            // transcription so the idle overlay stays lightweight.
+            // Weights load when recording starts and drop after transcription
+            // so the idle overlay stays lightweight.
             recognizer: Arc::new(Mutex::new(None)),
-            model_dir: model_dir.to_path_buf(),
+            paths,
+            tokens_path,
+            label: spec.label.to_string(),
             current_language: Arc::new(Mutex::new(lang_str)),
         })
     }
 
-    fn model_path(model_dir: &Path) -> PathBuf {
-        if model_dir.join("model.int8.onnx").exists() {
-            model_dir.join("model.int8.onnx")
-        } else {
-            model_dir.join("model.onnx")
-        }
-    }
-
     fn create_recognizer(&self) -> Result<OfflineRecognizer, String> {
-        let model_path = Self::model_path(&self.model_dir);
-        let tokens_path = self.model_dir.join("tokens.txt");
         let language = self.current_language.lock().clone();
+        let tokens = self.tokens_path.to_string_lossy().to_string();
 
-        let sense_voice = OfflineSenseVoiceModelConfig {
-            model: Some(model_path.to_string_lossy().to_string()),
-            language: Some(language),
-            use_itn: true,
-        };
-
-        let model_config = OfflineModelConfig {
-            sense_voice,
-            tokens: Some(tokens_path.to_string_lossy().to_string()),
-            num_threads: 2,
-            debug: false,
-            provider: Some("cpu".to_string()),
-            model_type: Some("sense_voice".to_string()),
-            ..Default::default()
+        let model_config = match &self.paths {
+            ModelPaths::SenseVoice { model } => OfflineModelConfig {
+                sense_voice: OfflineSenseVoiceModelConfig {
+                    model: Some(model.to_string_lossy().to_string()),
+                    language: Some(language),
+                    use_itn: true,
+                },
+                tokens: Some(tokens),
+                num_threads: 2,
+                debug: false,
+                provider: Some("cpu".to_string()),
+                model_type: Some("sense_voice".to_string()),
+                ..Default::default()
+            },
+            ModelPaths::Whisper { encoder, decoder } => OfflineModelConfig {
+                whisper: OfflineWhisperModelConfig {
+                    encoder: Some(encoder.to_string_lossy().to_string()),
+                    decoder: Some(decoder.to_string_lossy().to_string()),
+                    language: whisper_language(&language),
+                    task: Some("transcribe".to_string()),
+                    ..Default::default()
+                },
+                tokens: Some(tokens),
+                num_threads: 2,
+                debug: false,
+                provider: Some("cpu".to_string()),
+                model_type: Some("whisper".to_string()),
+                ..Default::default()
+            },
         };
 
         let config = OfflineRecognizerConfig {
@@ -79,7 +92,7 @@ impl SttEngine {
         };
 
         OfflineRecognizer::create(&config)
-            .ok_or_else(|| "Failed to initialize Sherpa-ONNX SenseVoice recognizer".to_string())
+            .ok_or_else(|| format!("Failed to initialize Sherpa-ONNX {} recognizer", self.label))
     }
 
     pub fn prepare(&self) -> Result<(), String> {
@@ -108,7 +121,7 @@ impl SttEngine {
         // Apply the new language the next time the model is prepared.
         self.release();
 
-        println!("SenseVoice language set to: {}", language);
+        println!("{} language set to: {}", self.label, language);
         Ok(())
     }
 
@@ -154,24 +167,46 @@ impl SttEngine {
 #[cfg(test)]
 mod tests {
     use super::SttEngine;
+    use crate::stt::models::{by_id, DEFAULT};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    #[test]
-    fn constructing_engine_does_not_load_model() {
+    fn unique_dir(tag: &str) -> std::path::PathBuf {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system time should be valid")
             .as_nanos();
-        let model_dir = std::env::temp_dir().join(format!("voice-stt-lazy-model-{unique}"));
+        std::env::temp_dir().join(format!("voice-stt-lazy-model-{tag}-{unique}"))
+    }
+
+    #[test]
+    fn constructing_engine_does_not_load_model() {
+        let model_dir = unique_dir("sv");
         fs::create_dir_all(&model_dir).expect("temporary model directory should be created");
         fs::write(model_dir.join("model.int8.onnx"), b"placeholder")
             .expect("placeholder model should be written");
         fs::write(model_dir.join("tokens.txt"), b"placeholder")
             .expect("placeholder tokens should be written");
 
-        let engine = SttEngine::new(&model_dir, "auto")
+        let engine = SttEngine::new(DEFAULT, &model_dir, "auto")
             .expect("construction should validate paths without loading ONNX");
+
+        assert!(!engine.is_loaded(), "model must stay unloaded while idle");
+        fs::remove_dir_all(model_dir).expect("temporary model directory should be removed");
+    }
+
+    #[test]
+    fn constructing_whisper_engine_does_not_load_model() {
+        let spec = by_id("whisper-medium").expect("whisper-medium is in the catalog");
+        let model_dir = unique_dir("w");
+        fs::create_dir_all(&model_dir).expect("temporary model directory should be created");
+        for file in spec.files {
+            fs::write(model_dir.join(file.name), b"placeholder")
+                .expect("placeholder model should be written");
+        }
+
+        let engine = SttEngine::new(spec, &model_dir, "en")
+            .expect("construction should validate whisper paths without loading ONNX");
 
         assert!(!engine.is_loaded(), "model must stay unloaded while idle");
         fs::remove_dir_all(model_dir).expect("temporary model directory should be removed");

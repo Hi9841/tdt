@@ -28,7 +28,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use stt::SttEngine;
+use stt::{models, SharedEngine, SttEngine};
 use tray_icon::menu::MenuEvent;
 use ui::preview;
 use ui::window_util::{
@@ -83,25 +83,35 @@ fn main() {
     };
 
     // 2. Initialize STT Engine
-    let stt_engine = match config.find_model_dir() {
-        Some(dir) => match SttEngine::new(&dir, &config.language) {
-            Ok(engine) => {
+    let model_spec = models::resolve(&config.model_id);
+    let stt_engine: SharedEngine = Arc::new(Mutex::new(
+        match models::find_dir(model_spec, config.model_dir.as_deref()) {
+            Some(dir) => match SttEngine::new(model_spec, &dir, &config.language) {
+                Ok(engine) => {
+                    append_log(&format!(
+                        "Sherpa-ONNX {} model found at: {}",
+                        model_spec.label,
+                        dir.display()
+                    ));
+                    Some(Arc::new(engine))
+                }
+                Err(e) => {
+                    append_log(&format!(
+                        "Failed to initialize {} STT Engine: {e}",
+                        model_spec.label
+                    ));
+                    None
+                }
+            },
+            None => {
                 append_log(&format!(
-                    "Sherpa-ONNX SenseVoice model found at: {}",
-                    dir.display()
+                    "{} is not downloaded. Open Settings to download it, or run models/download-models.ps1.",
+                    model_spec.label
                 ));
-                Some(Arc::new(engine))
-            }
-            Err(e) => {
-                append_log(&format!("Failed to initialize SenseVoice STT Engine: {e}"));
                 None
             }
         },
-        None => {
-            append_log("SenseVoice model not found. Run models/download-models.ps1 to download.");
-            None
-        }
-    };
+    ));
 
     // 3. Initialize paste injector
     let injector = Arc::new(PasteInjector::new());
@@ -213,7 +223,10 @@ fn main() {
                         lock_overlay_chrome();
                         poll_capture_timeout();
                         while update_ping_rx.try_recv().is_ok() {
-                            let _ = this.update(cx, |_, cx| cx.notify());
+                            let _ = this.update(cx, |view, cx| {
+                                view.take_ready_model();
+                                cx.notify();
+                            });
                         }
 
                         // 1. Process Menu Events from tray. Drain every queued
@@ -277,13 +290,14 @@ fn main() {
 
                         // Helper closure to run transcription in background thread
                         let dispatch_transcribe = |samples: Vec<f32>,
-                                                   stt_worker: Option<Arc<SttEngine>>,
+                                                   stt_worker: SharedEngine,
                                                    inj_worker: Arc<PasteInjector>,
                                                    tx: crossbeam_channel::Sender<InternalEvent>,
                                                    should_paste: bool,
                                                    target: Option<isize>| {
                             std::thread::spawn(move || {
-                                if let Some(ref engine) = stt_worker {
+                                let engine = stt_worker.lock().clone();
+                                if let Some(ref engine) = engine {
                                     let start_t = Instant::now();
                                     let duration_secs = samples.len() as f32 / 16000.0;
                                     match engine.transcribe(&samples) {
@@ -319,7 +333,8 @@ fn main() {
                                     }
                                 } else {
                                     let _ = tx.send(InternalEvent::TranscribeError(
-                                        "SenseVoice model not loaded".to_string(),
+                                        "Speech model not ready. Open Settings to download it."
+                                            .to_string(),
                                     ));
                                 }
                             });
@@ -367,7 +382,7 @@ fn main() {
                                     if !is_recording_state && !is_processing_state {
                                         *target_hwnd.lock() = capture_fg();
                                         rec.start();
-                                        if let Some(engine) = stt.clone() {
+                                        if let Some(engine) = stt.lock().clone() {
                                             std::thread::spawn(move || {
                                                 if let Err(error) = engine.prepare() {
                                                     eprintln!("Failed to prepare STT model: {error}");

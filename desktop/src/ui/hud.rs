@@ -2,7 +2,7 @@ use crate::audio::VIS_BARS;
 use crate::config::{AppConfig, AppStats};
 use crate::hotkey;
 use crate::paste::PasteInjector;
-use crate::stt::SttEngine;
+use crate::stt::{models, DownloadPhase, SharedEngine, SttEngine, CATALOG, DEFAULT_MODEL_ID};
 use crate::ui::preview::{self, Spec as PreviewSpec};
 use crate::ui::text::{clip_text, format_mmss};
 use crate::ui::window_util::{
@@ -106,11 +106,14 @@ pub struct HudView {
     pub toggle_epoch: u64,
     pub injector: PasteInjector,
     pub selected_language: String,
-    pub stt_engine: Option<Arc<SttEngine>>,
+    pub selected_model: String,
+    pub stt_engine: SharedEngine,
     pub auto_paste_state: Arc<Mutex<bool>>,
     panel_motion: Option<PanelMotion>,
     update: Arc<Mutex<UpdatePhase>>,
     update_ping: crossbeam_channel::Sender<()>,
+    model_phase: Arc<Mutex<DownloadPhase>>,
+    model_error: Option<String>,
     pub hotkey_capturing: bool,
 }
 
@@ -119,7 +122,7 @@ impl HudView {
         auto_paste_enabled: bool,
         hotkey_label: String,
         selected_language: String,
-        stt_engine: Option<Arc<SttEngine>>,
+        stt_engine: SharedEngine,
         auto_paste_state: Arc<Mutex<bool>>,
         update: Arc<Mutex<UpdatePhase>>,
         update_ping: crossbeam_channel::Sender<()>,
@@ -153,11 +156,14 @@ impl HudView {
             toggle_epoch: 0,
             injector: PasteInjector::new(),
             selected_language,
+            selected_model: models::resolve(&AppConfig::load().model_id).id.to_string(),
             stt_engine,
             auto_paste_state,
             panel_motion: None,
             update,
             update_ping,
+            model_phase: Arc::new(Mutex::new(DownloadPhase::Idle)),
+            model_error: None,
             hotkey_capturing: false,
         };
         view.apply_preview_state();
@@ -179,7 +185,10 @@ impl HudView {
         self.autostart_enabled = false;
         self.autostart_error = None;
         self.selected_language = "auto".into();
+        self.selected_model = DEFAULT_MODEL_ID.into();
         self.hotkey_capturing = false;
+        *self.model_phase.lock() = DownloadPhase::Idle;
+        self.model_error = None;
         self.copied_key = None;
         self.expanded_history_key = None;
         self.copied_at = None;
@@ -414,12 +423,128 @@ impl HudView {
 
     fn select_language(&mut self, code: &str) {
         self.selected_language = code.to_string();
-        if let Some(engine) = &self.stt_engine {
+        if let Some(engine) = self.stt_engine.lock().clone() {
             let _ = engine.set_language(code);
         }
         let mut cfg = AppConfig::load();
         cfg.language = code.to_string();
         let _ = cfg.save();
+    }
+
+    fn model_busy(&self) -> bool {
+        matches!(
+            self.status,
+            HudStatus::Listening { .. } | HudStatus::Transcribing { .. }
+        )
+    }
+
+    pub fn take_ready_model(&mut self) {
+        let ready_id = match &*self.model_phase.lock() {
+            DownloadPhase::Ready { id } => Some(id.clone()),
+            _ => None,
+        };
+        let Some(id) = ready_id else {
+            return;
+        };
+        *self.model_phase.lock() = DownloadPhase::Idle;
+        if self.selected_model == id {
+            self.install_engine(&id);
+        }
+    }
+
+    fn install_engine(&mut self, id: &str) {
+        let spec = models::resolve(id);
+        let override_dir = AppConfig::load().model_dir;
+        let Some(dir) = models::find_dir(spec, override_dir.as_deref()) else {
+            *self.stt_engine.lock() = None;
+            return;
+        };
+        match SttEngine::new(spec, &dir, &self.selected_language) {
+            Ok(engine) => {
+                *self.stt_engine.lock() = Some(Arc::new(engine));
+                self.model_error = None;
+            }
+            Err(error) => {
+                *self.stt_engine.lock() = None;
+                self.model_error = Some(format!("Could not load {}. {error}", spec.label));
+            }
+        }
+    }
+
+    fn select_model(&mut self, id: &str) {
+        if self.model_busy() {
+            self.model_error =
+                Some("Wait until transcription finishes, then switch models.".into());
+            return;
+        }
+        let spec = models::resolve(id);
+        self.selected_model = spec.id.to_string();
+        let mut cfg = AppConfig::load();
+        cfg.model_id = spec.id.to_string();
+        let _ = cfg.save();
+        if models::find_dir(spec, cfg.model_dir.as_deref()).is_some() {
+            self.install_engine(spec.id);
+        } else {
+            *self.stt_engine.lock() = None;
+            self.model_error = None;
+        }
+    }
+
+    fn start_model_download(&mut self) {
+        if let DownloadPhase::Downloading { id, .. } = &*self.model_phase.lock() {
+            if id != &self.selected_model {
+                self.model_error = Some("Wait for the current download to finish.".into());
+            }
+            return;
+        }
+        let spec = models::resolve(&self.selected_model);
+        let override_dir = AppConfig::load().model_dir;
+        if models::find_dir(spec, override_dir.as_deref()).is_some() {
+            self.install_engine(spec.id);
+            return;
+        }
+        let dest = models::install_dir(spec);
+        let id = spec.id.to_string();
+        let phase = Arc::clone(&self.model_phase);
+        let ping = self.update_ping.clone();
+        *phase.lock() = DownloadPhase::Downloading {
+            id: id.clone(),
+            done: 0,
+            total: spec.size_bytes.max(1),
+        };
+        std::thread::spawn(move || {
+            let spec = models::resolve(&id);
+            let mut last_ping = Instant::now();
+            let result = models::download(spec, &dest, |done, total| {
+                *phase.lock() = DownloadPhase::Downloading {
+                    id: spec.id.to_string(),
+                    done,
+                    total,
+                };
+                if last_ping.elapsed() >= Duration::from_millis(200) {
+                    let _ = ping.send(());
+                    last_ping = Instant::now();
+                }
+            });
+            match result {
+                Ok(()) => {
+                    *phase.lock() = DownloadPhase::Ready {
+                        id: spec.id.to_string(),
+                    };
+                }
+                Err(error) => {
+                    eprintln!("{error}");
+                    *phase.lock() = DownloadPhase::Failed {
+                        id: spec.id.to_string(),
+                        message: format!(
+                            "Could not download {}. Check your network and try again.",
+                            spec.label
+                        ),
+                    };
+                }
+            }
+            let _ = ping.send(());
+        });
     }
 
     fn toggle_auto_paste(&mut self) {
@@ -1674,47 +1799,284 @@ impl HudView {
                 .into_any_element(),
         );
 
-        let engine_row = settings_row(
-            "Model",
-            "SenseVoice Small, loaded while you talk".to_string(),
-            div()
-                .flex()
-                .items_center()
-                .gap(px(8.0))
-                .child(
-                    div()
-                        .px(px(8.0))
-                        .py(px(5.0))
-                        .rounded_lg()
-                        .bg(rgba(0x393552cc))
-                        .text_size(px(11.0))
-                        .font_family("Consolas")
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(rgb(FOAM))
-                        .whitespace_nowrap()
-                        .child(update::current_version()),
-                )
-                .child(
+        let spec = models::resolve(&self.selected_model);
+        let installed = models::find_dir(spec, None).is_some();
+        let phase = match &*self.model_phase.lock() {
+            DownloadPhase::Downloading { id, done, total } if id == spec.id => {
+                DownloadPhase::Downloading {
+                    id: id.clone(),
+                    done: *done,
+                    total: *total,
+                }
+            }
+            DownloadPhase::Failed { id, message } if id == spec.id => DownloadPhase::Failed {
+                id: id.clone(),
+                message: message.clone(),
+            },
+            DownloadPhase::Ready { id } if id == spec.id => DownloadPhase::Ready { id: id.clone() },
+            _ => DownloadPhase::Idle,
+        };
+        let downloading = matches!(phase, DownloadPhase::Downloading { .. });
+        let model_sub = match &phase {
+            DownloadPhase::Downloading { done, total, .. } => format!(
+                "Downloading {} of {}",
+                models::format_mb(*done),
+                models::format_mb(*total)
+            ),
+            DownloadPhase::Failed { message, .. } => message.clone(),
+            _ if installed => format!("{}, {}", spec.label, spec.blurb),
+            _ => format!("{}, not downloaded, {}", spec.label, spec.size_label),
+        };
+        let status_label = if downloading {
+            "Downloading"
+        } else if installed {
+            "On demand"
+        } else {
+            "Not on disk"
+        };
+        let status_color = if downloading {
+            GOLD
+        } else if installed {
+            SUCCESS
+        } else {
+            TEXT_MUTED
+        };
+        let mut model_buttons = Vec::new();
+        for (i, option) in CATALOG.iter().enumerate() {
+            let is_selected = self.selected_model == option.id;
+            let option_id = option.id;
+            model_buttons.push(
+                div()
+                    .id(ElementId::NamedInteger("model_btn".into(), i as u64))
+                    .flex()
+                    .flex_1()
+                    .items_center()
+                    .justify_center()
+                    .h(px(44.0))
+                    .px(px(6.0))
+                    .min_w(px(0.0))
+                    .rounded_lg()
+                    .border_2()
+                    .border_color(if is_selected {
+                        rgba(0xc4a7e780)
+                    } else {
+                        rgba(0x00000000)
+                    })
+                    .tab_index(0)
+                    .focus(|style| style.border_color(rgb(FOAM)))
+                    .text_size(px(12.0))
+                    .font_weight(if is_selected {
+                        FontWeight::MEDIUM
+                    } else {
+                        FontWeight::NORMAL
+                    })
+                    .bg(if is_selected {
+                        rgba(SELECTED_FILL)
+                    } else {
+                        rgba(0x00000000)
+                    })
+                    .text_color(if is_selected {
+                        rgb(IRIS)
+                    } else {
+                        rgb(TEXT_SECONDARY)
+                    })
+                    .whitespace_nowrap()
+                    .cursor_pointer()
+                    .hover(|style| {
+                        if is_selected {
+                            style
+                        } else {
+                            style.bg(rgba(HOVER))
+                        }
+                    })
+                    .active(|style| style.opacity(0.92))
+                    .child(option.chip)
+                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                        if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                            this.select_model(option_id);
+                            cx.stop_propagation();
+                            cx.notify();
+                        }
+                    }))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.select_model(option_id);
+                        cx.notify();
+                    })),
+            );
+        }
+        let mut model_rows = Vec::new();
+        let mut row = Vec::new();
+        for button in model_buttons {
+            row.push(button);
+            if row.len() == 2 {
+                model_rows.push(
                     div()
                         .flex()
-                        .items_center()
+                        .w_full()
                         .gap(px(8.0))
-                        .px(px(8.0))
-                        .py(px(5.0))
+                        .children(std::mem::take(&mut row))
+                        .into_any_element(),
+                );
+            }
+        }
+        if !row.is_empty() {
+            model_rows.push(
+                div()
+                    .flex()
+                    .w_full()
+                    .gap(px(8.0))
+                    .children(row)
+                    .into_any_element(),
+            );
+        }
+        let download_action = if downloading {
+            "Downloading"
+        } else if matches!(phase, DownloadPhase::Failed { .. }) {
+            "Try again"
+        } else {
+            "Download model"
+        };
+        let show_download = !installed || matches!(phase, DownloadPhase::Failed { .. });
+        let model_row = div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .gap(px(8.0))
+            .px(px(8.0))
+            .py(px(8.0))
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(10.0))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(3.0))
+                            .flex_1()
+                            .min_w(px(128.0))
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(rgb(TEXT))
+                                    .child("Model"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .line_height(px(14.0))
+                                    .text_color(rgb(TEXT_MUTED))
+                                    .line_clamp(2)
+                                    .child(model_sub),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(
+                                div()
+                                    .px(px(8.0))
+                                    .py(px(5.0))
+                                    .rounded_lg()
+                                    .bg(rgba(0x393552cc))
+                                    .text_size(px(11.0))
+                                    .font_family("Consolas")
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(rgb(FOAM))
+                                    .whitespace_nowrap()
+                                    .child(update::current_version()),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(8.0))
+                                    .px(px(8.0))
+                                    .py(px(5.0))
+                                    .rounded_lg()
+                                    .bg(rgba(if installed && !downloading {
+                                        0x3e8fb022
+                                    } else {
+                                        0x393552cc
+                                    }))
+                                    .child(
+                                        div()
+                                            .w(px(6.0))
+                                            .h(px(6.0))
+                                            .rounded_full()
+                                            .bg(rgb(status_color)),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(11.0))
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(rgb(status_color))
+                                            .whitespace_nowrap()
+                                            .child(status_label),
+                                    ),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .w_full()
+                    .gap(px(8.0))
+                    .children(model_rows),
+            )
+            .when(show_download, |block| {
+                block.child(
+                    div()
+                        .id("download_model_btn")
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .h(px(44.0))
+                        .px(px(10.0))
                         .rounded_lg()
-                        .bg(rgba(0x3e8fb022))
-                        .child(div().w(px(6.0)).h(px(6.0)).rounded_full().bg(rgb(SUCCESS)))
-                        .child(
-                            div()
-                                .text_size(px(11.0))
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(rgb(SUCCESS))
-                                .whitespace_nowrap()
-                                .child("On demand"),
-                        ),
+                        .tab_index(0)
+                        .border_2()
+                        .border_color(rgba(0x00000000))
+                        .focus(|style| style.border_color(rgb(FOAM)))
+                        .bg(rgba(if downloading { 0x39355299 } else { 0x393552cc }))
+                        .text_size(px(11.0))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(rgb(TEXT))
+                        .whitespace_nowrap()
+                        .cursor_pointer()
+                        .hover(|style| {
+                            if downloading {
+                                style
+                            } else {
+                                style.bg(rgba(SELECTED_FILL))
+                            }
+                        })
+                        .active(|style| style.opacity(0.92))
+                        .child(if downloading {
+                            download_action.to_string()
+                        } else {
+                            format!("{download_action} · {}", spec.size_label)
+                        })
+                        .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                            if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                                this.start_model_download();
+                                cx.stop_propagation();
+                                cx.notify();
+                            }
+                        }))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.start_model_download();
+                            cx.notify();
+                        })),
                 )
-                .into_any_element(),
-        );
+            });
 
         div()
             .flex()
@@ -1735,7 +2097,17 @@ impl HudView {
             })
             .child(language_row)
             .child(hotkey_row)
-            .child(engine_row)
+            .child(model_row)
+            .when_some(self.model_error.clone(), |view, error| {
+                view.child(
+                    div()
+                        .px(px(8.0))
+                        .text_size(px(11.0))
+                        .line_height(px(14.0))
+                        .text_color(rgb(LOVE))
+                        .child(error),
+                )
+            })
             .child(update_row)
             .into_any_element()
     }
