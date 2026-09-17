@@ -6,16 +6,20 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-if (-not $PSScriptRoot) {
-    $PSScriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+$ScriptDir = $PSScriptRoot
+if (-not $ScriptDir -and $MyInvocation.MyCommand.Path) {
+    $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+}
+if (-not $ScriptDir) {
+    $ScriptDir = Join-Path (Get-Location) "packaging"
 }
 if (-not $RepoRoot) {
-    $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+    $RepoRoot = (Resolve-Path (Join-Path $ScriptDir "..")).Path
 }
 $Version = $Version.TrimStart("vV")
 $Desktop = Join-Path $RepoRoot "desktop"
-$SetupCrate = Join-Path $PSScriptRoot "tdt-setup"
-$Stage = Join-Path $PSScriptRoot "stage"
+$SetupCrate = Join-Path $ScriptDir "tdt-setup"
+$Stage = Join-Path $ScriptDir "stage"
 $Dist = Join-Path $RepoRoot "dist"
 $ModelSrc = Join-Path $RepoRoot "models\sensevoice"
 $ReleaseExe = Join-Path $Desktop "target\release\TDT.exe"
@@ -48,7 +52,7 @@ Copy-Item (Join-Path $RepoRoot "LICENSE") $Stage
 Copy-Item (Join-Path $RepoRoot "NOTICE") $Stage
 Copy-Item (Join-Path $RepoRoot "THIRD_PARTY_NOTICES.md") $Stage
 Copy-Item (Join-Path $RepoRoot "README.md") $Stage
-Copy-Item (Join-Path $PSScriptRoot "tdt-setup.ps1") (Join-Path $Stage "Install-TDT.ps1")
+Copy-Item (Join-Path $ScriptDir "tdt-setup.ps1") (Join-Path $Stage "Install-TDT.ps1")
 Set-Content -LiteralPath (Join-Path $Stage "VERSION") -Value $Version -NoNewline
 Copy-Item (Join-Path $ModelSrc "*") (Join-Path $Stage "models\sensevoice") -Force
 
@@ -57,7 +61,7 @@ if (Test-Path $portable) { Remove-Item $portable -Force }
 Compress-Archive -Path (Join-Path $Stage "*") -DestinationPath $portable -Force
 Write-Host "Wrote $portable"
 
-$payload = Join-Path $PSScriptRoot "payload.zip"
+$payload = Join-Path $ScriptDir "payload.zip"
 if (Test-Path $payload) { Remove-Item $payload -Force }
 Compress-Archive -Path (Join-Path $Stage "*") -DestinationPath $payload -Force
 

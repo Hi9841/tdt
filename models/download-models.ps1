@@ -4,10 +4,19 @@
 param(
     [ValidateSet("sensevoice-small", "sensevoice-full", "whisper-small", "whisper-medium", "all")]
     [string]$Model = "sensevoice-small",
-    [string]$ModelsRoot = $PSScriptRoot
+    [string]$ModelsRoot = ""
 )
 
 $ErrorActionPreference = "Stop"
+if (-not $ModelsRoot) {
+    if ($PSScriptRoot) {
+        $ModelsRoot = $PSScriptRoot
+    } elseif ($MyInvocation.MyCommand.Path) {
+        $ModelsRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+    } else {
+        $ModelsRoot = Join-Path (Get-Location) "models"
+    }
+}
 $Catalog = @{
     "sensevoice-small" = @{
         Label = "SenseVoice Small"
