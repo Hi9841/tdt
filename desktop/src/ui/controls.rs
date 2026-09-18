@@ -55,7 +55,7 @@ pub fn ghost_button(id: &'static str, label: impl Into<SharedString>) -> Statefu
         .text_color(muted())
         .whitespace_nowrap()
         .cursor_pointer()
-        .hover(|s| s.text_color(foam()))
+        .hover(|s| s.bg(hover()).text_color(text()))
         .active(|s| s.opacity(0.88))
         .focus(|s| s.border_color(focus_ring()))
         .child(label.into())
@@ -129,9 +129,9 @@ pub fn setting_row(
         .justify_between()
         .gap(px(GAP_TIGHT))
         .w_full()
-        .min_h(px(32.0))
+        .min_h(px(44.0))
         .px(px(2.0))
-        .py(px(3.0))
+        .py(px(4.0))
         .child(
             div()
                 .flex()
@@ -162,7 +162,7 @@ pub fn grouped_section(title: &'static str, rows: impl IntoIterator<Item = AnyEl
         .flex()
         .flex_col()
         .w_full()
-        .gap(px(4.0))
+        .gap(px(GAP_TIGHT))
         .child(section_label(title))
         .child(div().flex().flex_col().w_full().children(rows))
 }
@@ -176,7 +176,7 @@ pub fn labeled_block(
         .flex()
         .flex_col()
         .w_full()
-        .gap(px(4.0))
+        .gap(px(GAP_TIGHT))
         .child(section_label(title))
         .child(
             div()
@@ -193,7 +193,7 @@ pub fn chip_row(chips: impl IntoIterator<Item = AnyElement>) -> AnyElement {
     div()
         .flex()
         .w_full()
-        .gap(px(4.0))
+        .gap(px(GAP_TIGHT))
         .children(chips)
         .into_any_element()
 }
@@ -212,24 +212,31 @@ pub fn choice_chip(id: ElementId, label: impl Into<SharedString>, is_on: bool) -
         .rounded(r_chip())
         .border_1()
         .border_color(theme::transparent())
-        .bg(if is_on {
-            selected()
-        } else {
-            theme::transparent()
-        })
+        .bg(if is_on { selected() } else { well() })
         .text_size(px(TYPE_DESC))
         .font_weight(if is_on { medium() } else { FontWeight::NORMAL })
         .text_color(if is_on { accent() } else { muted() })
         .whitespace_nowrap()
         .cursor_pointer()
-        .hover(|s| if is_on { s } else { s.text_color(text()) })
+        .hover(|s| {
+            if is_on {
+                s
+            } else {
+                s.bg(hover()).text_color(text())
+            }
+        })
         .active(|s| s.opacity(0.9))
         .focus(|s| s.border_color(focus_ring()))
         .child(label.into())
 }
 
 pub fn chip_well(rows: impl IntoIterator<Item = AnyElement>) -> Div {
-    div().flex().flex_col().w_full().gap(px(4.0)).children(rows)
+    div()
+        .flex()
+        .flex_col()
+        .w_full()
+        .gap(px(GAP_TIGHT))
+        .children(rows)
 }
 
 pub fn progress_bar(done: u64, total: u64) -> AnyElement {
@@ -300,10 +307,13 @@ pub fn toggle_hit(id: &'static str, track: Div) -> Stateful<Div> {
         .flex()
         .items_center()
         .justify_center()
+        .min_w(px(44.0))
+        .min_h(px(44.0))
         .cursor_pointer()
         .rounded(r_chip())
         .border_1()
         .border_color(theme::transparent())
+        .hover(|s| s.bg(hover()))
         .focus(|s| s.border_color(focus_ring()))
         .active(|s| s.opacity(0.9))
         .child(track)

@@ -51,6 +51,7 @@ enum InternalEvent {
 }
 
 fn main() {
+    lock_working_directory();
     std::panic::set_hook(Box::new(|info| {
         let msg = format!("TDT crashed: {info}");
         append_log(&msg);
@@ -224,6 +225,13 @@ fn main() {
                         follow_current_virtual_desktop();
                         lock_overlay_chrome();
                         poll_capture_timeout();
+                        if take_show_request() {
+                            set_overlay_hidden(false);
+                            let _ = this.update(cx, |view, cx| {
+                                view.reveal_overlay();
+                                cx.notify();
+                            });
+                        }
                         while update_ping_rx.try_recv().is_ok() {
                             let _ = this.update(cx, |view, cx| {
                                 view.take_ready_model();
@@ -617,14 +625,54 @@ enum InstanceClaim {
 
 struct InstanceGuard {
     #[cfg(windows)]
-    handle: windows::Win32::Foundation::HANDLE,
+    mutex: windows::Win32::Foundation::HANDLE,
+    #[cfg(windows)]
+    show_event: windows::Win32::Foundation::HANDLE,
 }
 
 #[cfg(windows)]
 impl Drop for InstanceGuard {
     fn drop(&mut self) {
         unsafe {
-            let _ = windows::Win32::Foundation::CloseHandle(self.handle);
+            *show_event_slot().lock() = None;
+            let _ = windows::Win32::Foundation::CloseHandle(self.show_event);
+            let _ = windows::Win32::Foundation::CloseHandle(self.mutex);
+        }
+    }
+}
+
+fn show_event_slot() -> &'static Mutex<Option<isize>> {
+    static SLOT: Mutex<Option<isize>> = Mutex::new(None);
+    &SLOT
+}
+
+fn take_show_request() -> bool {
+    #[cfg(windows)]
+    {
+        use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
+        use windows::Win32::System::Threading::WaitForSingleObject;
+        let Some(raw) = *show_event_slot().lock() else {
+            return false;
+        };
+        unsafe { WaitForSingleObject(HANDLE(raw as _), 0) == WAIT_OBJECT_0 }
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+fn signal_running_instance() {
+    #[cfg(windows)]
+    {
+        use windows::core::w;
+        use windows::Win32::System::Threading::{OpenEventW, SetEvent, EVENT_MODIFY_STATE};
+        unsafe {
+            if let Ok(handle) = OpenEventW(EVENT_MODIFY_STATE, false, w!("Local\\TDT-ShowOverlay"))
+            {
+                let _ = SetEvent(handle);
+                let _ = windows::Win32::Foundation::CloseHandle(handle);
+            }
         }
     }
 }
@@ -634,16 +682,26 @@ fn claim_instance() -> InstanceClaim {
     {
         use windows::core::w;
         use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
-        use windows::Win32::System::Threading::CreateMutexW;
+        use windows::Win32::System::Threading::{CreateEventW, CreateMutexW};
 
         unsafe {
             match CreateMutexW(None, true, w!("Local\\TDT-TalkDontType")) {
-                Ok(handle) => {
+                Ok(mutex) => {
                     if GetLastError() == ERROR_ALREADY_EXISTS {
-                        let _ = windows::Win32::Foundation::CloseHandle(handle);
+                        let _ = windows::Win32::Foundation::CloseHandle(mutex);
+                        signal_running_instance();
                         InstanceClaim::AlreadyRunning
                     } else {
-                        InstanceClaim::Owned(InstanceGuard { handle })
+                        match CreateEventW(None, false, false, w!("Local\\TDT-ShowOverlay")) {
+                            Ok(show_event) => {
+                                *show_event_slot().lock() = Some(show_event.0 as isize);
+                                InstanceClaim::Owned(InstanceGuard { mutex, show_event })
+                            }
+                            Err(error) => {
+                                let _ = windows::Win32::Foundation::CloseHandle(mutex);
+                                InstanceClaim::Failed(format!("Could not start TDT: {error}"))
+                            }
+                        }
                     }
                 }
                 Err(error) => InstanceClaim::Failed(format!("Could not start TDT: {error}")),
@@ -653,6 +711,14 @@ fn claim_instance() -> InstanceClaim {
     #[cfg(not(windows))]
     {
         InstanceClaim::Owned(InstanceGuard {})
+    }
+}
+
+fn lock_working_directory() {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let _ = std::env::set_current_dir(dir);
+        }
     }
 }
 
