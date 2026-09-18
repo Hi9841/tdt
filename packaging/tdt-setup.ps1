@@ -44,8 +44,11 @@ $Version = $Version.TrimStart("vV")
 if ($Uninstall) {
     Stop-TdtProcesses
     Remove-Item "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\TDT" -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item (Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\Startup\TDT.lnk") -Force -ErrorAction SilentlyContinue
     Remove-Item (Join-Path $env:USERPROFILE "Desktop\TDT.lnk") -Force -ErrorAction SilentlyContinue
     Remove-Item "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run\TDT" -Force -ErrorAction SilentlyContinue
+    Remove-Item "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run\TDT" -Force -ErrorAction SilentlyContinue
+    Remove-Item "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder\TDT.lnk" -Force -ErrorAction SilentlyContinue
     Remove-Item $UninstallReg -Recurse -Force -ErrorAction SilentlyContinue
     Remove-Item $InstallDir -Recurse -Force -ErrorAction SilentlyContinue
     Write-SetupLog "TDT removed."

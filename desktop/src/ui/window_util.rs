@@ -293,18 +293,28 @@ pub fn find_app_hwnd() -> Option<HWND> {
         let _ = EnumWindows(Some(enum_proc), LPARAM(&mut ctx as *mut _ as isize));
     }
 
-    if ctx.found.is_none() {
-        ctx.visible_only = false;
-        unsafe {
-            let _ = EnumWindows(Some(enum_proc), LPARAM(&mut ctx as *mut _ as isize));
-        }
-    }
-
     if let Some(hwnd) = ctx.found {
         *remembered_hwnd().lock() = Some(hwnd.0 as isize);
         return Some(hwnd);
     }
 
+    if let Some(hwnd) = stored_overlay_hwnd() {
+        return Some(hwnd);
+    }
+
+    ctx.visible_only = false;
+    unsafe {
+        let _ = EnumWindows(Some(enum_proc), LPARAM(&mut ctx as *mut _ as isize));
+    }
+    if let Some(hwnd) = ctx.found {
+        *remembered_hwnd().lock() = Some(hwnd.0 as isize);
+        return Some(hwnd);
+    }
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn stored_overlay_hwnd() -> Option<HWND> {
     let stored = *remembered_hwnd().lock();
     stored.and_then(|raw| {
         let hwnd = HWND(raw as _);

@@ -8,8 +8,8 @@ use crate::ui::preview::{self, Spec as PreviewSpec};
 use crate::ui::text::{clip_text, format_mmss, format_time_saved};
 use crate::ui::theme::{
     self, accent, foam, focus_ring, gold, hairline, hover, love, muted, pad, panel_bg, pill_bg,
-    r_chip, r_section, r_window, selected, success, text, well, GAP_SECTION, H_CTRL, H_TAB,
-    MOTION_MS, MUTED, TAB_FADE_MS, TEXT, TYPE_DESC, TYPE_LABEL, TYPE_META, TYPE_TITLE,
+    r_chip, r_section, r_window, selected, success, text, well, GAP_SECTION, GAP_TIGHT, H_CTRL,
+    H_TAB, MOTION_MS, MUTED, TAB_FADE_MS, TEXT, TYPE_DESC, TYPE_LABEL, TYPE_META, TYPE_TITLE,
 };
 use crate::ui::window_util::{
     client_animations_enabled, set_overlay_hidden, set_window_mode, start_window_drag,
@@ -594,6 +594,7 @@ impl HudView {
             }
             Err(error) => {
                 eprintln!("{error}");
+                self.autostart_enabled = crate::autostart::is_enabled();
                 self.autostart_error = Some(
                     "Could not change startup. Check Windows startup permissions and try again."
                         .into(),
@@ -726,10 +727,9 @@ impl HudView {
 
         let left_section = div()
             .flex()
-            .flex_1()
-            .min_w(px(0.0))
+            .flex_none()
             .items_center()
-            .gap(px(8.0))
+            .gap(px(GAP_TIGHT))
             .child(phase_indicator(
                 "status_indicator",
                 true,
@@ -753,16 +753,16 @@ impl HudView {
 
         let right_section = div()
             .flex()
-            .flex_1()
-            .min_w(px(0.0))
+            .flex_none()
             .items_center()
             .justify_end()
-            .gap(px(4.0));
+            .gap(px(GAP_TIGHT));
 
         let right_section = if matches!(&self.status, HudStatus::Idle) {
             right_section
                 .child(
                     controls::ghost_button("hide_overlay_btn", "Hide")
+                        .h(px(SETTINGS_HIT_HEIGHT))
                         .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
                             if matches!(event.keystroke.key.as_str(), "enter" | "space") {
                                 cx.stop_propagation();
@@ -781,7 +781,8 @@ impl HudView {
                         })),
                 )
                 .child(
-                    controls::ghost_button("open_settings_btn", "Settings")
+                    controls::secondary_button("open_settings_btn", "Settings")
+                        .h(px(SETTINGS_HIT_HEIGHT))
                         .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
                             if matches!(event.keystroke.key.as_str(), "enter" | "space") {
                                 cx.stop_propagation();
@@ -819,11 +820,10 @@ impl HudView {
             .id("recording_overlay_pill")
             .flex()
             .items_center()
-            .justify_between()
             .w(px(BUBBLE_WIDTH))
             .h(px(BUBBLE_HEIGHT))
-            .px(px(12.0))
-            .gap(px(8.0))
+            .px(pad())
+            .gap(px(GAP_TIGHT))
             .rounded(r_window())
             .bg(pill_bg())
             .border_1()
@@ -838,7 +838,9 @@ impl HudView {
                 }),
             )
             .child(left_section)
+            .child(div().flex_1().min_w(px(0.0)))
             .child(center_child)
+            .child(div().flex_1().min_w(px(0.0)))
             .child(right_section)
             .into_any_element()
     }
@@ -967,46 +969,22 @@ impl HudView {
                             )),
                     )
                     .child(
-                        div()
-                            .flex()
-                            .flex_none()
-                            .items_center()
-                            .gap(px(2.0))
-                            .child(
-                                controls::ghost_button("hide_panel_btn", "Hide")
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|_, _, _, cx| cx.stop_propagation()),
-                                    )
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        cx.stop_propagation();
-                                        this.hide_overlay(cx);
-                                        cx.notify();
-                                    })),
+                        controls::ghost_button("close_settings_btn", "Close")
+                            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                                    this.close_stats_settings(cx);
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                }
+                            }))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|_, _, _, cx| cx.stop_propagation()),
                             )
-                            .child(
-                                controls::ghost_button("close_settings_btn", "Close")
-                                    .on_key_down(cx.listener(
-                                        |this, event: &KeyDownEvent, _, cx| {
-                                            if matches!(
-                                                event.keystroke.key.as_str(),
-                                                "enter" | "space"
-                                            ) {
-                                                this.close_stats_settings(cx);
-                                                cx.stop_propagation();
-                                                cx.notify();
-                                            }
-                                        },
-                                    ))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|_, _, _, cx| cx.stop_propagation()),
-                                    )
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.close_stats_settings(cx);
-                                        cx.notify();
-                                    })),
-                            ),
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.close_stats_settings(cx);
+                                cx.notify();
+                            })),
                     ),
             );
 
@@ -1027,9 +1005,9 @@ impl HudView {
             .w_full()
             .min_h(px(0.0));
         let faded_content = if self.active_tab == SettingsTab::Stats {
-            faded_content.overflow_y_scroll()
-        } else {
             faded_content.overflow_hidden()
+        } else {
+            faded_content.overflow_y_scroll()
         };
         let faded_content = faded_content.child(content);
         let faded_content = if client_animations_enabled() {
@@ -1114,7 +1092,7 @@ impl HudView {
                         div()
                             .text_size(px(TYPE_DESC))
                             .text_color(muted())
-                            .child("Your recent transcriptions will appear here."),
+                            .child(format!("Press or hold {} to talk.", self.hotkey_label)),
                     )
                     .into_any_element(),
             );
@@ -1299,7 +1277,7 @@ impl HudView {
             );
         if has_recents {
             history_header = history_header.child(
-                controls::ghost_button("clear_recents_btn", "Clear").on_click(cx.listener(
+                controls::ghost_button("clear_recents_btn", "Clear recents").on_click(cx.listener(
                     |this, _, _, cx| {
                         this.clear_recents();
                         cx.notify();
@@ -1311,13 +1289,27 @@ impl HudView {
         let history_section = div()
             .flex()
             .flex_col()
-            .gap(px(8.0))
+            .flex_1()
+            .min_h(px(0.0))
+            .gap(px(GAP_TIGHT))
             .child(history_header)
-            .children(history_items);
+            .child(
+                div()
+                    .id("history_scroller")
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .overflow_y_scroll()
+                    .gap(px(GAP_TIGHT))
+                    .children(history_items),
+            );
 
         div()
             .flex()
             .flex_col()
+            .flex_1()
+            .min_h(px(0.0))
             .gap(px(GAP_SECTION))
             .child(grid)
             .child(history_section)
@@ -1468,11 +1460,7 @@ impl HudView {
             } else {
                 theme::transparent()
             })
-            .bg(if capturing {
-                selected()
-            } else {
-                theme::transparent()
-            })
+            .bg(if capturing { selected() } else { well() })
             .cursor_pointer()
             .active(|style| style.opacity(0.9))
             .child(if capturing {
@@ -1664,13 +1652,6 @@ impl HudView {
             _ if installed => format!("{}, {}", spec.label, spec.blurb),
             _ => format!("{}, not downloaded, {}", spec.label, spec.size_label),
         };
-        let status_label = match &phase {
-            DownloadPhase::Downloading { done, total, .. } => {
-                format!("{}%", models::percent(*done, *total))
-            }
-            _ if installed => "On demand".to_string(),
-            _ => "Not on disk".to_string(),
-        };
         let mut model_buttons = Vec::new();
         for (i, option) in CATALOG.iter().enumerate() {
             let is_selected = self.selected_model == option.id;
@@ -1719,10 +1700,6 @@ impl HudView {
             }
             _ => None,
         };
-        let model_sub = format!(
-            "{model_sub} · {} · {status_label}",
-            update::current_version()
-        );
         let mut model_body = vec![controls::chip_well(model_rows).into_any_element()];
         if let Some(meter) = model_meter {
             model_body.push(meter);
@@ -1786,7 +1763,8 @@ impl HudView {
             .when_some(self.autostart_error.clone(), |view, error| {
                 view.child(
                     div()
-                        .px(px(10.0))
+                        .px(px(2.0))
+                        .mt(px(-4.0))
                         .text_size(px(TYPE_DESC))
                         .line_height(px(15.0))
                         .text_color(love())
