@@ -13,11 +13,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Download SenseVoice model
-        shell: pwsh
-        run: |
-          $script = Join-Path $pwd "models/download-models.ps1"
-          & $script
       - name: Build installer
         shell: pwsh
         run: |

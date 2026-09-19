@@ -19,14 +19,14 @@ powershell -ExecutionPolicy Bypass -File .\packaging\build-installer.ps1
 That writes:
 
 - `dist/TDT.exe` slim app binary used by in-app updates
-- `dist/TDT-Setup.exe` per-user installer (app only; SenseVoice stays on
-  disk if you already have it, or downloads from Settings on first run)
-- `dist/TDT-0.1.6-windows-x64.zip` portable copy with SenseVoice Small
+- `dist/TDT-Setup.exe` per-user installer (app only, no speech model)
+- `dist/TDT-0.1.6-windows-x64.zip` portable copy (app only, no speech model)
 - `dist/SHA256SUMS.txt`
 
 The installer copies TDT and the license files into `%LOCALAPPDATA%\TDT`,
-adds a Start Menu shortcut, and opens the app. No admin rights. Uninstall
-from Settings > Apps, or:
+adds a Start Menu shortcut, and opens the app. SenseVoice is not bundled.
+Open Settings and download Small on first run, or keep a model you already
+have. No admin rights. Uninstall from Settings > Apps, or:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\TDT\uninstall-tdt.ps1" -Uninstall

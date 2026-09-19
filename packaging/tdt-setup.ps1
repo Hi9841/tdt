@@ -69,17 +69,10 @@ if (-not (Test-Path (Join-Path $StageDir "TDT.exe"))) {
 Stop-TdtProcesses
 
 New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
-# Setup no longer ships SenseVoice. Leave an existing models folder in place
-# so in-app updates do not re-copy hundreds of megabytes.
-Get-ChildItem -LiteralPath $StageDir -Force | ForEach-Object {
-    if ($_.Name -eq "models") { return }
+# Never copy models/. Updates and reinstalls must leave a downloaded
+# SenseVoice tree on disk.
+Get-ChildItem -LiteralPath $StageDir -Force | Where-Object { $_.Name -ne "models" } | ForEach-Object {
     Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $InstallDir $_.Name) -Recurse -Force
-}
-if (Test-Path (Join-Path $StageDir "models")) {
-    $modelsDest = Join-Path $InstallDir "models"
-    if (-not (Test-Path $modelsDest)) {
-        Copy-Item (Join-Path $StageDir "models") $modelsDest -Recurse -Force
-    }
 }
 
 $uninstaller = Join-Path $InstallDir "uninstall-tdt.ps1"

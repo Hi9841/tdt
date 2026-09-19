@@ -21,7 +21,6 @@ $Desktop = Join-Path $RepoRoot "desktop"
 $SetupCrate = Join-Path $ScriptDir "tdt-setup"
 $Stage = Join-Path $ScriptDir "stage"
 $Dist = Join-Path $RepoRoot "dist"
-$ModelSrc = Join-Path $RepoRoot "models\sensevoice"
 $ReleaseExe = Join-Path $Desktop "target\release\TDT.exe"
 $StubExe = Join-Path $SetupCrate "target\release\tdt-setup.exe"
 
@@ -38,13 +37,9 @@ if (-not (Test-Path $ReleaseExe)) {
 if (-not (Test-Path $StubExe)) {
     throw "Missing $StubExe"
 }
-if (-not (Test-Path (Join-Path $ModelSrc "model.int8.onnx"))) {
-    Write-Host "Downloading SenseVoice model..."
-    powershell -ExecutionPolicy Bypass -File (Join-Path $RepoRoot "models\download-models.ps1")
-}
 
 if (Test-Path $Stage) { Remove-Item $Stage -Recurse -Force }
-New-Item -ItemType Directory -Path (Join-Path $Stage "models\sensevoice") -Force | Out-Null
+New-Item -ItemType Directory -Path $Stage -Force | Out-Null
 New-Item -ItemType Directory -Path $Dist -Force | Out-Null
 
 Copy-Item $ReleaseExe (Join-Path $Stage "TDT.exe")
@@ -54,18 +49,15 @@ Copy-Item (Join-Path $RepoRoot "THIRD_PARTY_NOTICES.md") $Stage
 Copy-Item (Join-Path $RepoRoot "README.md") $Stage
 Copy-Item (Join-Path $ScriptDir "tdt-setup.ps1") (Join-Path $Stage "Install-TDT.ps1")
 Set-Content -LiteralPath (Join-Path $Stage "VERSION") -Value $Version -NoNewline
-Copy-Item (Join-Path $ModelSrc "*") (Join-Path $Stage "models\sensevoice") -Force
 
+# Never bundle SenseVoice. First run downloads it from Settings. Updates
+# must not reinstall a 200 MB model the user already has.
 $portable = Join-Path $Dist "TDT-$Version-windows-x64.zip"
 if (Test-Path $portable) { Remove-Item $portable -Force }
 Compress-Archive -Path (Join-Path $Stage "*") -DestinationPath $portable -Force
 Write-Host "Wrote $portable"
 
 Copy-Item $ReleaseExe (Join-Path $Dist "TDT.exe") -Force
-
-# In-app updates and TDT-Setup.exe must not re-download SenseVoice. Keep the
-# model in the portable zip only. Existing installs already have it on disk.
-Remove-Item (Join-Path $Stage "models") -Recurse -Force
 
 $payload = Join-Path $ScriptDir "payload.zip"
 if (Test-Path $payload) { Remove-Item $payload -Force }
