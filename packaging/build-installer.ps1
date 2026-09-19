@@ -61,6 +61,12 @@ if (Test-Path $portable) { Remove-Item $portable -Force }
 Compress-Archive -Path (Join-Path $Stage "*") -DestinationPath $portable -Force
 Write-Host "Wrote $portable"
 
+Copy-Item $ReleaseExe (Join-Path $Dist "TDT.exe") -Force
+
+# In-app updates and TDT-Setup.exe must not re-download SenseVoice. Keep the
+# model in the portable zip only. Existing installs already have it on disk.
+Remove-Item (Join-Path $Stage "models") -Recurse -Force
+
 $payload = Join-Path $ScriptDir "payload.zip"
 if (Test-Path $payload) { Remove-Item $payload -Force }
 Compress-Archive -Path (Join-Path $Stage "*") -DestinationPath $payload -Force
