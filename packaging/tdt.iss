@@ -52,7 +52,7 @@ Source: "stage\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "stage\NOTICE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "stage\THIRD_PARTY_NOTICES.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "stage\README.md"; DestDir: "{app}"; Flags: ignoreversion
-Source: "stage\models\sensevoice\*"; DestDir: "{app}\models\sensevoice"; Flags: ignoreversion recursesubdirs
+Source: "..\models\sensevoice\*"; DestDir: "{app}\models\sensevoice"; Flags: ignoreversion recursesubdirs
 
 [Icons]
 Name: "{group}\TDT"; Filename: "{app}\TDT.exe"; Comment: "Talk Don't Type"

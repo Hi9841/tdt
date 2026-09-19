@@ -319,9 +319,10 @@ impl HudView {
         let snapshot = self.update.lock().clone();
         match snapshot {
             UpdatePhase::Available {
+                version,
                 asset_url,
+                asset_name,
                 sums_url,
-                ..
             } => {
                 let cell = Arc::clone(&self.update);
                 let ping = self.update_ping.clone();
@@ -332,6 +333,7 @@ impl HudView {
                     let mut last_ping = Instant::now();
                     let next = match update::download_installer(
                         &asset_url,
+                        &asset_name,
                         sums_url.as_deref(),
                         |done, total| {
                             *cell.lock() = UpdatePhase::Downloading { done, total };
@@ -341,10 +343,19 @@ impl HudView {
                             }
                         },
                     ) {
-                        Ok(path) => match update::launch_installer(&path) {
-                            Ok(()) => UpdatePhase::Ready { installer: path },
-                            Err(error) => UpdatePhase::Failed(error),
-                        },
+                        Ok(path) => {
+                            if update::is_app_binary(&asset_name) {
+                                match update::replace_running_exe(&path, &version) {
+                                    Ok(()) => std::process::exit(0),
+                                    Err(error) => UpdatePhase::Failed(error),
+                                }
+                            } else {
+                                match update::launch_installer(&path) {
+                                    Ok(()) => UpdatePhase::Ready { installer: path },
+                                    Err(error) => UpdatePhase::Failed(error),
+                                }
+                            }
+                        }
                         Err(error) => UpdatePhase::Failed(error),
                     };
                     // Only the newest install action may write the phase.
@@ -1518,8 +1529,8 @@ impl HudView {
             ),
             UpdatePhase::Available { version, .. } => (
                 "Updates",
-                format!("v{version} is ready to download"),
-                "Download update".to_string(),
+                format!("v{version} is ready. Downloads the app only, not the speech model."),
+                "Download and restart".to_string(),
                 false,
             ),
             UpdatePhase::Downloading { done, total } => {
