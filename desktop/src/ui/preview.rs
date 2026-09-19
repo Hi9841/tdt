@@ -144,12 +144,13 @@ pub fn update_phase(spec: &Spec) -> Option<UpdatePhase> {
         Spec::PanelSettingsUpdateUpToDate => UpdatePhase::UpToDate,
         Spec::PanelSettingsUpdateAvailable => UpdatePhase::Available {
             version: "0.2.0".into(),
-            asset_url: "https://example.invalid/TDT-Setup.exe".into(),
+            asset_url: "https://example.invalid/TDT.exe".into(),
+            asset_name: "TDT.exe".into(),
             sums_url: None,
         },
         Spec::PanelSettingsUpdateDownloading => UpdatePhase::Downloading {
-            done: 42_000_000,
-            total: 160_000_000,
+            done: 12_000_000,
+            total: 28_000_000,
         },
         Spec::PanelSettingsUpdateReady => UpdatePhase::Ready {
             installer: PathBuf::from(r"C:\TDT-Setup.exe"),

@@ -18,13 +18,15 @@ powershell -ExecutionPolicy Bypass -File .\packaging\build-installer.ps1
 
 That writes:
 
-- `dist/TDT-Setup.exe` self-contained per-user installer
-- `dist/TDT-0.1.6-windows-x64.zip` portable copy
+- `dist/TDT.exe` slim app binary used by in-app updates
+- `dist/TDT-Setup.exe` per-user installer (app only; SenseVoice stays on
+  disk if you already have it, or downloads from Settings on first run)
+- `dist/TDT-0.1.6-windows-x64.zip` portable copy with SenseVoice Small
 - `dist/SHA256SUMS.txt`
 
-The installer copies TDT, SenseVoice Small, and the license files into
-`%LOCALAPPDATA%\TDT`, adds a Start Menu shortcut, and opens the app. No admin
-rights. Uninstall from Settings > Apps, or:
+The installer copies TDT and the license files into `%LOCALAPPDATA%\TDT`,
+adds a Start Menu shortcut, and opens the app. No admin rights. Uninstall
+from Settings > Apps, or:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\TDT\uninstall-tdt.ps1" -Uninstall
@@ -62,11 +64,14 @@ cargo clippy --manifest-path .\desktop\Cargo.toml --all-targets --all-features -
 
 GitHub Releases is the update source (`Hi9841/tdt` by default, or
 `TDT_GITHUB_REPO`). Checking happens in the background after launch, never as
-part of recording. Installing an update downloads `TDT-Setup.exe` and runs it
-silently. Set `TDT_DISABLE_UPDATES=1` to turn that off.
+part of recording. Installing an update downloads `TDT.exe` (the app only)
+and replaces the running binary, the same way Prism updates. The speech
+model is not re-downloaded. Older releases fall back to `TDT-Setup.exe`.
+Set `TDT_DISABLE_UPDATES=1` to turn that off.
 
 Publish a release tagged `v0.1.0` (or later) so the in-app checker can find
-it. The `Release` workflow builds `TDT-Setup.exe` on tag `v*`.
+it. The `Release` workflow publishes `TDT.exe`, `TDT-Setup.exe`, and the
+portable zip on tag `v*`.
 
 ## Android
 

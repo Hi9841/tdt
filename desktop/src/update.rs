@@ -16,6 +16,7 @@ pub enum UpdatePhase {
     Available {
         version: String,
         asset_url: String,
+        asset_name: String,
         sums_url: Option<String>,
     },
     Downloading {
@@ -34,7 +35,7 @@ struct GithubRelease {
     assets: Vec<GithubAsset>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct GithubAsset {
     name: String,
     browser_download_url: String,
@@ -94,8 +95,8 @@ pub fn check_latest() -> Result<UpdatePhase, String> {
     if !version_newer(&latest, current_version()) {
         return Ok(UpdatePhase::UpToDate);
     }
-    let asset = pick_setup_asset(&release.assets)
-        .ok_or_else(|| "Latest release has no TDT-Setup.exe asset".to_string())?;
+    let asset = pick_update_asset(&release.assets)
+        .ok_or_else(|| "Latest release has no TDT.exe or TDT-Setup.exe asset".to_string())?;
     let sums_url = release
         .assets
         .iter()
@@ -104,20 +105,35 @@ pub fn check_latest() -> Result<UpdatePhase, String> {
     Ok(UpdatePhase::Available {
         version: latest,
         asset_url: asset.browser_download_url.clone(),
+        asset_name: asset.name.clone(),
         sums_url,
     })
 }
 
-/// Download the setup installer, streaming to a temp file, and verify its
-/// SHA256 against the release's published `SHA256SUMS.txt` when available.
-/// Returns the verified installer path.
+/// Download a release binary, streaming to a temp file, and verify SHA256
+/// against the published `SHA256SUMS.txt`. Prefers the slim `TDT.exe` app
+/// binary (Prism-style in-place replace) over the full setup SFX.
 pub fn download_installer(
     asset_url: &str,
+    asset_name: &str,
     sums_url: Option<&str>,
     mut on_progress: impl FnMut(u64, u64),
 ) -> Result<PathBuf, String> {
-    let path = std::env::temp_dir().join("TDT-Setup.exe.download");
-    let mut file = File::create(&path).map_err(|e| format!("Could not write installer: {e}"))?;
+    let Some(sums_url) = sums_url else {
+        return Err(
+            "Release has no SHA256SUMS.txt; refusing to run an unverified installer".to_string(),
+        );
+    };
+    let sums_url = sums_url.to_string();
+    let sums_job = std::thread::spawn(move || http_get_string(&sums_url));
+
+    let file_name = if is_app_binary(asset_name) {
+        "TDT.exe"
+    } else {
+        "TDT-Setup.exe"
+    };
+    let path = std::env::temp_dir().join(format!("{file_name}.download"));
+    let mut file = File::create(&path).map_err(|e| format!("Could not write update: {e}"))?;
     let mut hasher = sha2::Sha256::new();
 
     let response = download_agent()
@@ -131,7 +147,7 @@ pub fn download_installer(
         .unwrap_or(0);
     on_progress(0, content_len.max(1));
     let mut reader = response.into_reader();
-    let mut chunk = [0u8; 64 * 1024];
+    let mut chunk = [0u8; 256 * 1024];
     let mut total: u64 = 0;
     loop {
         let read = reader
@@ -142,7 +158,7 @@ pub fn download_installer(
         }
         hasher.update(&chunk[..read]);
         file.write_all(&chunk[..read])
-            .map_err(|e| format!("Could not write installer: {e}"))?;
+            .map_err(|e| format!("Could not write update: {e}"))?;
         total += read as u64;
         on_progress(total, content_len.max(total).max(1));
     }
@@ -150,52 +166,55 @@ pub fn download_installer(
 
     if total < 64 {
         let _ = std::fs::remove_file(&path);
-        return Err("Downloaded installer was empty".to_string());
+        return Err("Downloaded update was empty".to_string());
     }
 
     let mut head = [0u8; 2];
     File::open(&path)
         .and_then(|mut f| f.read_exact(&mut head))
-        .map_err(|e| format!("Could not read installer: {e}"))?;
+        .map_err(|e| format!("Could not read update: {e}"))?;
     if !looks_like_pe(&head) {
         let _ = std::fs::remove_file(&path);
-        return Err("Downloaded file is not a Windows installer".to_string());
+        return Err("Downloaded file is not a Windows executable".to_string());
     }
 
-    if let Some(sums_url) = sums_url {
-        let sums = http_get_string(sums_url)?;
-        let expected = expected_hash_for(&sums, "TDT-Setup.exe")
-            .or_else(|| expected_hash_for(&sums, &download_file_name(asset_url)));
-        match expected {
-            Some(expected) => {
-                let actual = format!("{:x}", hasher.finalize());
-                if actual != expected {
-                    let _ = std::fs::remove_file(&path);
-                    return Err(
-                        "Downloaded installer failed SHA256 verification; update aborted"
-                            .to_string(),
-                    );
-                }
-            }
-            None => {
-                // Sums file exists but lists no installer entry; do not run
-                // an unverifiable executable.
+    let sums = match sums_job.join() {
+        Ok(Ok(body)) => body,
+        Ok(Err(error)) => {
+            let _ = std::fs::remove_file(&path);
+            return Err(error);
+        }
+        Err(_) => {
+            let _ = std::fs::remove_file(&path);
+            return Err("Could not read release checksums".to_string());
+        }
+    };
+    let expected = expected_hash_for(&sums, file_name)
+        .or_else(|| expected_hash_for(&sums, asset_name))
+        .or_else(|| expected_hash_for(&sums, &download_file_name(asset_url)));
+    match expected {
+        Some(expected) => {
+            let actual = format!("{:x}", hasher.finalize());
+            if actual != expected {
                 let _ = std::fs::remove_file(&path);
                 return Err(
-                    "Release checksums do not list the installer; update aborted".to_string(),
+                    "Downloaded update failed SHA256 verification; update aborted".to_string(),
                 );
             }
         }
-    } else {
-        let _ = std::fs::remove_file(&path);
-        return Err(
-            "Release has no SHA256SUMS.txt; refusing to run an unverified installer".to_string(),
-        );
+        None => {
+            let _ = std::fs::remove_file(&path);
+            return Err("Release checksums do not list the update; update aborted".to_string());
+        }
     }
 
-    let final_path = std::env::temp_dir().join("TDT-Setup.exe");
-    std::fs::rename(&path, &final_path)
-        .map_err(|e| format!("Could not finalize installer download: {e}"))?;
+    let final_path = std::env::temp_dir().join(file_name);
+    if let Err(error) = std::fs::rename(&path, &final_path) {
+        std::fs::copy(&path, &final_path).map_err(|e| {
+            format!("Could not finalize update download: {error}; copy failed: {e}")
+        })?;
+        let _ = std::fs::remove_file(&path);
+    }
     Ok(final_path)
 }
 
@@ -221,6 +240,57 @@ pub fn launch_installer(path: &Path) -> Result<(), String> {
         .spawn()
         .map_err(|e| format!("Could not start installer: {e}"))?;
     Ok(())
+}
+
+/// True when the release asset is the slim app binary, not the setup SFX.
+pub fn is_app_binary(name: &str) -> bool {
+    Path::new(name)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .is_some_and(|file| file.eq_ignore_ascii_case("TDT.exe"))
+}
+
+/// Replace the running TDT.exe and relaunch, same idea as Prism's NSIS
+/// updater: swap the binary, do not re-download models.
+pub fn replace_running_exe(new_exe: &Path, version: &str) -> Result<(), String> {
+    let current =
+        std::env::current_exe().map_err(|error| format!("Could not locate TDT.exe: {error}"))?;
+    let dir = current
+        .parent()
+        .ok_or_else(|| "Could not locate the TDT folder".to_string())?;
+    let staged = dir.join("TDT.exe.new");
+    std::fs::copy(new_exe, &staged)
+        .map_err(|error| format!("Could not stage the update: {error}"))?;
+    let _ = std::fs::write(dir.join("VERSION"), version.trim().trim_start_matches('v'));
+
+    let script = dir.join("tdt-apply-update.cmd");
+    let staged_s = staged.display().to_string().replace('"', "");
+    let current_s = current.display().to_string().replace('"', "");
+    let body = format!(
+        "@echo off\r\n:retry\r\nping -n 2 127.0.0.1 >nul\r\nmove /Y \"{staged_s}\" \"{current_s}\"\r\nif exist \"{staged_s}\" goto retry\r\nstart \"\" \"{current_s}\"\r\ndel \"%~f0\"\r\n"
+    );
+    std::fs::write(&script, body)
+        .map_err(|error| format!("Could not write the update script: {error}"))?;
+
+    let mut cmd = Command::new("cmd.exe");
+    cmd.args(["/C", &script.to_string_lossy()]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        cmd.creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
+    }
+    cmd.spawn()
+        .map_err(|error| format!("Could not start the update script: {error}"))?;
+    Ok(())
+}
+
+fn pick_update_asset(assets: &[GithubAsset]) -> Option<&GithubAsset> {
+    assets
+        .iter()
+        .find(|asset| is_app_binary(&asset.name))
+        .or_else(|| pick_setup_asset(assets))
 }
 
 fn pick_setup_asset(assets: &[GithubAsset]) -> Option<&GithubAsset> {
@@ -327,6 +397,28 @@ mod tests {
         assert!(is_setup_asset("tdt-0.1.0-setup.exe"));
         assert!(!is_setup_asset("notes.md"));
         assert!(!is_setup_asset("TDT.exe"));
+    }
+
+    #[test]
+    fn update_asset_prefers_slim_app_binary() {
+        let setup = GithubAsset {
+            name: "TDT-Setup.exe".into(),
+            browser_download_url: "https://example.invalid/TDT-Setup.exe".into(),
+        };
+        let app = GithubAsset {
+            name: "TDT.exe".into(),
+            browser_download_url: "https://example.invalid/TDT.exe".into(),
+        };
+        assert!(is_app_binary("TDT.exe"));
+        assert!(!is_app_binary("TDT-Setup.exe"));
+        assert_eq!(
+            pick_update_asset(&[setup.clone(), app.clone()]).map(|asset| asset.name.as_str()),
+            Some("TDT.exe")
+        );
+        assert_eq!(
+            pick_update_asset(&[setup]).map(|asset| asset.name.as_str()),
+            Some("TDT-Setup.exe")
+        );
     }
 
     #[test]
