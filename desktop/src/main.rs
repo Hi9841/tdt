@@ -78,6 +78,9 @@ fn main() {
             }
         })
     };
+    if !preview::is_active() {
+        autostart::refresh_if_enabled();
+    }
 
     let config = if preview::is_active() {
         AppConfig::default()

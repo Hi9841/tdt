@@ -2,7 +2,7 @@
 [CmdletBinding()]
 param(
     [string]$RepoRoot = "",
-    [string]$Version = "0.1.8"
+    [string]$Version = "0.1.9"
 )
 
 $ErrorActionPreference = "Stop"
@@ -25,11 +25,11 @@ $ReleaseExe = Join-Path $Desktop "target\release\TDT.exe"
 $StubExe = Join-Path $SetupCrate "target\release\tdt-setup.exe"
 
 Write-Host "Building TDT $Version..."
-$appBuild = Start-Process cargo -ArgumentList @('build', '--release', '--locked', '--manifest-path', ('"{0}"' -f (Join-Path $Desktop 'Cargo.toml'))) -NoNewWindow -Wait -PassThru
-if ($appBuild.ExitCode -ne 0) { throw "cargo build --release failed" }
+& cargo build --release --locked --manifest-path (Join-Path $Desktop 'Cargo.toml')
+if ($LASTEXITCODE -ne 0) { throw "cargo build --release failed" }
 
-$setupBuild = Start-Process cargo -ArgumentList @('build', '--release', '--locked', '--manifest-path', ('"{0}"' -f (Join-Path $SetupCrate 'Cargo.toml'))) -NoNewWindow -Wait -PassThru
-if ($setupBuild.ExitCode -ne 0) { throw "tdt-setup build failed" }
+& cargo build --release --locked --manifest-path (Join-Path $SetupCrate 'Cargo.toml')
+if ($LASTEXITCODE -ne 0) { throw "tdt-setup build failed" }
 
 if (-not (Test-Path $ReleaseExe)) {
     throw "Missing $ReleaseExe"
