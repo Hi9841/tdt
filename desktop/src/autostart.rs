@@ -45,6 +45,26 @@ pub fn is_enabled() -> bool {
     read_value_exists(RUN_SUBKEY, VALUE_NAME) && !is_approved_disabled(APPROVED_RUN, VALUE_NAME)
 }
 
+/// Keep the Startup shortcut aimed at this TDT.exe after an update or move.
+pub fn refresh_if_enabled() {
+    if !is_enabled() {
+        return;
+    }
+    let Ok(exe) = current_tdt_exe() else {
+        return;
+    };
+    if !is_tdt_exe_name(&exe) {
+        return;
+    }
+    let _ = enable_startup();
+}
+
+fn is_tdt_exe_name(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("TDT.exe"))
+}
+
 /// Register or unregister TDT as a per-user startup app.
 pub fn set_enabled(enable: bool) -> Result<(), String> {
     if enable {
@@ -150,12 +170,15 @@ fn write_shortcut_sta(exe: &Path, path: &Path) -> Result<(), String> {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
         let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)
             .map_err(|error| format!("Could not create a startup shortcut: {error}"))?;
-        link.SetPath(&HSTRING::from(exe.to_string_lossy().as_ref()))
+        let exe_hs = HSTRING::from(exe.to_string_lossy().as_ref());
+        link.SetPath(&exe_hs)
             .map_err(|error| format!("Could not set the startup target: {error}"))?;
         link.SetWorkingDirectory(&HSTRING::from(workdir.to_string_lossy().as_ref()))
             .map_err(|error| format!("Could not set the startup folder: {error}"))?;
         link.SetDescription(&HSTRING::from("TDT - Talk Don't Type"))
             .map_err(|error| format!("Could not set the startup description: {error}"))?;
+        link.SetIconLocation(&exe_hs, 0)
+            .map_err(|error| format!("Could not set the startup icon: {error}"))?;
         let persist: IPersistFile = link
             .cast()
             .map_err(|error| format!("Could not save the startup shortcut: {error}"))?;
@@ -411,6 +434,26 @@ mod tests {
             rendered.contains("Start Menu") && rendered.contains("Startup"),
             "expected a user Startup folder path, got {rendered}"
         );
+    }
+
+    #[test]
+    fn refresh_skips_test_binaries_and_keeps_installed_name() {
+        assert!(is_tdt_exe_name(Path::new(r"C:\Users\hi\AppData\Local\TDT\TDT.exe")));
+        assert!(is_tdt_exe_name(Path::new(r"C:\Apps\tdt.exe")));
+        assert!(!is_tdt_exe_name(Path::new(
+            r"C:\repo\desktop\target\debug\deps\TDT-71689b29e1f673d8.exe"
+        )));
+    }
+
+    #[test]
+    fn refresh_if_enabled_is_noop_when_disabled() {
+        let shortcut = shortcut_path();
+        let had_shortcut = shortcut.exists();
+        if !had_shortcut && !read_value_exists(RUN_SUBKEY, VALUE_NAME) {
+            refresh_if_enabled();
+            assert!(!shortcut.exists());
+            assert!(!read_value_exists(RUN_SUBKEY, VALUE_NAME));
+        }
     }
 
     #[test]

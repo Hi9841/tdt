@@ -1,6 +1,6 @@
 [package]
 name = "tdt-setup"
-version = "0.1.8"
+version = "0.1.9"
 edition = "2021"
 license = "Apache-2.0"
 publish = false
@@ -9,6 +9,9 @@ description = "Per-user TDT installer stub. packaging/build-installer.ps1 append
 [[bin]]
 name = "tdt-setup"
 path = "src/main.rs"
+
+[build-dependencies]
+embed-resource = "3.0"
 
 [profile.release]
 opt-level = "z"

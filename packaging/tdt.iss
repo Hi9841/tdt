@@ -3,7 +3,7 @@
 #define AppName "TDT"
 #define AppLongName "TDT - Talk Don't Type"
 #ifndef AppVersion
-  #define AppVersion "0.1.8"
+  #define AppVersion "0.1.9"
 #endif
 #define AppPublisher "Hi9841"
 #define AppURL "https://github.com/Hi9841/tdt"
@@ -32,6 +32,7 @@ PrivilegesRequiredOverridesAllowed=dialog
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0
+SetupIconFile=..\desktop\assets\tdt.ico
 UninstallDisplayIcon={app}\TDT.exe
 UninstallDisplayName={#AppLongName}
 CloseApplications=yes
