@@ -1,2 +1,2 @@
 pub mod injector;
-pub use injector::PasteInjector;
+pub use injector::{DeliveryOutcome, PasteInjector};
