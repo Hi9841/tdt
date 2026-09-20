@@ -4,6 +4,33 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+#[derive(Debug, PartialEq)]
+pub enum DeliveryOutcome {
+    NoSpeech,
+    Copied,
+    Pasted,
+    CopiedFallback(String),
+}
+
+fn deliver_with(
+    text: &str,
+    should_paste: bool,
+    copy: impl FnOnce(&str) -> Result<(), String>,
+    insert: impl FnOnce(&str) -> Result<(), String>,
+) -> Result<DeliveryOutcome, String> {
+    if text.trim().is_empty() {
+        return Ok(DeliveryOutcome::NoSpeech);
+    }
+    copy(text)?;
+    if !should_paste {
+        return Ok(DeliveryOutcome::Copied);
+    }
+    Ok(match insert(text) {
+        Ok(()) => DeliveryOutcome::Pasted,
+        Err(error) => DeliveryOutcome::CopiedFallback(error),
+    })
+}
+
 #[derive(Clone)]
 pub struct PasteInjector {
     clipboard: Arc<Mutex<Option<Clipboard>>>,
@@ -42,9 +69,24 @@ impl PasteInjector {
         Err(last_err)
     }
 
-    pub fn auto_paste(&self, text: &str, target_hwnd: Option<isize>) -> Result<(), String> {
-        // Keep the transcription available on the clipboard as a fallback.
-        self.copy_to_clipboard(text)?;
+    pub fn deliver(
+        &self,
+        text: &str,
+        should_paste: bool,
+        target_hwnd: Option<isize>,
+    ) -> Result<DeliveryOutcome, String> {
+        deliver_with(
+            text,
+            should_paste,
+            |text| self.copy_to_clipboard(text),
+            |text| self.insert_text(text, target_hwnd),
+        )
+    }
+
+    fn insert_text(&self, text: &str, target_hwnd: Option<isize>) -> Result<(), String> {
+        if target_hwnd.is_none_or(|handle| handle == 0) {
+            return Err("The destination app is no longer available.".into());
+        }
 
         // Bring the original target back to the foreground.
         #[cfg(target_os = "windows")]
@@ -166,5 +208,51 @@ impl PasteInjector {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod delivery_tests {
+    use super::{deliver_with, DeliveryOutcome};
+
+    #[test]
+    fn silence_does_not_touch_clipboard_or_insert() {
+        assert_eq!(
+            deliver_with(" \n", true, |_| panic!("copy"), |_| panic!("insert")),
+            Ok(DeliveryOutcome::NoSpeech)
+        );
+    }
+
+    #[test]
+    fn clipboard_failure_never_attempts_insertion() {
+        assert_eq!(
+            deliver_with(
+                "words",
+                true,
+                |_| Err("clipboard busy".into()),
+                |_| panic!("insert")
+            ),
+            Err("clipboard busy".into())
+        );
+    }
+
+    #[test]
+    fn insertion_failure_preserves_successful_copy() {
+        assert_eq!(
+            deliver_with("words", true, |_| Ok(()), |_| Err("focus lost".into())),
+            Ok(DeliveryOutcome::CopiedFallback("focus lost".into()))
+        );
+    }
+
+    #[test]
+    fn copy_only_never_inserts_and_successful_insertion_is_pasted() {
+        assert_eq!(
+            deliver_with("words", false, |_| Ok(()), |_| panic!("insert")),
+            Ok(DeliveryOutcome::Copied)
+        );
+        assert_eq!(
+            deliver_with("words", true, |_| Ok(()), |_| Ok(())),
+            Ok(DeliveryOutcome::Pasted)
+        );
     }
 }

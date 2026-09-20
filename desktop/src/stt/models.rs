@@ -21,7 +21,6 @@ pub struct ModelFile {
 #[derive(Debug, Clone, Copy)]
 pub struct ModelSpec {
     pub id: &'static str,
-    pub chip: &'static str,
     pub label: &'static str,
     pub blurb: &'static str,
     pub size_label: &'static str,
@@ -66,7 +65,6 @@ pub const DEFAULT_MODEL_ID: &str = "sensevoice-small";
 pub const CATALOG: &[ModelSpec] = &[
     ModelSpec {
         id: DEFAULT_MODEL_ID,
-        chip: "Small",
         label: "SenseVoice Small",
         blurb: "Fast multilingual, loaded while you talk",
         size_label: "228 MB",
@@ -87,7 +85,6 @@ pub const CATALOG: &[ModelSpec] = &[
     },
     ModelSpec {
         id: "sensevoice-full",
-        chip: "Full",
         label: "SenseVoice Full",
         blurb: "Same languages, higher quality, slower",
         size_label: "894 MB",
@@ -108,7 +105,6 @@ pub const CATALOG: &[ModelSpec] = &[
     },
     ModelSpec {
         id: "whisper-small",
-        chip: "Whisper",
         label: "Whisper Small",
         blurb: "Many languages, loaded while you talk",
         size_label: "358 MB",
@@ -133,7 +129,6 @@ pub const CATALOG: &[ModelSpec] = &[
     },
     ModelSpec {
         id: "whisper-medium",
-        chip: "Medium",
         label: "Whisper Medium",
         blurb: "Higher quality Whisper, slower, 902 MB",
         size_label: "902 MB",
@@ -504,7 +499,6 @@ mod tests {
         let mut ids = Vec::new();
         for spec in CATALOG {
             assert!(!spec.id.is_empty());
-            assert!(!spec.chip.is_empty());
             assert!(spec.size_bytes > 0);
             assert!(spec.files.iter().any(|file| file.name.contains("tokens")));
             match spec.family {

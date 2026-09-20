@@ -1,42 +1,20 @@
+use super::envelope::{SpeechEnvelope, VIS_BARS};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use parking_lot::Mutex;
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 pub const TARGET_SAMPLE_RATE: u32 = 16000;
 pub const MAX_RECORDING_SECONDS: usize = 120;
-pub const VIS_BARS: usize = 26;
-const VIS_WINDOW: usize = VIS_BARS * 40;
 
 pub struct AudioRecorder {
     is_recording: Arc<AtomicBool>,
+    at_limit: Arc<AtomicBool>,
+    last_error: Arc<Mutex<Option<String>>>,
     buffer: Arc<Mutex<Vec<f32>>>,
     current_rms: Arc<Mutex<f32>>,
-    vis_ring: Arc<Mutex<VecDeque<f32>>>,
-    vis_peaks: Arc<Mutex<[f32; VIS_BARS]>>,
+    envelope: Arc<Mutex<SpeechEnvelope>>,
     _stream: cpal::Stream,
-}
-
-pub fn bin_peaks(samples: &[f32], bars: usize) -> Vec<f32> {
-    let mut out = vec![0.0f32; bars];
-    if samples.is_empty() || bars == 0 {
-        return out;
-    }
-    let chunk = (samples.len() / bars).max(1);
-    for (i, slot) in out.iter_mut().enumerate() {
-        let start = (i * chunk).min(samples.len());
-        let end = ((i + 1) * chunk).min(samples.len());
-        if start >= end {
-            break;
-        }
-        let mut peak = 0.0f32;
-        for &sample in &samples[start..end] {
-            peak = peak.max(sample.abs());
-        }
-        *slot = peak.min(1.0);
-    }
-    out
 }
 
 impl AudioRecorder {
@@ -53,42 +31,41 @@ impl AudioRecorder {
         let config: cpal::StreamConfig = supported_config.into();
 
         let is_recording = Arc::new(AtomicBool::new(false));
+        let at_limit = Arc::new(AtomicBool::new(false));
+        let last_error = Arc::new(Mutex::new(None));
         let buffer = Arc::new(Mutex::new(Vec::new()));
         let current_rms = Arc::new(Mutex::new(0.0f32));
-        let vis_ring = Arc::new(Mutex::new(VecDeque::with_capacity(VIS_WINDOW)));
-        let vis_peaks = Arc::new(Mutex::new([0.0f32; VIS_BARS]));
+        let envelope = Arc::new(Mutex::new(SpeechEnvelope::default()));
 
         let is_rec_clone = Arc::clone(&is_recording);
+        let at_limit_clone = Arc::clone(&at_limit);
         let buffer_clone = Arc::clone(&buffer);
         let rms_clone = Arc::clone(&current_rms);
-        let vis_ring_clone = Arc::clone(&vis_ring);
-        let vis_peaks_clone = Arc::clone(&vis_peaks);
+        let envelope_clone = Arc::clone(&envelope);
 
         let input_sample_rate = config.sample_rate.0;
         let channels = config.channels as usize;
-
-        let err_fn = |err| eprintln!("Audio stream error: {}", err);
 
         let stream = match sample_format {
             cpal::SampleFormat::F32 => device.build_input_stream(
                 &config,
                 move |data: &[f32], _: &_| {
                     if is_rec_clone.load(Ordering::Relaxed) {
-                        Self::process_samples_f32(
+                        if Self::process_samples_f32(
                             data,
                             channels,
                             input_sample_rate,
                             &buffer_clone,
                             &rms_clone,
-                            &vis_ring_clone,
-                            &vis_peaks_clone,
-                        );
+                            &envelope_clone,
+                        ) {
+                            at_limit_clone.store(true, Ordering::SeqCst);
+                        }
                     } else {
                         *rms_clone.lock() = 0.0;
-                        decay_vis(&vis_peaks_clone);
                     }
                 },
-                err_fn,
+                stream_error_callback(Arc::clone(&last_error), Arc::clone(&is_recording)),
                 None,
             ),
             cpal::SampleFormat::I16 => device.build_input_stream(
@@ -97,21 +74,21 @@ impl AudioRecorder {
                     if is_rec_clone.load(Ordering::Relaxed) {
                         let f32_data: Vec<f32> =
                             data.iter().map(|&s| s as f32 / i16::MAX as f32).collect();
-                        Self::process_samples_f32(
+                        if Self::process_samples_f32(
                             &f32_data,
                             channels,
                             input_sample_rate,
                             &buffer_clone,
                             &rms_clone,
-                            &vis_ring_clone,
-                            &vis_peaks_clone,
-                        );
+                            &envelope_clone,
+                        ) {
+                            at_limit_clone.store(true, Ordering::SeqCst);
+                        }
                     } else {
                         *rms_clone.lock() = 0.0;
-                        decay_vis(&vis_peaks_clone);
                     }
                 },
-                err_fn,
+                stream_error_callback(Arc::clone(&last_error), Arc::clone(&is_recording)),
                 None,
             ),
             _ => return Err("Unsupported audio sample format".to_string()),
@@ -124,10 +101,11 @@ impl AudioRecorder {
 
         Ok(Self {
             is_recording,
+            at_limit,
+            last_error,
             buffer,
             current_rms,
-            vis_ring,
-            vis_peaks,
+            envelope,
             _stream: stream,
         })
     }
@@ -138,11 +116,10 @@ impl AudioRecorder {
         sample_rate: u32,
         buffer: &Arc<Mutex<Vec<f32>>>,
         rms: &Arc<Mutex<f32>>,
-        vis_ring: &Arc<Mutex<VecDeque<f32>>>,
-        vis_peaks: &Arc<Mutex<[f32; VIS_BARS]>>,
-    ) {
+        envelope: &Arc<Mutex<SpeechEnvelope>>,
+    ) -> bool {
         if data.is_empty() {
-            return;
+            return false;
         }
 
         // Downmix to mono
@@ -156,6 +133,7 @@ impl AudioRecorder {
         let sum_squares: f32 = mono.iter().map(|&s| s * s).sum();
         let level = (sum_squares / mono.len() as f32).sqrt().min(1.0);
         *rms.lock() = level;
+        envelope.lock().push(&mono, sample_rate);
 
         // Resample to 16,000 Hz if necessary
         let resampled = if sample_rate != TARGET_SAMPLE_RATE && sample_rate > 0 {
@@ -164,31 +142,8 @@ impl AudioRecorder {
             mono
         };
 
-        {
-            let mut ring = vis_ring.lock();
-            ring.extend(resampled.iter().copied());
-            while ring.len() > VIS_WINDOW {
-                ring.pop_front();
-            }
-            let snapshot: Vec<f32> = ring.iter().copied().collect();
-            let binned = bin_peaks(&snapshot, VIS_BARS);
-            let mut peaks = vis_peaks.lock();
-            for (slot, value) in peaks.iter_mut().zip(binned) {
-                if value > *slot {
-                    *slot = *slot * 0.25 + value * 0.75;
-                } else {
-                    *slot = *slot * 0.80 + value * 0.20;
-                }
-            }
-        }
-
         let mut recorded = buffer.lock();
-        let room = MAX_RECORDING_SECONDS * TARGET_SAMPLE_RATE as usize;
-        if recorded.len() >= room {
-            return;
-        }
-        let take = (room - recorded.len()).min(resampled.len());
-        recorded.extend_from_slice(&resampled[..take]);
+        append_bounded(&mut recorded, &resampled, max_recording_samples())
     }
 
     fn resample_linear(input: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
@@ -216,16 +171,15 @@ impl AudioRecorder {
     pub fn start(&self) {
         self.buffer.lock().clear();
         *self.current_rms.lock() = 0.0;
-        self.vis_ring.lock().clear();
-        *self.vis_peaks.lock() = [0.0; VIS_BARS];
+        *self.envelope.lock() = SpeechEnvelope::default();
+        clear_session_signals(&self.last_error, &self.at_limit);
         self.is_recording.store(true, Ordering::SeqCst);
     }
 
     pub fn stop(&self) -> Vec<f32> {
         self.is_recording.store(false, Ordering::SeqCst);
         *self.current_rms.lock() = 0.0;
-        self.vis_ring.lock().clear();
-        *self.vis_peaks.lock() = [0.0; VIS_BARS];
+        *self.envelope.lock() = SpeechEnvelope::default();
         let mut buf = self.buffer.lock();
         std::mem::take(&mut *buf)
     }
@@ -240,17 +194,61 @@ impl AudioRecorder {
     }
 
     pub fn vis_peaks(&self) -> [f32; VIS_BARS] {
-        *self.vis_peaks.lock()
+        self.envelope.lock().bars()
+    }
+
+    pub fn take_error(&self) -> Option<String> {
+        take_pending_error(&self.last_error)
+    }
+
+    pub fn limit_reached(&self) -> bool {
+        self.at_limit.load(Ordering::Relaxed)
     }
 }
 
-fn decay_vis(vis_peaks: &Arc<Mutex<[f32; VIS_BARS]>>) {
-    let mut peaks = vis_peaks.lock();
-    for peak in peaks.iter_mut() {
-        *peak *= 0.55;
-        if *peak < 0.002 {
-            *peak = 0.0;
-        }
+fn max_recording_samples() -> usize {
+    MAX_RECORDING_SECONDS * TARGET_SAMPLE_RATE as usize
+}
+
+/// Appends samples until `capacity`. Returns true when the buffer is full.
+fn append_bounded(recorded: &mut Vec<f32>, samples: &[f32], capacity: usize) -> bool {
+    if recorded.len() >= capacity {
+        return true;
+    }
+    let take = (capacity - recorded.len()).min(samples.len());
+    recorded.extend_from_slice(&samples[..take]);
+    recorded.len() >= capacity
+}
+
+fn stream_error_message(err: impl std::fmt::Display) -> String {
+    format!("Microphone disconnected. Check the input device and try again. ({err})")
+}
+
+fn apply_stream_error(
+    last_error: &Mutex<Option<String>>,
+    is_recording: &AtomicBool,
+    err: impl std::fmt::Display,
+) {
+    *last_error.lock() = Some(stream_error_message(err));
+    is_recording.store(false, Ordering::SeqCst);
+}
+
+fn take_pending_error(last_error: &Mutex<Option<String>>) -> Option<String> {
+    last_error.lock().take()
+}
+
+fn clear_session_signals(last_error: &Mutex<Option<String>>, at_limit: &AtomicBool) {
+    *last_error.lock() = None;
+    at_limit.store(false, Ordering::SeqCst);
+}
+
+fn stream_error_callback(
+    last_error: Arc<Mutex<Option<String>>>,
+    is_recording: Arc<AtomicBool>,
+) -> impl FnMut(cpal::StreamError) + Send + 'static {
+    move |err| {
+        eprintln!("Audio stream error: {}", err);
+        apply_stream_error(&last_error, &is_recording, err);
     }
 }
 
@@ -259,21 +257,65 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bin_peaks_silence_is_flat() {
-        let peaks = bin_peaks(&[0.0; 260], VIS_BARS);
-        assert_eq!(peaks.len(), VIS_BARS);
-        assert!(peaks.iter().all(|&p| p == 0.0));
+    fn max_recording_samples_matches_120s_at_target_rate() {
+        assert_eq!(
+            max_recording_samples(),
+            MAX_RECORDING_SECONDS * TARGET_SAMPLE_RATE as usize
+        );
+        assert_eq!(max_recording_samples(), 120 * 16_000);
     }
 
     #[test]
-    fn bin_peaks_spike_lands_in_last_bar() {
-        let mut samples = vec![0.0f32; VIS_BARS * 4];
-        let last_start = (VIS_BARS - 1) * 4;
-        for sample in &mut samples[last_start..] {
-            *sample = 0.8;
-        }
-        let peaks = bin_peaks(&samples, VIS_BARS);
-        assert!(peaks[VIS_BARS - 1] > 0.7);
-        assert!(peaks[0] < 0.01);
+    fn append_bounded_signals_limit_and_drops_overflow() {
+        let mut recorded = Vec::new();
+        let capacity = 8;
+        assert!(!append_bounded(&mut recorded, &[0.1, 0.2, 0.3], capacity));
+        assert_eq!(recorded, vec![0.1, 0.2, 0.3]);
+
+        assert!(append_bounded(
+            &mut recorded,
+            &[0.4, 0.5, 0.6, 0.7, 0.8, 0.9],
+            capacity
+        ));
+        assert_eq!(recorded, vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]);
+
+        assert!(append_bounded(&mut recorded, &[1.0, 1.0], capacity));
+        assert_eq!(recorded.len(), capacity);
+        assert_eq!(recorded.last().copied(), Some(0.8));
+    }
+
+    #[test]
+    fn append_bounded_full_buffer_matches_120s_capacity() {
+        let capacity = max_recording_samples();
+        let mut recorded = vec![0.0f32; capacity - 4];
+        assert!(append_bounded(&mut recorded, &[0.5; 16], capacity));
+        assert_eq!(recorded.len(), capacity);
+        assert!(append_bounded(&mut recorded, &[0.9; 32], capacity));
+        assert_eq!(recorded.len(), capacity);
+    }
+
+    #[test]
+    fn stream_error_stops_recording_and_is_taken_once() {
+        let last_error = Mutex::new(None);
+        let is_recording = AtomicBool::new(true);
+
+        apply_stream_error(&last_error, &is_recording, "device unplugged");
+        assert!(!is_recording.load(Ordering::SeqCst));
+
+        let message = take_pending_error(&last_error).expect("stream error");
+        assert!(message.contains("Microphone disconnected"));
+        assert!(message.contains("Check the input device and try again"));
+        assert!(message.contains("device unplugged"));
+        assert!(take_pending_error(&last_error).is_none());
+    }
+
+    #[test]
+    fn start_reset_clears_pending_error_and_limit() {
+        let last_error = Mutex::new(Some("stale error".into()));
+        let at_limit = AtomicBool::new(true);
+
+        clear_session_signals(&last_error, &at_limit);
+        assert!(take_pending_error(&last_error).is_none());
+        assert!(!at_limit.load(Ordering::SeqCst));
     }
 }

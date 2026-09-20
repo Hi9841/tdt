@@ -21,7 +21,8 @@ use hotkey::{
     poll_capture_timeout, set_binding, tap_should_stop, HotkeyAction, HotkeyBinding, HotkeyListener,
 };
 use parking_lot::Mutex;
-use paste::PasteInjector;
+use paste::{DeliveryOutcome, PasteInjector};
+use std::cell::RefCell;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
@@ -44,10 +45,16 @@ enum InternalEvent {
     TranscribeSuccess {
         text: String,
         auto_pasted: bool,
+        notice: Option<String>,
         _duration_secs: f32,
         latency_ms: u64,
     },
     TranscribeError(String),
+    NoSpeech,
+    PrepareFailed {
+        session: u64,
+        message: String,
+    },
 }
 
 fn main() {
@@ -58,32 +65,40 @@ fn main() {
         show_error(&msg);
     }));
 
-    let _instance = match claim_instance() {
-        InstanceClaim::AlreadyRunning => return,
-        InstanceClaim::Owned(guard) => guard,
-        InstanceClaim::Failed(error) => {
-            append_log(&error);
-            show_error(&error);
-            return;
-        }
+    let _instance = if preview::is_active() {
+        None
+    } else {
+        Some(match claim_instance() {
+            InstanceClaim::AlreadyRunning => return,
+            InstanceClaim::Owned(guard) => guard,
+            InstanceClaim::Failed(error) => {
+                append_log(&error);
+                show_error(&error);
+                return;
+            }
+        })
     };
 
-    let config = AppConfig::load();
+    let config = if preview::is_active() {
+        AppConfig::default()
+    } else {
+        AppConfig::load()
+    };
     let auto_paste = config.auto_paste;
     let hotkey_binding = HotkeyBinding::parse(&config.hotkey).unwrap_or_default();
     set_binding(hotkey_binding);
     let hotkey_label = hotkey_binding.display();
 
     // 1. Initialize audio recorder
-    let recorder = match AudioRecorder::new() {
-        Ok(r) => Rc::new(r),
-        Err(e) => {
-            let msg = format!("Could not start the microphone: {e}");
-            append_log(&msg);
-            show_error(&msg);
-            return;
+    let (recorder, microphone_error) = if preview::is_active() {
+        (None, None)
+    } else {
+        match AudioRecorder::new() {
+            Ok(recorder) => (Some(recorder), None),
+            Err(error) => (None, Some(format!("Could not start the microphone. Connect a microphone and choose Retry microphone. {error}"))),
         }
     };
+    let recorder = Rc::new(RefCell::new(recorder));
 
     // 2. Initialize STT Engine
     let model_spec = models::resolve(&config.model_id);
@@ -120,25 +135,29 @@ fn main() {
     let injector = Arc::new(PasteInjector::new());
 
     // 4. Initialize hotkey hook
-    let (_hotkey_guard, hotkey_rx) = HotkeyListener::start();
+    let (_hotkey_guard, hotkey_rx) = if preview::is_active() {
+        (None, crossbeam_channel::never())
+    } else {
+        let (guard, rx) = HotkeyListener::start();
+        (Some(guard), rx)
+    };
 
     // 5. Launch GPUI application with floating bubble window
     let app = Application::new();
     let recorder_clone = Rc::clone(&recorder);
     let injector_clone = Arc::clone(&injector);
     let stt_clone = stt_engine.clone();
-    let initial_language = config.language.clone();
     let stt_for_view = stt_engine.clone();
 
     app.run(move |cx: &mut App| {
         // Windows requires the event loop to exist before creating the tray icon.
-        let tray = match SystemTray::new(auto_paste, &hotkey_label) {
+        let tray = if preview::is_active() { None } else { match SystemTray::new(auto_paste, &hotkey_label) {
             Ok(tray) => Some(tray),
             Err(error) => {
                 append_log(&format!("Failed to create system tray: {error}"));
                 None
             }
-        };
+        } };
 
         let window_options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(Bounds {
@@ -147,6 +166,8 @@ fn main() {
             })),
             titlebar: None,
             focus: false,
+            // GPUI only requests frames for windows it owns as visible. Showing
+            // a hidden HWND later through Win32 leaves the surface transparent.
             show: true,
             is_resizable: false,
             kind: WindowKind::PopUp,
@@ -173,25 +194,19 @@ fn main() {
         // Background thread to apply Win32 WS_EX_TOPMOST & WS_EX_NOACTIVATE & WS_EX_TOOLWINDOW
         #[cfg(target_os = "windows")]
         std::thread::spawn(move || {
-            use windows::Win32::UI::WindowsAndMessaging::{
-                GetWindowLongW, SetWindowLongW, GWL_EXSTYLE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-                WS_EX_TOPMOST,
-            };
-
-            std::thread::sleep(Duration::from_millis(300));
-
-            let Some(hwnd) = find_app_hwnd() else {
+            let mut overlay = None;
+            for _ in 0..60 {
+                overlay = find_app_hwnd();
+                if overlay.is_some() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let Some(hwnd) = overlay else {
                 return;
             };
 
-            unsafe {
-                let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE);
-                let _ = SetWindowLongW(
-                    hwnd,
-                    GWL_EXSTYLE,
-                    ex_style | (WS_EX_TOPMOST.0 | WS_EX_NOACTIVATE.0 | WS_EX_TOOLWINDOW.0) as i32,
-                );
-            }
+            ui::window_util::apply_overlay_window_style(hwnd);
 
             position_bubble_on_preferred_monitor(hwnd);
             follow_current_virtual_desktop();
@@ -212,6 +227,8 @@ fn main() {
                     let mut is_recording_state = false;
                     let mut is_processing_state = false;
                     let mut recording_before_press = false;
+                    let mut recording_session = 0u64;
+                    let mut limit_notice = false;
 
                     loop {
                         let poll_interval = if is_recording_state || is_processing_state {
@@ -238,6 +255,23 @@ fn main() {
                                 cx.notify();
                             });
                         }
+                        let _ = this.update(cx, |view, cx| {
+                            view.take_ready_model();
+                            if view.retry_microphone {
+                                view.retry_microphone = false;
+                                if !preview::is_active() && !is_recording_state && !is_processing_state {
+                                    match AudioRecorder::new() {
+                                        Ok(recorder) => {
+                                            *rec.borrow_mut() = Some(recorder);
+                                            view.status = HudStatus::Idle;
+                                            view.recovery_message = None;
+                                        }
+                                        Err(error) => view.set_error(format!("Could not open the microphone. Check Windows microphone access and try again. {error}")),
+                                    }
+                                }
+                                cx.notify();
+                            }
+                        });
 
                         // 1. Process Menu Events from tray. Drain every queued
                         // event so quick tray clicks are never dropped.
@@ -311,19 +345,6 @@ fn main() {
                             }
                         }
 
-                        // Helper closure to capture user's active editor window before recording
-                        let capture_fg = || {
-                            #[cfg(target_os = "windows")]
-                            {
-                                use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
-                                let fg = unsafe { GetForegroundWindow() };
-                                if fg.0 != 0 as _ {
-                                    return Some(fg.0 as isize);
-                                }
-                            }
-                            None
-                        };
-
                         // Helper closure to run transcription in background thread
                         let dispatch_transcribe = |samples: Vec<f32>,
                                                    stt_worker: SharedEngine,
@@ -339,26 +360,24 @@ fn main() {
                                     match engine.transcribe(&samples) {
                                         Ok(text) => {
                                             let latency_ms = start_t.elapsed().as_millis() as u64;
-                                            if !text.is_empty() {
+                                            if !text.trim().is_empty() {
                                                 let mut stats = AppStats::load();
                                                 stats.record_and_save(&text, duration_secs, latency_ms);
-
-                                                let paste_result = if should_paste {
-                                                    inj_worker.auto_paste(&text, target)
-                                                } else {
-                                                    inj_worker.copy_to_clipboard(&text)
-                                                };
-
-                                                if let Err(error) = paste_result {
-                                                    let _ = tx.send(InternalEvent::TranscribeError(
-                                                        format!("Transcribed and copied, but could not insert text: {error}"),
-                                                    ));
+                                            }
+                                            let (auto_pasted, notice) = match inj_worker.deliver(&text, should_paste, target) {
+                                                Ok(DeliveryOutcome::NoSpeech) => { let _ = tx.send(InternalEvent::NoSpeech); return; }
+                                                Ok(DeliveryOutcome::Copied) => (false, None),
+                                                Ok(DeliveryOutcome::Pasted) => (true, None),
+                                                Ok(DeliveryOutcome::CopiedFallback(_)) => (false, Some("Copied. Could not insert all text. Check the destination before pasting with Ctrl+V.".into())),
+                                                Err(error) => {
+                                                    let _ = tx.send(InternalEvent::TranscribeError(format!("Could not copy text. Open History to copy the saved transcript. {error}")));
                                                     return;
                                                 }
-                                            }
+                                            };
                                             let _ = tx.send(InternalEvent::TranscribeSuccess {
                                                 text,
-                                                auto_pasted: should_paste,
+                                                auto_pasted,
+                                                notice,
                                                 _duration_secs: duration_secs,
                                                 latency_ms,
                                             });
@@ -380,7 +399,21 @@ fn main() {
                         if preview::is_active() {
                             while hotkey_rx.try_recv().is_ok() {}
                         }
-                        while let Ok(action) = hotkey_rx.try_recv() {
+                        let mut actions: Vec<_> = hotkey_rx.try_iter().collect();
+                        let stream_error = rec.borrow().as_ref().and_then(AudioRecorder::take_error);
+                        if let Some(error) = stream_error {
+                            if let Some(recorder) = rec.borrow().as_ref() { recorder.stop(); }
+                            *rec.borrow_mut() = None;
+                            is_recording_state = false;
+                            let _ = this.update(cx, |view, cx| { view.set_error(error); cx.notify(); });
+                        }
+                        let at_limit = is_recording_state && rec.borrow().as_ref().is_some_and(AudioRecorder::limit_reached);
+                        let stop_requested = this.update(cx, |view, _| std::mem::take(&mut view.stop_requested)).unwrap_or(false);
+                        if is_recording_state && (at_limit || stop_requested) {
+                            limit_notice = at_limit;
+                            actions.insert(0, HotkeyAction::HoldReleased);
+                        }
+                        for action in actions {
                             if preview::is_active() {
                                 continue;
                             }
@@ -415,12 +448,34 @@ fn main() {
                                     // engine are single-session by design.
                                     if !is_recording_state && !is_processing_state {
                                         set_overlay_hidden(false);
-                                        *target_hwnd.lock() = capture_fg();
-                                        rec.start();
+                                        if stt.lock().is_none() {
+                                            let _ = this.update(cx, |view, cx| {
+                                                view.set_error("Download a speech model in Settings before recording.".into());
+                                                view.open_settings(cx);
+                                                cx.notify();
+                                            });
+                                            continue;
+                                        }
+                                        if rec.borrow().is_none() {
+                                            match AudioRecorder::new() {
+                                                Ok(recorder) => *rec.borrow_mut() = Some(recorder),
+                                                Err(error) => {
+                                                    let _ = this.update(cx, |view, cx| { view.set_error(format!("Could not open the microphone. Connect a microphone and retry. {error}")); cx.notify(); });
+                                                    continue;
+                                                }
+                                            }
+                                        }
+                                        *target_hwnd.lock() = ui::window_util::dictation_target_window();
+                                        let _ = this.update(cx, |view, cx| view.close_stats_settings(cx));
+                                        if let Some(recorder) = rec.borrow().as_ref() { recorder.start(); }
+                                        recording_session = recording_session.wrapping_add(1);
+                                        limit_notice = false;
                                         if let Some(engine) = stt.lock().clone() {
+                                            let tx = internal_tx.clone();
+                                            let session = recording_session;
                                             std::thread::spawn(move || {
                                                 if let Err(error) = engine.prepare() {
-                                                    eprintln!("Failed to prepare STT model: {error}");
+                                                    let _ = tx.send(InternalEvent::PrepareFailed { session, message: format!("Could not load the speech model. Choose another model in Settings. {error}") });
                                                 }
                                             });
                                         }
@@ -428,6 +483,7 @@ fn main() {
                                         is_recording_state = true;
                                         let started_at = Instant::now();
                                         let _ = this.update(cx, |view, cx| {
+                                            view.recovery_message = None;
                                             view.status = HudStatus::Listening {
                                                 audio_level: 0.0,
                                                 started_at,
@@ -450,7 +506,7 @@ fn main() {
                                     if should_stop && is_recording_state {
                                         is_recording_state = false;
                                         is_processing_state = true;
-                                        let samples = rec.stop();
+                                        let samples = rec.borrow().as_ref().map(AudioRecorder::stop).unwrap_or_default();
                                         play_sound(SoundEffect::StopListening);
                                         let _ = this.update(cx, |view, cx| {
                                             // Recording is over; drop the live
@@ -463,6 +519,7 @@ fn main() {
                                                 _ => Duration::from_secs(0),
                                             };
                                             view.status = HudStatus::Transcribing { recorded_for };
+                                            if limit_notice { view.recovery_message = Some("Recording stopped at the 2-minute limit. Transcribing the recorded audio.".into()); }
                                             cx.notify();
                                         });
 
@@ -481,15 +538,16 @@ fn main() {
 
                         // 3. Process background transcription results
                         while let Ok(event) = internal_rx.try_recv() {
-                            is_processing_state = false;
                             match event {
-                                InternalEvent::TranscribeSuccess { text, auto_pasted, latency_ms, .. } => {
+                                InternalEvent::TranscribeSuccess { text, auto_pasted, notice, latency_ms, .. } => {
+                                    is_processing_state = false;
                                     play_sound(SoundEffect::Success);
                                     let word_count = text.split_whitespace().count();
                                     println!("Transcription completed ({} words, latency: {}ms)", word_count, latency_ms);
                                     let finished_at = Instant::now();
                                     let _ = this.update(cx, |view, cx| {
                                         view.stats = AppStats::load();
+                                        if notice.is_some() { view.recovery_message = notice; }
                                         view.status = HudStatus::Success {
                                             text,
                                             auto_pasted,
@@ -499,24 +557,37 @@ fn main() {
                                     });
                                 }
                                 InternalEvent::TranscribeError(err) => {
+                                    is_processing_state = false;
                                     play_sound(SoundEffect::Error);
-                                    let occurred_at = Instant::now();
                                     let _ = this.update(cx, |view, cx| {
-                                        view.status = HudStatus::Error {
-                                            message: err,
-                                            occurred_at,
-                                        };
+                                        view.stats = AppStats::load();
+                                        view.set_error(err);
                                         cx.notify();
                                     });
+                                }
+                                InternalEvent::NoSpeech => {
+                                    is_processing_state = false;
+                                    let _ = this.update(cx, |view, cx| {
+                                        view.status = HudStatus::NoSpeech;
+                                        view.recovery_message = Some("No speech detected. Try again and check your microphone.".into());
+                                        cx.notify();
+                                    });
+                                }
+                                InternalEvent::PrepareFailed { session, message } => {
+                                    if session == recording_session && is_recording_state {
+                                        if let Some(recorder) = rec.borrow().as_ref() { recorder.stop(); }
+                                        is_recording_state = false;
+                                        let _ = this.update(cx, |view, cx| { view.set_error(message); cx.notify(); });
+                                    }
                                 }
                             }
                         }
 
                         // 4. Animation frame & audio level updates
-                        let current_level = if is_recording_state { rec.audio_level() } else { 0.0 };
+                        let current_level = if is_recording_state { rec.borrow().as_ref().map_or(0.0, AudioRecorder::audio_level) } else { 0.0 };
                         // Avoid locking the audio visualization buffer when it
                         // cannot be displayed.
-                        let vis_peaks = is_recording_state.then(|| rec.vis_peaks());
+                        let vis_peaks = if is_recording_state { rec.borrow().as_ref().map(AudioRecorder::vis_peaks) } else { None };
 
                         let _ = this.update(cx, |view, cx| {
                             if !preview::is_active() {
@@ -535,16 +606,10 @@ fn main() {
                                         cx.notify();
                                     } else {
                                         *audio_level = current_level;
-                                        for (slot, target) in view
-                                            .wave_peaks
-                                            .iter_mut()
-                                            .zip(vis_peaks.into_iter().flatten())
-                                        {
-                                            if target > *slot {
-                                                *slot += (target - *slot) * 0.58;
-                                            } else {
-                                                *slot += (target - *slot) * 0.24;
-                                            }
+                                        if let Some(peaks) = vis_peaks {
+                                            // Already smoothed in audio time. A second frame-based
+                                            // filter would smear syllables across historical bars.
+                                            view.wave_peaks = peaks;
                                         }
                                         cx.notify();
                                     }
@@ -561,15 +626,7 @@ fn main() {
                                         cx.notify();
                                     }
                                 }
-                                HudStatus::Error { occurred_at, .. } => {
-                                    if !preview::is_active()
-                                        && occurred_at.elapsed() > Duration::from_millis(2400)
-                                    {
-                                        view.status = HudStatus::Idle;
-                                        cx.notify();
-                                    }
-                                }
-                                HudStatus::Idle => {}
+                                HudStatus::Error { .. } | HudStatus::NoSpeech | HudStatus::Idle => {}
                             }
                         });
                     }
@@ -596,15 +653,17 @@ fn main() {
                     }
                 });
 
-                HudView::new(
+                let mut view = HudView::new(
                     auto_paste,
                     hotkey_label,
-                    initial_language,
                     stt_for_view,
                     auto_paste_view,
                     update_for_view,
                     update_ping_view,
-                )
+                    cx,
+                );
+                if let Some(error) = microphone_error { view.set_error(error); }
+                view
             })
         }) {
             Ok(_) => append_log("TDT window opened successfully."),

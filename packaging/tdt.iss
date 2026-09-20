@@ -3,7 +3,7 @@
 #define AppName "TDT"
 #define AppLongName "TDT - Talk Don't Type"
 #ifndef AppVersion
-  #define AppVersion "0.1.7"
+  #define AppVersion "0.1.8"
 #endif
 #define AppPublisher "Hi9841"
 #define AppURL "https://github.com/Hi9841/tdt"

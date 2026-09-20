@@ -5,39 +5,6 @@ use super::theme::{self, *};
 use crate::stt::models;
 use gpui::*;
 
-pub fn icon_glyph(mark: &'static str, color: Hsla) -> Div {
-    div()
-        .flex()
-        .items_center()
-        .justify_center()
-        .w(px(ICON))
-        .h(px(ICON))
-        .text_size(px(ICON))
-        .line_height(px(ICON))
-        .text_color(color)
-        .child(mark)
-}
-
-pub fn icon_button(id: &'static str, mark: &'static str) -> Stateful<Div> {
-    div()
-        .id(id)
-        .tab_index(0)
-        .flex()
-        .items_center()
-        .justify_center()
-        .w(h_icon())
-        .h(h_icon())
-        .rounded(r_chip())
-        .border_1()
-        .border_color(theme::transparent())
-        .text_color(muted())
-        .cursor_pointer()
-        .hover(|s| s.bg(hover()).text_color(text()))
-        .active(|s| s.opacity(0.88))
-        .focus(|s| s.border_color(focus_ring()))
-        .child(icon_glyph(mark, muted()))
-}
-
 pub fn ghost_button(id: &'static str, label: impl Into<SharedString>) -> Stateful<Div> {
     div()
         .id(id)
@@ -48,16 +15,30 @@ pub fn ghost_button(id: &'static str, label: impl Into<SharedString>) -> Statefu
         .h(h_btn())
         .px(px(10.0))
         .rounded(r_chip())
-        .border_1()
-        .border_color(theme::transparent())
         .text_size(px(TYPE_META))
+        .line_height(px(16.0))
         .font_weight(medium())
         .text_color(muted())
         .whitespace_nowrap()
         .cursor_pointer()
-        .hover(|s| s.bg(hover()).text_color(text()))
-        .active(|s| s.opacity(0.88))
-        .focus(|s| s.border_color(focus_ring()))
+        .hover(|s| {
+            s.bg(hover())
+                .text_color(text())
+                .text_size(px(TYPE_META))
+                .font_weight(medium())
+        })
+        .active(|s| {
+            s.bg(pressed())
+                .text_color(text())
+                .text_size(px(TYPE_META))
+                .font_weight(medium())
+        })
+        .focus(|s| {
+            s.bg(pressed())
+                .text_color(text())
+                .text_size(px(TYPE_META))
+                .font_weight(medium())
+        })
         .child(label.into())
 }
 
@@ -71,17 +52,16 @@ pub fn secondary_button(id: &'static str, label: impl Into<SharedString>) -> Sta
         .h(h_btn())
         .px(px(12.0))
         .rounded(r_chip())
-        .border_1()
-        .border_color(theme::transparent())
         .bg(well())
         .text_size(px(TYPE_META))
+        .line_height(px(16.0))
         .font_weight(medium())
         .text_color(text())
         .whitespace_nowrap()
         .cursor_pointer()
         .hover(|s| s.bg(hover()))
-        .active(|s| s.opacity(0.88))
-        .focus(|s| s.border_color(focus_ring()))
+        .active(|s| s.bg(pressed()))
+        .focus(|s| s.bg(pressed()))
         .child(label.into())
 }
 
@@ -95,17 +75,15 @@ pub fn primary_button(id: &'static str, label: impl Into<SharedString>) -> State
         .h(px(H_BTN_PRIMARY))
         .px(px(12.0))
         .rounded(r_chip())
-        .border_1()
-        .border_color(theme::transparent())
         .bg(rgb(ACCENT))
         .text_size(px(TYPE_META))
         .font_weight(semibold())
         .text_color(rgb(BG))
         .whitespace_nowrap()
         .cursor_pointer()
-        .hover(|s| s.opacity(0.92))
-        .active(|s| s.opacity(0.84))
-        .focus(|s| s.border_color(rgb(IRIS)))
+        .hover(|s| s.bg(rgb(PRIMARY_HOVER)))
+        .active(|s| s.bg(rgb(PRIMARY_ACTIVE)))
+        .focus(|s| s.bg(rgb(PRIMARY_HOVER)))
         .child(label.into())
 }
 
@@ -114,7 +92,7 @@ pub fn section_label(title: &'static str) -> Div {
         .px(px(2.0))
         .text_size(px(TYPE_META))
         .font_weight(semibold())
-        .text_color(iris())
+        .text_color(muted())
         .child(title)
 }
 
@@ -199,35 +177,35 @@ pub fn chip_row(chips: impl IntoIterator<Item = AnyElement>) -> AnyElement {
 }
 
 pub fn choice_chip(id: ElementId, label: impl Into<SharedString>, is_on: bool) -> Stateful<Div> {
+    let label = label.into();
     div()
         .id(id)
         .tab_index(0)
         .flex()
+        .flex_col()
         .flex_1()
         .items_center()
         .justify_center()
+        .gap(px(2.0))
         .h(h_ctrl())
         .px(px(8.0))
         .min_w(px(0.0))
         .rounded(r_chip())
-        .border_1()
-        .border_color(theme::transparent())
-        .bg(if is_on { selected() } else { well() })
+        .bg(theme::transparent())
         .text_size(px(TYPE_DESC))
-        .font_weight(if is_on { medium() } else { FontWeight::NORMAL })
-        .text_color(if is_on { accent() } else { muted() })
+        .font_weight(FontWeight::NORMAL)
+        .text_color(muted())
         .whitespace_nowrap()
         .cursor_pointer()
-        .hover(|s| {
-            if is_on {
-                s
-            } else {
-                s.bg(hover()).text_color(text())
-            }
-        })
-        .active(|s| s.opacity(0.9))
-        .focus(|s| s.border_color(focus_ring()))
-        .child(label.into())
+        .hover(|s| s.opacity(0.88))
+        .active(|s| s.opacity(0.66))
+        .focus(|s| s)
+        .child(label)
+        .child(div().w(px(18.0)).h(px(2.0)).rounded_full().bg(if is_on {
+            accent()
+        } else {
+            theme::transparent()
+        }))
 }
 
 pub fn chip_well(rows: impl IntoIterator<Item = AnyElement>) -> Div {
@@ -249,13 +227,13 @@ pub fn progress_bar(done: u64, total: u64) -> AnyElement {
         .w_full()
         .h(px(METER_H))
         .rounded_full()
-        .bg(rgba(0xffffff12))
+        .bg(well())
         .overflow_hidden()
         .child(
             div()
                 .h_full()
                 .rounded_full()
-                .bg(accent())
+                .bg(foam())
                 .w(relative(fraction.max(0.02))),
         )
         .into_any_element()
@@ -266,14 +244,13 @@ pub fn keycap(label: impl Into<SharedString>) -> Div {
         .flex()
         .items_center()
         .justify_center()
-        .h(px(22.0))
-        .px(px(6.0))
-        .rounded(px(6.0))
-        .bg(rgba(0xffffff12))
-        .text_size(px(10.0))
+        .h(px(24.0))
+        .px(px(2.0))
+        .text_size(px(TYPE_META))
+        .line_height(px(16.0))
         .font_family("Consolas")
         .font_weight(medium())
-        .text_color(foam())
+        .text_color(text())
         .whitespace_nowrap()
         .child(label.into())
 }
@@ -284,7 +261,8 @@ pub fn shortcut_keys(hotkey: &str) -> AnyElement {
         if i > 0 {
             parts.push(
                 div()
-                    .text_size(px(10.0))
+                    .text_size(px(TYPE_META))
+                    .line_height(px(16.0))
                     .text_color(muted())
                     .child("+")
                     .into_any_element(),
@@ -296,6 +274,8 @@ pub fn shortcut_keys(hotkey: &str) -> AnyElement {
         .flex()
         .items_center()
         .gap(px(4.0))
+        .h(px(24.0))
+        .px(px(2.0))
         .children(parts)
         .into_any_element()
 }
@@ -311,11 +291,9 @@ pub fn toggle_hit(id: &'static str, track: Div) -> Stateful<Div> {
         .min_h(px(44.0))
         .cursor_pointer()
         .rounded(r_chip())
-        .border_1()
-        .border_color(theme::transparent())
-        .hover(|s| s.bg(hover()))
-        .focus(|s| s.border_color(focus_ring()))
-        .active(|s| s.opacity(0.9))
+        .hover(|s| s.opacity(0.88))
+        .focus(|s| s.opacity(0.78))
+        .active(|s| s.opacity(0.72))
         .child(track)
 }
 
@@ -327,7 +305,7 @@ pub fn toggle_track(on: bool, knob: AnyElement) -> Div {
         .w(px(TOGGLE_W))
         .h(px(TOGGLE_H))
         .rounded_full()
-        .bg(if on { accent() } else { track_off() })
+        .bg(if on { toggle_on() } else { track_off() })
         .overflow_hidden()
         .child(knob)
 }
@@ -337,7 +315,7 @@ pub fn toggle_knob() -> Div {
         .w(px(TOGGLE_KNOB))
         .h(px(TOGGLE_KNOB))
         .rounded_full()
-        .bg(rgb(TEXT))
+        .bg(rgb(BG))
 }
 
 pub fn stat_block(label: &'static str, value: impl Into<SharedString>) -> Div {
@@ -375,7 +353,7 @@ pub fn download_copy(
     let pct = models::percent(done, total);
     match file {
         Some(name) if file_count > 1 => format!(
-            "{}% · {} of {} · {} · {} of {}",
+            "{}% - {} of {} - {} - {} of {}",
             pct,
             file_index,
             file_count,
@@ -384,7 +362,7 @@ pub fn download_copy(
             models::format_mb(total)
         ),
         _ => format!(
-            "{}% · {} of {}",
+            "{}% - {} of {}",
             pct,
             models::format_mb(done),
             models::format_mb(total)
