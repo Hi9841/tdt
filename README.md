@@ -1,5 +1,9 @@
 # TDT (Talk Don't Type)
 
+
+https://github.com/user-attachments/assets/8bb3021b-f878-4d41-9b1d-32040b7e1897
+
+
 TDT is an offline speech-to-text app for Windows and Android. Audio is
 processed locally with Sherpa-ONNX and recognized text is copied to
 the system clipboard. The default model is SenseVoice Small. Settings can
