@@ -15,6 +15,8 @@ packaging/tdt-setup/target/
 models/sensevoice/*.onnx
 models/sensevoice/tokens.txt
 models/**/*.download
+models/moonshine-medium-streaming/
+models/parakeet-unified-en-0.6b-q8/
 models/whisper-small/
 models/whisper-medium/
 

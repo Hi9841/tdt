@@ -1,9 +1,9 @@
 # Download Sherpa-ONNX speech models used by TDT.
-# Default keeps the bundled SenseVoice Small layout at models/sensevoice.
+# Default is the recommended Parakeet Q8 layout at models/parakeet-unified-en-0.6b-q8.
 [CmdletBinding()]
 param(
-    [ValidateSet("sensevoice-small", "sensevoice-full", "whisper-small", "whisper-medium", "all")]
-    [string]$Model = "sensevoice-small",
+    [ValidateSet("moonshine-medium-streaming", "sensevoice-full", "parakeet-unified-en-0.6b-q8", "whisper-medium", "all")]
+    [string]$Model = "parakeet-unified-en-0.6b-q8",
     [string]$ModelsRoot = ""
 )
 
@@ -18,15 +18,16 @@ if (-not $ModelsRoot) {
     }
 }
 $Catalog = @{
-    "sensevoice-small" = @{
-        Label = "SenseVoice Small"
-        Repo = "csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17"
-        Dir = "sensevoice"
+    "moonshine-medium-streaming" = @{
+        Label = "Moonshine Medium"
+        Repo = "csukuangfj/sherpa-onnx-moonshine-base-en-int8"
+        Dir = "moonshine-medium-streaming"
         Files = @(
-            @{ Name = "tokens.txt"; Sha256 = "F449EB28DC567533D7FA59BE34E2ABCA8784F771850C78A47FB731A31429A1DC" },
-            @{ Name = "model.int8.onnx"; Sha256 = "C71F0CE00BEC95B07744E116345E33D8CBBE08CEF896382CF907BF4B51A2CD51" },
-            @{ Name = "LICENSE"; Sha256 = $null },
-            @{ Name = "README.md"; Sha256 = $null }
+            @{ Name = "preprocess.onnx"; Sha256 = "FFA630D395C5CCF76F5D4954BE5B882DF76AAF6491519EC01FD82EA7A3819FB2" },
+            @{ Name = "encode.int8.onnx"; Sha256 = "7E38770F776F2E5583A53B052936005DF2BA5C833D7E09C2A5FD796B94BF73E2" },
+            @{ Name = "uncached_decode.int8.onnx"; Sha256 = "C01F4B35093BCAC20D352D23A75A539E772964579F9D024A90E5E6F09CAE9987" },
+            @{ Name = "cached_decode.int8.onnx"; Sha256 = "2DB74E51CEDF64A8B1BE3C8192E0BB5E4923AF0E90BD9E87F8E8771873F8EA03" },
+            @{ Name = "tokens.txt"; Sha256 = $null }
         )
     }
     "sensevoice-full" = @{
@@ -40,14 +41,15 @@ $Catalog = @{
             @{ Name = "README.md"; Sha256 = $null }
         )
     }
-    "whisper-small" = @{
-        Label = "Whisper Small"
-        Repo = "csukuangfj/sherpa-onnx-whisper-small"
-        Dir = "whisper-small"
+    "parakeet-unified-en-0.6b-q8" = @{
+        Label = "Parakeet Q8"
+        Repo = "csukuangfj2/sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-streaming-1120ms"
+        Dir = "parakeet-unified-en-0.6b-q8"
         Files = @(
-            @{ Name = "small-encoder.int8.onnx"; Sha256 = "4CBE7B22FA9026B843B60A68640C747DE05BAFB1A11B57EDC0E66C232D9F33A9" },
-            @{ Name = "small-decoder.int8.onnx"; Sha256 = "ACAD50B5C782696E91B55914CC5AB4F756F1532F76E22AA6FC615F39FB69A8EE" },
-            @{ Name = "small-tokens.txt"; Sha256 = "B34B360DBB493E781E479794586D661700670D65564001F23024971D1F2FA126" }
+            @{ Name = "encoder.int8.onnx"; Sha256 = "1C03F1192DE41771384AF22972CA10203613BA56197A024F275B86727CD35911" },
+            @{ Name = "decoder.int8.onnx"; Sha256 = "34FEA72425D2506600772BA191A6D3F99C0710ABDB68D9A3DC89FA8CB2AA473A" },
+            @{ Name = "joiner.int8.onnx"; Sha256 = "869F43F7D24595C55581AD3BF249A935FB8A71389FBDAA7504B9F46F93140F8A" },
+            @{ Name = "tokens.txt"; Sha256 = $null }
         )
     }
     "whisper-medium" = @{
@@ -92,7 +94,7 @@ function Install-TdtModel([string]$Id) {
 }
 
 $ids = if ($Model -eq "all") {
-    @("sensevoice-small", "sensevoice-full", "whisper-small", "whisper-medium")
+    @("moonshine-medium-streaming", "sensevoice-full", "parakeet-unified-en-0.6b-q8", "whisper-medium")
 } else {
     @($Model)
 }
