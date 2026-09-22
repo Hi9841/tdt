@@ -27,7 +27,7 @@ $Catalog = @{
             @{ Name = "encode.int8.onnx"; Sha256 = "7E38770F776F2E5583A53B052936005DF2BA5C833D7E09C2A5FD796B94BF73E2" },
             @{ Name = "uncached_decode.int8.onnx"; Sha256 = "C01F4B35093BCAC20D352D23A75A539E772964579F9D024A90E5E6F09CAE9987" },
             @{ Name = "cached_decode.int8.onnx"; Sha256 = "2DB74E51CEDF64A8B1BE3C8192E0BB5E4923AF0E90BD9E87F8E8771873F8EA03" },
-            @{ Name = "tokens.txt"; Sha256 = $null }
+            @{ Name = "tokens.txt"; Sha256 = "1165C2AEB9F72F457A83BE2D459A09054F27490ACD9B41BD43794DFD25E296EA" }
         )
     }
     "sensevoice-full" = @{
@@ -49,7 +49,7 @@ $Catalog = @{
             @{ Name = "encoder.int8.onnx"; Sha256 = "1C03F1192DE41771384AF22972CA10203613BA56197A024F275B86727CD35911" },
             @{ Name = "decoder.int8.onnx"; Sha256 = "34FEA72425D2506600772BA191A6D3F99C0710ABDB68D9A3DC89FA8CB2AA473A" },
             @{ Name = "joiner.int8.onnx"; Sha256 = "869F43F7D24595C55581AD3BF249A935FB8A71389FBDAA7504B9F46F93140F8A" },
-            @{ Name = "tokens.txt"; Sha256 = $null }
+            @{ Name = "tokens.txt"; Sha256 = "DC0B4584AB2E4DDBF888425C076C61B736E7356A015250DB7D307E6F1A8188FF" }
         )
     }
     "whisper-medium" = @{

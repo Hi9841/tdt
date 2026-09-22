@@ -39,6 +39,7 @@ if (-not (Test-Path $StubExe)) {
 }
 
 if (Test-Path $Stage) { Remove-Item $Stage -Recurse -Force }
+if (Test-Path $Dist) { Remove-Item $Dist -Recurse -Force }
 New-Item -ItemType Directory -Path $Stage -Force | Out-Null
 New-Item -ItemType Directory -Path $Dist -Force | Out-Null
 
