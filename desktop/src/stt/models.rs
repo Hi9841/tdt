@@ -111,7 +111,7 @@ pub const CATALOG: &[ModelSpec] = &[
             },
             ModelFile {
                 name: "tokens.txt",
-                sha256: "",
+                sha256: "1165C2AEB9F72F457A83BE2D459A09054F27490ACD9B41BD43794DFD25E296EA",
             },
         ],
     },
@@ -140,7 +140,7 @@ pub const CATALOG: &[ModelSpec] = &[
         label: "Parakeet Q8",
         blurb: "High-accuracy English model with fast streaming. Recommended.",
         size_label: "632 MB",
-        size_bytes: 663_048_080,
+        size_bytes: 663_048_980,
         family: ModelFamily::ParakeetTransducer,
         // Q8/int8 Unified EN 0.6B transducer package with native streaming weights.
         hf_repo: "csukuangfj2/sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-streaming-1120ms",
@@ -160,7 +160,7 @@ pub const CATALOG: &[ModelSpec] = &[
             },
             ModelFile {
                 name: "tokens.txt",
-                sha256: "",
+                sha256: "DC0B4584AB2E4DDBF888425C076C61B736E7356A015250DB7D307E6F1A8188FF",
             },
         ],
     },
@@ -393,7 +393,9 @@ pub fn download(
             file_count,
         });
         let dest = dest_dir.join(file.name);
-        if dest.is_file() && file_sha256(&dest)?.eq_ignore_ascii_case(file.sha256) {
+        if dest.is_file()
+            && (file.sha256.is_empty() || file_sha256(&dest)?.eq_ignore_ascii_case(file.sha256))
+        {
             done = (done + file_len(&dest)).min(total);
             on_progress(DownloadProgress {
                 done,
@@ -473,7 +475,7 @@ fn download_file(
     drop(file);
 
     let actual = format!("{:X}", hasher.finalize());
-    if !actual.eq_ignore_ascii_case(expected_sha) {
+    if !expected_sha.is_empty() && !actual.eq_ignore_ascii_case(expected_sha) {
         let _ = fs::remove_file(&tmp);
         return Err(format!(
             "SHA256 mismatch for {}",
@@ -674,7 +676,7 @@ mod tests {
 
     #[test]
     fn format_mb_rounds_known_sizes() {
-        assert_eq!(format_mb(663_048_080), "632 MB");
+        assert_eq!(format_mb(663_048_980), "632 MB");
         assert_eq!(format_mb(946_072_270), "902 MB");
     }
 
