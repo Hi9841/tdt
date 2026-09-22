@@ -6,8 +6,8 @@ https://github.com/user-attachments/assets/8bb3021b-f878-4d41-9b1d-32040b7e1897
 
 TDT is an offline speech-to-text app for Windows and Android. Audio is
 processed locally with Sherpa-ONNX and recognized text is copied to
-the system clipboard. The default model is SenseVoice Small. Settings can
-switch to SenseVoice Full, Whisper Small, or Whisper Medium. Extra models
+the system clipboard. The default model is Parakeet Q8. Settings can
+switch to Moonshine Medium, SenseVoice Full, or Whisper Medium. Extra models
 download on demand and stay on disk. The selected model is loaded while you
 talk and released after each transcription, so idle memory stays low.
 
@@ -24,7 +24,7 @@ That writes:
 
 - `dist/TDT.exe` slim app binary used by in-app updates
 - `dist/TDT-Setup.exe` per-user installer (app only, no speech model)
-- `dist/TDT-0.1.9-windows-x64.zip` portable copy (app only, no speech model)
+- `dist/TDT-0.2.0-windows-x64.zip` portable copy (app only, no speech model)
 - `dist/SHA256SUMS.txt`
 
 The installer copies TDT and the license files into `%LOCALAPPDATA%\TDT`,
@@ -50,12 +50,12 @@ Settings by clicking the shortcut chip, then press the new combo. The tray
 menu controls auto-paste. Auto-paste writes the result to the clipboard and
 injects Unicode text directly into the previously focused application.
 
-In Settings, pick Small, Full, Whisper, or Medium. Missing models show
-Download model. Whisper Medium is about 902 MB. To fetch one from a
-terminal:
+In Settings, pick Moonshine Medium, SenseVoice Full, Parakeet Q8, or Whisper
+Medium. Missing models show Download model. Parakeet Q8 is about 632 MB. To
+fetch one from a terminal:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\models\download-models.ps1 -Model whisper-medium
+powershell -ExecutionPolicy Bypass -File .\models\download-models.ps1 -Model parakeet-unified-en-0.6b-q8
 ```
 
 ```powershell
@@ -97,8 +97,8 @@ Grant microphone, notification, and overlay permissions when prompted.
 - `desktop/`: Rust + GPUI Windows app with global `Ctrl + ;` tap or hold-to-talk.
 - `mobile/`: Kotlin Multiplatform Android app with push-to-talk and an optional
   floating overlay bubble.
-- `models/`: downloader for SenseVoice and Whisper models used by desktop.
-  Android still bundles SenseVoice Small.
+- `models/`: downloader for Moonshine, SenseVoice, Parakeet Q8, and Whisper
+  models used by desktop. Android still bundles SenseVoice Small.
 - `packaging/`: Windows installer stub and build script.
 - `THIRD_PARTY_NOTICES.md`: upstream license and attribution information.
 

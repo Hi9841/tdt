@@ -10,6 +10,8 @@ const HF_BASE: &str = "https://huggingface.co";
 pub enum ModelFamily {
     SenseVoice,
     Whisper,
+    ParakeetTransducer,
+    Moonshine,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -60,33 +62,63 @@ pub struct DownloadProgress {
     pub file_count: usize,
 }
 
-pub const DEFAULT_MODEL_ID: &str = "sensevoice-small";
+/// Recommended default: high-accuracy English Parakeet transducer (int8).
+pub const DEFAULT_MODEL_ID: &str = "parakeet-unified-en-0.6b-q8";
+
+/// Previous default, kept so existing `config.json` files migrate cleanly.
+#[allow(dead_code)]
+pub const LEGACY_DEFAULT_MODEL_ID: &str = "sensevoice-small";
+
+/// Retired ids kept for migration only; they resolve to a supported model.
+fn migrated_id(id: &str) -> &'static str {
+    match id.trim() {
+        // Retired Whisper Small slot is now Parakeet Q8.
+        "whisper-small" => DEFAULT_MODEL_ID,
+        // Retired SenseVoice Small slot is now Moonshine Medium Streaming.
+        "sensevoice-small" => "moonshine-medium-streaming",
+        _ => DEFAULT_MODEL_ID,
+    }
+}
 
 pub const CATALOG: &[ModelSpec] = &[
     ModelSpec {
-        id: DEFAULT_MODEL_ID,
-        label: "SenseVoice Small",
-        blurb: "Fast multilingual, loaded while you talk",
-        size_label: "228 MB",
-        size_bytes: 239_549_735,
-        family: ModelFamily::SenseVoice,
-        hf_repo: "csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17",
-        dir_name: "sensevoice",
+        id: "moonshine-medium-streaming",
+        label: "Moonshine Medium",
+        blurb: "Lightweight English model with native streaming and low latency.",
+        size_label: "274 MB",
+        size_bytes: 286_929_760,
+        family: ModelFamily::Moonshine,
+        // Upstream publishes this lightweight native-streaming package as
+        // base-en int8 (Moonshine v1); no medium-en-int8 package exists.
+        hf_repo: "csukuangfj/sherpa-onnx-moonshine-base-en-int8",
+        dir_name: "moonshine-medium-streaming",
         files: &[
             ModelFile {
-                name: "model.int8.onnx",
-                sha256: "C71F0CE00BEC95B07744E116345E33D8CBBE08CEF896382CF907BF4B51A2CD51",
+                name: "preprocess.onnx",
+                sha256: "FFA630D395C5CCF76F5D4954BE5B882DF76AAF6491519EC01FD82EA7A3819FB2",
+            },
+            ModelFile {
+                name: "encode.int8.onnx",
+                sha256: "7E38770F776F2E5583A53B052936005DF2BA5C833D7E09C2A5FD796B94BF73E2",
+            },
+            ModelFile {
+                name: "uncached_decode.int8.onnx",
+                sha256: "C01F4B35093BCAC20D352D23A75A539E772964579F9D024A90E5E6F09CAE9987",
+            },
+            ModelFile {
+                name: "cached_decode.int8.onnx",
+                sha256: "2DB74E51CEDF64A8B1BE3C8192E0BB5E4923AF0E90BD9E87F8E8771873F8EA03",
             },
             ModelFile {
                 name: "tokens.txt",
-                sha256: "F449EB28DC567533D7FA59BE34E2ABCA8784F771850C78A47FB731A31429A1DC",
+                sha256: "",
             },
         ],
     },
     ModelSpec {
         id: "sensevoice-full",
         label: "SenseVoice Full",
-        blurb: "Same languages, higher quality, slower",
+        blurb: "Fast local transcription with low resource usage.",
         size_label: "894 MB",
         size_bytes: 937_933_072,
         family: ModelFamily::SenseVoice,
@@ -104,33 +136,38 @@ pub const CATALOG: &[ModelSpec] = &[
         ],
     },
     ModelSpec {
-        id: "whisper-small",
-        label: "Whisper Small",
-        blurb: "Many languages, loaded while you talk",
-        size_label: "358 MB",
-        size_bytes: 375_485_327,
-        family: ModelFamily::Whisper,
-        hf_repo: "csukuangfj/sherpa-onnx-whisper-small",
-        dir_name: "whisper-small",
+        id: DEFAULT_MODEL_ID,
+        label: "Parakeet Q8",
+        blurb: "High-accuracy English model with fast streaming. Recommended.",
+        size_label: "632 MB",
+        size_bytes: 663_048_080,
+        family: ModelFamily::ParakeetTransducer,
+        // Q8/int8 Unified EN 0.6B transducer package with native streaming weights.
+        hf_repo: "csukuangfj2/sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-streaming-1120ms",
+        dir_name: "parakeet-unified-en-0.6b-q8",
         files: &[
             ModelFile {
-                name: "small-encoder.int8.onnx",
-                sha256: "4CBE7B22FA9026B843B60A68640C747DE05BAFB1A11B57EDC0E66C232D9F33A9",
+                name: "encoder.int8.onnx",
+                sha256: "1C03F1192DE41771384AF22972CA10203613BA56197A024F275B86727CD35911",
             },
             ModelFile {
-                name: "small-decoder.int8.onnx",
-                sha256: "ACAD50B5C782696E91B55914CC5AB4F756F1532F76E22AA6FC615F39FB69A8EE",
+                name: "decoder.int8.onnx",
+                sha256: "34FEA72425D2506600772BA191A6D3F99C0710ABDB68D9A3DC89FA8CB2AA473A",
             },
             ModelFile {
-                name: "small-tokens.txt",
-                sha256: "B34B360DBB493E781E479794586D661700670D65564001F23024971D1F2FA126",
+                name: "joiner.int8.onnx",
+                sha256: "869F43F7D24595C55581AD3BF249A935FB8A71389FBDAA7504B9F46F93140F8A",
+            },
+            ModelFile {
+                name: "tokens.txt",
+                sha256: "",
             },
         ],
     },
     ModelSpec {
         id: "whisper-medium",
         label: "Whisper Medium",
-        blurb: "Higher quality Whisper, slower, 902 MB",
+        blurb: "Heavyweight Whisper model for maximum compatibility.",
         size_label: "902 MB",
         size_bytes: 946_072_270,
         family: ModelFamily::Whisper,
@@ -153,14 +190,17 @@ pub const CATALOG: &[ModelSpec] = &[
     },
 ];
 
-pub const DEFAULT: &ModelSpec = &CATALOG[0];
+pub const DEFAULT: &ModelSpec = &CATALOG[2];
 
 pub fn by_id(id: &str) -> Option<&'static ModelSpec> {
-    CATALOG.iter().find(|spec| spec.id == id)
+    CATALOG.iter().find(|spec| spec.id == id.trim())
 }
 
 pub fn resolve(id: &str) -> &'static ModelSpec {
-    by_id(id).unwrap_or(DEFAULT)
+    if let Some(spec) = by_id(id) {
+        return spec;
+    }
+    by_id(migrated_id(id)).unwrap_or(DEFAULT)
 }
 
 impl ModelSpec {
@@ -209,6 +249,46 @@ impl ModelSpec {
             .find(|file| file.name.contains("decoder"))
             .map(|file| file.name)
             .unwrap_or("decoder.onnx");
+        dir.join(name)
+    }
+
+    pub fn transducer_part(&self, dir: &Path, kind: &str) -> PathBuf {
+        let name = self
+            .files
+            .iter()
+            .find(|file| file.name.starts_with(kind))
+            .map(|file| file.name)
+            .unwrap_or(match kind {
+                "encoder" => "encoder.int8.onnx",
+                "decoder" => "decoder.int8.onnx",
+                _ => "joiner.int8.onnx",
+            });
+        dir.join(name)
+    }
+
+    pub fn moonshine_preprocessor(&self, dir: &Path) -> PathBuf {
+        self.named_file(dir, "preprocess", "preprocess.onnx")
+    }
+
+    pub fn moonshine_encoder(&self, dir: &Path) -> PathBuf {
+        self.named_file(dir, "encode", "encode.int8.onnx")
+    }
+
+    pub fn moonshine_uncached_decoder(&self, dir: &Path) -> PathBuf {
+        self.named_file(dir, "uncached_decode", "uncached_decode.int8.onnx")
+    }
+
+    pub fn moonshine_cached_decoder(&self, dir: &Path) -> PathBuf {
+        self.named_file(dir, "cached_decode", "cached_decode.int8.onnx")
+    }
+
+    fn named_file(&self, dir: &Path, prefix: &str, fallback: &str) -> PathBuf {
+        let name = self
+            .files
+            .iter()
+            .find(|file| file.name.starts_with(prefix))
+            .map(|file| file.name)
+            .unwrap_or(fallback);
         dir.join(name)
     }
 
@@ -509,15 +589,60 @@ mod tests {
                     assert!(spec.files.iter().any(|file| file.name.contains("encoder")));
                     assert!(spec.files.iter().any(|file| file.name.contains("decoder")));
                 }
+                ModelFamily::ParakeetTransducer => {
+                    for part in ["encoder", "decoder", "joiner"] {
+                        assert!(
+                            spec.files.iter().any(|file| file.name.starts_with(part)),
+                            "parakeet {part} missing",
+                        );
+                    }
+                }
+                ModelFamily::Moonshine => {
+                    for part in ["preprocess", "encode", "uncached_decode", "cached_decode"] {
+                        assert!(
+                            spec.files.iter().any(|file| file.name.starts_with(part)),
+                            "moonshine {part} missing",
+                        );
+                    }
+                }
             }
             assert!(!ids.contains(&spec.id), "duplicate model id {}", spec.id);
             ids.push(spec.id);
         }
         assert!(ids.contains(&DEFAULT_MODEL_ID));
+        assert_eq!(
+            CATALOG.len(),
+            4,
+            "catalog keeps exactly Moonshine, SenseVoice Full, Parakeet Q8, Whisper Medium",
+        );
+        assert_eq!(
+            by_id(DEFAULT_MODEL_ID).map(|spec| spec.id),
+            Some(DEFAULT_MODEL_ID)
+        );
     }
 
     #[test]
-    fn unknown_id_falls_back_to_sensevoice_small() {
+    fn default_is_parakeet_q8_with_expected_labels() {
+        assert_eq!(resolve("").id, DEFAULT_MODEL_ID);
+        assert_eq!(
+            CATALOG.iter().map(|spec| spec.label).collect::<Vec<_>>(),
+            vec![
+                "Moonshine Medium",
+                "SenseVoice Full",
+                "Parakeet Q8",
+                "Whisper Medium"
+            ]
+        );
+    }
+
+    #[test]
+    fn retired_ids_migrate_to_supported_models() {
+        assert_eq!(resolve("whisper-small").id, DEFAULT_MODEL_ID);
+        assert_eq!(resolve("sensevoice-small").id, "moonshine-medium-streaming");
+    }
+
+    #[test]
+    fn unknown_id_falls_back_to_parakeet_q8() {
         assert_eq!(resolve("nope").id, DEFAULT_MODEL_ID);
         assert_eq!(
             by_id(DEFAULT_MODEL_ID).map(|spec| spec.id),
@@ -535,7 +660,8 @@ mod tests {
 
     #[test]
     fn install_check_requires_every_catalog_file() {
-        let spec: &ModelSpec = by_id("whisper-small").expect("whisper-small is in the catalog");
+        let spec: &ModelSpec =
+            by_id(DEFAULT_MODEL_ID).expect("parakeet q8 default is in the catalog");
         let dir = unique_dir("install");
         fs::create_dir_all(&dir).expect("temp dir");
         assert!(!spec.is_installed_in(&dir));
@@ -548,7 +674,7 @@ mod tests {
 
     #[test]
     fn format_mb_rounds_known_sizes() {
-        assert_eq!(format_mb(239_549_735), "228 MB");
+        assert_eq!(format_mb(663_048_080), "632 MB");
         assert_eq!(format_mb(946_072_270), "902 MB");
     }
 

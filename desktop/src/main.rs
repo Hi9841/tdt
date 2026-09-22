@@ -82,11 +82,17 @@ fn main() {
         autostart::refresh_if_enabled();
     }
 
-    let config = if preview::is_active() {
+    let mut config = if preview::is_active() {
         AppConfig::default()
     } else {
         AppConfig::load()
     };
+    // Persist the exact resolved internal model id so app restarts reopen the
+    // same STT backend (and migrate retired ids forward).
+    config.model_id = models::resolve(&config.model_id).id.to_string();
+    if !preview::is_active() {
+        let _ = config.save();
+    }
     let auto_paste = config.auto_paste;
     let hotkey_binding = HotkeyBinding::parse(&config.hotkey).unwrap_or_default();
     set_binding(hotkey_binding);

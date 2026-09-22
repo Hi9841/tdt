@@ -2,7 +2,7 @@ use crate::audio::VIS_BARS;
 use crate::config::{AppConfig, AppStats};
 use crate::hotkey;
 use crate::paste::PasteInjector;
-use crate::stt::{models, DownloadPhase, SharedEngine, SttEngine, CATALOG, DEFAULT_MODEL_ID};
+use crate::stt::{models, DownloadPhase, SharedEngine, SttEngine, CATALOG};
 use crate::ui::controls;
 use crate::ui::preview::{self, Spec as PreviewSpec};
 use crate::ui::text::{clip_text, format_mmss, format_time_saved};
@@ -224,7 +224,7 @@ impl HudView {
         self.autostart_enabled = false;
         self.autostart_error = None;
         self.selected_language = "auto".into();
-        self.selected_model = DEFAULT_MODEL_ID.into();
+        self.selected_model = models::DEFAULT_MODEL_ID.into();
         self.hotkey_capturing = false;
         *self.model_phase.lock() = DownloadPhase::Idle;
         self.model_error = None;
@@ -234,8 +234,8 @@ impl HudView {
         self.wave_peaks = [0.0; WAVE_BARS];
         self.status = HudStatus::Idle;
         self.preview_ready = Some(true);
-        self.active_model = Some(DEFAULT_MODEL_ID.into());
-        self.installed_models = vec![DEFAULT_MODEL_ID.into()];
+        self.active_model = Some(models::DEFAULT_MODEL_ID.into());
+        self.installed_models = vec![models::DEFAULT_MODEL_ID.into()];
         self.active_tab = if is_panel {
             SettingsTab::Settings
         } else {
@@ -290,8 +290,8 @@ impl HudView {
                 self.wave_peaks = preview_wave(true);
             }
             PreviewSpec::PanelModelFailed => {
-                self.selected_model = "whisper-medium".into();
-                *self.model_phase.lock() = DownloadPhase::Failed { id: self.selected_model.clone(), message: "Download failed. Check your connection and try again. SenseVoice Small is still active.".into() };
+                self.selected_model = models::DEFAULT.id.to_string();
+                *self.model_phase.lock() = DownloadPhase::Failed { id: self.selected_model.clone(), message: "Download failed. Check your connection and try again. Parakeet Q8 is still active.".into() };
             }
             PreviewSpec::PanelRecovery => self.set_error("Microphone disconnected. Connect a microphone, check Windows microphone access, then choose Retry microphone.".into()),
             PreviewSpec::PanelClearHistory => {
@@ -1969,7 +1969,7 @@ impl HudView {
             );
         }
         if !self.model_ready() {
-            model_body.insert(0, div().text_size(px(TYPE_DESC)).line_height(px(16.0)).text_color(gold()).child("Set up dictation: download SenseVoice Small to get started. Setup needs internet; your speech stays on this device.").into_any_element());
+            model_body.insert(0, div().text_size(px(TYPE_DESC)).line_height(px(16.0)).text_color(gold()).child("Set up dictation: download Parakeet Q8 to get started. Setup needs internet; your speech stays on this device.").into_any_element());
         }
         if installed
             && self.active_model.as_deref() != Some(spec.id)

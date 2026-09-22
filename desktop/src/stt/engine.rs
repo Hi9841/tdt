@@ -1,15 +1,31 @@
 use super::models::{whisper_language, ModelFamily, ModelSpec};
 use parking_lot::Mutex;
 use sherpa_onnx::{
-    OfflineModelConfig, OfflineRecognizer, OfflineRecognizerConfig, OfflineSenseVoiceModelConfig,
-    OfflineWhisperModelConfig,
+    OfflineModelConfig, OfflineMoonshineModelConfig, OfflineRecognizer, OfflineRecognizerConfig,
+    OfflineSenseVoiceModelConfig, OfflineTransducerModelConfig, OfflineWhisperModelConfig,
 };
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 enum ModelPaths {
-    SenseVoice { model: PathBuf },
-    Whisper { encoder: PathBuf, decoder: PathBuf },
+    SenseVoice {
+        model: PathBuf,
+    },
+    Whisper {
+        encoder: PathBuf,
+        decoder: PathBuf,
+    },
+    ParakeetTransducer {
+        encoder: PathBuf,
+        decoder: PathBuf,
+        joiner: PathBuf,
+    },
+    Moonshine {
+        preprocessor: PathBuf,
+        encoder: PathBuf,
+        uncached_decoder: PathBuf,
+        cached_decoder: PathBuf,
+    },
 }
 
 pub struct SttEngine {
@@ -31,6 +47,17 @@ impl SttEngine {
             ModelFamily::Whisper => ModelPaths::Whisper {
                 encoder: spec.whisper_encoder(model_dir),
                 decoder: spec.whisper_decoder(model_dir),
+            },
+            ModelFamily::ParakeetTransducer => ModelPaths::ParakeetTransducer {
+                encoder: spec.transducer_part(model_dir, "encoder"),
+                decoder: spec.transducer_part(model_dir, "decoder"),
+                joiner: spec.transducer_part(model_dir, "joiner"),
+            },
+            ModelFamily::Moonshine => ModelPaths::Moonshine {
+                preprocessor: spec.moonshine_preprocessor(model_dir),
+                encoder: spec.moonshine_encoder(model_dir),
+                uncached_decoder: spec.moonshine_uncached_decoder(model_dir),
+                cached_decoder: spec.moonshine_cached_decoder(model_dir),
             },
         };
 
@@ -82,6 +109,41 @@ impl SttEngine {
                 debug: false,
                 provider: Some("cpu".to_string()),
                 model_type: Some("whisper".to_string()),
+                ..Default::default()
+            },
+            ModelPaths::ParakeetTransducer {
+                encoder,
+                decoder,
+                joiner,
+            } => OfflineModelConfig {
+                transducer: OfflineTransducerModelConfig {
+                    encoder: Some(encoder.to_string_lossy().to_string()),
+                    decoder: Some(decoder.to_string_lossy().to_string()),
+                    joiner: Some(joiner.to_string_lossy().to_string()),
+                },
+                tokens: Some(tokens),
+                num_threads: 2,
+                debug: false,
+                provider: Some("cpu".to_string()),
+                ..Default::default()
+            },
+            ModelPaths::Moonshine {
+                preprocessor,
+                encoder,
+                uncached_decoder,
+                cached_decoder,
+            } => OfflineModelConfig {
+                moonshine: OfflineMoonshineModelConfig {
+                    preprocessor: Some(preprocessor.to_string_lossy().to_string()),
+                    encoder: Some(encoder.to_string_lossy().to_string()),
+                    uncached_decoder: Some(uncached_decoder.to_string_lossy().to_string()),
+                    cached_decoder: Some(cached_decoder.to_string_lossy().to_string()),
+                    ..Default::default()
+                },
+                tokens: Some(tokens),
+                num_threads: 2,
+                debug: false,
+                provider: Some("cpu".to_string()),
                 ..Default::default()
             },
         };
@@ -181,15 +243,32 @@ mod tests {
 
     #[test]
     fn constructing_engine_does_not_load_model() {
-        let model_dir = unique_dir("sv");
+        let model_dir = unique_dir("pq8");
         fs::create_dir_all(&model_dir).expect("temporary model directory should be created");
-        fs::write(model_dir.join("model.int8.onnx"), b"placeholder")
-            .expect("placeholder model should be written");
-        fs::write(model_dir.join("tokens.txt"), b"placeholder")
-            .expect("placeholder tokens should be written");
+        for file in DEFAULT.files {
+            fs::write(model_dir.join(file.name), b"placeholder")
+                .expect("placeholder model should be written");
+        }
 
         let engine = SttEngine::new(DEFAULT, &model_dir, "auto")
             .expect("construction should validate paths without loading ONNX");
+
+        assert!(!engine.is_loaded(), "model must stay unloaded while idle");
+        fs::remove_dir_all(model_dir).expect("temporary model directory should be removed");
+    }
+
+    #[test]
+    fn constructing_moonshine_engine_does_not_load_model() {
+        let spec = by_id("moonshine-medium-streaming").expect("moonshine medium is in the catalog");
+        let model_dir = unique_dir("mm");
+        fs::create_dir_all(&model_dir).expect("temporary model directory should be created");
+        for file in spec.files {
+            fs::write(model_dir.join(file.name), b"placeholder")
+                .expect("placeholder model should be written");
+        }
+
+        let engine = SttEngine::new(spec, &model_dir, "en")
+            .expect("construction should validate moonshine paths without loading ONNX");
 
         assert!(!engine.is_loaded(), "model must stay unloaded while idle");
         fs::remove_dir_all(model_dir).expect("temporary model directory should be removed");

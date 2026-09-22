@@ -438,7 +438,9 @@ mod tests {
 
     #[test]
     fn refresh_skips_test_binaries_and_keeps_installed_name() {
-        assert!(is_tdt_exe_name(Path::new(r"C:\Users\hi\AppData\Local\TDT\TDT.exe")));
+        assert!(is_tdt_exe_name(Path::new(
+            r"C:\Users\hi\AppData\Local\TDT\TDT.exe"
+        )));
         assert!(is_tdt_exe_name(Path::new(r"C:\Apps\tdt.exe")));
         assert!(!is_tdt_exe_name(Path::new(
             r"C:\repo\desktop\target\debug\deps\TDT-71689b29e1f673d8.exe"
