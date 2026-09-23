@@ -22,7 +22,7 @@ sherpa-onnx = "1.13.8"
 cpal = "0.15"
 arboard = "3.4"
 enigo = { version = "0.3", default-features = false }
-tray-icon = "0.19"
+tray-icon = "0.25"
 crossbeam-channel = "0.5"
 parking_lot = "0.12"
 serde = { version = "1.0", features = ["derive"] }
