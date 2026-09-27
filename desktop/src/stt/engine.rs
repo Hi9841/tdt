@@ -210,7 +210,18 @@ impl SttEngine {
     }
 
     /// Decode Parakeet audio as it arrives. `Finish` starts the response-time clock.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn transcribe_live(&self, rx: &Receiver<LiveAudio>) -> Result<LiveTranscript, String> {
+        self.transcribe_live_reporting(rx, None)
+    }
+
+    /// Same as [`Self::transcribe_live`]. When `partials` is set, each non-empty
+    /// streaming chunk stores the current hypothesis there.
+    pub fn transcribe_live_reporting(
+        &self,
+        rx: &Receiver<LiveAudio>,
+        partials: Option<&parking_lot::Mutex<String>>,
+    ) -> Result<LiveTranscript, String> {
         let mut utterance = self.start_utterance()?;
         let mut samples_seen = 0usize;
         let mut stopped_at = None;
@@ -226,6 +237,9 @@ impl SttEngine {
                         captured.extend_from_slice(&samples);
                     }
                     self.push_audio(&mut utterance, &samples);
+                    if !samples.is_empty() {
+                        self.publish_partial(&utterance, partials);
+                    }
                 }
                 Ok(LiveAudio::Finish(at)) => {
                     stopped_at = Some(at);
@@ -252,25 +266,57 @@ impl SttEngine {
         })
     }
 
+    /// Copy a non-empty streaming hypothesis into `partials`.
+    ///
+    /// The recognizer lock is released before `partials` is taken. The UI
+    /// thread locks only `partials`.
+    fn publish_partial(&self, utterance: &Utterance, partials: Option<&Mutex<String>>) {
+        let Some(partials) = partials else {
+            return;
+        };
+        let UtteranceKind::Streaming(stream) = &utterance.kind else {
+            return;
+        };
+        let text = {
+            let guard = self.recognizer.lock();
+            let Some(Recognizer::Online(recognizer)) = guard.as_ref() else {
+                return;
+            };
+            recognizer
+                .get_result(stream)
+                .map(|result| result.text.trim().to_string())
+                .unwrap_or_default()
+        };
+        if text.is_empty() {
+            return;
+        }
+        let mut current = partials.lock();
+        if *current != text {
+            *current = text;
+        }
+    }
+
     fn is_streaming_recognizer(&self) -> bool {
         matches!(*self.recognizer.lock(), Some(Recognizer::Online(_)))
     }
 
-    /// Retry a brief utterance with the offline recognizer.
+    /// Retry a brief utterance on the resident streaming recognizer, then offline.
     ///
     /// The streaming transducer only encodes a window once it holds enough
     /// context, so a short take decodes zero times and `get_result` returns
-    /// nothing. The user sees an empty transcript and reasonably concludes the
-    /// microphone is dead. The offline recognizer reads the same weights and
-    /// handles it, for roughly 35 ms of compute.
+    /// nothing. Padding to one 1120 ms chunk lets that resident model finish
+    /// the take. The offline recognizer is loaded only when that still returns
+    /// nothing.
     ///
     /// Only attempted inside the band where streaming is known to give up.
     /// Longer audio always streams, and near-silence is not worth loading a
     /// second recognizer to learn nothing.
     fn retry_short_utterance(&self, samples: &[f32]) -> Option<String> {
-        if samples.len() < SHORT_FALLBACK_MIN_SAMPLES || samples.len() >= SHORT_FALLBACK_MAX_SAMPLES
-        {
+        if !(SHORT_FALLBACK_MIN_SAMPLES..SHORT_FALLBACK_MAX_SAMPLES).contains(&samples.len()) {
             return None;
+        }
+        if let Some(text) = self.decode_padded_streaming(samples) {
+            return Some(text);
         }
         let recognizer = self.create_offline().ok()?;
         let stream = recognizer.create_stream();
@@ -278,6 +324,27 @@ impl SttEngine {
         recognizer.decode(&stream);
         let text = stream
             .get_result()
+            .map(|result| result.text.trim().to_string())
+            .unwrap_or_default();
+        (!text.is_empty()).then_some(text)
+    }
+
+    /// Re-decode on the resident online recognizer. `None` if it is not online
+    /// or the trimmed hypothesis is empty, so the caller can still load offline.
+    fn decode_padded_streaming(&self, samples: &[f32]) -> Option<String> {
+        let guard = self.recognizer.lock();
+        let Recognizer::Online(recognizer) = guard.as_ref()? else {
+            return None;
+        };
+        let stream = recognizer.create_stream();
+        stream.accept_waveform(16000, samples);
+        if let Some(pad) = streaming_pad_len(samples.len()).filter(|pad| *pad > 0) {
+            let zeros = vec![0.0f32; pad];
+            stream.accept_waveform(16000, &zeros);
+        }
+        decode_ready(recognizer, &stream, &[], true);
+        let text = recognizer
+            .get_result(&stream)
             .map(|result| result.text.trim().to_string())
             .unwrap_or_default();
         (!text.is_empty()).then_some(text)
@@ -372,6 +439,15 @@ fn inference_threads() -> i32 {
 /// point where the streaming path reliably produces a transcript.
 const SHORT_FALLBACK_MIN_SAMPLES: usize = 2_400;
 const SHORT_FALLBACK_MAX_SAMPLES: usize = 32_000;
+
+/// Trailing zeros so a short take fills one 1120 ms streaming chunk.
+/// None outside the short-utterance band (same bounds as the offline retry).
+fn streaming_pad_len(samples: usize) -> Option<usize> {
+    if !(SHORT_FALLBACK_MIN_SAMPLES..SHORT_FALLBACK_MAX_SAMPLES).contains(&samples) {
+        return None;
+    }
+    Some(17_920usize.saturating_sub(samples))
+}
 
 fn decode_ready(
     recognizer: &OnlineRecognizer,
@@ -482,6 +558,14 @@ mod tests {
         );
 
         fs::remove_dir_all(model_dir).expect("temporary model directory should be removed");
+    }
+
+    #[test]
+    fn streaming_pad_len_fills_one_chunk_inside_the_short_band() {
+        assert_eq!(super::streaming_pad_len(0), None);
+        assert_eq!(super::streaming_pad_len(100), None);
+        assert_eq!(super::streaming_pad_len(40_000), None);
+        assert_eq!(super::streaming_pad_len(2_400), Some(17_920 - 2_400));
     }
 
     #[test]
