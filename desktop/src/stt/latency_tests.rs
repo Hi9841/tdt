@@ -77,6 +77,59 @@ fn speech_response_latency() {
 ///
 /// It calls the same public methods `transcribe_live` calls, in the same order,
 /// so it measures the shipping path without modifying it.
+/// Does the offline recognizer rescue audio the streaming one drops?
+///
+/// The streaming transducer needs a minimum context before it will encode a
+/// window, so a brief utterance decodes zero times and returns nothing. If the
+/// offline path transcribes the same audio, a short-utterance fallback is
+/// available instead of leaving the user with silence.
+#[test]
+#[ignore = "requires installed Parakeet Q8 and TDT_BENCH_WAV speech fixture"]
+fn short_utterance_streaming_vs_offline() {
+    use sherpa_onnx::{
+        OfflineModelConfig, OfflineRecognizer, OfflineRecognizerConfig,
+        OfflineTransducerModelConfig,
+    };
+
+    let wave = sherpa_onnx::Wave::read(&std::env::var("TDT_BENCH_WAV").expect("TDT_BENCH_WAV"))
+        .expect("read mono WAV fixture");
+    let samples = wave.samples();
+    let dir = std::path::PathBuf::from(std::env::var_os("LOCALAPPDATA").expect("LOCALAPPDATA"))
+        .join("TDT/models/parakeet-unified-en-0.6b-q8");
+
+    let recognizer = OfflineRecognizer::create(&OfflineRecognizerConfig {
+        model_config: OfflineModelConfig {
+            transducer: OfflineTransducerModelConfig {
+                encoder: Some(dir.join("encoder.int8.onnx").to_string_lossy().to_string()),
+                decoder: Some(dir.join("decoder.int8.onnx").to_string_lossy().to_string()),
+                joiner: Some(dir.join("joiner.int8.onnx").to_string_lossy().to_string()),
+            },
+            tokens: Some(dir.join("tokens.txt").to_string_lossy().to_string()),
+            num_threads: 4,
+            model_type: Some("nemo_transducer".to_string()),
+            ..Default::default()
+        },
+        decoding_method: Some("greedy_search".to_string()),
+        max_active_paths: 1,
+        ..Default::default()
+    })
+    .expect("offline recognizer");
+
+    for keep_ms in [200, 300, 400, 500, 800, 1600] {
+        let slice = &samples[..samples.len().min(keep_ms * 16)];
+        let stream = recognizer.create_stream();
+        stream.accept_waveform(16000, slice);
+        let started = Instant::now();
+        recognizer.decode(&stream);
+        let offline = started.elapsed().as_millis();
+        let text = stream
+            .get_result()
+            .map(|r| r.text.trim().to_string())
+            .unwrap_or_default();
+        println!("offline keep_ms={keep_ms} decode_ms={offline} text={text:?}");
+    }
+}
+
 #[test]
 #[ignore = "requires installed Parakeet Q8 and TDT_BENCH_WAV speech fixture"]
 fn response_time_breakdown() {

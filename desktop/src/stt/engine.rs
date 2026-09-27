@@ -297,10 +297,17 @@ impl SttEngine {
         let mut utterance = self.start_utterance()?;
         let mut samples_seen = 0usize;
         let mut stopped_at = None;
+        // Kept only so a too-short utterance can be retried offline. Bounded by
+        // the same ceiling the fallback accepts, so a long recording costs
+        // 128 KB rather than a second copy of the whole take.
+        let mut captured: Vec<f32> = Vec::new();
         loop {
             match rx.recv_timeout(Duration::from_millis(20)) {
                 Ok(LiveAudio::Chunk(samples)) => {
                     samples_seen += samples.len();
+                    if captured.len() < SHORT_FALLBACK_MAX_SAMPLES {
+                        captured.extend_from_slice(&samples);
+                    }
                     self.push_audio(&mut utterance, &samples);
                 }
                 Ok(LiveAudio::Finish(at)) => {
@@ -312,12 +319,51 @@ impl SttEngine {
             }
         }
         let stopped_at = stopped_at.unwrap_or_else(Instant::now);
+        let streaming = self.is_streaming_recognizer();
         let text = self.finish_utterance(utterance)?;
+        // An empty transcript from the streaming path means the utterance was
+        // too brief to fill the encoder's context, not that the room was quiet.
+        let text = if streaming && text.trim().is_empty() {
+            self.retry_short_utterance(&captured).unwrap_or(text)
+        } else {
+            text
+        };
         Ok(LiveTranscript {
             text,
             latency_ms: stopped_at.elapsed().as_millis() as u64,
             duration_secs: samples_seen as f32 / 16000.0,
         })
+    }
+
+    fn is_streaming_recognizer(&self) -> bool {
+        matches!(*self.recognizer.lock(), Some(Recognizer::Online(_)))
+    }
+
+    /// Retry a brief utterance with the offline recognizer.
+    ///
+    /// The streaming transducer only encodes a window once it holds enough
+    /// context, so a short take decodes zero times and `get_result` returns
+    /// nothing. The user sees an empty transcript and reasonably concludes the
+    /// microphone is dead. The offline recognizer reads the same weights and
+    /// handles it, for roughly 35 ms of compute.
+    ///
+    /// Only attempted inside the band where streaming is known to give up.
+    /// Longer audio always streams, and near-silence is not worth loading a
+    /// second recognizer to learn nothing.
+    fn retry_short_utterance(&self, samples: &[f32]) -> Option<String> {
+        if samples.len() < SHORT_FALLBACK_MIN_SAMPLES || samples.len() >= SHORT_FALLBACK_MAX_SAMPLES
+        {
+            return None;
+        }
+        let recognizer = self.create_offline().ok()?;
+        let stream = recognizer.create_stream();
+        stream.accept_waveform(16000, samples);
+        recognizer.decode(&stream);
+        let text = stream
+            .get_result()
+            .map(|result| result.text.trim().to_string())
+            .unwrap_or_default();
+        (!text.is_empty()).then_some(text)
     }
 
     pub fn release(&self) {
@@ -404,6 +450,12 @@ fn inference_threads() -> i32 {
     )
 }
 
+/// Bounds for retrying a too-short utterance offline, in samples at 16 kHz.
+/// 0.15 s is below anything a person would say on purpose; 2 s is above the
+/// point where the streaming path reliably produces a transcript.
+const SHORT_FALLBACK_MIN_SAMPLES: usize = 2_400;
+const SHORT_FALLBACK_MAX_SAMPLES: usize = 32_000;
+
 fn decode_ready(
     recognizer: &OnlineRecognizer,
     stream: &OnlineStream,
@@ -487,6 +539,32 @@ mod tests {
             flush_ms < 1_000,
             "flush after a streamed utterance took {flush_ms} ms"
         );
+    }
+
+    #[test]
+    fn short_utterance_fallback_declines_audio_outside_its_band() {
+        // Both of these must return before a second recognizer is loaded: a long
+        // take always streams, and a stray tap is not an utterance. Guards the
+        // model-load cost of the fallback.
+        let model_dir = unique_dir("short-fallback");
+        fs::create_dir_all(&model_dir).expect("temporary model directory should be created");
+        for file in DEFAULT.files {
+            fs::write(model_dir.join(file.name), b"placeholder")
+                .expect("placeholder model should be written");
+        }
+        let engine = SttEngine::new(DEFAULT, &model_dir, "en").expect("engine");
+
+        assert!(engine.retry_short_utterance(&[]).is_none(), "no audio");
+        assert!(
+            engine.retry_short_utterance(&vec![0.1; 100]).is_none(),
+            "below the band"
+        );
+        assert!(
+            engine.retry_short_utterance(&vec![0.1; 40_000]).is_none(),
+            "above the band, streaming already handled it"
+        );
+
+        fs::remove_dir_all(model_dir).expect("temporary model directory should be removed");
     }
 
     #[test]

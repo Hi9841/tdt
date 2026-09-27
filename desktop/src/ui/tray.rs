@@ -12,8 +12,6 @@ pub struct SystemTray {
     pub show_item: MenuItem,
     pub updates_item: MenuItem,
     pub quit_item: MenuItem,
-    pub tray_mode_item: CheckMenuItem,
-    pub hide_item: MenuItem,
     pub stop_item: MenuItem,
     last_frame: Option<(TrayState, usize, u8)>,
     last_tooltip: String,
@@ -43,17 +41,11 @@ impl TrayState {
 }
 
 impl SystemTray {
-    pub fn new(
-        auto_paste_enabled: bool,
-        hotkey_label: &str,
-        tray_mode: bool,
-    ) -> Result<Self, String> {
+    pub fn new(auto_paste_enabled: bool, hotkey_label: &str) -> Result<Self, String> {
         let tray_menu = Menu::new();
 
         let show_item = MenuItem::new("Open TDT", true, None);
         let stop_item = MenuItem::new("Stop recording", false, None);
-        let hide_item = MenuItem::new("Hide overlay", true, None);
-        let tray_mode_item = CheckMenuItem::new("Keep bubble in tray", true, tray_mode, None);
         let settings_item = MenuItem::new("Open settings", true, None);
         let auto_paste_item = CheckMenuItem::new(
             "Auto-paste into the focused app",
@@ -72,12 +64,6 @@ impl SystemTray {
             .map_err(|e| format!("Menu error: {e}"))?;
         tray_menu
             .append(&stop_item)
-            .map_err(|e| format!("Menu error: {e}"))?;
-        tray_menu
-            .append(&hide_item)
-            .map_err(|e| format!("Menu error: {e}"))?;
-        tray_menu
-            .append(&tray_mode_item)
             .map_err(|e| format!("Menu error: {e}"))?;
         tray_menu
             .append(&PredefinedMenuItem::separator())
@@ -117,8 +103,6 @@ impl SystemTray {
             show_item,
             updates_item,
             quit_item,
-            tray_mode_item,
-            hide_item,
             stop_item,
             last_frame: None,
             last_tooltip: String::new(),
