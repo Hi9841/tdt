@@ -51,7 +51,7 @@ Copy-Item (Join-Path $RepoRoot "README.md") $Stage
 Copy-Item (Join-Path $ScriptDir "tdt-setup.ps1") (Join-Path $Stage "Install-TDT.ps1")
 Set-Content -LiteralPath (Join-Path $Stage "VERSION") -Value $Version -NoNewline
 
-# Never bundle SenseVoice. First run downloads it from Settings. Updates
+# Never bundle speech models. First run downloads Parakeet INT8 from Settings. Updates
 # must not reinstall a 200 MB model the user already has.
 $portable = Join-Path $Dist "TDT-$Version-windows-x64.zip"
 if (Test-Path $portable) { Remove-Item $portable -Force }

@@ -306,7 +306,7 @@ impl HudView {
             }
             PreviewSpec::PanelModelFailed => {
                 self.selected_model = models::DEFAULT.id.to_string();
-                *self.model_phase.lock() = DownloadPhase::Failed { id: self.selected_model.clone(), message: "Download failed. Check your connection and try again. Parakeet Q8 is still active.".into() };
+                *self.model_phase.lock() = DownloadPhase::Failed { id: self.selected_model.clone(), message: format!("Download failed. Check your connection and try again. {} is still active.", models::DEFAULT.label) };
             }
             PreviewSpec::PanelRecovery => self.set_error("Microphone disconnected. Connect a microphone, check Windows microphone access, then choose Retry microphone.".into()),
             PreviewSpec::PanelClearHistory => {
@@ -2012,7 +2012,7 @@ impl HudView {
             );
         }
         if !self.model_ready() {
-            model_body.insert(0, div().text_size(px(TYPE_DESC)).line_height(px(16.0)).text_color(gold()).child("Set up dictation: download Parakeet Q8 to get started. Setup needs internet; your speech stays on this device.").into_any_element());
+            model_body.insert(0, div().text_size(px(TYPE_DESC)).line_height(px(16.0)).text_color(gold()).child(format!("Set up dictation: download {} to get started. Setup needs internet; your speech stays on this device.", models::DEFAULT.label)).into_any_element());
         }
         if installed
             && self.active_model.as_deref() != Some(spec.id)

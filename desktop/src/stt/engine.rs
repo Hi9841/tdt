@@ -1,9 +1,8 @@
-use super::models::{whisper_language, ModelFamily, ModelSpec};
+use super::models::ModelSpec;
 use crossbeam_channel::{Receiver, RecvTimeoutError};
 use parking_lot::Mutex;
 use sherpa_onnx::{
-    OfflineModelConfig, OfflineMoonshineModelConfig, OfflineRecognizer, OfflineRecognizerConfig,
-    OfflineSenseVoiceModelConfig, OfflineTransducerModelConfig, OfflineWhisperModelConfig,
+    OfflineModelConfig, OfflineRecognizer, OfflineRecognizerConfig, OfflineTransducerModelConfig,
     OnlineModelConfig, OnlineRecognizer, OnlineRecognizerConfig, OnlineStream,
     OnlineTransducerModelConfig,
 };
@@ -38,25 +37,10 @@ pub struct LiveTranscript {
     pub duration_secs: f32,
 }
 
-enum ModelPaths {
-    SenseVoice {
-        model: PathBuf,
-    },
-    Whisper {
-        encoder: PathBuf,
-        decoder: PathBuf,
-    },
-    ParakeetTransducer {
-        encoder: PathBuf,
-        decoder: PathBuf,
-        joiner: PathBuf,
-    },
-    Moonshine {
-        preprocessor: PathBuf,
-        encoder: PathBuf,
-        uncached_decoder: PathBuf,
-        cached_decoder: PathBuf,
-    },
+struct ModelPaths {
+    encoder: PathBuf,
+    decoder: PathBuf,
+    joiner: PathBuf,
 }
 
 pub struct SttEngine {
@@ -71,25 +55,10 @@ impl SttEngine {
     pub fn new(spec: &ModelSpec, model_dir: &Path, language: &str) -> Result<Self, String> {
         spec.require_installed(model_dir)?;
         let tokens_path = spec.tokens_path(model_dir);
-        let paths = match spec.family {
-            ModelFamily::SenseVoice => ModelPaths::SenseVoice {
-                model: spec.sense_voice_model(model_dir),
-            },
-            ModelFamily::Whisper => ModelPaths::Whisper {
-                encoder: spec.whisper_encoder(model_dir),
-                decoder: spec.whisper_decoder(model_dir),
-            },
-            ModelFamily::ParakeetTransducer => ModelPaths::ParakeetTransducer {
-                encoder: spec.transducer_part(model_dir, "encoder"),
-                decoder: spec.transducer_part(model_dir, "decoder"),
-                joiner: spec.transducer_part(model_dir, "joiner"),
-            },
-            ModelFamily::Moonshine => ModelPaths::Moonshine {
-                preprocessor: spec.moonshine_preprocessor(model_dir),
-                encoder: spec.moonshine_encoder(model_dir),
-                uncached_decoder: spec.moonshine_uncached_decoder(model_dir),
-                cached_decoder: spec.moonshine_cached_decoder(model_dir),
-            },
+        let paths = ModelPaths {
+            encoder: spec.transducer_part(model_dir, "encoder"),
+            decoder: spec.transducer_part(model_dir, "decoder"),
+            joiner: spec.transducer_part(model_dir, "joiner"),
         };
 
         let lang_str = if language.is_empty() {
@@ -117,14 +86,11 @@ impl SttEngine {
     }
 
     fn create_online(&self) -> Option<OnlineRecognizer> {
-        let ModelPaths::ParakeetTransducer {
+        let ModelPaths {
             encoder,
             decoder,
             joiner,
-        } = &self.paths
-        else {
-            return None;
-        };
+        } = &self.paths;
         let config = OnlineRecognizerConfig {
             model_config: OnlineModelConfig {
                 transducer: OnlineTransducerModelConfig {
@@ -148,77 +114,28 @@ impl SttEngine {
     }
 
     fn create_offline(&self) -> Result<OfflineRecognizer, String> {
-        let language = self.current_language.lock().clone();
         let tokens = self.tokens_path.to_string_lossy().to_string();
 
         // Keep the existing budget for offline models. The larger thread pool
         // is measured against the streaming Parakeet encoder only.
         let threads = inference_threads().min(4);
-        let model_config = match &self.paths {
-            ModelPaths::SenseVoice { model } => OfflineModelConfig {
-                sense_voice: OfflineSenseVoiceModelConfig {
-                    model: Some(model.to_string_lossy().to_string()),
-                    language: Some(language),
-                    use_itn: true,
-                },
-                tokens: Some(tokens),
-                num_threads: threads,
-                debug: false,
-                provider: Some("cpu".to_string()),
-                model_type: Some("sense_voice".to_string()),
-                ..Default::default()
+        let ModelPaths {
+            encoder,
+            decoder,
+            joiner,
+        } = &self.paths;
+        let model_config = OfflineModelConfig {
+            transducer: OfflineTransducerModelConfig {
+                encoder: Some(encoder.to_string_lossy().to_string()),
+                decoder: Some(decoder.to_string_lossy().to_string()),
+                joiner: Some(joiner.to_string_lossy().to_string()),
             },
-            ModelPaths::Whisper { encoder, decoder } => OfflineModelConfig {
-                whisper: OfflineWhisperModelConfig {
-                    encoder: Some(encoder.to_string_lossy().to_string()),
-                    decoder: Some(decoder.to_string_lossy().to_string()),
-                    language: whisper_language(&language),
-                    task: Some("transcribe".to_string()),
-                    ..Default::default()
-                },
-                tokens: Some(tokens),
-                num_threads: threads,
-                debug: false,
-                provider: Some("cpu".to_string()),
-                model_type: Some("whisper".to_string()),
-                ..Default::default()
-            },
-            ModelPaths::ParakeetTransducer {
-                encoder,
-                decoder,
-                joiner,
-            } => OfflineModelConfig {
-                transducer: OfflineTransducerModelConfig {
-                    encoder: Some(encoder.to_string_lossy().to_string()),
-                    decoder: Some(decoder.to_string_lossy().to_string()),
-                    joiner: Some(joiner.to_string_lossy().to_string()),
-                },
-                tokens: Some(tokens),
-                num_threads: threads,
-                debug: false,
-                provider: Some("cpu".to_string()),
-                model_type: Some("nemo_transducer".to_string()),
-                ..Default::default()
-            },
-            ModelPaths::Moonshine {
-                preprocessor,
-                encoder,
-                uncached_decoder,
-                cached_decoder,
-            } => OfflineModelConfig {
-                moonshine: OfflineMoonshineModelConfig {
-                    preprocessor: Some(preprocessor.to_string_lossy().to_string()),
-                    encoder: Some(encoder.to_string_lossy().to_string()),
-                    uncached_decoder: Some(uncached_decoder.to_string_lossy().to_string()),
-                    cached_decoder: Some(cached_decoder.to_string_lossy().to_string()),
-                    ..Default::default()
-                },
-                tokens: Some(tokens),
-                num_threads: threads,
-                debug: false,
-                provider: Some("cpu".to_string()),
-                ..Default::default()
-            },
+            tokens: Some(tokens),
+            num_threads: threads,
+            debug: false,
+            provider: Some("cpu".to_string()),
+            model_type: Some("nemo_transducer".to_string()),
+            ..Default::default()
         };
 
         let config = OfflineRecognizerConfig {
@@ -523,7 +440,7 @@ mod tests {
         engine.prepare().expect("load");
         assert!(
             engine.is_streaming(),
-            "Parakeet Q8 should decode with the streaming recognizer"
+            "Parakeet INT8 should decode with the streaming recognizer"
         );
         let mut utterance = engine.start_utterance().expect("utterance");
         let chunk = vec![0.0f32; 16_000];
@@ -595,9 +512,9 @@ mod tests {
     }
 
     #[test]
-    fn constructing_moonshine_engine_does_not_load_model() {
-        let spec = by_id("moonshine-medium-streaming").expect("moonshine medium is in the catalog");
-        let model_dir = unique_dir("mm");
+    fn constructing_parakeet_q8_engine_does_not_load_model() {
+        let spec = by_id("parakeet-unified-en-0.6b-q8").expect("parakeet q8 is in the catalog");
+        let model_dir = unique_dir("pq8");
         fs::create_dir_all(&model_dir).expect("temporary model directory should be created");
         for file in spec.files {
             fs::write(model_dir.join(file.name), b"placeholder")
@@ -605,24 +522,7 @@ mod tests {
         }
 
         let engine = SttEngine::new(spec, &model_dir, "en")
-            .expect("construction should validate moonshine paths without loading ONNX");
-
-        assert!(!engine.is_loaded(), "model must stay unloaded while idle");
-        fs::remove_dir_all(model_dir).expect("temporary model directory should be removed");
-    }
-
-    #[test]
-    fn constructing_whisper_engine_does_not_load_model() {
-        let spec = by_id("whisper-medium").expect("whisper-medium is in the catalog");
-        let model_dir = unique_dir("w");
-        fs::create_dir_all(&model_dir).expect("temporary model directory should be created");
-        for file in spec.files {
-            fs::write(model_dir.join(file.name), b"placeholder")
-                .expect("placeholder model should be written");
-        }
-
-        let engine = SttEngine::new(spec, &model_dir, "en")
-            .expect("construction should validate whisper paths without loading ONNX");
+            .expect("construction should validate parakeet paths without loading ONNX");
 
         assert!(!engine.is_loaded(), "model must stay unloaded while idle");
         fs::remove_dir_all(model_dir).expect("temporary model directory should be removed");

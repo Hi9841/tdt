@@ -6,8 +6,9 @@ https://github.com/user-attachments/assets/8bb3021b-f878-4d41-9b1d-32040b7e1897
 
 TDT is an offline speech-to-text app for Windows. Audio is
 processed locally with Sherpa-ONNX and recognized text is copied to
-the system clipboard. The default model is Parakeet Q8. Settings can
-switch to Parakeet v3, Moonshine Medium, SenseVoice Full, or Whisper Medium. Extra models
+the system clipboard. The default model is Parakeet INT8. Settings can
+switch between Parakeet INT8 and Parakeet Q8. Both are FluidAudio's English
+Parakeet Unified 0.6B, using the same 8-bit streaming weights. Extra models
 download on demand and stay on disk. The selected model loads and warms up in the
 background when TDT starts, then stays in memory so recordings skip model load time.
 
@@ -24,12 +25,12 @@ That writes:
 
 - `dist/TDT.exe` slim app binary used by in-app updates
 - `dist/TDT-Setup.exe` per-user installer (app only, no speech model)
-- `dist/TDT-0.2.3-windows-x64.zip` portable copy (app only, no speech model)
+- `dist/TDT-0.2.4-windows-x64.zip` portable copy (app only, no speech model)
 - `dist/SHA256SUMS.txt`
 
 The installer copies TDT and the license files into `%LOCALAPPDATA%\TDT`,
-adds a Start Menu shortcut, and opens the app. SenseVoice is not bundled.
-Open Settings and download Small on first run, or keep a model you already
+adds a Start Menu shortcut, and opens the app. Speech models are not bundled.
+Open Settings and download Parakeet INT8 on first run, or keep a model you already
 have. No admin rights. Uninstall from Settings > Apps, or:
 
 ```powershell
@@ -60,12 +61,11 @@ Click the tray icon to open settings. Its menu offers **Stop recording**,
 drag its icon onto the visible taskbar area. Windows controls which tray icons
 remain visible.
 
-In Settings, pick Parakeet Q8, Parakeet v3, Moonshine Medium, SenseVoice Full,
-or Whisper Medium. Missing models show Download model. Parakeet Q8 is about
-632 MB. To fetch one from a terminal:
+In Settings, pick Parakeet INT8 or Parakeet Q8. Missing models show Download model.
+Both chips use the same FluidAudio Unified package, about 632 MB. To fetch it:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\models\download-models.ps1 -Model parakeet-unified-en-0.6b-q8
+powershell -ExecutionPolicy Bypass -File .\models\download-models.ps1 -Model parakeet-unified-en-0.6b-int8
 ```
 
 ```powershell
@@ -90,8 +90,7 @@ portable zip on tag `v*`.
 ## Repository layout
 
 - `desktop/`: Rust + GPUI Windows app with global `Ctrl + ;` tap or hold-to-talk.
-- `models/`: downloader for Parakeet v3, Parakeet Q8, Moonshine, SenseVoice, and Whisper
-  models used by desktop.
+- `models/`: downloader for the FluidAudio Parakeet Unified INT8/Q8 package.
 - `packaging/`: Windows installer stub and build script.
 - `THIRD_PARTY_NOTICES.md`: upstream license and attribution information.
 

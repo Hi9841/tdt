@@ -6,14 +6,6 @@ use std::time::Duration;
 
 const HF_BASE: &str = "https://huggingface.co";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ModelFamily {
-    SenseVoice,
-    Whisper,
-    ParakeetTransducer,
-    Moonshine,
-}
-
 #[derive(Debug, Clone, Copy)]
 pub struct ModelFile {
     pub name: &'static str,
@@ -27,7 +19,6 @@ pub struct ModelSpec {
     pub blurb: &'static str,
     pub size_label: &'static str,
     pub size_bytes: u64,
-    pub family: ModelFamily,
     pub hf_repo: &'static str,
     pub dir_name: &'static str,
     pub files: &'static [ModelFile],
@@ -62,166 +53,72 @@ pub struct DownloadProgress {
     pub file_count: usize,
 }
 
-/// Recommended default: English Parakeet Unified 0.6B int8. Lower English
-/// error rate than v3, and the streaming export is the low-latency one.
-pub const DEFAULT_MODEL_ID: &str = "parakeet-unified-en-0.6b-q8";
+/// Recommended default: FluidAudio's English Parakeet Unified 0.6B, INT8 streaming.
+pub const DEFAULT_MODEL_ID: &str = "parakeet-unified-en-0.6b-int8";
+
+/// Existing installs stored this id for the same FluidAudio Unified package.
+pub const PARAKEET_Q8_ID: &str = "parakeet-unified-en-0.6b-q8";
+
+/// Shared on-disk folder. INT8 and Q8 are the same sherpa-onnx streaming export.
+const UNIFIED_DIR: &str = "parakeet-unified-en-0.6b-q8";
+
+/// FluidAudio Windows path: sherpa-onnx INT8 streaming export of
+/// nvidia/parakeet-unified-en-0.6b (1120 ms). One download covers both chips.
+const UNIFIED_REPO: &str =
+    "csukuangfj2/sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-streaming-1120ms";
+
+const UNIFIED_FILES: &[ModelFile] = &[
+    ModelFile {
+        name: "encoder.int8.onnx",
+        sha256: "1C03F1192DE41771384AF22972CA10203613BA56197A024F275B86727CD35911",
+    },
+    ModelFile {
+        name: "decoder.int8.onnx",
+        sha256: "34FEA72425D2506600772BA191A6D3F99C0710ABDB68D9A3DC89FA8CB2AA473A",
+    },
+    ModelFile {
+        name: "joiner.int8.onnx",
+        sha256: "869F43F7D24595C55581AD3BF249A935FB8A71389FBDAA7504B9F46F93140F8A",
+    },
+    ModelFile {
+        name: "tokens.txt",
+        sha256: "DC0B4584AB2E4DDBF888425C076C61B736E7356A015250DB7D307E6F1A8188FF",
+    },
+];
 
 /// Previous default, kept so existing `config.json` files migrate cleanly.
 #[allow(dead_code)]
 pub const LEGACY_DEFAULT_MODEL_ID: &str = "sensevoice-small";
 
-/// Retired ids kept for migration only; they resolve to a supported model.
-fn migrated_id(id: &str) -> &'static str {
-    match id.trim() {
-        // Retired Whisper Small slot follows the current default.
-        "whisper-small" => DEFAULT_MODEL_ID,
-        // Retired SenseVoice Small slot is now Moonshine Medium Streaming.
-        "sensevoice-small" => "moonshine-medium-streaming",
-        _ => DEFAULT_MODEL_ID,
-    }
+/// Retired ids kept for migration only; they resolve to Parakeet INT8.
+fn migrated_id(_id: &str) -> &'static str {
+    DEFAULT_MODEL_ID
 }
 
 pub const CATALOG: &[ModelSpec] = &[
     ModelSpec {
-        id: "moonshine-medium-streaming",
-        label: "Moonshine Medium",
-        blurb: "Lightweight English model with native streaming and low latency.",
-        size_label: "274 MB",
-        size_bytes: 286_929_760,
-        family: ModelFamily::Moonshine,
-        // Upstream publishes this lightweight native-streaming package as
-        // base-en int8 (Moonshine v1); no medium-en-int8 package exists.
-        hf_repo: "csukuangfj/sherpa-onnx-moonshine-base-en-int8",
-        dir_name: "moonshine-medium-streaming",
-        files: &[
-            ModelFile {
-                name: "preprocess.onnx",
-                sha256: "FFA630D395C5CCF76F5D4954BE5B882DF76AAF6491519EC01FD82EA7A3819FB2",
-            },
-            ModelFile {
-                name: "encode.int8.onnx",
-                sha256: "7E38770F776F2E5583A53B052936005DF2BA5C833D7E09C2A5FD796B94BF73E2",
-            },
-            ModelFile {
-                name: "uncached_decode.int8.onnx",
-                sha256: "C01F4B35093BCAC20D352D23A75A539E772964579F9D024A90E5E6F09CAE9987",
-            },
-            ModelFile {
-                name: "cached_decode.int8.onnx",
-                sha256: "2DB74E51CEDF64A8B1BE3C8192E0BB5E4923AF0E90BD9E87F8E8771873F8EA03",
-            },
-            ModelFile {
-                name: "tokens.txt",
-                sha256: "1165C2AEB9F72F457A83BE2D459A09054F27490ACD9B41BD43794DFD25E296EA",
-            },
-        ],
-    },
-    ModelSpec {
-        id: "sensevoice-full",
-        label: "SenseVoice Full",
-        blurb: "Fast local transcription with low resource usage.",
-        size_label: "894 MB",
-        size_bytes: 937_933_072,
-        family: ModelFamily::SenseVoice,
-        hf_repo: "csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17",
-        dir_name: "sensevoice",
-        files: &[
-            ModelFile {
-                name: "model.onnx",
-                sha256: "977016BD9C79F9EB343430B5CC305E07AB64D5212DFF41B0DCFA1694BEE9A8CB",
-            },
-            ModelFile {
-                name: "tokens.txt",
-                sha256: "F449EB28DC567533D7FA59BE34E2ABCA8784F771850C78A47FB731A31429A1DC",
-            },
-        ],
-    },
-    ModelSpec {
         id: DEFAULT_MODEL_ID,
-        label: "Parakeet Q8",
-        blurb:
-            "Most accurate English model here, with the low-latency streaming export. Recommended.",
+        label: "Parakeet INT8",
+        blurb: "FluidAudio English Unified. INT8 streaming. Recommended.",
         size_label: "632 MB",
         size_bytes: 663_048_980,
-        family: ModelFamily::ParakeetTransducer,
-        // Q8/int8 Unified EN 0.6B transducer package with native streaming weights.
-        hf_repo: "csukuangfj2/sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-streaming-1120ms",
-        dir_name: "parakeet-unified-en-0.6b-q8",
-        files: &[
-            ModelFile {
-                name: "encoder.int8.onnx",
-                sha256: "1C03F1192DE41771384AF22972CA10203613BA56197A024F275B86727CD35911",
-            },
-            ModelFile {
-                name: "decoder.int8.onnx",
-                sha256: "34FEA72425D2506600772BA191A6D3F99C0710ABDB68D9A3DC89FA8CB2AA473A",
-            },
-            ModelFile {
-                name: "joiner.int8.onnx",
-                sha256: "869F43F7D24595C55581AD3BF249A935FB8A71389FBDAA7504B9F46F93140F8A",
-            },
-            ModelFile {
-                name: "tokens.txt",
-                sha256: "DC0B4584AB2E4DDBF888425C076C61B736E7356A015250DB7D307E6F1A8188FF",
-            },
-        ],
+        hf_repo: UNIFIED_REPO,
+        dir_name: UNIFIED_DIR,
+        files: UNIFIED_FILES,
     },
     ModelSpec {
-        id: "parakeet-tdt-0.6b-v3",
-        label: "Parakeet v3",
-        blurb: "25 European languages. English accuracy and latency trail Parakeet Q8.",
-        size_label: "639 MB",
-        size_bytes: 670_478_772,
-        family: ModelFamily::ParakeetTransducer,
-        // int8 offline export of nvidia/parakeet-tdt-0.6b-v3.
-        hf_repo: "csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8",
-        dir_name: "parakeet-tdt-0.6b-v3",
-        files: &[
-            ModelFile {
-                name: "encoder.int8.onnx",
-                sha256: "ACFC2B4456377E15D04F0243AF540B7FE7C992F8D898D751CF134C3A55FD2247",
-            },
-            ModelFile {
-                name: "decoder.int8.onnx",
-                sha256: "179E50C43D1A9DE79C8A24149A2F9BAC6EB5981823F2A2ED88D655B24248DB4E",
-            },
-            ModelFile {
-                name: "joiner.int8.onnx",
-                sha256: "3164C13FC2821009440D20FCB5FDC78BFF28B4DB2F8D0F0B329101719C0948B3",
-            },
-            ModelFile {
-                name: "tokens.txt",
-                sha256: "D58544679EA4BC6AC563D1F545EB7D474BD6CFA467F0A6E2C1DC1C7D37E3C35D",
-            },
-        ],
-    },
-    ModelSpec {
-        id: "whisper-medium",
-        label: "Whisper Medium",
-        blurb: "Heavyweight Whisper model for maximum compatibility.",
-        size_label: "902 MB",
-        size_bytes: 946_072_270,
-        family: ModelFamily::Whisper,
-        hf_repo: "csukuangfj/sherpa-onnx-whisper-medium",
-        dir_name: "whisper-medium",
-        files: &[
-            ModelFile {
-                name: "medium-encoder.int8.onnx",
-                sha256: "1C54582B4D829DE0089F6CB63BBBDB3BF7555398BACAF855FBECF1A84DFD193E",
-            },
-            ModelFile {
-                name: "medium-decoder.int8.onnx",
-                sha256: "595D00A338A365A7BFA0CA7F296CABC639583BEF770AB6130DF90F49A6412747",
-            },
-            ModelFile {
-                name: "medium-tokens.txt",
-                sha256: "B34B360DBB493E781E479794586D661700670D65564001F23024971D1F2FA126",
-            },
-        ],
+        id: PARAKEET_Q8_ID,
+        label: "Parakeet Q8",
+        blurb: "FluidAudio English Unified. Same 8-bit streaming weights as INT8.",
+        size_label: "632 MB",
+        size_bytes: 663_048_980,
+        hf_repo: UNIFIED_REPO,
+        dir_name: UNIFIED_DIR,
+        files: UNIFIED_FILES,
     },
 ];
 
-pub const DEFAULT: &ModelSpec = &CATALOG[2];
+pub const DEFAULT: &ModelSpec = &CATALOG[0];
 
 pub fn by_id(id: &str) -> Option<&'static ModelSpec> {
     CATALOG.iter().find(|spec| spec.id == id.trim())
@@ -253,36 +150,6 @@ impl ModelSpec {
         dir.join(name)
     }
 
-    pub fn sense_voice_model(&self, dir: &Path) -> PathBuf {
-        let name = self
-            .files
-            .iter()
-            .find(|file| file.name.ends_with(".onnx"))
-            .map(|file| file.name)
-            .unwrap_or("model.int8.onnx");
-        dir.join(name)
-    }
-
-    pub fn whisper_encoder(&self, dir: &Path) -> PathBuf {
-        let name = self
-            .files
-            .iter()
-            .find(|file| file.name.contains("encoder"))
-            .map(|file| file.name)
-            .unwrap_or("encoder.onnx");
-        dir.join(name)
-    }
-
-    pub fn whisper_decoder(&self, dir: &Path) -> PathBuf {
-        let name = self
-            .files
-            .iter()
-            .find(|file| file.name.contains("decoder"))
-            .map(|file| file.name)
-            .unwrap_or("decoder.onnx");
-        dir.join(name)
-    }
-
     pub fn transducer_part(&self, dir: &Path, kind: &str) -> PathBuf {
         let name = self
             .files
@@ -294,32 +161,6 @@ impl ModelSpec {
                 "decoder" => "decoder.int8.onnx",
                 _ => "joiner.int8.onnx",
             });
-        dir.join(name)
-    }
-
-    pub fn moonshine_preprocessor(&self, dir: &Path) -> PathBuf {
-        self.named_file(dir, "preprocess", "preprocess.onnx")
-    }
-
-    pub fn moonshine_encoder(&self, dir: &Path) -> PathBuf {
-        self.named_file(dir, "encode", "encode.int8.onnx")
-    }
-
-    pub fn moonshine_uncached_decoder(&self, dir: &Path) -> PathBuf {
-        self.named_file(dir, "uncached_decode", "uncached_decode.int8.onnx")
-    }
-
-    pub fn moonshine_cached_decoder(&self, dir: &Path) -> PathBuf {
-        self.named_file(dir, "cached_decode", "cached_decode.int8.onnx")
-    }
-
-    fn named_file(&self, dir: &Path, prefix: &str, fallback: &str) -> PathBuf {
-        let name = self
-            .files
-            .iter()
-            .find(|file| file.name.starts_with(prefix))
-            .map(|file| file.name)
-            .unwrap_or(fallback);
         dir.join(name)
     }
 
@@ -393,13 +234,6 @@ pub fn file_label(name: &str) -> String {
         .trim_end_matches(".txt")
         .replace(".int8", "")
         .to_string()
-}
-
-pub fn whisper_language(language: &str) -> Option<String> {
-    match language.trim() {
-        "" | "auto" => None,
-        other => Some(other.to_string()),
-    }
 }
 
 pub fn download(
@@ -593,8 +427,8 @@ fn canonicalize_or_clone(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        by_id, file_label, format_mb, percent, resolve, whisper_language, ModelFamily, ModelSpec,
-        CATALOG, DEFAULT, DEFAULT_MODEL_ID,
+        by_id, file_label, format_mb, percent, resolve, ModelSpec, CATALOG, DEFAULT,
+        DEFAULT_MODEL_ID,
     };
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -614,39 +448,21 @@ mod tests {
             assert!(!spec.id.is_empty());
             assert!(spec.size_bytes > 0);
             assert!(spec.files.iter().any(|file| file.name.contains("tokens")));
-            match spec.family {
-                ModelFamily::SenseVoice => {
-                    assert!(spec.files.iter().any(|file| file.name.ends_with(".onnx")));
-                }
-                ModelFamily::Whisper => {
-                    assert!(spec.files.iter().any(|file| file.name.contains("encoder")));
-                    assert!(spec.files.iter().any(|file| file.name.contains("decoder")));
-                }
-                ModelFamily::ParakeetTransducer => {
-                    for part in ["encoder", "decoder", "joiner"] {
-                        assert!(
-                            spec.files.iter().any(|file| file.name.starts_with(part)),
-                            "parakeet {part} missing",
-                        );
-                    }
-                }
-                ModelFamily::Moonshine => {
-                    for part in ["preprocess", "encode", "uncached_decode", "cached_decode"] {
-                        assert!(
-                            spec.files.iter().any(|file| file.name.starts_with(part)),
-                            "moonshine {part} missing",
-                        );
-                    }
-                }
+            for part in ["encoder", "decoder", "joiner"] {
+                assert!(
+                    spec.files.iter().any(|file| file.name.starts_with(part)),
+                    "parakeet {part} missing",
+                );
             }
             assert!(!ids.contains(&spec.id), "duplicate model id {}", spec.id);
             ids.push(spec.id);
         }
         assert!(ids.contains(&DEFAULT_MODEL_ID));
+        assert!(ids.contains(&super::PARAKEET_Q8_ID));
         assert_eq!(
             CATALOG.len(),
-            5,
-            "catalog keeps Moonshine, SenseVoice Full, Parakeet v3, Parakeet Q8, Whisper Medium",
+            2,
+            "catalog keeps Parakeet INT8 and Parakeet Q8",
         );
         assert_eq!(
             by_id(DEFAULT_MODEL_ID).map(|spec| spec.id),
@@ -655,43 +471,50 @@ mod tests {
     }
 
     #[test]
-    fn default_is_parakeet_q8_with_expected_labels() {
+    fn default_is_parakeet_int8_with_q8_alias() {
         assert_eq!(resolve("").id, DEFAULT_MODEL_ID);
-        assert_eq!(DEFAULT_MODEL_ID, "parakeet-unified-en-0.6b-q8");
+        assert_eq!(DEFAULT_MODEL_ID, "parakeet-unified-en-0.6b-int8");
         assert_eq!(DEFAULT.id, DEFAULT_MODEL_ID);
         assert_eq!(
             CATALOG.iter().map(|spec| spec.label).collect::<Vec<_>>(),
-            vec![
-                "Moonshine Medium",
-                "SenseVoice Full",
-                "Parakeet Q8",
-                "Parakeet v3",
-                "Whisper Medium"
-            ]
+            vec!["Parakeet INT8", "Parakeet Q8"]
         );
+        let int8 = by_id(DEFAULT_MODEL_ID).expect("int8");
+        let q8 = by_id(super::PARAKEET_Q8_ID).expect("q8");
+        assert_eq!(int8.dir_name, q8.dir_name);
+        assert_eq!(int8.hf_repo, q8.hf_repo);
+        assert_eq!(
+            int8.files.iter().map(|file| file.name).collect::<Vec<_>>(),
+            q8.files.iter().map(|file| file.name).collect::<Vec<_>>()
+        );
+        assert!(int8
+            .files
+            .iter()
+            .all(|file| file.name.contains("int8") || file.name.contains("tokens")));
     }
 
     #[test]
-    fn retired_ids_migrate_to_supported_models() {
-        assert_eq!(resolve("whisper-small").id, DEFAULT_MODEL_ID);
-        assert_eq!(resolve("sensevoice-small").id, "moonshine-medium-streaming");
+    fn retired_ids_migrate_to_parakeet_int8() {
+        for id in [
+            "whisper-small",
+            "whisper-medium",
+            "sensevoice-small",
+            "sensevoice-full",
+            "moonshine-medium-streaming",
+            "parakeet-tdt-0.6b-v3",
+        ] {
+            assert_eq!(resolve(id).id, DEFAULT_MODEL_ID, "{id}");
+        }
+        assert_eq!(resolve(super::PARAKEET_Q8_ID).id, super::PARAKEET_Q8_ID);
     }
 
     #[test]
-    fn unknown_id_falls_back_to_parakeet_q8() {
+    fn unknown_id_falls_back_to_parakeet_int8() {
         assert_eq!(resolve("nope").id, DEFAULT_MODEL_ID);
         assert_eq!(
             by_id(DEFAULT_MODEL_ID).map(|spec| spec.id),
             Some(DEFAULT_MODEL_ID)
         );
-    }
-
-    #[test]
-    fn whisper_auto_language_is_empty() {
-        assert_eq!(whisper_language("auto"), None);
-        assert_eq!(whisper_language(""), None);
-        assert_eq!(whisper_language("en").as_deref(), Some("en"));
-        assert_eq!(whisper_language("yue").as_deref(), Some("yue"));
     }
 
     #[test]
