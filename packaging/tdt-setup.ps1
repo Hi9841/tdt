@@ -70,7 +70,7 @@ Stop-TdtProcesses
 
 New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
 # Never copy models/. Updates and reinstalls must leave a downloaded
-# SenseVoice tree on disk.
+# Parakeet tree on disk.
 Get-ChildItem -LiteralPath $StageDir -Force | Where-Object { $_.Name -ne "models" } | ForEach-Object {
     Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $InstallDir $_.Name) -Recurse -Force
 }
