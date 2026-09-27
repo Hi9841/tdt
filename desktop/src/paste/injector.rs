@@ -359,8 +359,7 @@ mod delivery_tests {
 #[cfg(test)]
 mod input_readiness_tests {
     use super::{
-        wait_for_input_ready_with, Duration, INPUT_READY_BUDGET, INPUT_READY_STEP,
-        ReadinessWait,
+        wait_for_input_ready_with, Duration, ReadinessWait, INPUT_READY_BUDGET, INPUT_READY_STEP,
     };
     use std::cell::Cell;
 

@@ -1,8 +1,5 @@
 # Build
 desktop/target/
-mobile/**/build/
-mobile/**/.gradle/
-mobile/local.properties
 dist/
 packaging/stage/
 packaging/.cache/
@@ -16,12 +13,10 @@ models/sensevoice/*.onnx
 models/sensevoice/tokens.txt
 models/**/*.download
 models/moonshine-medium-streaming/
+models/parakeet-tdt-0.6b-v3/
 models/parakeet-unified-en-0.6b-q8/
 models/whisper-small/
 models/whisper-medium/
-
-# Prebuilt Android AAR (place in mobile/app/libs/)
-*.aar
 
 # Logs and local captures
 *.log
@@ -30,6 +25,10 @@ overlay-*.png
 verification-*.png
 settings-page.png
 stats-page.png
+
+# Python bytecode from the tray verification scripts
+__pycache__/
+*.pyc
 
 # OS
 Thumbs.db
