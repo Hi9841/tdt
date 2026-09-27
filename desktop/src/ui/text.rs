@@ -2,6 +2,10 @@ pub fn format_mmss(secs: u64) -> String {
     format!("{:02}:{:02}", secs / 60, secs % 60)
 }
 
+pub fn format_latency_ms(latency_ms: u64) -> String {
+    format!("{latency_ms}ms")
+}
+
 pub fn format_time_saved(secs: f32) -> String {
     let total = secs.max(0.0) as u64;
     if total < 60 {
@@ -32,6 +36,13 @@ mod tests {
         assert_eq!(format_mmss(0), "00:00");
         assert_eq!(format_mmss(9), "00:09");
         assert_eq!(format_mmss(75), "01:15");
+    }
+
+    #[test]
+    fn format_latency_ms_is_compact() {
+        assert_eq!(format_latency_ms(0), "0ms");
+        assert_eq!(format_latency_ms(182), "182ms");
+        assert_eq!(format_latency_ms(1200), "1200ms");
     }
 
     #[test]

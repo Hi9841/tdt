@@ -58,6 +58,7 @@ impl AudioRecorder {
                             &buffer_clone,
                             &rms_clone,
                             &envelope_clone,
+                            &is_rec_clone,
                         ) {
                             at_limit_clone.store(true, Ordering::SeqCst);
                         }
@@ -81,6 +82,7 @@ impl AudioRecorder {
                             &buffer_clone,
                             &rms_clone,
                             &envelope_clone,
+                            &is_rec_clone,
                         ) {
                             at_limit_clone.store(true, Ordering::SeqCst);
                         }
@@ -117,6 +119,7 @@ impl AudioRecorder {
         buffer: &Arc<Mutex<Vec<f32>>>,
         rms: &Arc<Mutex<f32>>,
         envelope: &Arc<Mutex<SpeechEnvelope>>,
+        is_recording: &AtomicBool,
     ) -> bool {
         if data.is_empty() {
             return false;
@@ -143,6 +146,9 @@ impl AudioRecorder {
         };
 
         let mut recorded = buffer.lock();
+        if !is_recording.load(Ordering::SeqCst) {
+            return false;
+        }
         append_bounded(&mut recorded, &resampled, max_recording_samples())
     }
 
@@ -174,6 +180,14 @@ impl AudioRecorder {
         *self.envelope.lock() = SpeechEnvelope::default();
         clear_session_signals(&self.last_error, &self.at_limit);
         self.is_recording.store(true, Ordering::SeqCst);
+    }
+
+    /// Samples captured since the last drain. Empty once recording has stopped.
+    pub fn drain(&self) -> Vec<f32> {
+        if !self.is_recording.load(Ordering::SeqCst) {
+            return Vec::new();
+        }
+        std::mem::take(&mut *self.buffer.lock())
     }
 
     pub fn stop(&self) -> Vec<f32> {
