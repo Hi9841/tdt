@@ -6,7 +6,6 @@ use std::path::PathBuf;
 #[serde(default)]
 pub struct AppConfig {
     pub auto_paste: bool,
-    pub tray_mode: bool,
     pub hotkey: String,
     pub model_dir: Option<PathBuf>,
     pub model_id: String,
@@ -17,7 +16,6 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             auto_paste: true,
-            tray_mode: false,
             hotkey: "Ctrl+;".to_string(),
             model_dir: None,
             model_id: crate::stt::DEFAULT_MODEL_ID.to_string(),
@@ -198,16 +196,6 @@ pub(crate) fn local_hms() -> String {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn tray_mode_migrates_old_config_and_round_trips() {
-        let mut config: super::AppConfig = serde_json::from_str(r#"{"hotkey":"Ctrl+;"}"#).unwrap();
-        assert!(!config.tray_mode);
-        config.tray_mode = true;
-        let saved = serde_json::to_string(&config).unwrap();
-        let restored: super::AppConfig = serde_json::from_str(&saved).unwrap();
-        assert!(restored.tray_mode);
-        assert_eq!(restored.hotkey, "Ctrl+;");
-    }
     use super::{AppConfig, AppStats, MAX_HISTORY};
 
     #[test]
