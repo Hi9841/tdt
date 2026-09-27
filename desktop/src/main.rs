@@ -481,9 +481,23 @@ fn main() {
                                             });
                                             continue;
                                         }
-                                        if rec.borrow().is_none() {
+                                        let reopen = {
+                                            let borrowed = rec.borrow();
+                                            borrowed.as_ref().is_some_and(|recorder| {
+                                                recorder.needs_reopen()
+                                                    || recorder.take_error().is_some()
+                                            })
+                                        };
+                                        if rec.borrow().is_none() || reopen {
+                                            *rec.borrow_mut() = None;
                                             match AudioRecorder::new() {
-                                                Ok(recorder) => *rec.borrow_mut() = Some(recorder),
+                                                Ok(recorder) => {
+                                                    append_log(&format!(
+                                                        "Microphone: {}",
+                                                        recorder.device_name()
+                                                    ));
+                                                    *rec.borrow_mut() = Some(recorder);
+                                                }
                                                 Err(error) => {
                                                     let _ = this.update(cx, |view, cx| { view.set_error(format!("Could not open the microphone. Connect a microphone and retry. {error}")); cx.notify(); });
                                                     continue;

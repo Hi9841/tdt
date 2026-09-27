@@ -1,11 +1,17 @@
 use super::envelope::{SpeechEnvelope, VIS_BARS};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use parking_lot::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const TARGET_SAMPLE_RATE: u32 = 16000;
 pub const MAX_RECORDING_SECONDS: usize = 120;
+/// A live WASAPI stream delivers buffers even in silence. Longer than this
+/// with no callback means the endpoint went away.
+const STALE_CALLBACK_MS: u64 = 1_500;
+/// First buffer should arrive quickly. Longer means the open did not stick.
+const STALE_OPEN_MS: u64 = 800;
 
 pub struct AudioRecorder {
     is_recording: Arc<AtomicBool>,
@@ -14,111 +20,112 @@ pub struct AudioRecorder {
     buffer: Arc<Mutex<Vec<f32>>>,
     current_rms: Arc<Mutex<f32>>,
     envelope: Arc<Mutex<SpeechEnvelope>>,
+    device_name: String,
+    opened_ms: u64,
+    last_callback_ms: Arc<AtomicU64>,
     _stream: cpal::Stream,
 }
 
 impl AudioRecorder {
     pub fn new() -> Result<Self, String> {
         let host = cpal::default_host();
-        let device = host
-            .default_input_device()
-            .ok_or_else(|| "No audio input device found".to_string())?;
-
-        let supported_config = device
-            .default_input_config()
-            .map_err(|e| format!("Failed to get default input config: {}", e))?;
-        let sample_format = supported_config.sample_format();
-        let config: cpal::StreamConfig = supported_config.into();
-
-        let is_recording = Arc::new(AtomicBool::new(false));
-        let at_limit = Arc::new(AtomicBool::new(false));
-        let last_error = Arc::new(Mutex::new(None));
-        let buffer = Arc::new(Mutex::new(Vec::new()));
-        let current_rms = Arc::new(Mutex::new(0.0f32));
-        let envelope = Arc::new(Mutex::new(SpeechEnvelope::default()));
-
-        let is_rec_clone = Arc::clone(&is_recording);
-        let at_limit_clone = Arc::clone(&at_limit);
-        let buffer_clone = Arc::clone(&buffer);
-        let rms_clone = Arc::clone(&current_rms);
-        let envelope_clone = Arc::clone(&envelope);
-
-        let input_sample_rate = config.sample_rate.0;
-        let channels = config.channels as usize;
-
-        let stream = match sample_format {
-            cpal::SampleFormat::F32 => device.build_input_stream(
-                &config,
-                move |data: &[f32], _: &_| {
-                    if is_rec_clone.load(Ordering::Relaxed) {
-                        if Self::process_samples_f32(
-                            data,
-                            channels,
-                            input_sample_rate,
-                            &buffer_clone,
-                            &rms_clone,
-                            &envelope_clone,
-                            &is_rec_clone,
-                        ) {
-                            at_limit_clone.store(true, Ordering::SeqCst);
-                        }
-                    } else {
-                        *rms_clone.lock() = 0.0;
-                    }
-                },
-                stream_error_callback(Arc::clone(&last_error), Arc::clone(&is_recording)),
-                None,
-            ),
-            cpal::SampleFormat::I16 => device.build_input_stream(
-                &config,
-                move |data: &[i16], _: &_| {
-                    if is_rec_clone.load(Ordering::Relaxed) {
-                        let f32_data: Vec<f32> =
-                            data.iter().map(|&s| s as f32 / i16::MAX as f32).collect();
-                        if Self::process_samples_f32(
-                            &f32_data,
-                            channels,
-                            input_sample_rate,
-                            &buffer_clone,
-                            &rms_clone,
-                            &envelope_clone,
-                            &is_rec_clone,
-                        ) {
-                            at_limit_clone.store(true, Ordering::SeqCst);
-                        }
-                    } else {
-                        *rms_clone.lock() = 0.0;
-                    }
-                },
-                stream_error_callback(Arc::clone(&last_error), Arc::clone(&is_recording)),
-                None,
-            ),
-            _ => return Err("Unsupported audio sample format".to_string()),
+        let names = ordered_input_names(&host)?;
+        let mut last_error = "No microphone found. Connect a microphone and try again.".to_string();
+        for name in names {
+            match open_named(&host, &name) {
+                Ok(recorder) => return Ok(recorder),
+                Err(error) => last_error = error,
+            }
         }
-        .map_err(|e| format!("Failed to build input stream: {}", e))?;
+        Err(last_error)
+    }
+}
 
-        stream
-            .play()
-            .map_err(|e| format!("Failed to start input stream: {}", e))?;
+fn open_named(host: &cpal::Host, device_name: &str) -> Result<AudioRecorder, String> {
+    let device = find_input(host, device_name)
+        .ok_or_else(|| format!("Microphone {device_name} disappeared"))?;
+    let supported_config = device
+        .default_input_config()
+        .map_err(|error| format!("{device_name}: {error}"))?;
+    let sample_format = supported_config.sample_format();
+    let config: cpal::StreamConfig = supported_config.into();
 
-        Ok(Self {
-            is_recording,
-            at_limit,
-            last_error,
-            buffer,
-            current_rms,
-            envelope,
-            _stream: stream,
-        })
+    let is_recording = Arc::new(AtomicBool::new(false));
+    let at_limit = Arc::new(AtomicBool::new(false));
+    let last_error = Arc::new(Mutex::new(None));
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    let current_rms = Arc::new(Mutex::new(0.0f32));
+    let envelope = Arc::new(Mutex::new(SpeechEnvelope::default()));
+    let last_callback_ms = Arc::new(AtomicU64::new(0));
+
+    let is_rec_clone = Arc::clone(&is_recording);
+    let at_limit_clone = Arc::clone(&at_limit);
+    let buffer_clone = Arc::clone(&buffer);
+    let rms_clone = Arc::clone(&current_rms);
+    let envelope_clone = Arc::clone(&envelope);
+    let callback_stamp = Arc::clone(&last_callback_ms);
+
+    let input_sample_rate = config.sample_rate.0;
+    let channels = config.channels.max(1) as usize;
+    let error_cb = stream_error_callback(Arc::clone(&last_error), Arc::clone(&is_recording));
+
+    let stream = build_stream(
+        &device,
+        &config,
+        sample_format,
+        channels,
+        input_sample_rate,
+        is_rec_clone,
+        at_limit_clone,
+        buffer_clone,
+        rms_clone,
+        envelope_clone,
+        callback_stamp,
+        error_cb,
+    )?;
+
+    stream
+        .play()
+        .map_err(|e| format!("Failed to start input stream: {}", e))?;
+
+    eprintln!("Microphone open: {device_name}");
+
+    Ok(AudioRecorder {
+        is_recording,
+        at_limit,
+        last_error,
+        buffer,
+        current_rms,
+        envelope,
+        device_name: device_name.to_string(),
+        opened_ms: now_ms(),
+        last_callback_ms,
+        _stream: stream,
+    })
+}
+
+impl AudioRecorder {
+    pub fn device_name(&self) -> &str {
+        &self.device_name
+    }
+
+    /// True when the capture callback has stopped. The next recording should
+    /// open the microphone again instead of writing into a dead stream.
+    pub fn needs_reopen(&self) -> bool {
+        stream_is_stale(
+            self.opened_ms,
+            nonzero(self.last_callback_ms.load(Ordering::Relaxed)),
+            now_ms(),
+        )
     }
 
     fn process_samples_f32(
         data: &[f32],
         channels: usize,
         sample_rate: u32,
-        buffer: &Arc<Mutex<Vec<f32>>>,
-        rms: &Arc<Mutex<f32>>,
-        envelope: &Arc<Mutex<SpeechEnvelope>>,
+        buffer: &Mutex<Vec<f32>>,
+        rms: &Mutex<f32>,
+        envelope: &Mutex<SpeechEnvelope>,
         is_recording: &AtomicBool,
     ) -> bool {
         if data.is_empty() {
@@ -266,6 +273,234 @@ fn stream_error_callback(
     }
 }
 
+fn ordered_input_names(host: &cpal::Host) -> Result<Vec<String>, String> {
+    let available = host
+        .input_devices()
+        .map_err(|error| format!("Could not list microphones: {error}"))?
+        .filter_map(|device| device.name().ok())
+        .collect::<Vec<_>>();
+    let default_name = host
+        .default_input_device()
+        .and_then(|device| device.name().ok());
+    let names = preferred_input_names(default_name.as_deref(), &available);
+    if names.is_empty() {
+        Err("No microphone found. Connect a microphone and try again.".to_string())
+    } else {
+        Ok(names)
+    }
+}
+
+fn find_input(host: &cpal::Host, name: &str) -> Option<cpal::Device> {
+    host.input_devices().ok()?.find(|device| {
+        device
+            .name()
+            .ok()
+            .is_some_and(|device_name| device_name == name)
+    })
+}
+
+/// Default endpoint first, then other real inputs. Loopback endpoints are omitted.
+pub fn preferred_input_names(default_name: Option<&str>, available: &[String]) -> Vec<String> {
+    let mut ranked = Vec::new();
+    for (index, name) in available.iter().enumerate() {
+        if let Some(rank) = input_priority(name) {
+            ranked.push((rank, index, name.as_str()));
+        }
+    }
+    ranked.sort_by(|left, right| right.0.cmp(&left.0).then(left.1.cmp(&right.1)));
+    let mut names: Vec<String> = ranked
+        .into_iter()
+        .map(|(_, _, name)| name.to_string())
+        .collect();
+    if let Some(default_name) = default_name {
+        if let Some(position) = names.iter().position(|name| name == default_name) {
+            let chosen = names.remove(position);
+            names.insert(0, chosen);
+        }
+    }
+    names
+}
+
+fn input_priority(name: &str) -> Option<u8> {
+    let normalized = name.to_ascii_lowercase();
+    if normalized.contains("stereo mix")
+        || normalized.contains("what u hear")
+        || normalized.contains("loopback")
+        || normalized.contains("wave out")
+        || normalized.contains("cable output")
+    {
+        return None;
+    }
+    if normalized.contains("mic") || normalized.contains("headset") {
+        Some(2)
+    } else {
+        Some(1)
+    }
+}
+
+fn stream_is_stale(opened_ms: u64, last_callback_ms: Option<u64>, now_ms: u64) -> bool {
+    match last_callback_ms {
+        Some(last) => now_ms.saturating_sub(last) > STALE_CALLBACK_MS,
+        None => now_ms.saturating_sub(opened_ms) > STALE_OPEN_MS,
+    }
+}
+
+fn nonzero(value: u64) -> Option<u64> {
+    (value != 0).then_some(value)
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn note_callback(last_callback_ms: &AtomicU64) {
+    last_callback_ms.store(now_ms().max(1), Ordering::Relaxed);
+}
+
+fn ingest(
+    samples: &[f32],
+    channels: usize,
+    sample_rate: u32,
+    is_recording: &AtomicBool,
+    at_limit: &AtomicBool,
+    buffer: &Mutex<Vec<f32>>,
+    rms: &Mutex<f32>,
+    envelope: &Mutex<SpeechEnvelope>,
+    last_callback_ms: &AtomicU64,
+) {
+    note_callback(last_callback_ms);
+    if is_recording.load(Ordering::Relaxed) {
+        if AudioRecorder::process_samples_f32(
+            samples,
+            channels,
+            sample_rate,
+            buffer,
+            rms,
+            envelope,
+            is_recording,
+        ) {
+            at_limit.store(true, Ordering::SeqCst);
+        }
+    } else {
+        *rms.lock() = 0.0;
+    }
+}
+
+fn build_stream(
+    device: &cpal::Device,
+    config: &cpal::StreamConfig,
+    sample_format: cpal::SampleFormat,
+    channels: usize,
+    sample_rate: u32,
+    is_recording: Arc<AtomicBool>,
+    at_limit: Arc<AtomicBool>,
+    buffer: Arc<Mutex<Vec<f32>>>,
+    rms: Arc<Mutex<f32>>,
+    envelope: Arc<Mutex<SpeechEnvelope>>,
+    last_callback_ms: Arc<AtomicU64>,
+    on_error: impl FnMut(cpal::StreamError) + Send + 'static,
+) -> Result<cpal::Stream, String> {
+    let unsupported = || format!("Unsupported audio sample format: {sample_format}");
+    match sample_format {
+        cpal::SampleFormat::F32 => device
+            .build_input_stream(
+                config,
+                move |data: &[f32], _| {
+                    ingest(
+                        data,
+                        channels,
+                        sample_rate,
+                        &is_recording,
+                        &at_limit,
+                        &buffer,
+                        &rms,
+                        &envelope,
+                        &last_callback_ms,
+                    );
+                },
+                on_error,
+                None,
+            )
+            .map_err(|error| format!("Failed to build input stream: {error}")),
+        cpal::SampleFormat::I16 => device
+            .build_input_stream(
+                config,
+                move |data: &[i16], _| {
+                    let samples = data
+                        .iter()
+                        .map(|sample| *sample as f32 / i16::MAX as f32)
+                        .collect::<Vec<_>>();
+                    ingest(
+                        &samples,
+                        channels,
+                        sample_rate,
+                        &is_recording,
+                        &at_limit,
+                        &buffer,
+                        &rms,
+                        &envelope,
+                        &last_callback_ms,
+                    );
+                },
+                on_error,
+                None,
+            )
+            .map_err(|error| format!("Failed to build input stream: {error}")),
+        cpal::SampleFormat::I32 => device
+            .build_input_stream(
+                config,
+                move |data: &[i32], _| {
+                    let samples = data
+                        .iter()
+                        .map(|sample| *sample as f32 / i32::MAX as f32)
+                        .collect::<Vec<_>>();
+                    ingest(
+                        &samples,
+                        channels,
+                        sample_rate,
+                        &is_recording,
+                        &at_limit,
+                        &buffer,
+                        &rms,
+                        &envelope,
+                        &last_callback_ms,
+                    );
+                },
+                on_error,
+                None,
+            )
+            .map_err(|error| format!("Failed to build input stream: {error}")),
+        cpal::SampleFormat::U16 => device
+            .build_input_stream(
+                config,
+                move |data: &[u16], _| {
+                    let samples = data
+                        .iter()
+                        .map(|sample| (*sample as f32 / u16::MAX as f32) * 2.0 - 1.0)
+                        .collect::<Vec<_>>();
+                    ingest(
+                        &samples,
+                        channels,
+                        sample_rate,
+                        &is_recording,
+                        &at_limit,
+                        &buffer,
+                        &rms,
+                        &envelope,
+                        &last_callback_ms,
+                    );
+                },
+                on_error,
+                None,
+            )
+            .map_err(|error| format!("Failed to build input stream: {error}")),
+        _ => Err(unsupported()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -331,5 +566,49 @@ mod tests {
         clear_session_signals(&last_error, &at_limit);
         assert!(take_pending_error(&last_error).is_none());
         assert!(!at_limit.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn preferred_input_skips_loopback_and_keeps_the_default_mic_first() {
+        let available = vec![
+            "Stereo Mix (Realtek)".to_string(),
+            "Microphone (fifine Microphone)".to_string(),
+            "Microphone (AB13X USB Audio)".to_string(),
+        ];
+        assert_eq!(
+            preferred_input_names(Some("Microphone (AB13X USB Audio)"), &available),
+            vec![
+                "Microphone (AB13X USB Audio)",
+                "Microphone (fifine Microphone)",
+            ]
+        );
+        assert_eq!(
+            preferred_input_names(None, &available),
+            vec![
+                "Microphone (fifine Microphone)",
+                "Microphone (AB13X USB Audio)",
+            ]
+        );
+        assert!(preferred_input_names(
+            Some("Stereo Mix (Realtek)"),
+            &["Stereo Mix (Realtek)".into()]
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn stale_stream_is_reopened_when_callbacks_stop() {
+        assert!(!stream_is_stale(1_000, None, 1_500));
+        assert!(stream_is_stale(1_000, None, 1_000 + STALE_OPEN_MS + 1));
+        assert!(!stream_is_stale(
+            1_000,
+            Some(5_000),
+            5_000 + STALE_CALLBACK_MS
+        ));
+        assert!(stream_is_stale(
+            1_000,
+            Some(5_000),
+            5_000 + STALE_CALLBACK_MS + 1
+        ));
     }
 }
