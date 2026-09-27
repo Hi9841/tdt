@@ -12,11 +12,12 @@ mod stt;
 mod ui;
 mod update;
 
-use audio::{play_sound, AudioRecorder, SoundEffect, VIS_BARS};
+use audio::{play_sound, AudioRecorder, SoundEffect, SpeechTail, MAX_TAIL, VIS_BARS};
 use config::{AppConfig, AppStats};
 use gpui::*;
 use hotkey::{
-    poll_capture_timeout, set_binding, tap_should_stop, HotkeyAction, HotkeyBinding, HotkeyListener,
+    current_binding, input_appeared, input_mask, is_modifier_vk, poll_capture_timeout, set_binding,
+    tap_should_stop, HotkeyAction, HotkeyBinding, HotkeyListener,
 };
 use parking_lot::Mutex;
 use paste::{DeliveryOutcome, PasteInjector};
@@ -281,12 +282,18 @@ fn main() {
 
                 // Spawn UI coordination loop running on GPUI executor
                 cx.spawn(async move |this, cx| {
+                    struct ReleaseTail {
+                        released_at: Instant,
+                        baseline: [bool; 256],
+                    }
                     let mut is_recording_state = false;
                     let mut is_processing_state = false;
                     let mut recording_before_press = false;
                     let mut recording_session = 0u64;
                     let mut limit_notice = false;
                     let mut live_tx: Option<crossbeam_channel::Sender<LiveAudio>> = None;
+                    let mut utterance_tail = SpeechTail::default();
+                    let mut release_tail: Option<ReleaseTail> = None;
 
                     loop {
                         let poll_interval = if is_recording_state || is_processing_state {
@@ -405,6 +412,7 @@ fn main() {
                             if let (Some(tx), Some(recorder)) = (live_tx.as_ref(), rec.borrow().as_ref()) {
                                 let chunk = recorder.drain();
                                 if !chunk.is_empty() {
+                                    utterance_tail.push_samples(&chunk);
                                     let _ = tx.send(LiveAudio::Chunk(chunk));
                                 }
                             }
@@ -414,19 +422,21 @@ fn main() {
                         if preview::is_active() {
                             while hotkey_rx.try_recv().is_ok() {}
                         }
-                        let mut actions: Vec<_> = hotkey_rx.try_iter().collect();
+                        let actions: Vec<_> = hotkey_rx.try_iter().collect();
                         let stream_error = rec.borrow().as_ref().and_then(AudioRecorder::take_error);
                         if let Some(error) = stream_error {
                             if let Some(recorder) = rec.borrow().as_ref() { recorder.stop(); }
                             *rec.borrow_mut() = None;
                             is_recording_state = false;
+                            release_tail = None;
                             let _ = this.update(cx, |view, cx| { view.set_error(error); cx.notify(); });
                         }
                         let at_limit = is_recording_state && rec.borrow().as_ref().is_some_and(AudioRecorder::limit_reached);
                         let stop_requested = this.update(cx, |view, _| std::mem::take(&mut view.stop_requested)).unwrap_or(false);
+                        let mut stop_now = false;
                         if is_recording_state && (at_limit || stop_requested) {
                             limit_notice = at_limit;
-                            actions.insert(0, HotkeyAction::HoldReleased);
+                            stop_now = true;
                         }
                         for action in actions {
                             if preview::is_active() {
@@ -485,6 +495,8 @@ fn main() {
                                         if let Some(recorder) = rec.borrow().as_ref() { recorder.start(); }
                                         recording_session = recording_session.wrapping_add(1);
                                         limit_notice = false;
+                                        utterance_tail = SpeechTail::default();
+                                        release_tail = None;
                                         if let Some(engine) = stt.lock().clone() {
                                             let (tx, rx) = crossbeam_channel::unbounded();
                                             live_tx = Some(tx);
@@ -529,32 +541,63 @@ fn main() {
                                     } else {
                                         true
                                     };
-                                    if should_stop && is_recording_state {
-                                        is_recording_state = false;
-                                        is_processing_state = true;
-                                        let samples = rec.borrow().as_ref().map(AudioRecorder::stop).unwrap_or_default();
-                                        if let Some(tx) = live_tx.take() {
-                                            let _ = tx.send(LiveAudio::Chunk(samples));
-                                            let _ = tx.send(LiveAudio::Finish(Instant::now()));
-                                        }
-                                        play_sound(SoundEffect::StopListening);
-                                        let _ = this.update(cx, |view, cx| {
-                                            // Recording is over; drop the live
-                                            // waveform here rather than in render.
-                                            view.wave_peaks = [0.0; VIS_BARS];
-                                            let recorded_for = match &view.status {
-                                                HudStatus::Listening { started_at, .. } => {
-                                                    started_at.elapsed()
-                                                }
-                                                _ => Duration::from_secs(0),
-                                            };
-                                            view.status = HudStatus::Transcribing { recorded_for };
-                                            if limit_notice { view.recovery_message = Some("Recording stopped at the 2-minute limit. Transcribing the recorded audio.".into()); }
-                                            cx.notify();
+                                    if should_stop && is_recording_state && !stop_now && release_tail.is_none()
+                                    {
+                                        utterance_tail.mark_release();
+                                        let baseline = input_mask();
+                                        let typing = baseline.iter().enumerate().any(|(vk, down)| {
+                                            *down
+                                                && !is_modifier_vk(vk as u16)
+                                                && vk as u16 != current_binding().vk
                                         });
+                                        if typing {
+                                            stop_now = true;
+                                        } else {
+                                            release_tail = Some(ReleaseTail {
+                                                released_at: Instant::now(),
+                                                baseline,
+                                            });
+                                        }
                                     }
                                 }
                             }
+                        }
+
+                        if is_recording_state {
+                            if let Some(tail) = release_tail.as_ref() {
+                                let timed_out = tail.released_at.elapsed() >= MAX_TAIL;
+                                if utterance_tail.should_stop()
+                                    || timed_out
+                                    || input_appeared(&tail.baseline)
+                                {
+                                    stop_now = true;
+                                }
+                            }
+                        }
+                        if stop_now && is_recording_state {
+                            is_recording_state = false;
+                            is_processing_state = true;
+                            release_tail = None;
+                            let samples = rec.borrow().as_ref().map(AudioRecorder::stop).unwrap_or_default();
+                            if let Some(tx) = live_tx.take() {
+                                let _ = tx.send(LiveAudio::Chunk(samples));
+                                let _ = tx.send(LiveAudio::Finish(Instant::now()));
+                            }
+                            play_sound(SoundEffect::StopListening);
+                            let _ = this.update(cx, |view, cx| {
+                                // Recording is over; drop the live
+                                // waveform here rather than in render.
+                                view.wave_peaks = [0.0; VIS_BARS];
+                                let recorded_for = match &view.status {
+                                    HudStatus::Listening { started_at, .. } => {
+                                        started_at.elapsed()
+                                    }
+                                    _ => Duration::from_secs(0),
+                                };
+                                view.status = HudStatus::Transcribing { recorded_for };
+                                if limit_notice { view.recovery_message = Some("Recording stopped at the 2-minute limit. Transcribing the recorded audio.".into()); }
+                                cx.notify();
+                            });
                         }
 
                         // 3. Process background transcription results
