@@ -8,6 +8,11 @@ pub fn is_active() -> bool {
     requested().is_some()
 }
 
+/// Native tray verification still uses isolated config, audio, and hotkeys.
+pub fn wants_tray() -> bool {
+    is_active() && std::env::var_os("TDT_PREVIEW_TRAY").is_some()
+}
+
 pub fn requested() -> Option<String> {
     std::env::var("TDT_PREVIEW_STATE")
         .ok()

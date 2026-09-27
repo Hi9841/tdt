@@ -1,9 +1,7 @@
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
 #[cfg(not(target_os = "windows"))]
-compile_error!(
-    "TDT desktop is a Windows-only build. Build the Android app from the `mobile` folder instead."
-);
+compile_error!("TDT desktop is a Windows-only build.");
 
 mod audio;
 mod autostart;
@@ -29,14 +27,14 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use stt::{models, SharedEngine, SttEngine};
+use stt::{models, LiveAudio, LiveTranscript, SharedEngine, SttEngine};
 use tray_icon::menu::MenuEvent;
 use tray_icon::{MouseButton, MouseButtonState, TrayIconEvent};
 use ui::preview;
 use ui::tray::tooltip_text;
 use ui::window_util::{
     find_app_hwnd, follow_current_virtual_desktop, lock_overlay_chrome,
-    position_bubble_on_preferred_monitor, set_overlay_hidden, BUBBLE_HEIGHT, BUBBLE_WIDTH,
+    position_bubble_on_preferred_monitor, BUBBLE_HEIGHT, BUBBLE_WIDTH,
 };
 use ui::{HudStatus, HudView, SystemTray};
 use update::UpdatePhase;
@@ -51,10 +49,47 @@ enum InternalEvent {
     },
     TranscribeError(String),
     NoSpeech,
-    PrepareFailed {
-        session: u64,
-        message: String,
-    },
+}
+
+fn deliver_transcript(
+    result: LiveTranscript,
+    injector: Arc<PasteInjector>,
+    tx: crossbeam_channel::Sender<InternalEvent>,
+    should_paste: bool,
+    target: Option<isize>,
+) {
+    if !result.text.trim().is_empty() {
+        let mut stats = AppStats::load();
+        stats.record_and_save(&result.text, result.duration_secs, result.latency_ms);
+    }
+    let (auto_pasted, notice) = match injector.deliver(&result.text, should_paste, target) {
+        Ok(DeliveryOutcome::NoSpeech) => {
+            let _ = tx.send(InternalEvent::NoSpeech);
+            return;
+        }
+        Ok(DeliveryOutcome::Copied) => (false, None),
+        Ok(DeliveryOutcome::Pasted) => (true, None),
+        Ok(DeliveryOutcome::CopiedFallback(_)) => (
+            false,
+            Some(
+                "Copied. Could not insert all text. Check the destination before pasting with Ctrl+V."
+                    .to_string(),
+            ),
+        ),
+        Err(error) => {
+            let _ = tx.send(InternalEvent::TranscribeError(format!(
+                "Could not copy text. Open History to copy the saved transcript. {error}"
+            )));
+            return;
+        }
+    };
+    let _ = tx.send(InternalEvent::TranscribeSuccess {
+        text: result.text,
+        auto_pasted,
+        notice,
+        _duration_secs: result.duration_secs,
+        latency_ms: result.latency_ms,
+    });
 }
 
 fn main() {
@@ -94,6 +129,9 @@ fn main() {
         let _ = config.save();
     }
     let auto_paste = config.auto_paste;
+    if preview::wants_tray() {
+        config.tray_mode = true;
+    }
     let hotkey_binding = HotkeyBinding::parse(&config.hotkey).unwrap_or_default();
     set_binding(hotkey_binding);
     let hotkey_label = hotkey_binding.display();
@@ -140,6 +178,19 @@ fn main() {
         },
     ));
 
+    // Load and warm the selected model while the app opens, so a short first
+    // dictation does not pay the full initialization cost after release.
+    // prepare() serializes with recording and retries on failure.
+    if !preview::is_active() {
+        if let Some(engine) = stt_engine.lock().clone() {
+            std::thread::spawn(move || {
+                if let Err(error) = engine.prepare() {
+                    append_log(&format!("Could not prepare the speech model: {error}"));
+                }
+            });
+        }
+    }
+
     // 3. Initialize paste injector
     let injector = Arc::new(PasteInjector::new());
 
@@ -160,7 +211,7 @@ fn main() {
 
     app.run(move |cx: &mut App| {
         // Windows requires the event loop to exist before creating the tray icon.
-        let tray = if preview::is_active() { None } else { match SystemTray::new(auto_paste, &hotkey_label) {
+        let mut tray = if preview::is_active() && !preview::wants_tray() { None } else { match SystemTray::new(auto_paste, &hotkey_label, config.tray_mode) {
             Ok(tray) => Some(tray),
             Err(error) => {
                 append_log(&format!("Failed to create system tray: {error}"));
@@ -238,6 +289,7 @@ fn main() {
                     let mut recording_before_press = false;
                     let mut recording_session = 0u64;
                     let mut limit_notice = false;
+                    let mut live_tx: Option<crossbeam_channel::Sender<LiveAudio>> = None;
 
                     loop {
                         let poll_interval = if is_recording_state || is_processing_state {
@@ -252,10 +304,8 @@ fn main() {
                         lock_overlay_chrome();
                         poll_capture_timeout();
                         if take_show_request() {
-                            set_overlay_hidden(false);
                             let _ = this.update(cx, |view, cx| {
-                                view.reveal_overlay();
-                                cx.notify();
+                                view.show_from_tray(cx);
                             });
                         }
                         while update_ping_rx.try_recv().is_ok() {
@@ -296,9 +346,11 @@ fn main() {
                                     let mut flag = auto_paste_flag.lock();
                                     *flag = !*flag;
                                     let current = *flag;
-                                    let mut cfg = AppConfig::load();
-                                    cfg.auto_paste = current;
-                                    let _ = cfg.save();
+                                    if !preview::is_active() {
+                                        let mut cfg = AppConfig::load();
+                                        cfg.auto_paste = current;
+                                        let _ = cfg.save();
+                                    }
                                     let _ = this.update(cx, |view, cx| {
                                         view.auto_paste_enabled = current;
                                         cx.notify();
@@ -307,11 +359,23 @@ fn main() {
                                     let _ = this.update(cx, |view, cx| {
                                         view.open_settings(cx);
                                     });
-                                } else if event.id == tray.show_item.id() {
-                                    set_overlay_hidden(false);
+                                } else if event.id == tray.tray_mode_item.id() {
                                     let _ = this.update(cx, |view, cx| {
-                                        view.reveal_overlay();
+                                        if let Err(error) = view.set_tray_mode(tray.tray_mode_item.is_checked()) {
+                                            tray.tray_mode_item.set_checked(view.tray_mode);
+                                            view.set_error(error);
+                                            view.open_settings(cx);
+                                        }
+                                        view.sync_tray_overlay(tray.tray_icon.rect());
                                         cx.notify();
+                                    });
+                                } else if event.id == tray.hide_item.id() {
+                                    let _ = this.update(cx, |view, cx| view.hide_overlay(cx));
+                                } else if event.id == tray.stop_item.id() {
+                                    let _ = this.update(cx, |view, _| view.stop_requested = true);
+                                } else if event.id == tray.show_item.id() {
+                                    let _ = this.update(cx, |view, cx| {
+                                        view.show_from_tray(cx);
                                     });
                                 } else if event.id == tray.updates_item.id() {
                                     let _ = this.update(cx, |view, cx| {
@@ -332,10 +396,8 @@ fn main() {
                                     button: MouseButton::Left,
                                     ..
                                 } => {
-                                    set_overlay_hidden(false);
                                     let _ = this.update(cx, |view, cx| {
-                                        view.reveal_overlay();
-                                        cx.notify();
+                                        view.show_from_tray(cx);
                                     });
                                 }
                                 _ => {}
@@ -354,55 +416,14 @@ fn main() {
                             }
                         }
 
-                        // Helper closure to run transcription in background thread
-                        let dispatch_transcribe = |samples: Vec<f32>,
-                                                   stt_worker: SharedEngine,
-                                                   inj_worker: Arc<PasteInjector>,
-                                                   tx: crossbeam_channel::Sender<InternalEvent>,
-                                                   should_paste: bool,
-                                                   target: Option<isize>| {
-                            std::thread::spawn(move || {
-                                let engine = stt_worker.lock().clone();
-                                if let Some(ref engine) = engine {
-                                    let start_t = Instant::now();
-                                    let duration_secs = samples.len() as f32 / 16000.0;
-                                    match engine.transcribe(&samples) {
-                                        Ok(text) => {
-                                            let latency_ms = start_t.elapsed().as_millis() as u64;
-                                            if !text.trim().is_empty() {
-                                                let mut stats = AppStats::load();
-                                                stats.record_and_save(&text, duration_secs, latency_ms);
-                                            }
-                                            let (auto_pasted, notice) = match inj_worker.deliver(&text, should_paste, target) {
-                                                Ok(DeliveryOutcome::NoSpeech) => { let _ = tx.send(InternalEvent::NoSpeech); return; }
-                                                Ok(DeliveryOutcome::Copied) => (false, None),
-                                                Ok(DeliveryOutcome::Pasted) => (true, None),
-                                                Ok(DeliveryOutcome::CopiedFallback(_)) => (false, Some("Copied. Could not insert all text. Check the destination before pasting with Ctrl+V.".into())),
-                                                Err(error) => {
-                                                    let _ = tx.send(InternalEvent::TranscribeError(format!("Could not copy text. Open History to copy the saved transcript. {error}")));
-                                                    return;
-                                                }
-                                            };
-                                            let _ = tx.send(InternalEvent::TranscribeSuccess {
-                                                text,
-                                                auto_pasted,
-                                                notice,
-                                                _duration_secs: duration_secs,
-                                                latency_ms,
-                                            });
-                                        }
-                                        Err(e) => {
-                                            let _ = tx.send(InternalEvent::TranscribeError(e));
-                                        }
-                                    }
-                                } else {
-                                    let _ = tx.send(InternalEvent::TranscribeError(
-                                        "Speech model not ready. Open Settings to download it."
-                                            .to_string(),
-                                    ));
+                        if is_recording_state {
+                            if let (Some(tx), Some(recorder)) = (live_tx.as_ref(), rec.borrow().as_ref()) {
+                                let chunk = recorder.drain();
+                                if !chunk.is_empty() {
+                                    let _ = tx.send(LiveAudio::Chunk(chunk));
                                 }
-                            });
-                        };
+                            }
+                        }
 
                         // 2. Process Hotkey Events
                         if preview::is_active() {
@@ -456,11 +477,11 @@ fn main() {
                                     // transcription. The current recorder and STT
                                     // engine are single-session by design.
                                     if !is_recording_state && !is_processing_state {
-                                        set_overlay_hidden(false);
+                                        let _ = this.update(cx, |view, _| view.reveal_overlay());
                                         if stt.lock().is_none() {
                                             let _ = this.update(cx, |view, cx| {
                                                 view.set_error("Download a speech model in Settings before recording.".into());
-                                                view.open_settings(cx);
+                                                if !view.tray_mode { view.open_settings(cx); }
                                                 cx.notify();
                                             });
                                             continue;
@@ -480,11 +501,22 @@ fn main() {
                                         recording_session = recording_session.wrapping_add(1);
                                         limit_notice = false;
                                         if let Some(engine) = stt.lock().clone() {
-                                            let tx = internal_tx.clone();
-                                            let session = recording_session;
+                                            let (tx, rx) = crossbeam_channel::unbounded();
+                                            live_tx = Some(tx);
+                                            let events = internal_tx.clone();
+                                            let inj_worker = Arc::clone(&inj);
+                                            let paste_flag = Arc::clone(&auto_paste_flag);
+                                            let target_flag = Arc::clone(&target_hwnd);
                                             std::thread::spawn(move || {
-                                                if let Err(error) = engine.prepare() {
-                                                    let _ = tx.send(InternalEvent::PrepareFailed { session, message: format!("Could not load the speech model. Choose another model in Settings. {error}") });
+                                                match engine.transcribe_live(&rx) {
+                                                    Ok(result) => {
+                                                        let should_paste = *paste_flag.lock();
+                                                        let target = *target_flag.lock();
+                                                        deliver_transcript(result, inj_worker, events, should_paste, target);
+                                                    }
+                                                    Err(error) => {
+                                                        let _ = events.send(InternalEvent::TranscribeError(format!("Could not load the speech model. Choose another model in Settings. {error}")));
+                                                    }
                                                 }
                                             });
                                         }
@@ -516,6 +548,10 @@ fn main() {
                                         is_recording_state = false;
                                         is_processing_state = true;
                                         let samples = rec.borrow().as_ref().map(AudioRecorder::stop).unwrap_or_default();
+                                        if let Some(tx) = live_tx.take() {
+                                            let _ = tx.send(LiveAudio::Chunk(samples));
+                                            let _ = tx.send(LiveAudio::Finish(Instant::now()));
+                                        }
                                         play_sound(SoundEffect::StopListening);
                                         let _ = this.update(cx, |view, cx| {
                                             // Recording is over; drop the live
@@ -531,15 +567,6 @@ fn main() {
                                             if limit_notice { view.recovery_message = Some("Recording stopped at the 2-minute limit. Transcribing the recorded audio.".into()); }
                                             cx.notify();
                                         });
-
-                                        dispatch_transcribe(
-                                            samples,
-                                            stt.clone(),
-                                            Arc::clone(&inj),
-                                            internal_tx.clone(),
-                                            *auto_paste_flag.lock(),
-                                            *target_hwnd.lock(),
-                                        );
                                     }
                                 }
                             }
@@ -560,6 +587,7 @@ fn main() {
                                         view.status = HudStatus::Success {
                                             text,
                                             auto_pasted,
+                                            latency_ms,
                                             finished_at,
                                         };
                                         cx.notify();
@@ -567,6 +595,11 @@ fn main() {
                                 }
                                 InternalEvent::TranscribeError(err) => {
                                     is_processing_state = false;
+                                    if is_recording_state {
+                                        if let Some(recorder) = rec.borrow().as_ref() { recorder.stop(); }
+                                        is_recording_state = false;
+                                        live_tx = None;
+                                    }
                                     play_sound(SoundEffect::Error);
                                     let _ = this.update(cx, |view, cx| {
                                         view.stats = AppStats::load();
@@ -582,13 +615,7 @@ fn main() {
                                         cx.notify();
                                     });
                                 }
-                                InternalEvent::PrepareFailed { session, message } => {
-                                    if session == recording_session && is_recording_state {
-                                        if let Some(recorder) = rec.borrow().as_ref() { recorder.stop(); }
-                                        is_recording_state = false;
-                                        let _ = this.update(cx, |view, cx| { view.set_error(message); cx.notify(); });
-                                    }
-                                }
+
                             }
                         }
 
@@ -629,13 +656,22 @@ fn main() {
                                 HudStatus::Transcribing { .. } => {}
                                 HudStatus::Success { finished_at, .. } => {
                                     if !preview::is_active()
-                                        && finished_at.elapsed() > Duration::from_millis(1800)
+                                        && view.recovery_message.is_none()
+                                        && finished_at.elapsed() > Duration::from_millis(if view.tray_mode { 6000 } else { 1800 })
                                     {
                                         view.status = HudStatus::Idle;
                                         cx.notify();
                                     }
                                 }
                                 HudStatus::Error { .. } | HudStatus::NoSpeech | HudStatus::Idle => {}
+                            }
+                            if let Some(tray) = tray.as_mut() {
+                                tray.update(&view.status, &view.hotkey_label);
+                                view.sync_tray_overlay(tray.tray_icon.rect());
+                            } else if view.tray_mode {
+                                // A failed tray must never make the app inaccessible.
+                                view.tray_mode = false;
+                                view.reveal_overlay();
                             }
                         });
                     }

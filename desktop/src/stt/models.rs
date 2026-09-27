@@ -62,7 +62,8 @@ pub struct DownloadProgress {
     pub file_count: usize,
 }
 
-/// Recommended default: high-accuracy English Parakeet transducer (int8).
+/// Recommended default: English Parakeet Unified 0.6B int8. Lower English
+/// error rate than v3, and the streaming export is the low-latency one.
 pub const DEFAULT_MODEL_ID: &str = "parakeet-unified-en-0.6b-q8";
 
 /// Previous default, kept so existing `config.json` files migrate cleanly.
@@ -72,7 +73,7 @@ pub const LEGACY_DEFAULT_MODEL_ID: &str = "sensevoice-small";
 /// Retired ids kept for migration only; they resolve to a supported model.
 fn migrated_id(id: &str) -> &'static str {
     match id.trim() {
-        // Retired Whisper Small slot is now Parakeet Q8.
+        // Retired Whisper Small slot follows the current default.
         "whisper-small" => DEFAULT_MODEL_ID,
         // Retired SenseVoice Small slot is now Moonshine Medium Streaming.
         "sensevoice-small" => "moonshine-medium-streaming",
@@ -138,7 +139,8 @@ pub const CATALOG: &[ModelSpec] = &[
     ModelSpec {
         id: DEFAULT_MODEL_ID,
         label: "Parakeet Q8",
-        blurb: "High-accuracy English model with fast streaming. Recommended.",
+        blurb:
+            "Most accurate English model here, with the low-latency streaming export. Recommended.",
         size_label: "632 MB",
         size_bytes: 663_048_980,
         family: ModelFamily::ParakeetTransducer,
@@ -161,6 +163,35 @@ pub const CATALOG: &[ModelSpec] = &[
             ModelFile {
                 name: "tokens.txt",
                 sha256: "DC0B4584AB2E4DDBF888425C076C61B736E7356A015250DB7D307E6F1A8188FF",
+            },
+        ],
+    },
+    ModelSpec {
+        id: "parakeet-tdt-0.6b-v3",
+        label: "Parakeet v3",
+        blurb: "25 European languages. English accuracy and latency trail Parakeet Q8.",
+        size_label: "639 MB",
+        size_bytes: 670_478_772,
+        family: ModelFamily::ParakeetTransducer,
+        // int8 offline export of nvidia/parakeet-tdt-0.6b-v3.
+        hf_repo: "csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8",
+        dir_name: "parakeet-tdt-0.6b-v3",
+        files: &[
+            ModelFile {
+                name: "encoder.int8.onnx",
+                sha256: "ACFC2B4456377E15D04F0243AF540B7FE7C992F8D898D751CF134C3A55FD2247",
+            },
+            ModelFile {
+                name: "decoder.int8.onnx",
+                sha256: "179E50C43D1A9DE79C8A24149A2F9BAC6EB5981823F2A2ED88D655B24248DB4E",
+            },
+            ModelFile {
+                name: "joiner.int8.onnx",
+                sha256: "3164C13FC2821009440D20FCB5FDC78BFF28B4DB2F8D0F0B329101719C0948B3",
+            },
+            ModelFile {
+                name: "tokens.txt",
+                sha256: "D58544679EA4BC6AC563D1F545EB7D474BD6CFA467F0A6E2C1DC1C7D37E3C35D",
             },
         ],
     },
@@ -563,7 +594,7 @@ fn canonicalize_or_clone(path: &Path) -> PathBuf {
 mod tests {
     use super::{
         by_id, file_label, format_mb, percent, resolve, whisper_language, ModelFamily, ModelSpec,
-        CATALOG, DEFAULT_MODEL_ID,
+        CATALOG, DEFAULT, DEFAULT_MODEL_ID,
     };
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -614,8 +645,8 @@ mod tests {
         assert!(ids.contains(&DEFAULT_MODEL_ID));
         assert_eq!(
             CATALOG.len(),
-            4,
-            "catalog keeps exactly Moonshine, SenseVoice Full, Parakeet Q8, Whisper Medium",
+            5,
+            "catalog keeps Moonshine, SenseVoice Full, Parakeet v3, Parakeet Q8, Whisper Medium",
         );
         assert_eq!(
             by_id(DEFAULT_MODEL_ID).map(|spec| spec.id),
@@ -626,12 +657,15 @@ mod tests {
     #[test]
     fn default_is_parakeet_q8_with_expected_labels() {
         assert_eq!(resolve("").id, DEFAULT_MODEL_ID);
+        assert_eq!(DEFAULT_MODEL_ID, "parakeet-unified-en-0.6b-q8");
+        assert_eq!(DEFAULT.id, DEFAULT_MODEL_ID);
         assert_eq!(
             CATALOG.iter().map(|spec| spec.label).collect::<Vec<_>>(),
             vec![
                 "Moonshine Medium",
                 "SenseVoice Full",
                 "Parakeet Q8",
+                "Parakeet v3",
                 "Whisper Medium"
             ]
         );
@@ -676,6 +710,7 @@ mod tests {
 
     #[test]
     fn format_mb_rounds_known_sizes() {
+        assert_eq!(format_mb(670_478_772), "639 MB");
         assert_eq!(format_mb(663_048_980), "632 MB");
         assert_eq!(format_mb(946_072_270), "902 MB");
     }

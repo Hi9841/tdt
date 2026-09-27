@@ -3,8 +3,15 @@
 TDT bundles or downloads components maintained by other projects. Their
 licenses remain applicable to those components.
 
-- Sherpa-ONNX: Apache-2.0. The Android build uses the `sherpa-onnx` release
-  AAR. Source and releases: https://github.com/k2-fsa/sherpa-onnx
+- Sherpa-ONNX: Apache-2.0. The Windows build uses the `sherpa-onnx` crate.
+  Source and releases: https://github.com/k2-fsa/sherpa-onnx
+- Parakeet TDT 0.6B v3: multilingual transducer weights from
+  https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3 (CC-BY-4.0). TDT downloads
+  the sherpa-onnx int8 export
+  `csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8`
+  (`encoder.int8.onnx`, `decoder.int8.onnx`, `joiner.int8.onnx`, `tokens.txt`)
+  into `%LOCALAPPDATA%\TDT\models\parakeet-tdt-0.6b-v3\` when you choose
+  Parakeet v3 in Settings.
 - Parakeet Unified EN 0.6B Q8: high-accuracy English transducer weights are
   distributed via the sherpa-onnx export
   `csukuangfj2/sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-streaming-1120ms`.
