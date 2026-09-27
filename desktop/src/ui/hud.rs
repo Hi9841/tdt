@@ -82,7 +82,6 @@ struct PreparedModel {
 
 pub struct HudView {
     pub status: HudStatus,
-    pub tray_mode: bool,
     pub auto_paste_enabled: bool,
     autostart_enabled: bool,
     autostart_error: Option<String>,
@@ -161,7 +160,6 @@ impl HudView {
         let (model_ready_tx, model_ready_rx) = crossbeam_channel::unbounded();
         let mut view = Self {
             status: HudStatus::Idle,
-            tray_mode: config.tray_mode || preview::wants_tray(),
             auto_paste_enabled,
             autostart_enabled: crate::autostart::is_enabled(),
             autostart_error: None,
@@ -519,40 +517,16 @@ impl HudView {
     }
 
     pub fn reveal_overlay(&mut self) {
-        set_overlay_hidden(self.tray_mode && self.mode == WindowViewMode::Bubble);
+        set_overlay_hidden(false);
     }
 
     pub fn show_from_tray(&mut self, cx: &mut Context<Self>) {
-        if self.tray_mode {
-            self.open_settings(cx);
-        } else {
-            self.reveal_overlay();
-        }
+        self.reveal_overlay();
         cx.notify();
     }
 
-    pub fn set_tray_mode(&mut self, enabled: bool) -> Result<(), String> {
-        if !preview::is_active() {
-            let mut config = AppConfig::load();
-            config.tray_mode = enabled;
-            config
-                .save()
-                .map_err(|error| format!("Could not save tray mode. Try again. {error}"))?;
-        }
-        self.tray_mode = enabled;
-        if !enabled {
-            self.reveal_overlay();
-            if self.mode == WindowViewMode::Bubble {
-                if let Some(hwnd) = crate::ui::window_util::find_app_hwnd() {
-                    crate::ui::window_util::position_bubble_on_preferred_monitor(hwnd);
-                }
-            }
-        }
-        Ok(())
-    }
-
     pub fn sync_tray_overlay(&mut self, rect: Option<tray_icon::Rect>) {
-        if !self.tray_mode || self.panel_motion.is_some() {
+        if self.panel_motion.is_some() {
             return;
         }
         let visible = self.mode == WindowViewMode::StatsAndSettings;
@@ -885,9 +859,6 @@ impl Render for HudView {
                 self.panel_needs_focus = false;
             }
             self.render_stats_settings(cx)
-        } else if self.tray_mode {
-            // Keep startup and close-transition frames free of a status bubble.
-            div().into_any_element()
         } else {
             self.render_bubble(cx)
         }
@@ -1131,10 +1102,8 @@ impl HudView {
             .cursor_move()
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, _, _, _| {
-                    if !this.tray_mode {
-                        start_window_drag();
-                    }
+                cx.listener(|_this, _, _, _| {
+                    start_window_drag();
                 }),
             )
             .child(
