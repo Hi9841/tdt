@@ -40,6 +40,7 @@ pub enum HudStatus {
     NoSpeech,
     Listening {
         audio_level: f32,
+        partial: String,
         started_at: Instant,
     },
     Transcribing {
@@ -257,6 +258,7 @@ impl HudView {
             PreviewSpec::BubbleListening { loud } => {
                 self.status = HudStatus::Listening {
                     audio_level: if loud { 0.8 } else { 0.12 },
+                    partial: String::new(),
                     started_at: Instant::now() - Duration::from_secs(12),
                 };
                 self.wave_peaks = preview_wave(loud);
@@ -301,7 +303,11 @@ impl HudView {
                 self.recovery_message = Some("Copied. Could not insert all text. Check the destination before pasting with Ctrl+V.".into());
             }
             PreviewSpec::BubbleLimit => {
-                self.status = HudStatus::Listening { audio_level: 0.5, started_at: Instant::now() - Duration::from_secs(115) };
+                self.status = HudStatus::Listening {
+                    audio_level: 0.5,
+                    partial: String::new(),
+                    started_at: Instant::now() - Duration::from_secs(115),
+                };
                 self.wave_peaks = preview_wave(true);
             }
             PreviewSpec::PanelModelFailed => {
@@ -916,6 +922,9 @@ impl HudView {
             HudStatus::Success { text, .. } => overlay_snippet(text, success()),
             HudStatus::Error { .. } => overlay_snippet("Open details to recover", muted()),
             HudStatus::NoSpeech => overlay_snippet("Try again", muted()),
+            HudStatus::Listening { partial, .. } if !partial.is_empty() => {
+                overlay_snippet(partial, text())
+            }
             _ => waveform,
         };
 

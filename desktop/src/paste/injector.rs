@@ -1,8 +1,129 @@
 use arboard::Clipboard;
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+
+/// What the final transcript should do to text already inserted at key-up.
+#[derive(Debug, PartialEq, Eq)]
+pub enum FinalEdit {
+    /// Final text is empty. `erase` is set when a partial was inserted.
+    NoSpeech { erase: Option<String> },
+    /// Copy only. Auto-paste is off.
+    CopyOnly,
+    /// Nothing was inserted early. Copy and type the whole final text.
+    TypeAll,
+    /// The insertion already matches the final text. Refresh the clipboard only.
+    Keep,
+    /// Final text continues the insertion. Type this tail.
+    Extend(String),
+    /// The hypothesis changed. Delete `erase`, then type `text`.
+    Replace { erase: String, text: String },
+}
+
+/// `inserted` is the exact string typed at key-up. `None` means the document was not changed.
+pub fn final_edit(inserted: Option<&str>, final_text: &str, should_paste: bool) -> FinalEdit {
+    let final_text = final_text.trim();
+    if final_text.is_empty() {
+        return FinalEdit::NoSpeech {
+            erase: inserted.map(str::to_string),
+        };
+    }
+    // Auto-paste off still corrects text that was already typed at key-up.
+    if !should_paste && inserted.is_none() {
+        return FinalEdit::CopyOnly;
+    }
+    let Some(inserted) = inserted else {
+        return FinalEdit::TypeAll;
+    };
+    if let Some(rest) = final_text.strip_prefix(inserted) {
+        return if rest.is_empty() {
+            FinalEdit::Keep
+        } else {
+            FinalEdit::Extend(rest.to_string())
+        };
+    }
+    FinalEdit::Replace {
+        erase: inserted.to_string(),
+        text: final_text.to_string(),
+    }
+}
+
+/// Keys actually sent for `text`. Carriage returns are skipped, matching insertion.
+pub fn inserted_key_count(text: &str) -> usize {
+    text.chars().filter(|character| *character != '\r').count()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum EarlyClaim {
+    /// No early insert ran. Type the final text normally.
+    None,
+    /// An early insert was attempted and did not land in the document.
+    NotInserted,
+    /// This exact string is already in the document.
+    Inserted(String),
+}
+
+enum PastePhase {
+    Idle,
+    Running,
+    Done { text: String, inserted: bool },
+    Closed,
+}
+
+/// One early insert per utterance, then the final pass waits for it.
+pub struct PasteGate {
+    phase: Mutex<PastePhase>,
+    cv: Condvar,
+}
+
+impl PasteGate {
+    pub fn new() -> Self {
+        Self {
+            phase: Mutex::new(PastePhase::Idle),
+            cv: Condvar::new(),
+        }
+    }
+
+    /// False when an early insert is already in flight or the final pass has claimed the slot.
+    pub fn begin(&self) -> bool {
+        let mut phase = self.phase.lock();
+        if !matches!(*phase, PastePhase::Idle) {
+            return false;
+        }
+        *phase = PastePhase::Running;
+        true
+    }
+
+    pub fn finish(&self, text: String, inserted: bool) {
+        let mut phase = self.phase.lock();
+        *phase = PastePhase::Done { text, inserted };
+        self.cv.notify_all();
+    }
+
+    pub fn claim_final(&self) -> EarlyClaim {
+        let mut phase = self.phase.lock();
+        loop {
+            match &*phase {
+                PastePhase::Idle => {
+                    *phase = PastePhase::Closed;
+                    return EarlyClaim::None;
+                }
+                PastePhase::Done { text, inserted } => {
+                    let claim = if *inserted {
+                        EarlyClaim::Inserted(text.clone())
+                    } else {
+                        EarlyClaim::NotInserted
+                    };
+                    *phase = PastePhase::Closed;
+                    return claim;
+                }
+                PastePhase::Closed => return EarlyClaim::None,
+                PastePhase::Running => self.cv.wait(&mut phase),
+            }
+        }
+    }
+}
 
 /// Longest we will wait for a restored window to become able to accept text.
 ///
@@ -167,7 +288,76 @@ impl PasteInjector {
         )
     }
 
+    /// Apply the final transcript after an optional key-up insert.
+    pub fn apply_final(
+        &self,
+        final_text: &str,
+        should_paste: bool,
+        target_hwnd: Option<isize>,
+        claim: EarlyClaim,
+    ) -> Result<DeliveryOutcome, String> {
+        let inserted = match claim {
+            EarlyClaim::Inserted(text) => Some(text),
+            EarlyClaim::None | EarlyClaim::NotInserted => None,
+        };
+        match final_edit(inserted.as_deref(), final_text, should_paste) {
+            FinalEdit::NoSpeech { erase } => {
+                if let Some(erase) = erase {
+                    let _ = self.replace_typed(&erase, "", target_hwnd);
+                }
+                Ok(DeliveryOutcome::NoSpeech)
+            }
+            FinalEdit::CopyOnly => self.deliver(final_text, false, target_hwnd),
+            FinalEdit::TypeAll => self.deliver(final_text, true, target_hwnd),
+            FinalEdit::Keep => {
+                self.copy_to_clipboard(final_text.trim())?;
+                Ok(DeliveryOutcome::Pasted)
+            }
+            FinalEdit::Extend(suffix) => {
+                self.copy_to_clipboard(final_text.trim())?;
+                match self.insert_text(&suffix, target_hwnd) {
+                    Ok(()) => Ok(DeliveryOutcome::Pasted),
+                    Err(error) => Ok(DeliveryOutcome::CopiedFallback(error)),
+                }
+            }
+            FinalEdit::Replace { erase, text } => {
+                self.copy_to_clipboard(&text)?;
+                match self.replace_typed(&erase, &text, target_hwnd) {
+                    Ok(()) => Ok(DeliveryOutcome::Pasted),
+                    Err(error) => Ok(DeliveryOutcome::CopiedFallback(error)),
+                }
+            }
+        }
+    }
+
     fn insert_text(&self, text: &str, target_hwnd: Option<isize>) -> Result<(), String> {
+        self.prepare_target(target_hwnd)?;
+        self.type_prepared(text)
+    }
+
+    fn replace_typed(
+        &self,
+        previous: &str,
+        next: &str,
+        target_hwnd: Option<isize>,
+    ) -> Result<(), String> {
+        self.prepare_target(target_hwnd)?;
+        #[cfg(target_os = "windows")]
+        {
+            backspace_windows(inserted_key_count(previous))?;
+            if !next.is_empty() {
+                type_text_windows(next)?;
+            }
+            Ok(())
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = (previous, next);
+            Ok(())
+        }
+    }
+
+    fn prepare_target(&self, target_hwnd: Option<isize>) -> Result<(), String> {
         if target_hwnd.is_none_or(|handle| handle == 0) {
             return Err("The destination app is no longer available.".into());
         }
@@ -221,11 +411,15 @@ impl PasteInjector {
         #[cfg(not(target_os = "windows"))]
         thread::sleep(INPUT_READY_BUDGET);
 
+        Ok(())
+    }
+
+    fn type_prepared(&self, text: &str) -> Result<(), String> {
         // Inject Unicode text directly. A synthetic Ctrl+V is interpreted as an image
         // paste by some apps (including Codex), even when CF_UNICODETEXT is present.
         #[cfg(target_os = "windows")]
         {
-            Self::type_text_windows(text)?;
+            type_text_windows(text)?;
         }
 
         #[cfg(not(target_os = "windows"))]
@@ -242,71 +436,179 @@ impl PasteInjector {
 
         Ok(())
     }
+}
 
-    #[cfg(target_os = "windows")]
-    fn type_text_windows(text: &str) -> Result<(), String> {
-        use windows::Win32::UI::Input::KeyboardAndMouse::{
-            SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
-            KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, VIRTUAL_KEY, VK_RETURN, VK_TAB,
-        };
+#[cfg(target_os = "windows")]
+fn type_text_windows(text: &str) -> Result<(), String> {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, VIRTUAL_KEY, VK_RETURN, VK_TAB,
+    };
 
-        fn keyboard_input(
-            virtual_key: VIRTUAL_KEY,
-            scan_code: u16,
-            flags: KEYBD_EVENT_FLAGS,
-        ) -> INPUT {
-            INPUT {
-                r#type: INPUT_KEYBOARD,
-                Anonymous: INPUT_0 {
-                    ki: KEYBDINPUT {
-                        wVk: virtual_key,
-                        wScan: scan_code,
-                        dwFlags: flags,
-                        time: 0,
-                        dwExtraInfo: 0,
-                    },
-                },
-            }
-        }
-
-        fn push_key(inputs: &mut Vec<INPUT>, virtual_key: VIRTUAL_KEY) {
-            inputs.push(keyboard_input(virtual_key, 0, KEYBD_EVENT_FLAGS::default()));
-            inputs.push(keyboard_input(virtual_key, 0, KEYEVENTF_KEYUP));
-        }
-
-        let mut inputs = Vec::with_capacity(text.encode_utf16().count() * 2);
-        for character in text.chars() {
-            match character {
-                '\n' => push_key(&mut inputs, VK_RETURN),
-                '\t' => push_key(&mut inputs, VK_TAB),
-                '\r' => continue,
-                '\0' => return Err("Cannot type text containing a null character".to_string()),
-                _ => {
-                    let mut encoded = [0_u16; 2];
-                    for &unit in character.encode_utf16(&mut encoded).iter() {
-                        inputs.push(keyboard_input(VIRTUAL_KEY(0), unit, KEYEVENTF_UNICODE));
-                        inputs.push(keyboard_input(
-                            VIRTUAL_KEY(0),
-                            unit,
-                            KEYEVENTF_UNICODE | KEYEVENTF_KEYUP,
-                        ));
-                    }
+    let mut inputs = Vec::with_capacity(text.encode_utf16().count() * 2);
+    for character in text.chars() {
+        match character {
+            '\n' => push_key(&mut inputs, VK_RETURN),
+            '\t' => push_key(&mut inputs, VK_TAB),
+            '\r' => continue,
+            '\0' => return Err("Cannot type text containing a null character".to_string()),
+            _ => {
+                let mut encoded = [0_u16; 2];
+                for &unit in character.encode_utf16(&mut encoded).iter() {
+                    inputs.push(keyboard_input(VIRTUAL_KEY(0), unit, KEYEVENTF_UNICODE));
+                    inputs.push(keyboard_input(
+                        VIRTUAL_KEY(0),
+                        unit,
+                        KEYEVENTF_UNICODE | KEYEVENTF_KEYUP,
+                    ));
                 }
             }
         }
+    }
+    send_inputs(&inputs)
+}
 
-        for chunk in inputs.chunks(512) {
-            let sent = unsafe { SendInput(chunk, std::mem::size_of::<INPUT>() as i32) };
-            if sent != chunk.len() as u32 {
-                return Err(format!(
-                    "Windows accepted {sent} of {} text input events: {}",
-                    chunk.len(),
-                    std::io::Error::last_os_error()
-                ));
-            }
+#[cfg(target_os = "windows")]
+fn backspace_windows(count: usize) -> Result<(), String> {
+    use windows::Win32::UI::Input::KeyboardAndMouse::VK_BACK;
+
+    let mut inputs = Vec::with_capacity(count * 2);
+    for _ in 0..count {
+        push_key(&mut inputs, VK_BACK);
+    }
+    send_inputs(&inputs)
+}
+
+#[cfg(target_os = "windows")]
+fn keyboard_input(
+    virtual_key: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY,
+    scan_code: u16,
+    flags: windows::Win32::UI::Input::KeyboardAndMouse::KEYBD_EVENT_FLAGS,
+) -> windows::Win32::UI::Input::KeyboardAndMouse::INPUT {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT};
+    INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: virtual_key,
+                wScan: scan_code,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn push_key(
+    inputs: &mut Vec<windows::Win32::UI::Input::KeyboardAndMouse::INPUT>,
+    virtual_key: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY,
+) {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP};
+    inputs.push(keyboard_input(virtual_key, 0, KEYBD_EVENT_FLAGS::default()));
+    inputs.push(keyboard_input(virtual_key, 0, KEYEVENTF_KEYUP));
+}
+
+#[cfg(target_os = "windows")]
+fn send_inputs(
+    inputs: &[windows::Win32::UI::Input::KeyboardAndMouse::INPUT],
+) -> Result<(), String> {
+    use windows::Win32::UI::Input::KeyboardAndMouse::SendInput;
+    for chunk in inputs.chunks(512) {
+        let sent = unsafe { SendInput(chunk, std::mem::size_of_val(&chunk[0]) as i32) };
+        if sent != chunk.len() as u32 {
+            return Err(format!(
+                "Windows accepted {sent} of {} text input events: {}",
+                chunk.len(),
+                std::io::Error::last_os_error()
+            ));
         }
+    }
+    Ok(())
+}
 
-        Ok(())
+#[cfg(test)]
+mod revision_tests {
+    use super::{final_edit, inserted_key_count, EarlyClaim, FinalEdit, PasteGate};
+    use std::sync::Arc;
+
+    #[test]
+    fn identical_text_is_left_in_place() {
+        assert_eq!(final_edit(Some("hello"), "hello", true), FinalEdit::Keep);
+    }
+
+    #[test]
+    fn a_longer_final_types_only_the_tail() {
+        assert_eq!(
+            final_edit(Some("hello"), "hello world", true),
+            FinalEdit::Extend(" world".to_string())
+        );
+    }
+
+    #[test]
+    fn a_rewritten_final_replaces_the_insertion() {
+        assert_eq!(
+            final_edit(Some("hello word"), "hello world", true),
+            FinalEdit::Replace {
+                erase: "hello word".to_string(),
+                text: "hello world".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn no_early_insert_types_the_whole_final() {
+        assert_eq!(final_edit(None, "hello", true), FinalEdit::TypeAll);
+        assert_eq!(final_edit(None, "hello", false), FinalEdit::CopyOnly);
+    }
+
+    #[test]
+    fn empty_final_erases_an_insertion_and_ignores_a_miss() {
+        assert_eq!(
+            final_edit(Some("hello"), "  ", true),
+            FinalEdit::NoSpeech {
+                erase: Some("hello".to_string()),
+            }
+        );
+        assert_eq!(
+            final_edit(None, "", true),
+            FinalEdit::NoSpeech { erase: None }
+        );
+    }
+
+    #[test]
+    fn key_count_skips_carriage_returns_only() {
+        assert_eq!(inserted_key_count("a\r\nb"), 3);
+        assert_eq!(inserted_key_count(""), 0);
+    }
+
+    #[test]
+    fn claim_before_an_early_insert_types_everything() {
+        let gate = PasteGate::new();
+        assert_eq!(gate.claim_final(), EarlyClaim::None);
+        assert!(!gate.begin());
+    }
+
+    #[test]
+    fn a_failed_early_insert_still_types_the_final() {
+        let gate = PasteGate::new();
+        assert!(gate.begin());
+        assert!(!gate.begin());
+        gate.finish("hi".into(), false);
+        assert_eq!(gate.claim_final(), EarlyClaim::NotInserted);
+    }
+
+    #[test]
+    fn claim_waits_until_the_early_insert_finishes() {
+        let gate = Arc::new(PasteGate::new());
+        assert!(gate.begin());
+        let waiting = Arc::clone(&gate);
+        let worker = std::thread::spawn(move || waiting.claim_final());
+        gate.finish("hello".into(), true);
+        assert_eq!(
+            worker.join().expect("claim"),
+            EarlyClaim::Inserted("hello".into())
+        );
     }
 }
 

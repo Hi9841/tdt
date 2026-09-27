@@ -20,12 +20,13 @@ use hotkey::{
     tap_should_stop, HotkeyAction, HotkeyBinding, HotkeyListener,
 };
 use parking_lot::Mutex;
-use paste::{DeliveryOutcome, PasteInjector};
+use paste::{DeliveryOutcome, EarlyClaim, PasteGate, PasteInjector};
 use std::cell::RefCell;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use stt::{models, LiveAudio, LiveTranscript, SharedEngine, SttEngine};
@@ -52,18 +53,47 @@ enum InternalEvent {
     NoSpeech,
 }
 
+fn queue_early_paste(
+    early: &Arc<PasteGate>,
+    partial: &Mutex<String>,
+    discard: &Arc<AtomicBool>,
+    auto_paste: &Mutex<bool>,
+    injector: &Arc<PasteInjector>,
+    target: Option<isize>,
+) {
+    if discard.load(Ordering::SeqCst) || !*auto_paste.lock() {
+        return;
+    }
+    let text = partial.lock().trim().to_string();
+    if text.is_empty() || !early.begin() {
+        return;
+    }
+    let early = Arc::clone(early);
+    let injector = Arc::clone(injector);
+    let discard = Arc::clone(discard);
+    std::thread::spawn(move || {
+        let inserted = !discard.load(Ordering::SeqCst)
+            && matches!(
+                injector.deliver(&text, true, target),
+                Ok(DeliveryOutcome::Pasted)
+            );
+        early.finish(text, inserted);
+    });
+}
+
 fn deliver_transcript(
     result: LiveTranscript,
     injector: Arc<PasteInjector>,
     tx: crossbeam_channel::Sender<InternalEvent>,
     should_paste: bool,
     target: Option<isize>,
+    claim: EarlyClaim,
 ) {
     if !result.text.trim().is_empty() {
         let mut stats = AppStats::load();
         stats.record_and_save(&result.text, result.duration_secs, result.latency_ms);
     }
-    let (auto_pasted, notice) = match injector.deliver(&result.text, should_paste, target) {
+    let (auto_pasted, notice) = match injector.apply_final(&result.text, should_paste, target, claim) {
         Ok(DeliveryOutcome::NoSpeech) => {
             let _ = tx.send(InternalEvent::NoSpeech);
             return;
@@ -282,18 +312,24 @@ fn main() {
 
                 // Spawn UI coordination loop running on GPUI executor
                 cx.spawn(async move |this, cx| {
-                    struct ReleaseTail {
-                        released_at: Instant,
-                        baseline: [bool; 256],
+                    struct LiveTake {
+                        tail: Arc<Mutex<SpeechTail>>,
+                        release: Arc<AtomicBool>,
+                        halt: Arc<AtomicBool>,
+                        done: Arc<AtomicBool>,
+                        hit_limit: Arc<AtomicBool>,
+                        discard: Arc<AtomicBool>,
+                        early: Arc<PasteGate>,
+                        partial: Arc<Mutex<String>>,
+                        baseline: Option<[bool; 256]>,
+                        released_at: Option<Instant>,
                     }
                     let mut is_recording_state = false;
                     let mut is_processing_state = false;
                     let mut recording_before_press = false;
                     let mut recording_session = 0u64;
                     let mut limit_notice = false;
-                    let mut live_tx: Option<crossbeam_channel::Sender<LiveAudio>> = None;
-                    let mut utterance_tail = SpeechTail::default();
-                    let mut release_tail: Option<ReleaseTail> = None;
+                    let mut session: Option<LiveTake> = None;
 
                     loop {
                         let poll_interval = if is_recording_state || is_processing_state {
@@ -408,16 +444,6 @@ fn main() {
                             }
                         }
 
-                        if is_recording_state {
-                            if let (Some(tx), Some(recorder)) = (live_tx.as_ref(), rec.borrow().as_ref()) {
-                                let chunk = recorder.drain();
-                                if !chunk.is_empty() {
-                                    utterance_tail.push_samples(&chunk);
-                                    let _ = tx.send(LiveAudio::Chunk(chunk));
-                                }
-                            }
-                        }
-
                         // 2. Process Hotkey Events
                         if preview::is_active() {
                             while hotkey_rx.try_recv().is_ok() {}
@@ -425,13 +451,22 @@ fn main() {
                         let actions: Vec<_> = hotkey_rx.try_iter().collect();
                         let stream_error = rec.borrow().as_ref().and_then(AudioRecorder::take_error);
                         if let Some(error) = stream_error {
-                            if let Some(recorder) = rec.borrow().as_ref() { recorder.stop(); }
+                            if let Some(live) = session.as_ref() {
+                                live.discard.store(true, Ordering::SeqCst);
+                                live.halt.store(true, Ordering::SeqCst);
+                            }
                             *rec.borrow_mut() = None;
                             is_recording_state = false;
-                            release_tail = None;
+                            if let Some(live) = session.as_mut() {
+                                live.baseline = None;
+                            }
                             let _ = this.update(cx, |view, cx| { view.set_error(error); cx.notify(); });
                         }
-                        let at_limit = is_recording_state && rec.borrow().as_ref().is_some_and(AudioRecorder::limit_reached);
+                        let hit_limit = is_recording_state
+                            && session.as_ref().is_some_and(|live| live.hit_limit.load(Ordering::SeqCst));
+                        let at_limit = is_recording_state
+                            && (hit_limit
+                                || rec.borrow().as_ref().is_some_and(AudioRecorder::limit_reached));
                         let stop_requested = this.update(cx, |view, _| std::mem::take(&mut view.stop_requested)).unwrap_or(false);
                         let mut stop_now = false;
                         if is_recording_state && (at_limit || stop_requested) {
@@ -471,7 +506,10 @@ fn main() {
                                     // Do not overlap recordings with an in-flight
                                     // transcription. The current recorder and STT
                                     // engine are single-session by design.
-                                    if !is_recording_state && !is_processing_state {
+                                    let pump_busy = session
+                                        .as_ref()
+                                        .is_some_and(|live| !live.done.load(Ordering::SeqCst));
+                                    if !is_recording_state && !is_processing_state && !pump_busy {
                                         let _ = this.update(cx, |view, _| view.reveal_overlay());
                                         if stt.lock().is_none() {
                                             let _ = this.update(cx, |view, cx| {
@@ -507,30 +545,98 @@ fn main() {
                                         *target_hwnd.lock() = ui::window_util::dictation_target_window();
                                         let _ = this.update(cx, |view, cx| view.close_stats_settings(cx));
                                         if let Some(recorder) = rec.borrow().as_ref() { recorder.start(); }
+                                        let Some(handle) = rec.borrow().as_ref().map(|recorder| recorder.handle()) else {
+                                            continue;
+                                        };
                                         recording_session = recording_session.wrapping_add(1);
                                         limit_notice = false;
-                                        utterance_tail = SpeechTail::default();
-                                        release_tail = None;
+                                        let tail = Arc::new(Mutex::new(SpeechTail::default()));
+                                        let release = Arc::new(AtomicBool::new(false));
+                                        let halt = Arc::new(AtomicBool::new(false));
+                                        let done = Arc::new(AtomicBool::new(false));
+                                        let hit_limit = Arc::new(AtomicBool::new(false));
+                                        let partial = Arc::new(Mutex::new(String::new()));
+                                        let discard = Arc::new(AtomicBool::new(false));
+                                        let early = Arc::new(PasteGate::new());
+                                        let (tx, rx) = crossbeam_channel::unbounded();
                                         if let Some(engine) = stt.lock().clone() {
-                                            let (tx, rx) = crossbeam_channel::unbounded();
-                                            live_tx = Some(tx);
                                             let events = internal_tx.clone();
                                             let inj_worker = Arc::clone(&inj);
                                             let paste_flag = Arc::clone(&auto_paste_flag);
                                             let target_flag = Arc::clone(&target_hwnd);
+                                            let partial_worker = Arc::clone(&partial);
+                                            let discard_worker = Arc::clone(&discard);
+                                            let early_worker = Arc::clone(&early);
                                             std::thread::spawn(move || {
-                                                match engine.transcribe_live(&rx) {
+                                                match engine.transcribe_live_reporting(&rx, Some(&partial_worker)) {
                                                     Ok(result) => {
+                                                        if discard_worker.load(Ordering::SeqCst) {
+                                                            return;
+                                                        }
                                                         let should_paste = *paste_flag.lock();
                                                         let target = *target_flag.lock();
-                                                        deliver_transcript(result, inj_worker, events, should_paste, target);
+                                                        let claim = early_worker.claim_final();
+                                                        deliver_transcript(result, inj_worker, events, should_paste, target, claim);
                                                     }
                                                     Err(error) => {
+                                                        if discard_worker.load(Ordering::SeqCst) {
+                                                            return;
+                                                        }
                                                         let _ = events.send(InternalEvent::TranscribeError(format!("Could not load the speech model. Choose another model in Settings. {error}")));
                                                     }
                                                 }
                                             });
+                                        } else {
+                                            drop(rx);
                                         }
+                                        let pump_tx = tx.clone();
+                                        let pump_tail = Arc::clone(&tail);
+                                        let pump_release = Arc::clone(&release);
+                                        let pump_halt = Arc::clone(&halt);
+                                        let pump_done = Arc::clone(&done);
+                                        let pump_limit = Arc::clone(&hit_limit);
+                                        drop(tx);
+                                        std::thread::spawn(move || {
+                                            loop {
+                                                if pump_halt.load(Ordering::SeqCst) {
+                                                    break;
+                                                }
+                                                if handle.limit_reached() {
+                                                    pump_limit.store(true, Ordering::SeqCst);
+                                                    break;
+                                                }
+                                                let chunk = handle.drain();
+                                                let empty = chunk.is_empty();
+                                                if !empty {
+                                                    pump_tail.lock().push_samples(&chunk);
+                                                    let _ = pump_tx.send(LiveAudio::Chunk(chunk));
+                                                }
+                                                if pump_release.load(Ordering::SeqCst) && pump_tail.lock().should_stop() {
+                                                    break;
+                                                }
+                                                if empty {
+                                                    handle.wait_for_audio(Duration::from_millis(8));
+                                                }
+                                            }
+                                            let rest = handle.stop();
+                                            if !rest.is_empty() {
+                                                let _ = pump_tx.send(LiveAudio::Chunk(rest));
+                                            }
+                                            let _ = pump_tx.send(LiveAudio::Finish(Instant::now()));
+                                            pump_done.store(true, Ordering::SeqCst);
+                                        });
+                                        session = Some(LiveTake {
+                                            tail,
+                                            release,
+                                            halt,
+                                            done,
+                                            hit_limit,
+                                            discard,
+                                            early,
+                                            partial,
+                                            baseline: None,
+                                            released_at: None,
+                                        });
                                         play_sound(SoundEffect::StartListening);
                                         is_recording_state = true;
                                         let started_at = Instant::now();
@@ -538,6 +644,7 @@ fn main() {
                                             view.recovery_message = None;
                                             view.status = HudStatus::Listening {
                                                 audio_level: 0.0,
+                                                partial: String::new(),
                                                 started_at,
                                             };
                                             cx.notify();
@@ -555,22 +662,33 @@ fn main() {
                                     } else {
                                         true
                                     };
-                                    if should_stop && is_recording_state && !stop_now && release_tail.is_none()
-                                    {
-                                        utterance_tail.mark_release();
-                                        let baseline = input_mask();
-                                        let typing = baseline.iter().enumerate().any(|(vk, down)| {
-                                            *down
-                                                && !is_modifier_vk(vk as u16)
-                                                && vk as u16 != current_binding().vk
-                                        });
-                                        if typing {
-                                            stop_now = true;
-                                        } else {
-                                            release_tail = Some(ReleaseTail {
-                                                released_at: Instant::now(),
-                                                baseline,
+                                    if should_stop && is_recording_state && !stop_now {
+                                        let tail_open = session.as_ref().is_some_and(|live| live.baseline.is_some());
+                                        if !tail_open {
+                                            let baseline = input_mask();
+                                            let typing = baseline.iter().enumerate().any(|(vk, down)| {
+                                                *down
+                                                    && !is_modifier_vk(vk as u16)
+                                                    && vk as u16 != current_binding().vk
                                             });
+                                            if typing {
+                                                stop_now = true;
+                                            } else if let Some(live) = session.as_mut() {
+                                                live.tail.lock().mark_release();
+                                                live.released_at = Some(Instant::now());
+                                                live.release.store(true, Ordering::SeqCst);
+                                                live.baseline = Some(baseline);
+                                                queue_early_paste(
+                                                    &live.early,
+                                                    &live.partial,
+                                                    &live.discard,
+                                                    &auto_paste_flag,
+                                                    &inj,
+                                                    *target_hwnd.lock(),
+                                                );
+                                            } else {
+                                                stop_now = true;
+                                            }
                                         }
                                     }
                                 }
@@ -578,25 +696,39 @@ fn main() {
                         }
 
                         if is_recording_state {
-                            if let Some(tail) = release_tail.as_ref() {
-                                let timed_out = tail.released_at.elapsed() >= MAX_TAIL;
-                                if utterance_tail.should_stop()
-                                    || timed_out
-                                    || input_appeared(&tail.baseline)
-                                {
+                            if let Some(baseline) = session.as_ref().and_then(|live| live.baseline.as_ref()) {
+                                if input_appeared(baseline) {
                                     stop_now = true;
                                 }
                             }
+                            // Sample time stops if the callback stalls. The cap is wall time too.
+                            if session.as_ref().is_some_and(|live| {
+                                live.released_at.is_some_and(|at| at.elapsed() >= MAX_TAIL)
+                            }) {
+                                stop_now = true;
+                            }
+                        }
+                        if is_recording_state && session.as_ref().is_some_and(|live| live.done.load(Ordering::SeqCst)) {
+                            if session.as_ref().is_some_and(|live| live.hit_limit.load(Ordering::SeqCst)) {
+                                limit_notice = true;
+                            }
+                            stop_now = true;
                         }
                         if stop_now && is_recording_state {
+                            if let Some(live) = session.as_mut() {
+                                queue_early_paste(
+                                    &live.early,
+                                    &live.partial,
+                                    &live.discard,
+                                    &auto_paste_flag,
+                                    &inj,
+                                    *target_hwnd.lock(),
+                                );
+                                live.halt.store(true, Ordering::SeqCst);
+                                live.baseline = None;
+                            }
                             is_recording_state = false;
                             is_processing_state = true;
-                            release_tail = None;
-                            let samples = rec.borrow().as_ref().map(AudioRecorder::stop).unwrap_or_default();
-                            if let Some(tx) = live_tx.take() {
-                                let _ = tx.send(LiveAudio::Chunk(samples));
-                                let _ = tx.send(LiveAudio::Finish(Instant::now()));
-                            }
                             play_sound(SoundEffect::StopListening);
                             let _ = this.update(cx, |view, cx| {
                                 // Recording is over; drop the live
@@ -638,9 +770,11 @@ fn main() {
                                 InternalEvent::TranscribeError(err) => {
                                     is_processing_state = false;
                                     if is_recording_state {
-                                        if let Some(recorder) = rec.borrow().as_ref() { recorder.stop(); }
+                                        if let Some(live) = session.as_mut() {
+                                            live.halt.store(true, Ordering::SeqCst);
+                                            live.baseline = None;
+                                        }
                                         is_recording_state = false;
-                                        live_tx = None;
                                     }
                                     play_sound(SoundEffect::Error);
                                     let _ = this.update(cx, |view, cx| {
@@ -663,6 +797,11 @@ fn main() {
 
                         // 4. Animation frame & audio level updates
                         let current_level = if is_recording_state { rec.borrow().as_ref().map_or(0.0, AudioRecorder::audio_level) } else { 0.0 };
+                        let partial_now = if is_recording_state {
+                            session.as_ref().map(|live| live.partial.lock().clone())
+                        } else {
+                            None
+                        };
                         // Avoid locking the audio visualization buffer when it
                         // cannot be displayed.
                         let vis_peaks = if is_recording_state { rec.borrow().as_ref().map(AudioRecorder::vis_peaks) } else { None };
@@ -679,7 +818,7 @@ fn main() {
                             }
 
                             match &mut view.status {
-                                HudStatus::Listening { audio_level, .. } => {
+                                HudStatus::Listening { audio_level, partial, .. } => {
                                     if preview::is_active() {
                                         cx.notify();
                                     } else {
@@ -688,6 +827,11 @@ fn main() {
                                             // Already smoothed in audio time. A second frame-based
                                             // filter would smear syllables across historical bars.
                                             view.wave_peaks = peaks;
+                                        }
+                                        if let Some(next) = partial_now.as_ref() {
+                                            if next != partial {
+                                                *partial = next.clone();
+                                            }
                                         }
                                         cx.notify();
                                     }

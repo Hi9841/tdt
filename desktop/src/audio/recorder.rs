@@ -1,7 +1,7 @@
 use super::envelope::{SpeechEnvelope, VIS_BARS};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use parking_lot::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use parking_lot::{Condvar, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -18,12 +18,26 @@ pub struct AudioRecorder {
     at_limit: Arc<AtomicBool>,
     last_error: Arc<Mutex<Option<String>>>,
     buffer: Arc<Mutex<Vec<f32>>>,
+    #[allow(dead_code)]
+    samples_ready: Arc<Condvar>,
+    captured: Arc<AtomicUsize>,
     current_rms: Arc<Mutex<f32>>,
     envelope: Arc<Mutex<SpeechEnvelope>>,
     device_name: String,
     opened_ms: u64,
     last_callback_ms: Arc<AtomicU64>,
     _stream: cpal::Stream,
+}
+
+#[allow(dead_code)]
+#[derive(Clone)]
+pub struct CaptureHandle {
+    is_recording: Arc<AtomicBool>,
+    at_limit: Arc<AtomicBool>,
+    buffer: Arc<Mutex<Vec<f32>>>,
+    samples_ready: Arc<Condvar>,
+    current_rms: Arc<Mutex<f32>>,
+    envelope: Arc<Mutex<SpeechEnvelope>>,
 }
 
 impl AudioRecorder {
@@ -41,6 +55,18 @@ impl AudioRecorder {
     }
 }
 
+#[derive(Clone)]
+struct CaptureParts {
+    is_recording: Arc<AtomicBool>,
+    at_limit: Arc<AtomicBool>,
+    buffer: Arc<Mutex<Vec<f32>>>,
+    samples_ready: Arc<Condvar>,
+    captured: Arc<AtomicUsize>,
+    rms: Arc<Mutex<f32>>,
+    envelope: Arc<Mutex<SpeechEnvelope>>,
+    last_callback_ms: Arc<AtomicU64>,
+}
+
 fn open_named(host: &cpal::Host, device_name: &str) -> Result<AudioRecorder, String> {
     let device = find_input(host, device_name)
         .ok_or_else(|| format!("Microphone {device_name} disappeared"))?;
@@ -50,24 +76,21 @@ fn open_named(host: &cpal::Host, device_name: &str) -> Result<AudioRecorder, Str
     let sample_format = supported_config.sample_format();
     let config: cpal::StreamConfig = supported_config.into();
 
-    let is_recording = Arc::new(AtomicBool::new(false));
-    let at_limit = Arc::new(AtomicBool::new(false));
     let last_error = Arc::new(Mutex::new(None));
-    let buffer = Arc::new(Mutex::new(Vec::new()));
-    let current_rms = Arc::new(Mutex::new(0.0f32));
-    let envelope = Arc::new(Mutex::new(SpeechEnvelope::default()));
-    let last_callback_ms = Arc::new(AtomicU64::new(0));
-
-    let is_rec_clone = Arc::clone(&is_recording);
-    let at_limit_clone = Arc::clone(&at_limit);
-    let buffer_clone = Arc::clone(&buffer);
-    let rms_clone = Arc::clone(&current_rms);
-    let envelope_clone = Arc::clone(&envelope);
-    let callback_stamp = Arc::clone(&last_callback_ms);
+    let parts = CaptureParts {
+        is_recording: Arc::new(AtomicBool::new(false)),
+        at_limit: Arc::new(AtomicBool::new(false)),
+        buffer: Arc::new(Mutex::new(Vec::new())),
+        samples_ready: Arc::new(Condvar::new()),
+        captured: Arc::new(AtomicUsize::new(0)),
+        rms: Arc::new(Mutex::new(0.0f32)),
+        envelope: Arc::new(Mutex::new(SpeechEnvelope::default())),
+        last_callback_ms: Arc::new(AtomicU64::new(0)),
+    };
 
     let input_sample_rate = config.sample_rate.0;
     let channels = config.channels.max(1) as usize;
-    let error_cb = stream_error_callback(Arc::clone(&last_error), Arc::clone(&is_recording));
+    let error_cb = stream_error_callback(Arc::clone(&last_error), Arc::clone(&parts.is_recording));
 
     let stream = build_stream(
         &device,
@@ -75,12 +98,7 @@ fn open_named(host: &cpal::Host, device_name: &str) -> Result<AudioRecorder, Str
         sample_format,
         channels,
         input_sample_rate,
-        is_rec_clone,
-        at_limit_clone,
-        buffer_clone,
-        rms_clone,
-        envelope_clone,
-        callback_stamp,
+        parts.clone(),
         error_cb,
     )?;
 
@@ -91,15 +109,17 @@ fn open_named(host: &cpal::Host, device_name: &str) -> Result<AudioRecorder, Str
     eprintln!("Microphone open: {device_name}");
 
     Ok(AudioRecorder {
-        is_recording,
-        at_limit,
+        is_recording: parts.is_recording,
+        at_limit: parts.at_limit,
         last_error,
-        buffer,
-        current_rms,
-        envelope,
+        buffer: parts.buffer,
+        samples_ready: parts.samples_ready,
+        captured: parts.captured,
+        current_rms: parts.rms,
+        envelope: parts.envelope,
         device_name: device_name.to_string(),
         opened_ms: now_ms(),
-        last_callback_ms,
+        last_callback_ms: parts.last_callback_ms,
         _stream: stream,
     })
 }
@@ -119,17 +139,9 @@ impl AudioRecorder {
         )
     }
 
-    fn process_samples_f32(
-        data: &[f32],
-        channels: usize,
-        sample_rate: u32,
-        buffer: &Mutex<Vec<f32>>,
-        rms: &Mutex<f32>,
-        envelope: &Mutex<SpeechEnvelope>,
-        is_recording: &AtomicBool,
-    ) -> bool {
+    fn process_samples_f32(data: &[f32], channels: usize, sample_rate: u32, parts: &CaptureParts) {
         if data.is_empty() {
-            return false;
+            return;
         }
 
         // Downmix to mono
@@ -142,8 +154,8 @@ impl AudioRecorder {
         // Calculate RMS audio level (0.0 to 1.0)
         let sum_squares: f32 = mono.iter().map(|&s| s * s).sum();
         let level = (sum_squares / mono.len() as f32).sqrt().min(1.0);
-        *rms.lock() = level;
-        envelope.lock().push(&mono, sample_rate);
+        *parts.rms.lock() = level;
+        parts.envelope.lock().push(&mono, sample_rate);
 
         // Resample to 16,000 Hz if necessary
         let resampled = if sample_rate != TARGET_SAMPLE_RATE && sample_rate > 0 {
@@ -152,11 +164,25 @@ impl AudioRecorder {
             mono
         };
 
-        let mut recorded = buffer.lock();
-        if !is_recording.load(Ordering::SeqCst) {
-            return false;
+        let mut recorded = parts.buffer.lock();
+        if !parts.is_recording.load(Ordering::SeqCst) {
+            return;
         }
-        append_bounded(&mut recorded, &resampled, max_recording_samples())
+        let capacity = max_recording_samples();
+        let already = parts.captured.load(Ordering::SeqCst);
+        let take = take_count(already, resampled.len(), capacity);
+        if take == 0 {
+            if already >= capacity {
+                parts.at_limit.store(true, Ordering::SeqCst);
+            }
+            return;
+        }
+        recorded.extend_from_slice(&resampled[..take]);
+        let stored = parts.captured.fetch_add(take, Ordering::SeqCst) + take;
+        if stored >= capacity {
+            parts.at_limit.store(true, Ordering::SeqCst);
+        }
+        parts.samples_ready.notify_one();
     }
 
     fn resample_linear(input: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
@@ -182,27 +208,45 @@ impl AudioRecorder {
     }
 
     pub fn start(&self) {
-        self.buffer.lock().clear();
+        {
+            let mut recorded = self.buffer.lock();
+            recorded.clear();
+            self.captured.store(0, Ordering::SeqCst);
+        }
         *self.current_rms.lock() = 0.0;
         *self.envelope.lock() = SpeechEnvelope::default();
         clear_session_signals(&self.last_error, &self.at_limit);
         self.is_recording.store(true, Ordering::SeqCst);
     }
 
-    /// Samples captured since the last drain. Empty once recording has stopped.
-    pub fn drain(&self) -> Vec<f32> {
-        if !self.is_recording.load(Ordering::SeqCst) {
-            return Vec::new();
+    /// Clone of the capture state. Safe to drain from a non-UI thread.
+    /// The cpal stream stays inside AudioRecorder.
+    #[allow(dead_code)]
+    pub fn handle(&self) -> CaptureHandle {
+        CaptureHandle {
+            is_recording: Arc::clone(&self.is_recording),
+            at_limit: Arc::clone(&self.at_limit),
+            buffer: Arc::clone(&self.buffer),
+            samples_ready: Arc::clone(&self.samples_ready),
+            current_rms: Arc::clone(&self.current_rms),
+            envelope: Arc::clone(&self.envelope),
         }
-        std::mem::take(&mut *self.buffer.lock())
     }
 
+    /// Samples captured since the last drain. Empty once recording has stopped.
+    #[allow(dead_code)]
+    pub fn drain(&self) -> Vec<f32> {
+        drain_samples(&self.is_recording, &self.buffer)
+    }
+
+    #[allow(dead_code)]
     pub fn stop(&self) -> Vec<f32> {
-        self.is_recording.store(false, Ordering::SeqCst);
-        *self.current_rms.lock() = 0.0;
-        *self.envelope.lock() = SpeechEnvelope::default();
-        let mut buf = self.buffer.lock();
-        std::mem::take(&mut *buf)
+        stop_samples(
+            &self.is_recording,
+            &self.current_rms,
+            &self.envelope,
+            &self.buffer,
+        )
     }
 
     #[allow(dead_code)]
@@ -227,11 +271,67 @@ impl AudioRecorder {
     }
 }
 
+#[allow(dead_code)]
+impl CaptureHandle {
+    pub fn drain(&self) -> Vec<f32> {
+        drain_samples(&self.is_recording, &self.buffer)
+    }
+
+    /// Same end state as AudioRecorder::stop: is_recording false, rms 0,
+    /// envelope reset, buffer taken.
+    pub fn stop(&self) -> Vec<f32> {
+        stop_samples(
+            &self.is_recording,
+            &self.current_rms,
+            &self.envelope,
+            &self.buffer,
+        )
+    }
+
+    pub fn limit_reached(&self) -> bool {
+        self.at_limit.load(Ordering::Relaxed)
+    }
+
+    /// Block until new samples arrive or `timeout`. Must not miss a wakeup:
+    /// the condvar waits on the same mutex as the sample buffer.
+    pub fn wait_for_audio(&self, timeout: std::time::Duration) {
+        let mut guard = self.buffer.lock();
+        if guard.is_empty() {
+            let _ = self.samples_ready.wait_for(&mut guard, timeout);
+        }
+    }
+}
+
+fn drain_samples(is_recording: &AtomicBool, buffer: &Mutex<Vec<f32>>) -> Vec<f32> {
+    let mut recorded = buffer.lock();
+    if !is_recording.load(Ordering::SeqCst) {
+        return Vec::new();
+    }
+    std::mem::take(&mut *recorded)
+}
+
+fn stop_samples(
+    is_recording: &AtomicBool,
+    current_rms: &Mutex<f32>,
+    envelope: &Mutex<SpeechEnvelope>,
+    buffer: &Mutex<Vec<f32>>,
+) -> Vec<f32> {
+    is_recording.store(false, Ordering::SeqCst);
+    *current_rms.lock() = 0.0;
+    *envelope.lock() = SpeechEnvelope::default();
+    std::mem::take(&mut *buffer.lock())
+}
+
 fn max_recording_samples() -> usize {
     MAX_RECORDING_SECONDS * TARGET_SAMPLE_RATE as usize
 }
 
+fn take_count(already: usize, incoming: usize, capacity: usize) -> usize {
+    capacity.saturating_sub(already).min(incoming)
+}
+
 /// Appends samples until `capacity`. Returns true when the buffer is full.
+#[allow(dead_code)]
 fn append_bounded(recorded: &mut Vec<f32>, samples: &[f32], capacity: usize) -> bool {
     if recorded.len() >= capacity {
         return true;
@@ -360,32 +460,12 @@ fn note_callback(last_callback_ms: &AtomicU64) {
     last_callback_ms.store(now_ms().max(1), Ordering::Relaxed);
 }
 
-fn ingest(
-    samples: &[f32],
-    channels: usize,
-    sample_rate: u32,
-    is_recording: &AtomicBool,
-    at_limit: &AtomicBool,
-    buffer: &Mutex<Vec<f32>>,
-    rms: &Mutex<f32>,
-    envelope: &Mutex<SpeechEnvelope>,
-    last_callback_ms: &AtomicU64,
-) {
-    note_callback(last_callback_ms);
-    if is_recording.load(Ordering::Relaxed) {
-        if AudioRecorder::process_samples_f32(
-            samples,
-            channels,
-            sample_rate,
-            buffer,
-            rms,
-            envelope,
-            is_recording,
-        ) {
-            at_limit.store(true, Ordering::SeqCst);
-        }
+fn ingest(samples: &[f32], channels: usize, sample_rate: u32, parts: &CaptureParts) {
+    note_callback(&parts.last_callback_ms);
+    if parts.is_recording.load(Ordering::Relaxed) {
+        AudioRecorder::process_samples_f32(samples, channels, sample_rate, parts);
     } else {
-        *rms.lock() = 0.0;
+        *parts.rms.lock() = 0.0;
     }
 }
 
@@ -395,12 +475,7 @@ fn build_stream(
     sample_format: cpal::SampleFormat,
     channels: usize,
     sample_rate: u32,
-    is_recording: Arc<AtomicBool>,
-    at_limit: Arc<AtomicBool>,
-    buffer: Arc<Mutex<Vec<f32>>>,
-    rms: Arc<Mutex<f32>>,
-    envelope: Arc<Mutex<SpeechEnvelope>>,
-    last_callback_ms: Arc<AtomicU64>,
+    parts: CaptureParts,
     on_error: impl FnMut(cpal::StreamError) + Send + 'static,
 ) -> Result<cpal::Stream, String> {
     let unsupported = || format!("Unsupported audio sample format: {sample_format}");
@@ -409,17 +484,7 @@ fn build_stream(
             .build_input_stream(
                 config,
                 move |data: &[f32], _| {
-                    ingest(
-                        data,
-                        channels,
-                        sample_rate,
-                        &is_recording,
-                        &at_limit,
-                        &buffer,
-                        &rms,
-                        &envelope,
-                        &last_callback_ms,
-                    );
+                    ingest(data, channels, sample_rate, &parts);
                 },
                 on_error,
                 None,
@@ -433,17 +498,7 @@ fn build_stream(
                         .iter()
                         .map(|sample| *sample as f32 / i16::MAX as f32)
                         .collect::<Vec<_>>();
-                    ingest(
-                        &samples,
-                        channels,
-                        sample_rate,
-                        &is_recording,
-                        &at_limit,
-                        &buffer,
-                        &rms,
-                        &envelope,
-                        &last_callback_ms,
-                    );
+                    ingest(&samples, channels, sample_rate, &parts);
                 },
                 on_error,
                 None,
@@ -457,17 +512,7 @@ fn build_stream(
                         .iter()
                         .map(|sample| *sample as f32 / i32::MAX as f32)
                         .collect::<Vec<_>>();
-                    ingest(
-                        &samples,
-                        channels,
-                        sample_rate,
-                        &is_recording,
-                        &at_limit,
-                        &buffer,
-                        &rms,
-                        &envelope,
-                        &last_callback_ms,
-                    );
+                    ingest(&samples, channels, sample_rate, &parts);
                 },
                 on_error,
                 None,
@@ -481,17 +526,7 @@ fn build_stream(
                         .iter()
                         .map(|sample| (*sample as f32 / u16::MAX as f32) * 2.0 - 1.0)
                         .collect::<Vec<_>>();
-                    ingest(
-                        &samples,
-                        channels,
-                        sample_rate,
-                        &is_recording,
-                        &at_limit,
-                        &buffer,
-                        &rms,
-                        &envelope,
-                        &last_callback_ms,
-                    );
+                    ingest(&samples, channels, sample_rate, &parts);
                 },
                 on_error,
                 None,
@@ -504,6 +539,23 @@ fn build_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn take_count_zero_room() {
+        assert_eq!(take_count(8, 4, 8), 0);
+        assert_eq!(take_count(9, 1, 8), 0);
+    }
+
+    #[test]
+    fn take_count_partial_room() {
+        assert_eq!(take_count(5, 10, 8), 3);
+    }
+
+    #[test]
+    fn take_count_exact_fit() {
+        assert_eq!(take_count(4, 4, 8), 4);
+        assert_eq!(take_count(0, 8, 8), 8);
+    }
 
     #[test]
     fn max_recording_samples_matches_120s_at_target_rate() {
