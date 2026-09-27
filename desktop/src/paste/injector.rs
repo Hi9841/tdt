@@ -4,12 +4,96 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+/// Longest we will wait for a restored window to become able to accept text.
+///
+/// This replaces a fixed sleep that every dictation paid whether or not the
+/// window was already ready, so it is the ceiling, not the common case. An
+/// app that never reports input focus waits exactly as long as it used to.
+const INPUT_READY_BUDGET: Duration = Duration::from_millis(60);
+/// Granularity of the readiness poll. Small enough that a late-ready window is
+/// still caught early, large enough not to spin.
+const INPUT_READY_STEP: Duration = Duration::from_millis(4);
+
 #[derive(Debug, PartialEq)]
 pub enum DeliveryOutcome {
     NoSpeech,
     Copied,
     Pasted,
     CopiedFallback(String),
+}
+
+/// How long the readiness wait actually cost, and how many times it asked.
+#[derive(Debug, PartialEq, Clone, Copy)]
+struct ReadinessWait {
+    polls: usize,
+    waited: Duration,
+}
+
+/// Poll `probe` until it reports ready or `budget` is spent, then give up and
+/// inject anyway.
+///
+/// The clock and the sleep are injected so the two properties that matter are
+/// unit-testable without a foreground window: a window that is already ready
+/// costs nothing, and a window that never becomes ready never costs more than
+/// the budget it replaced.
+fn wait_for_input_ready_with(
+    probe: &mut dyn FnMut() -> bool,
+    elapsed: &mut dyn FnMut() -> Duration,
+    sleep: &mut dyn FnMut(Duration),
+    budget: Duration,
+    step: Duration,
+) -> ReadinessWait {
+    let mut polls = 0;
+    let mut waited = Duration::ZERO;
+    loop {
+        polls += 1;
+        if probe() {
+            return ReadinessWait { polls, waited };
+        }
+        let spent = elapsed();
+        if spent >= budget {
+            return ReadinessWait { polls, waited };
+        }
+        let nap = step.min(budget - spent);
+        sleep(nap);
+        waited += nap;
+    }
+}
+
+/// True once the window's input focus is live, meaning synthesized keystrokes
+/// will land in a real edit control rather than being dropped.
+#[cfg(target_os = "windows")]
+fn has_input_focus(hwnd: windows::Win32::Foundation::HWND) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetGUIThreadInfo, GetWindowThreadProcessId, GUITHREADINFO,
+    };
+    unsafe {
+        let thread = GetWindowThreadProcessId(hwnd, None);
+        if thread == 0 {
+            return false;
+        }
+        let mut info = GUITHREADINFO {
+            cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+            ..Default::default()
+        };
+        // hwndFocus is the window itself when it owns focus directly, so this
+        // also covers apps with no child edit control.
+        GetGUIThreadInfo(thread, &mut info).is_ok() && !info.hwndFocus.is_invalid()
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn wait_for_input_focus(hwnd: windows::Win32::Foundation::HWND) -> ReadinessWait {
+    let started = std::time::Instant::now();
+    let mut elapsed = || started.elapsed();
+    let mut sleep = |nap: Duration| thread::sleep(nap);
+    wait_for_input_ready_with(
+        &mut || has_input_focus(hwnd),
+        &mut elapsed,
+        &mut sleep,
+        INPUT_READY_BUDGET,
+        INPUT_READY_STEP,
+    )
 }
 
 fn deliver_with(
@@ -115,12 +199,27 @@ impl PasteInjector {
                                 .to_string(),
                         );
                     }
+
+                    // Wait for the window to be able to accept text, rather
+                    // than sleeping a fixed 60 ms on every dictation. A window
+                    // that is already live costs nothing; one that never
+                    // becomes live still costs no more than it used to.
+                    let wait = wait_for_input_focus(hwnd);
+                    if wait.waited > Duration::ZERO {
+                        println!(
+                            "delivery: input focus live after {} ms across {} polls",
+                            wait.waited.as_millis(),
+                            wait.polls
+                        );
+                    }
                 }
             }
         }
 
-        // Give Windows time to restore focus before sending text input.
-        thread::sleep(Duration::from_millis(60));
+        // Non-Windows targets keep the fixed delay: the readiness probe is a
+        // Win32 concept and this path is not shipped.
+        #[cfg(not(target_os = "windows"))]
+        thread::sleep(INPUT_READY_BUDGET);
 
         // Inject Unicode text directly. A synthetic Ctrl+V is interpreted as an image
         // paste by some apps (including Codex), even when CF_UNICODETEXT is present.
@@ -254,5 +353,95 @@ mod delivery_tests {
             deliver_with("words", true, |_| Ok(()), |_| Ok(())),
             Ok(DeliveryOutcome::Pasted)
         );
+    }
+}
+
+#[cfg(test)]
+mod input_readiness_tests {
+    use super::{
+        wait_for_input_ready_with, Duration, INPUT_READY_BUDGET, INPUT_READY_STEP,
+        ReadinessWait,
+    };
+    use std::cell::Cell;
+
+    /// Drives the wait with a fake clock so both timing contracts are exact.
+    fn run(ready_after: Option<usize>) -> (ReadinessWait, usize) {
+        let mut polls = 0usize;
+        let mut naps = 0usize;
+        let clock = Cell::new(Duration::ZERO);
+        let mut probe = || {
+            polls += 1;
+            ready_after.is_some_and(|n| polls > n)
+        };
+        let mut elapsed = || clock.get();
+        let mut sleep = |nap: Duration| {
+            naps += 1;
+            clock.set(clock.get() + nap);
+        };
+        let result = wait_for_input_ready_with(
+            &mut probe,
+            &mut elapsed,
+            &mut sleep,
+            INPUT_READY_BUDGET,
+            INPUT_READY_STEP,
+        );
+        (result, naps)
+    }
+
+    #[test]
+    fn already_ready_window_costs_no_wait_at_all() {
+        let (result, naps) = run(Some(0));
+        assert_eq!(result.waited, Duration::ZERO);
+        assert_eq!(naps, 0, "a live window must not be slept on");
+        assert_eq!(result.polls, 1);
+    }
+
+    #[test]
+    fn window_that_becomes_ready_early_stops_waiting_early() {
+        let (result, _) = run(Some(2));
+        assert_eq!(result.waited, INPUT_READY_STEP * 2u32);
+        assert!(result.waited < INPUT_READY_BUDGET);
+    }
+
+    #[test]
+    fn window_that_never_becomes_ready_never_exceeds_the_old_fixed_sleep() {
+        let (result, naps) = run(None);
+        assert_eq!(
+            result.waited, INPUT_READY_BUDGET,
+            "worst case must match the 60 ms it replaced, not exceed it"
+        );
+        assert_eq!(result.polls, naps + 1);
+    }
+
+    #[test]
+    fn wait_never_overshoots_a_smaller_budget() {
+        let clock = Cell::new(Duration::ZERO);
+        let mut probe = || false;
+        let mut elapsed = || clock.get();
+        let mut sleep = |nap: Duration| clock.set(clock.get() + nap);
+        let result = wait_for_input_ready_with(
+            &mut probe,
+            &mut elapsed,
+            &mut sleep,
+            Duration::from_millis(10),
+            Duration::from_millis(4),
+        );
+        assert_eq!(result.waited, Duration::from_millis(10));
+    }
+
+    #[test]
+    fn step_larger_than_budget_cannot_oversleep() {
+        let clock = Cell::new(Duration::ZERO);
+        let mut probe = || false;
+        let mut elapsed = || clock.get();
+        let mut sleep = |nap: Duration| clock.set(clock.get() + nap);
+        let result = wait_for_input_ready_with(
+            &mut probe,
+            &mut elapsed,
+            &mut sleep,
+            Duration::from_millis(5),
+            Duration::from_millis(500),
+        );
+        assert_eq!(result.waited, Duration::from_millis(5));
     }
 }
