@@ -1,7 +1,7 @@
 pub mod engine;
 pub mod models;
 
-pub use engine::SttEngine;
+pub use engine::{LiveAudio, LiveTranscript, SttEngine};
 pub use models::{DownloadPhase, CATALOG, DEFAULT_MODEL_ID};
 
 use parking_lot::Mutex;

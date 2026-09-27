@@ -5,7 +5,7 @@ use crate::paste::PasteInjector;
 use crate::stt::{models, DownloadPhase, SharedEngine, SttEngine, CATALOG};
 use crate::ui::controls;
 use crate::ui::preview::{self, Spec as PreviewSpec};
-use crate::ui::text::{clip_text, format_mmss, format_time_saved};
+use crate::ui::text::{clip_text, format_latency_ms, format_mmss, format_time_saved};
 use crate::ui::theme::{
     self, accent, foam, gold, hover, love, muted, pad, pressed, r_chip, r_section, r_window,
     selected, shell_surface, success, text, well, GAP_SECTION, GAP_TIGHT, H_CTRL, H_TAB, MOTION_MS,
@@ -48,6 +48,7 @@ pub enum HudStatus {
     Success {
         text: String,
         auto_pasted: bool,
+        latency_ms: u64,
         finished_at: Instant,
     },
     Error {
@@ -81,6 +82,7 @@ struct PreparedModel {
 
 pub struct HudView {
     pub status: HudStatus,
+    pub tray_mode: bool,
     pub auto_paste_enabled: bool,
     autostart_enabled: bool,
     autostart_error: Option<String>,
@@ -159,6 +161,7 @@ impl HudView {
         let (model_ready_tx, model_ready_rx) = crossbeam_channel::unbounded();
         let mut view = Self {
             status: HudStatus::Idle,
+            tray_mode: config.tray_mode || preview::wants_tray(),
             auto_paste_enabled,
             autostart_enabled: crate::autostart::is_enabled(),
             autostart_error: None,
@@ -262,6 +265,7 @@ impl HudView {
                 self.status = HudStatus::Success {
                     text: "this is a sample transcript".into(),
                     auto_pasted: pasted,
+                    latency_ms: 182,
                     finished_at: Instant::now(),
                 };
             }
@@ -282,7 +286,12 @@ impl HudView {
             }
             PreviewSpec::BubbleCopyFailed => self.set_error("Could not copy text. Open History to copy the saved transcript.".into()),
             PreviewSpec::BubblePasteFallback => {
-                self.status = HudStatus::Success { text: "This transcript is ready to paste.".into(), auto_pasted: false, finished_at: Instant::now() };
+                self.status = HudStatus::Success {
+                    text: "This transcript is ready to paste.".into(),
+                    auto_pasted: false,
+                    latency_ms: 240,
+                    finished_at: Instant::now(),
+                };
                 self.recovery_message = Some("Copied. Could not insert all text. Check the destination before pasting with Ctrl+V.".into());
             }
             PreviewSpec::BubbleLimit => {
@@ -510,15 +519,55 @@ impl HudView {
     }
 
     pub fn reveal_overlay(&mut self) {
-        set_overlay_hidden(false);
+        set_overlay_hidden(self.tray_mode && self.mode == WindowViewMode::Bubble);
+    }
+
+    pub fn show_from_tray(&mut self, cx: &mut Context<Self>) {
+        if self.tray_mode {
+            self.open_settings(cx);
+        } else {
+            self.reveal_overlay();
+        }
+        cx.notify();
+    }
+
+    pub fn set_tray_mode(&mut self, enabled: bool) -> Result<(), String> {
+        if !preview::is_active() {
+            let mut config = AppConfig::load();
+            config.tray_mode = enabled;
+            config
+                .save()
+                .map_err(|error| format!("Could not save tray mode. Try again. {error}"))?;
+        }
+        self.tray_mode = enabled;
+        if !enabled {
+            self.reveal_overlay();
+            if self.mode == WindowViewMode::Bubble {
+                if let Some(hwnd) = crate::ui::window_util::find_app_hwnd() {
+                    crate::ui::window_util::position_bubble_on_preferred_monitor(hwnd);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn sync_tray_overlay(&mut self, rect: Option<tray_icon::Rect>) {
+        if !self.tray_mode || self.panel_motion.is_some() {
+            return;
+        }
+        let visible = self.mode == WindowViewMode::StatsAndSettings;
+        crate::ui::window_util::position_overlay_by_tray(rect);
+        if crate::ui::window_util::is_overlay_hidden() == visible {
+            set_overlay_hidden(!visible);
+        }
     }
 
     pub fn open_settings(&mut self, cx: &mut Context<Self>) {
+        self.mode = WindowViewMode::StatsAndSettings;
         self.reveal_overlay();
         if !preview::is_active() {
             self.stats = AppStats::load();
         }
-        self.mode = WindowViewMode::StatsAndSettings;
         self.active_tab = SettingsTab::Settings;
         self.panel_needs_focus = true;
         let started_at = Instant::now();
@@ -647,7 +696,6 @@ impl HudView {
             let result = SttEngine::new(spec, &dir, &language)
                 .and_then(|engine| {
                     engine.prepare()?;
-                    engine.release();
                     Ok(PreparedModel {
                         id: spec.id.into(),
                         engine: Arc::new(engine),
@@ -837,6 +885,9 @@ impl Render for HudView {
                 self.panel_needs_focus = false;
             }
             self.render_stats_settings(cx)
+        } else if self.tray_mode {
+            // Keep startup and close-transition frames free of a status bubble.
+            div().into_any_element()
         } else {
             self.render_bubble(cx)
         }
@@ -965,6 +1016,10 @@ impl HudView {
             HudStatus::Transcribing { recorded_for } => format_mmss(recorded_for.as_secs()),
             _ => String::new(),
         };
+        let latency_label = match &self.status {
+            HudStatus::Success { latency_ms, .. } => Some(format_latency_ms(*latency_ms)),
+            _ => None,
+        };
 
         let right_section = div()
             .flex()
@@ -1046,6 +1101,21 @@ impl HudView {
         } else {
             right_section
         };
+        let right_section = if let Some(label) = latency_label {
+            right_section.child(
+                div()
+                    .text_size(px(TYPE_META))
+                    .line_height(px(14.0))
+                    .font_family("Consolas")
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(muted())
+                    .text_right()
+                    .whitespace_nowrap()
+                    .child(label),
+            )
+        } else {
+            right_section
+        };
 
         div()
             .id("recording_overlay_pill")
@@ -1061,8 +1131,10 @@ impl HudView {
             .cursor_move()
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|_, _, _, _| {
-                    start_window_drag();
+                cx.listener(|this, _, _, _| {
+                    if !this.tray_mode {
+                        start_window_drag();
+                    }
                 }),
             )
             .child(

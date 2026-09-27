@@ -1,11 +1,42 @@
 use super::models::{whisper_language, ModelFamily, ModelSpec};
+use crossbeam_channel::{Receiver, RecvTimeoutError};
 use parking_lot::Mutex;
 use sherpa_onnx::{
     OfflineModelConfig, OfflineMoonshineModelConfig, OfflineRecognizer, OfflineRecognizerConfig,
     OfflineSenseVoiceModelConfig, OfflineTransducerModelConfig, OfflineWhisperModelConfig,
+    OnlineModelConfig, OnlineRecognizer, OnlineRecognizerConfig, OnlineStream,
+    OnlineTransducerModelConfig,
 };
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+enum Recognizer {
+    Offline(OfflineRecognizer),
+    Online(OnlineRecognizer),
+}
+
+enum UtteranceKind {
+    Buffered(Vec<f32>),
+    Streaming(OnlineStream),
+}
+
+pub struct Utterance {
+    kind: UtteranceKind,
+}
+
+/// Audio captured while the user is still holding the hotkey.
+pub enum LiveAudio {
+    Chunk(Vec<f32>),
+    /// `Instant` is the moment recording stopped. Latency is measured from here.
+    Finish(Instant),
+}
+
+pub struct LiveTranscript {
+    pub text: String,
+    pub latency_ms: u64,
+    pub duration_secs: f32,
+}
 
 enum ModelPaths {
     SenseVoice {
@@ -29,7 +60,7 @@ enum ModelPaths {
 }
 
 pub struct SttEngine {
-    recognizer: Arc<Mutex<Option<OfflineRecognizer>>>,
+    recognizer: Arc<Mutex<Option<Recognizer>>>,
     paths: ModelPaths,
     tokens_path: PathBuf,
     label: String,
@@ -68,8 +99,8 @@ impl SttEngine {
         };
 
         Ok(Self {
-            // Weights load when recording starts and drop after transcription
-            // so the idle overlay stays lightweight.
+            // Construction only validates paths. The app prepares the selected
+            // model in the background, then keeps its weights resident.
             recognizer: Arc::new(Mutex::new(None)),
             paths,
             tokens_path,
@@ -78,10 +109,51 @@ impl SttEngine {
         })
     }
 
-    fn create_recognizer(&self) -> Result<OfflineRecognizer, String> {
+    fn create_recognizer(&self) -> Result<Recognizer, String> {
+        if let Some(online) = self.create_online() {
+            return Ok(Recognizer::Online(online));
+        }
+        Ok(Recognizer::Offline(self.create_offline()?))
+    }
+
+    fn create_online(&self) -> Option<OnlineRecognizer> {
+        let ModelPaths::ParakeetTransducer {
+            encoder,
+            decoder,
+            joiner,
+        } = &self.paths
+        else {
+            return None;
+        };
+        let config = OnlineRecognizerConfig {
+            model_config: OnlineModelConfig {
+                transducer: OnlineTransducerModelConfig {
+                    encoder: Some(encoder.to_string_lossy().to_string()),
+                    decoder: Some(decoder.to_string_lossy().to_string()),
+                    joiner: Some(joiner.to_string_lossy().to_string()),
+                },
+                tokens: Some(self.tokens_path.to_string_lossy().to_string()),
+                num_threads: inference_threads(),
+                provider: Some("cpu".to_string()),
+                debug: false,
+                model_type: Some("nemo_transducer".to_string()),
+                ..Default::default()
+            },
+            decoding_method: Some("greedy_search".to_string()),
+            max_active_paths: 1,
+            enable_endpoint: false,
+            ..Default::default()
+        };
+        OnlineRecognizer::create(&config)
+    }
+
+    fn create_offline(&self) -> Result<OfflineRecognizer, String> {
         let language = self.current_language.lock().clone();
         let tokens = self.tokens_path.to_string_lossy().to_string();
 
+        // Keep the existing budget for offline models. The larger thread pool
+        // is measured against the streaming Parakeet encoder only.
+        let threads = inference_threads().min(4);
         let model_config = match &self.paths {
             ModelPaths::SenseVoice { model } => OfflineModelConfig {
                 sense_voice: OfflineSenseVoiceModelConfig {
@@ -90,7 +162,7 @@ impl SttEngine {
                     use_itn: true,
                 },
                 tokens: Some(tokens),
-                num_threads: 2,
+                num_threads: threads,
                 debug: false,
                 provider: Some("cpu".to_string()),
                 model_type: Some("sense_voice".to_string()),
@@ -105,7 +177,7 @@ impl SttEngine {
                     ..Default::default()
                 },
                 tokens: Some(tokens),
-                num_threads: 2,
+                num_threads: threads,
                 debug: false,
                 provider: Some("cpu".to_string()),
                 model_type: Some("whisper".to_string()),
@@ -122,9 +194,10 @@ impl SttEngine {
                     joiner: Some(joiner.to_string_lossy().to_string()),
                 },
                 tokens: Some(tokens),
-                num_threads: 2,
+                num_threads: threads,
                 debug: false,
                 provider: Some("cpu".to_string()),
+                model_type: Some("nemo_transducer".to_string()),
                 ..Default::default()
             },
             ModelPaths::Moonshine {
@@ -141,7 +214,7 @@ impl SttEngine {
                     ..Default::default()
                 },
                 tokens: Some(tokens),
-                num_threads: 2,
+                num_threads: threads,
                 debug: false,
                 provider: Some("cpu".to_string()),
                 ..Default::default()
@@ -150,6 +223,10 @@ impl SttEngine {
 
         let config = OfflineRecognizerConfig {
             model_config,
+            // Greedy search is the fastest transducer decode. Beam search
+            // spends the extra time on paths we do not show.
+            decoding_method: Some("greedy_search".to_string()),
+            max_active_paths: 1,
             ..Default::default()
         };
 
@@ -160,9 +237,87 @@ impl SttEngine {
     pub fn prepare(&self) -> Result<(), String> {
         let mut guard = self.recognizer.lock();
         if guard.is_none() {
-            *guard = Some(self.create_recognizer()?);
+            let recognizer = self.create_recognizer()?;
+            // First ONNX run pays kernel init. Do it on a throwaway stream
+            // while the user is still talking, then keep the session resident.
+            warm_session(&recognizer);
+            *guard = Some(recognizer);
         }
         Ok(())
+    }
+
+    pub fn start_utterance(&self) -> Result<Utterance, String> {
+        self.prepare()?;
+        let guard = self.recognizer.lock();
+        match guard.as_ref() {
+            Some(Recognizer::Online(recognizer)) => Ok(Utterance {
+                kind: UtteranceKind::Streaming(recognizer.create_stream()),
+            }),
+            Some(Recognizer::Offline(_)) => Ok(Utterance {
+                kind: UtteranceKind::Buffered(Vec::new()),
+            }),
+            None => Err("STT recognizer not initialized".to_string()),
+        }
+    }
+
+    pub fn push_audio(&self, utterance: &mut Utterance, samples: &[f32]) {
+        if samples.is_empty() {
+            return;
+        }
+        match &mut utterance.kind {
+            UtteranceKind::Buffered(buffered) => buffered.extend_from_slice(samples),
+            UtteranceKind::Streaming(stream) => {
+                let guard = self.recognizer.lock();
+                if let Some(Recognizer::Online(recognizer)) = guard.as_ref() {
+                    decode_ready(recognizer, stream, samples, false);
+                }
+            }
+        }
+    }
+
+    pub fn finish_utterance(&self, utterance: Utterance) -> Result<String, String> {
+        match utterance.kind {
+            UtteranceKind::Buffered(samples) => self.transcribe_offline(&samples),
+            UtteranceKind::Streaming(stream) => {
+                let guard = self.recognizer.lock();
+                let Some(Recognizer::Online(recognizer)) = guard.as_ref() else {
+                    return Err("STT recognizer not initialized".to_string());
+                };
+                decode_ready(recognizer, &stream, &[], true);
+                Ok(recognizer
+                    .get_result(&stream)
+                    .map(|result| result.text.trim().to_string())
+                    .unwrap_or_default())
+            }
+        }
+    }
+
+    /// Decode Parakeet audio as it arrives. `Finish` starts the response-time clock.
+    pub fn transcribe_live(&self, rx: &Receiver<LiveAudio>) -> Result<LiveTranscript, String> {
+        let mut utterance = self.start_utterance()?;
+        let mut samples_seen = 0usize;
+        let mut stopped_at = None;
+        loop {
+            match rx.recv_timeout(Duration::from_millis(20)) {
+                Ok(LiveAudio::Chunk(samples)) => {
+                    samples_seen += samples.len();
+                    self.push_audio(&mut utterance, &samples);
+                }
+                Ok(LiveAudio::Finish(at)) => {
+                    stopped_at = Some(at);
+                    break;
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        let stopped_at = stopped_at.unwrap_or_else(Instant::now);
+        let text = self.finish_utterance(utterance)?;
+        Ok(LiveTranscript {
+            text,
+            latency_ms: stopped_at.elapsed().as_millis() as u64,
+            duration_secs: samples_seen as f32 / 16000.0,
+        })
     }
 
     pub fn release(&self) {
@@ -192,39 +347,98 @@ impl SttEngine {
         self.current_language.lock().clone()
     }
 
+    #[allow(dead_code)]
     pub fn transcribe(&self, samples: &[f32]) -> Result<String, String> {
         if samples.is_empty() {
             return Ok(String::new());
         }
+        let mut utterance = self.start_utterance()?;
+        self.push_audio(&mut utterance, samples);
+        self.finish_utterance(utterance)
+    }
 
+    fn transcribe_offline(&self, samples: &[f32]) -> Result<String, String> {
+        if samples.is_empty() {
+            return Ok(String::new());
+        }
         self.prepare()?;
-
-        let result = {
-            let recognizer_guard = self.recognizer.lock();
-            let recognizer = recognizer_guard
-                .as_ref()
-                .ok_or_else(|| "STT recognizer not initialized".to_string())?;
-
-            let stream = recognizer.create_stream();
-            stream.accept_waveform(16000, samples);
-            recognizer.decode(&stream);
-
-            stream
-                .get_result()
-                .map(|result| result.text.trim().to_string())
-                .unwrap_or_default()
+        let guard = self.recognizer.lock();
+        let Some(Recognizer::Offline(recognizer)) = guard.as_ref() else {
+            return Err("STT recognizer not initialized".to_string());
         };
-
-        self.release();
-
-        Ok(result)
+        let stream = recognizer.create_stream();
+        stream.accept_waveform(16000, samples);
+        recognizer.decode(&stream);
+        Ok(stream
+            .get_result()
+            .map(|result| result.text.trim().to_string())
+            .unwrap_or_default())
     }
 
     #[cfg(test)]
     fn is_loaded(&self) -> bool {
         self.recognizer.lock().is_some()
     }
+
+    #[cfg(test)]
+    fn is_streaming(&self) -> bool {
+        matches!(self.recognizer.lock().as_ref(), Some(Recognizer::Online(_)))
+    }
 }
+
+/// Streaming Parakeet benefits from eight threads on larger CPUs. Cap the
+/// pool there: twelve threads were slower in the real-time speech replay.
+pub(crate) fn inference_thread_count(parallelism: usize) -> i32 {
+    parallelism.clamp(1, 8) as i32
+}
+
+fn inference_threads() -> i32 {
+    #[cfg(test)]
+    if let Ok(threads) = std::env::var("TDT_BENCH_THREADS") {
+        return threads.parse().expect("benchmark thread count");
+    }
+    inference_thread_count(
+        std::thread::available_parallelism()
+            .map(|count| count.get())
+            .unwrap_or(2),
+    )
+}
+
+fn decode_ready(
+    recognizer: &OnlineRecognizer,
+    stream: &OnlineStream,
+    samples: &[f32],
+    finished: bool,
+) {
+    if !samples.is_empty() {
+        stream.accept_waveform(16000, samples);
+    }
+    if finished {
+        stream.input_finished();
+    }
+    while recognizer.is_ready(stream) {
+        recognizer.decode(stream);
+    }
+}
+
+fn warm_session(recognizer: &Recognizer) {
+    let silence = [0.0f32; 3200];
+    match recognizer {
+        Recognizer::Offline(recognizer) => {
+            let stream = recognizer.create_stream();
+            stream.accept_waveform(16000, &silence);
+            recognizer.decode(&stream);
+        }
+        Recognizer::Online(recognizer) => {
+            let stream = recognizer.create_stream();
+            decode_ready(recognizer, &stream, &silence, true);
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "latency_tests.rs"]
+mod latency_tests;
 
 #[cfg(test)]
 mod tests {
@@ -239,6 +453,51 @@ mod tests {
             .expect("system time should be valid")
             .as_nanos();
         std::env::temp_dir().join(format!("voice-stt-lazy-model-{tag}-{unique}"))
+    }
+
+    #[test]
+    fn installed_parakeet_q8_decodes_while_audio_arrives() {
+        let Some(local) = std::env::var_os("LOCALAPPDATA") else {
+            return;
+        };
+        let dir = std::path::PathBuf::from(local)
+            .join("TDT")
+            .join("models")
+            .join("parakeet-unified-en-0.6b-q8");
+        if !dir.join("encoder.int8.onnx").is_file() {
+            return;
+        }
+        let engine = SttEngine::new(DEFAULT, &dir, "en").expect("engine");
+        engine.prepare().expect("load");
+        assert!(
+            engine.is_streaming(),
+            "Parakeet Q8 should decode with the streaming recognizer"
+        );
+        let mut utterance = engine.start_utterance().expect("utterance");
+        let chunk = vec![0.0f32; 16_000];
+        for _ in 0..3 {
+            engine.push_audio(&mut utterance, &chunk);
+        }
+        let flush_ms = {
+            let started = std::time::Instant::now();
+            engine.finish_utterance(utterance).expect("finish");
+            started.elapsed().as_millis()
+        };
+        assert!(
+            flush_ms < 1_000,
+            "flush after a streamed utterance took {flush_ms} ms"
+        );
+    }
+
+    #[test]
+    fn inference_threads_scale_with_cores_and_cap_at_eight() {
+        assert_eq!(super::inference_thread_count(0), 1);
+        assert_eq!(super::inference_thread_count(1), 1);
+        assert_eq!(super::inference_thread_count(2), 2);
+        assert_eq!(super::inference_thread_count(4), 4);
+        assert_eq!(super::inference_thread_count(8), 8);
+        assert_eq!(super::inference_thread_count(16), 8);
+        assert_eq!(super::inference_thread_count(usize::MAX), 8);
     }
 
     #[test]

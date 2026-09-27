@@ -2,7 +2,7 @@
 # Default is the recommended Parakeet Q8 layout at models/parakeet-unified-en-0.6b-q8.
 [CmdletBinding()]
 param(
-    [ValidateSet("moonshine-medium-streaming", "sensevoice-full", "parakeet-unified-en-0.6b-q8", "whisper-medium", "all")]
+    [ValidateSet("moonshine-medium-streaming", "sensevoice-full", "parakeet-tdt-0.6b-v3", "parakeet-unified-en-0.6b-q8", "whisper-medium", "all")]
     [string]$Model = "parakeet-unified-en-0.6b-q8",
     [string]$ModelsRoot = ""
 )
@@ -39,6 +39,17 @@ $Catalog = @{
             @{ Name = "model.onnx"; Sha256 = "977016BD9C79F9EB343430B5CC305E07AB64D5212DFF41B0DCFA1694BEE9A8CB" },
             @{ Name = "LICENSE"; Sha256 = $null },
             @{ Name = "README.md"; Sha256 = $null }
+        )
+    }
+    "parakeet-tdt-0.6b-v3" = @{
+        Label = "Parakeet v3"
+        Repo = "csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8"
+        Dir = "parakeet-tdt-0.6b-v3"
+        Files = @(
+            @{ Name = "encoder.int8.onnx"; Sha256 = "ACFC2B4456377E15D04F0243AF540B7FE7C992F8D898D751CF134C3A55FD2247" },
+            @{ Name = "decoder.int8.onnx"; Sha256 = "179E50C43D1A9DE79C8A24149A2F9BAC6EB5981823F2A2ED88D655B24248DB4E" },
+            @{ Name = "joiner.int8.onnx"; Sha256 = "3164C13FC2821009440D20FCB5FDC78BFF28B4DB2F8D0F0B329101719C0948B3" },
+            @{ Name = "tokens.txt"; Sha256 = "D58544679EA4BC6AC563D1F545EB7D474BD6CFA467F0A6E2C1DC1C7D37E3C35D" }
         )
     }
     "parakeet-unified-en-0.6b-q8" = @{
@@ -94,7 +105,7 @@ function Install-TdtModel([string]$Id) {
 }
 
 $ids = if ($Model -eq "all") {
-    @("moonshine-medium-streaming", "sensevoice-full", "parakeet-unified-en-0.6b-q8", "whisper-medium")
+    @("moonshine-medium-streaming", "sensevoice-full", "parakeet-tdt-0.6b-v3", "parakeet-unified-en-0.6b-q8", "whisper-medium")
 } else {
     @($Model)
 }
