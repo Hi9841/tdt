@@ -1945,7 +1945,18 @@ impl HudView {
             ),
             DownloadPhase::Failed { message, .. } => message.clone(),
             _ if self.model_loading.as_deref() == Some(spec.id) => {
-                format!("Checking {}. Your current model stays active.", spec.label)
+                match self
+                    .active_model
+                    .as_deref()
+                    .filter(|active| *active != spec.id)
+                {
+                    Some(active) => format!(
+                        "Loading {}. {} keeps running until it is ready.",
+                        spec.label,
+                        models::resolve(active).label
+                    ),
+                    None => format!("Loading {}.", spec.label),
+                }
             }
             _ if self.active_model.as_deref() == Some(spec.id) => {
                 format!("Active: {}. {}", spec.label, spec.blurb)
@@ -1995,21 +2006,28 @@ impl HudView {
             _ => None,
         };
         let mut model_body = vec![controls::chip_well(model_rows).into_any_element()];
-        if let Some(active) = self
-            .active_model
-            .as_ref()
-            .filter(|active| active.as_str() != self.selected_model)
-        {
-            model_body.push(
-                div()
-                    .text_size(px(TYPE_DESC))
-                    .text_color(foam())
-                    .child(format!(
-                        "Using {} while you choose another model.",
+        if self.model_loading.as_deref() != Some(spec.id) {
+            if let Some(active) = self
+                .active_model
+                .as_ref()
+                .filter(|active| active.as_str() != self.selected_model)
+            {
+                let note = if installed {
+                    format!("{} is still running.", models::resolve(active).label)
+                } else {
+                    format!(
+                        "{} keeps running until you download this model.",
                         models::resolve(active).label
-                    ))
-                    .into_any_element(),
-            );
+                    )
+                };
+                model_body.push(
+                    div()
+                        .text_size(px(TYPE_DESC))
+                        .text_color(foam())
+                        .child(note)
+                        .into_any_element(),
+                );
+            }
         }
         if !self.model_ready() {
             model_body.insert(0, div().text_size(px(TYPE_DESC)).line_height(px(16.0)).text_color(gold()).child(format!("Set up dictation: download {} to get started. Setup needs internet; your speech stays on this device.", models::DEFAULT.label)).into_any_element());
