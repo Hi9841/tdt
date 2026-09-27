@@ -695,7 +695,6 @@ fn main() {
                             }
                             if let Some(tray) = tray.as_mut() {
                                 tray.update(&view.status, &view.hotkey_label);
-                                view.sync_tray_overlay(tray.tray_icon.rect());
                             }
                         });
                     }
