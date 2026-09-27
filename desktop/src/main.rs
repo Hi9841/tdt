@@ -129,9 +129,6 @@ fn main() {
         let _ = config.save();
     }
     let auto_paste = config.auto_paste;
-    if preview::wants_tray() {
-        config.tray_mode = true;
-    }
     let hotkey_binding = HotkeyBinding::parse(&config.hotkey).unwrap_or_default();
     set_binding(hotkey_binding);
     let hotkey_label = hotkey_binding.display();
@@ -211,7 +208,7 @@ fn main() {
 
     app.run(move |cx: &mut App| {
         // Windows requires the event loop to exist before creating the tray icon.
-        let mut tray = if preview::is_active() && !preview::wants_tray() { None } else { match SystemTray::new(auto_paste, &hotkey_label, config.tray_mode) {
+        let mut tray = if preview::is_active() && !preview::wants_tray() { None } else { match SystemTray::new(auto_paste, &hotkey_label) {
             Ok(tray) => Some(tray),
             Err(error) => {
                 append_log(&format!("Failed to create system tray: {error}"));
@@ -359,18 +356,6 @@ fn main() {
                                     let _ = this.update(cx, |view, cx| {
                                         view.open_settings(cx);
                                     });
-                                } else if event.id == tray.tray_mode_item.id() {
-                                    let _ = this.update(cx, |view, cx| {
-                                        if let Err(error) = view.set_tray_mode(tray.tray_mode_item.is_checked()) {
-                                            tray.tray_mode_item.set_checked(view.tray_mode);
-                                            view.set_error(error);
-                                            view.open_settings(cx);
-                                        }
-                                        view.sync_tray_overlay(tray.tray_icon.rect());
-                                        cx.notify();
-                                    });
-                                } else if event.id == tray.hide_item.id() {
-                                    let _ = this.update(cx, |view, cx| view.hide_overlay(cx));
                                 } else if event.id == tray.stop_item.id() {
                                     let _ = this.update(cx, |view, _| view.stop_requested = true);
                                 } else if event.id == tray.show_item.id() {
@@ -481,7 +466,7 @@ fn main() {
                                         if stt.lock().is_none() {
                                             let _ = this.update(cx, |view, cx| {
                                                 view.set_error("Download a speech model in Settings before recording.".into());
-                                                if !view.tray_mode { view.open_settings(cx); }
+                                                view.open_settings(cx);
                                                 cx.notify();
                                             });
                                             continue;
@@ -657,7 +642,7 @@ fn main() {
                                 HudStatus::Success { finished_at, .. } => {
                                     if !preview::is_active()
                                         && view.recovery_message.is_none()
-                                        && finished_at.elapsed() > Duration::from_millis(if view.tray_mode { 6000 } else { 1800 })
+                                        && finished_at.elapsed() > Duration::from_millis(1800)
                                     {
                                         view.status = HudStatus::Idle;
                                         cx.notify();
@@ -668,10 +653,6 @@ fn main() {
                             if let Some(tray) = tray.as_mut() {
                                 tray.update(&view.status, &view.hotkey_label);
                                 view.sync_tray_overlay(tray.tray_icon.rect());
-                            } else if view.tray_mode {
-                                // A failed tray must never make the app inaccessible.
-                                view.tray_mode = false;
-                                view.reveal_overlay();
                             }
                         });
                     }

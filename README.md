@@ -24,7 +24,7 @@ That writes:
 
 - `dist/TDT.exe` slim app binary used by in-app updates
 - `dist/TDT-Setup.exe` per-user installer (app only, no speech model)
-- `dist/TDT-0.2.1-windows-x64.zip` portable copy (app only, no speech model)
+- `dist/TDT-0.2.2-windows-x64.zip` portable copy (app only, no speech model)
 - `dist/SHA256SUMS.txt`
 
 The installer copies TDT and the license files into `%LOCALAPPDATA%\TDT`,
@@ -50,17 +50,15 @@ Settings by clicking the shortcut chip, then press the new combo. The tray
 menu controls auto-paste. Auto-paste writes the result to the clipboard and
 injects Unicode text directly into the previously focused application.
 
-To keep TDT in the Windows notification area, right-click its tray bubble and
-enable **Keep bubble in tray**. The choice is saved. The idle overlay disappears;
-the voice animation stays entirely inside the tray icon while listening or
-transcribing. Recording, results, and errors never open a separate status bubble.
-Hover the icon for status or the latest transcript, and open History for the full
-text. Windows' animation setting is respected.
+The floating bubble stays on screen while TDT runs and shows recording state
+directly. The tray icon mirrors that state, so hovering it gives status or the
+latest transcript, and History holds the full text. Windows' animation setting
+is respected.
 
-Click the tray bubble to open settings. Its menu offers **Stop recording**,
-**Open settings**, and **Quit TDT**. Turn off **Keep bubble in tray** to return to
-the floating bubble. If Windows puts TDT under the tray arrow, drag its icon onto
-the visible taskbar area. Windows controls which tray icons remain visible.
+Click the tray icon to open settings. Its menu offers **Stop recording**,
+**Open settings**, and **Quit TDT**. If Windows puts TDT under the tray arrow,
+drag its icon onto the visible taskbar area. Windows controls which tray icons
+remain visible.
 
 In Settings, pick Parakeet Q8, Parakeet v3, Moonshine Medium, SenseVoice Full,
 or Whisper Medium. Missing models show Download model. Parakeet Q8 is about
