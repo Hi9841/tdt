@@ -63,6 +63,14 @@ pub enum WindowViewMode {
     StatsAndSettings,
 }
 
+/// The bubble and the settings panel are the same window. Closing settings
+/// returns to the bubble. Neither mode dismisses the app.
+pub fn window_hidden_for_mode(mode: WindowViewMode) -> bool {
+    match mode {
+        WindowViewMode::Bubble | WindowViewMode::StatsAndSettings => false,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SettingsTab {
     Stats,
@@ -497,6 +505,11 @@ impl HudView {
                 if view.panel_motion == Some(PanelMotion::Closing { started_at }) {
                     view.mode = WindowViewMode::Bubble;
                     view.panel_motion = None;
+                    if window_hidden_for_mode(view.mode) {
+                        set_overlay_hidden(true);
+                    } else {
+                        view.reveal_overlay();
+                    }
                     cx.notify();
                 }
             });
@@ -523,17 +536,6 @@ impl HudView {
     pub fn show_from_tray(&mut self, cx: &mut Context<Self>) {
         self.reveal_overlay();
         cx.notify();
-    }
-
-    pub fn sync_tray_overlay(&mut self, rect: Option<tray_icon::Rect>) {
-        if self.panel_motion.is_some() {
-            return;
-        }
-        let visible = self.mode == WindowViewMode::StatsAndSettings;
-        crate::ui::window_util::position_overlay_by_tray(rect);
-        if crate::ui::window_util::is_overlay_hidden() == visible {
-            set_overlay_hidden(!visible);
-        }
     }
 
     pub fn open_settings(&mut self, cx: &mut Context<Self>) {
@@ -2145,7 +2147,16 @@ const _: () = assert!(SETTINGS_SURFACE_HEIGHT <= BUBBLE_HEIGHT - 14.0);
 
 #[cfg(test)]
 mod motion_tests {
-    use super::{history_text_overflows, toggle_offset, HISTORY_EXPAND_CHARS};
+    use super::{
+        history_text_overflows, toggle_offset, window_hidden_for_mode, WindowViewMode,
+        HISTORY_EXPAND_CHARS,
+    };
+
+    #[test]
+    fn closing_settings_keeps_the_bubble_on_screen() {
+        assert!(!window_hidden_for_mode(WindowViewMode::StatsAndSettings));
+        assert!(!window_hidden_for_mode(WindowViewMode::Bubble));
+    }
 
     #[test]
     fn toggle_finishes_inside_track_in_both_directions() {

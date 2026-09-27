@@ -1,9 +1,9 @@
-use super::{hud::HudStatus, theme, window_util::client_animations_enabled};
-use std::time::{Duration, Instant};
+use super::hud::HudStatus;
 use tray_icon::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
-const ICON_SIZE: u32 = 32;
+/// Ordinal of the icon in `desktop/assets/tdt.rc`. Same image as the exe icon.
+const APP_ICON_ID: u16 = 1;
 
 pub struct SystemTray {
     pub tray_icon: TrayIcon,
@@ -13,10 +13,7 @@ pub struct SystemTray {
     pub updates_item: MenuItem,
     pub quit_item: MenuItem,
     pub stop_item: MenuItem,
-    last_frame: Option<(TrayState, usize, u8)>,
     last_tooltip: String,
-    next_frame: Instant,
-    started: Instant,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,12 +78,7 @@ impl SystemTray {
             .append(&quit_item)
             .map_err(|e| format!("Menu error: {e}"))?;
 
-        let icon = Icon::from_rgba(
-            render_bubble_icon(TrayState::Idle, 0, 0),
-            ICON_SIZE,
-            ICON_SIZE,
-        )
-        .map_err(|e| format!("Failed to create tray icon: {e}"))?;
+        let icon = app_icon()?;
 
         let tray_icon = TrayIconBuilder::new()
             .with_menu(Box::new(tray_menu))
@@ -104,10 +96,7 @@ impl SystemTray {
             updates_item,
             quit_item,
             stop_item,
-            last_frame: None,
             last_tooltip: String::new(),
-            next_frame: Instant::now(),
-            started: Instant::now(),
         })
     }
 
@@ -121,97 +110,19 @@ impl SystemTray {
         if tooltip != self.last_tooltip && self.tray_icon.set_tooltip(Some(&tooltip)).is_ok() {
             self.last_tooltip = tooltip;
         }
-        let now = Instant::now();
-        if now < self.next_frame && self.last_frame.is_some_and(|(last, _, _)| last == state) {
-            return;
-        }
-        self.next_frame = now + Duration::from_millis(100);
-        let motion = client_animations_enabled();
-        let frame = animation_frame(state, self.started.elapsed(), motion);
-        let level = match status {
-            HudStatus::Listening { audio_level, .. } if motion => {
-                (audio_level.clamp(0.0, 1.0).sqrt() * 8.0).round() as u8
-            }
-            _ => 4,
-        };
-        if self.last_frame == Some((state, frame, level)) {
-            return;
-        }
-        if let Ok(icon) = Icon::from_rgba(
-            render_bubble_icon(state, frame, level),
-            ICON_SIZE,
-            ICON_SIZE,
-        ) {
-            if self.tray_icon.set_icon(Some(icon)).is_ok() {
-                self.last_frame = Some((state, frame, level));
-            }
-        }
     }
 }
 
-fn animation_frame(state: TrayState, elapsed: Duration, motion: bool) -> usize {
-    if motion && matches!(state, TrayState::Listening | TrayState::Transcribing) {
-        (elapsed.as_millis() / 100 % 12) as usize
-    } else {
-        0
-    }
+fn app_icon() -> Result<Icon, String> {
+    let side = tray_icon_px();
+    Icon::from_resource(APP_ICON_ID, Some((side, side)))
+        .map_err(|error| format!("Failed to load the app icon: {error}"))
 }
 
-/// Antialiased bubble with a state glyph, legible on light and dark taskbars.
-fn render_bubble_icon(state: TrayState, frame: usize, level: u8) -> Vec<u8> {
-    let color = match state {
-        TrayState::Idle => theme::IRIS,
-        TrayState::Listening => theme::FOAM,
-        TrayState::Transcribing => theme::GOLD,
-        TrayState::Success => theme::SUCCESS,
-        TrayState::Attention => theme::LOVE,
-    };
-    let mut pixels = vec![0; (ICON_SIZE * ICON_SIZE * 4) as usize];
-    let phase = frame as f32 / 12.0 * std::f32::consts::TAU;
-    for y in 0..ICON_SIZE {
-        for x in 0..ICON_SIZE {
-            let dx = x as f32 - 15.5;
-            let dy = y as f32 - 15.5;
-            let distance = dx.hypot(dy);
-            let alpha = (14.5 - distance).clamp(0.0, 1.0);
-            let glyph = match state {
-                TrayState::Idle => dx.hypot(dy) < 3.0,
-                TrayState::Listening => {
-                    let column = ((dx + 8.0) / 5.0).floor();
-                    (-8.0..8.0).contains(&dx)
-                        && (dx + 8.0) % 5.0 < 3.0
-                        && dy.abs()
-                            < 2.0 + level as f32 * (0.4 + 0.6 * (phase + column * 1.5).sin().abs())
-                }
-                TrayState::Transcribing => {
-                    (7.0..10.0).contains(&distance)
-                        && (dy.atan2(dx) - phase).rem_euclid(std::f32::consts::TAU) < 4.7
-                }
-                TrayState::Success => {
-                    ((dx + 4.0).abs() < 4.0 && (dy - dx - 4.0).abs() < 1.8)
-                        || ((-1.0..8.0).contains(&dx) && (dy + dx - 3.0).abs() < 1.8)
-                }
-                TrayState::Attention => {
-                    dx.abs() < 1.8 && ((-8.0..3.0).contains(&dy) || (5.0..8.0).contains(&dy))
-                }
-            };
-            let rgb = if glyph {
-                theme::BG
-            } else if distance > 12.0 {
-                color
-            } else {
-                theme::TEXT
-            };
-            let offset = ((y * ICON_SIZE + x) * 4) as usize;
-            pixels[offset..offset + 4].copy_from_slice(&[
-                (rgb >> 16) as u8,
-                (rgb >> 8) as u8,
-                rgb as u8,
-                (alpha * 255.0) as u8,
-            ]);
-        }
-    }
-    pixels
+fn tray_icon_px() -> u32 {
+    use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSMICON};
+    let side = unsafe { GetSystemMetrics(SM_CXSMICON) };
+    side.max(16) as u32
 }
 
 pub fn tooltip_text(hotkey_label: &str) -> String {
@@ -248,48 +159,13 @@ fn status_tooltip(status: &HudStatus, hotkey: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{animation_frame, render_bubble_icon, TrayState};
-    use super::{tooltip_text, ICON_SIZE};
-    use std::time::Duration;
+    use super::tooltip_text;
 
     #[test]
-    fn motion_only_runs_for_active_states_and_respects_reduced_motion() {
-        for state in [TrayState::Idle, TrayState::Success, TrayState::Attention] {
-            assert_eq!(animation_frame(state, Duration::from_millis(500), true), 0);
-        }
-        for state in [TrayState::Listening, TrayState::Transcribing] {
-            assert_eq!(animation_frame(state, Duration::from_millis(500), false), 0);
-            assert_eq!(animation_frame(state, Duration::from_millis(500), true), 5);
-            assert_ne!(
-                render_bubble_icon(state, 0, 8),
-                render_bubble_icon(state, 5, 8)
-            );
-        }
-    }
-
-    #[test]
-    fn bubble_icon_is_visible_with_transparent_corners() {
-        let pixels = render_bubble_icon(TrayState::Idle, 0, 0);
-        assert_eq!(pixels[3], 0);
-        assert_eq!(pixels.len(), (ICON_SIZE * ICON_SIZE * 4) as usize);
-        let mut opaque = 0usize;
-        let mut colored = 0usize;
-        for px in pixels.as_chunks::<4>().0 {
-            if px[3] == 255 {
-                opaque += 1;
-            }
-            if px[3] > 0 && (px[0] > 40 || px[1] > 40 || px[2] > 80) {
-                colored += 1;
-            }
-        }
-        assert!(
-            opaque > 500,
-            "bubble should fill most of the 32px icon, got {opaque}"
-        );
-        assert!(
-            colored > 40,
-            "bubble should be visible, got {colored} colored pixels"
-        );
+    fn tray_uses_the_executable_app_icon() {
+        let rc = include_str!("../../assets/tdt.rc");
+        assert!(rc.contains("1 ICON \"tdt.ico\""));
+        assert_eq!(super::APP_ICON_ID, 1);
     }
 
     #[test]
@@ -297,14 +173,6 @@ mod tests {
         assert_eq!(
             tooltip_text("Ctrl+;"),
             "TDT. Shortcut Ctrl+;. Click to open."
-        );
-    }
-
-    #[test]
-    fn tray_wave_responds_to_voice_level() {
-        assert_ne!(
-            render_bubble_icon(TrayState::Listening, 0, 0),
-            render_bubble_icon(TrayState::Listening, 0, 8)
         );
     }
 

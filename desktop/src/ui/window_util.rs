@@ -7,8 +7,8 @@ use windows::Win32::Graphics::Dwm::{
 };
 #[cfg(target_os = "windows")]
 use windows::Win32::Graphics::Gdi::{
-    EnumDisplayMonitors, GetMonitorInfoW, MonitorFromRect, MonitorFromWindow, SetWindowRgn, HDC,
-    HMONITOR, HRGN, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    EnumDisplayMonitors, GetMonitorInfoW, MonitorFromWindow, SetWindowRgn, HDC, HMONITOR, HRGN,
+    MONITORINFO, MONITOR_DEFAULTTONEAREST,
 };
 #[cfg(target_os = "windows")]
 use windows::Win32::System::Com::{
@@ -20,14 +20,13 @@ use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetFocus};
 use windows::Win32::UI::Shell::{IVirtualDesktopManager, VirtualDesktopManager};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, FindWindowW, GetClassNameW, GetClientRect, GetForegroundWindow, GetWindowLongW,
-    GetWindowRect, GetWindowThreadProcessId, IsWindow, PostMessageW, SetForegroundWindow,
-    SetWindowLongW, SetWindowPos, ShowWindow, SystemParametersInfoW, GWL_EXSTYLE, GWL_STYLE,
-    HTCAPTION, HWND_TOPMOST, SPI_GETCLIENTAREAANIMATION, SWP_FRAMECHANGED, SWP_NOACTIVATE,
-    SWP_NOCOPYBITS, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE,
-    SW_SHOWNOACTIVATE, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WM_NCLBUTTONDOWN, WS_CAPTION,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP,
-    WS_THICKFRAME,
+    EnumWindows, GetClassNameW, GetClientRect, GetForegroundWindow, GetWindowLongW, GetWindowRect,
+    GetWindowThreadProcessId, IsWindow, PostMessageW, SetForegroundWindow, SetWindowLongW,
+    SetWindowPos, ShowWindow, SystemParametersInfoW, GWL_EXSTYLE, GWL_STYLE, HTCAPTION,
+    HWND_TOPMOST, SPI_GETCLIENTAREAANIMATION, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOCOPYBITS,
+    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, SW_SHOWNOACTIVATE,
+    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WM_NCLBUTTONDOWN, WS_CAPTION, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_THICKFRAME,
 };
 
 pub const BUBBLE_WIDTH: f32 = 400.0;
@@ -304,55 +303,7 @@ pub fn set_overlay_hidden(hidden: bool) {
     }
 }
 
-/// Place beside the live notification icon, or the taskbar when it is in overflow.
-/// Never move a panel while its open/close transition owns the window geometry.
-pub fn position_overlay_by_tray(icon: Option<tray_icon::Rect>) {
-    if overlay_animating().load(std::sync::atomic::Ordering::SeqCst) {
-        return;
-    }
-    let Some(hwnd) = find_app_hwnd() else {
-        return;
-    };
-    unsafe {
-        let mut anchor = RECT::default();
-        if let Some(icon) = icon.filter(|r| r.size.width > 0 && r.size.height > 0) {
-            anchor = RECT {
-                left: icon.position.x.round() as i32,
-                top: icon.position.y.round() as i32,
-                right: icon.position.x.round() as i32 + icon.size.width as i32,
-                bottom: icon.position.y.round() as i32 + icon.size.height as i32,
-            };
-        } else if let Ok(taskbar) = FindWindowW(windows::core::w!("Shell_TrayWnd"), None) {
-            if GetWindowRect(taskbar, &mut anchor).is_err() {
-                return;
-            }
-        } else {
-            return;
-        }
-        let monitor = MonitorFromRect(&anchor, MONITOR_DEFAULTTONEAREST);
-        let mut info = MONITORINFO {
-            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
-            ..Default::default()
-        };
-        if !GetMonitorInfoW(monitor, &mut info).as_bool() {
-            return;
-        }
-        let mut rect = RECT::default();
-        if GetWindowRect(hwnd, &mut rect).is_err() {
-            return;
-        }
-        let (x, y) = tray_popup_origin(
-            anchor,
-            info.rcWork,
-            (rect.right - rect.left, rect.bottom - rect.top),
-            logical_to_device(8.0, window_scale(hwnd)),
-        );
-        if (x, y) != (rect.left, rect.top) {
-            let _ = SetWindowPos(hwnd, HWND_TOPMOST, x, y, 0, 0, SWP_NOACTIVATE | SWP_NOSIZE);
-        }
-    }
-}
-
+#[cfg(test)]
 fn tray_popup_origin(anchor: RECT, work: RECT, size: (i32, i32), gap: i32) -> (i32, i32) {
     let (width, height) = size;
     let (x, y) = if anchor.bottom <= work.top {
