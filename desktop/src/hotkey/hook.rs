@@ -235,6 +235,26 @@ fn key_down(vk: i32) -> bool {
     unsafe { GetAsyncKeyState(vk) as u16 & 0x8000 != 0 }
 }
 
+/// Keys and mouse buttons that are down right now. Index is the virtual-key code.
+#[cfg(target_os = "windows")]
+pub fn input_mask() -> [bool; 256] {
+    let mut mask = [false; 256];
+    for vk in 1..256 {
+        mask[vk] = key_down(vk as i32);
+    }
+    mask
+}
+
+/// A key or button that was up when `baseline` was taken and is down now.
+/// Modifiers are ignored so the shortcut's Ctrl can stay held.
+#[cfg(target_os = "windows")]
+pub fn input_appeared(baseline: &[bool; 256]) -> bool {
+    let now = input_mask();
+    now.iter().enumerate().any(|(vk, down)| {
+        *down && !baseline.get(vk).copied().unwrap_or(false) && !is_modifier_vk(vk as u16)
+    })
+}
+
 #[cfg(target_os = "windows")]
 fn modifiers_down() -> (bool, bool, bool, bool) {
     use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -349,7 +369,7 @@ unsafe extern "system" fn hotkey_hook_proc(
     )
 }
 
-fn is_modifier_vk(vk: u16) -> bool {
+pub fn is_modifier_vk(vk: u16) -> bool {
     matches!(
         vk,
         0x10 | 0x11 | 0x12 | 0x5B | 0x5C | 0xA0 | 0xA1 | 0xA2 | 0xA3 | 0xA4 | 0xA5
