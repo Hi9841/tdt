@@ -191,21 +191,26 @@ pub fn choice_chip(id: ElementId, label: impl Into<SharedString>, is_on: bool) -
         .px(px(8.0))
         .min_w(px(0.0))
         .rounded(r_chip())
-        .bg(theme::transparent())
+        .bg(if is_on {
+            selected()
+        } else {
+            theme::transparent()
+        })
         .text_size(px(TYPE_DESC))
-        .font_weight(FontWeight::NORMAL)
-        .text_color(muted())
+        .font_weight(if is_on {
+            FontWeight::MEDIUM
+        } else {
+            FontWeight::NORMAL
+        })
+        .text_color(if is_on { text() } else { muted() })
         .whitespace_nowrap()
         .cursor_pointer()
         .hover(|s| s.opacity(0.88))
         .active(|s| s.opacity(0.66))
-        .focus(|s| s)
+        .focus(|s| s.border_color(focus_ring()))
+        .border_1()
+        .border_color(theme::transparent())
         .child(label)
-        .child(div().w(px(18.0)).h(px(2.0)).rounded_full().bg(if is_on {
-            accent()
-        } else {
-            theme::transparent()
-        }))
 }
 
 pub fn chip_well(rows: impl IntoIterator<Item = AnyElement>) -> Div {
@@ -215,6 +220,18 @@ pub fn chip_well(rows: impl IntoIterator<Item = AnyElement>) -> Div {
         .w_full()
         .gap(px(GAP_TIGHT))
         .children(rows)
+}
+
+/// Thin activity mark used while transcription is in progress.
+pub fn activity_bar() -> AnyElement {
+    div()
+        .w(px(64.0))
+        .h(px(3.0))
+        .rounded_full()
+        .bg(well())
+        .overflow_hidden()
+        .child(div().h_full().w(px(24.0)).rounded_full().bg(accent()))
+        .into_any_element()
 }
 
 pub fn progress_bar(done: u64, total: u64) -> AnyElement {

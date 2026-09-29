@@ -107,6 +107,8 @@ pub struct HudView {
     pub copied_at: Option<Instant>,
     /// Bumped on each auto-paste toggle so the knob animation restarts.
     pub toggle_epoch: u64,
+    /// Bumped on each startup toggle so that knob restarts on its own channel.
+    startup_epoch: u64,
     pub injector: PasteInjector,
     pub selected_language: String,
     pub selected_model: String,
@@ -189,6 +191,7 @@ impl HudView {
             expanded_history_key: None,
             copied_at: None,
             toggle_epoch: 0,
+            startup_epoch: 0,
             injector: PasteInjector::new(),
             selected_language,
             selected_model,
@@ -806,6 +809,7 @@ impl HudView {
     fn toggle_autostart(&mut self) {
         if preview::is_active() {
             self.autostart_enabled = !self.autostart_enabled;
+            self.startup_epoch = self.startup_epoch.wrapping_add(1);
             return;
         }
         let enabled = !crate::autostart::is_enabled();
@@ -813,6 +817,7 @@ impl HudView {
             Ok(()) => {
                 self.autostart_enabled = enabled;
                 self.autostart_error = None;
+                self.startup_epoch = self.startup_epoch.wrapping_add(1);
             }
             Err(error) => {
                 eprintln!("{error}");
@@ -876,11 +881,10 @@ impl Render for HudView {
 impl HudView {
     fn render_bubble(&mut self, cx: &mut Context<'_, Self>) -> AnyElement {
         let holding = matches!(&self.status, HudStatus::Listening { .. });
-        let released = matches!(&self.status, HudStatus::Transcribing { .. });
 
-        let waveform = if holding || released {
+        let waveform = if holding {
             let mut bars = Vec::with_capacity(WAVE_BARS);
-            let bar_color = if holding { foam() } else { gold() };
+            let bar_color = accent();
             for peak in self.wave_peaks {
                 let height = if holding {
                     wave_height(peak)
@@ -919,9 +923,10 @@ impl HudView {
                 .child(controls::shortcut_keys(&self.hotkey_label))
                 .into_any_element(),
             HudStatus::Idle => overlay_snippet("Download a model", muted()),
-            HudStatus::Success { text, .. } => overlay_snippet(text, success()),
-            HudStatus::Error { .. } => overlay_snippet("Open details to recover", muted()),
-            HudStatus::NoSpeech => overlay_snippet("Try again", muted()),
+            HudStatus::Success { text, .. } => overlay_snippet(text, theme::text()),
+            HudStatus::Error { message, .. } => overlay_snippet(message, text()),
+            HudStatus::NoSpeech => overlay_snippet("No speech detected", text()),
+            HudStatus::Transcribing { .. } => controls::activity_bar(),
             HudStatus::Listening { partial, .. } if !partial.is_empty() => {
                 overlay_snippet(partial, text())
             }
@@ -959,10 +964,10 @@ impl HudView {
 
         let (status_label, status_color) = match &self.status {
             HudStatus::Idle if !self.model_ready() => ("Set up", gold()),
-            HudStatus::Idle => ("Ready", success()),
+            HudStatus::Idle => ("Ready", text()),
             HudStatus::NoSpeech => ("No speech", gold()),
-            HudStatus::Listening { .. } => ("Listening", foam()),
-            HudStatus::Transcribing { .. } => ("Transcribing", gold()),
+            HudStatus::Listening { .. } => ("Listening", accent()),
+            HudStatus::Transcribing { .. } => ("Transcribing", accent()),
             HudStatus::Success { auto_pasted, .. } => {
                 (if *auto_pasted { "Pasted" } else { "Copied" }, success())
             }
@@ -975,6 +980,14 @@ impl HudView {
             .items_center()
             .h_full()
             .gap(px(GAP_TIGHT))
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(6.0))
+                    .h(px(6.0))
+                    .rounded_full()
+                    .bg(status_color),
+            )
             .child(
                 div()
                     .text_size(px(TYPE_LABEL))
@@ -1027,9 +1040,8 @@ impl HudView {
                         })),
                 )
                 .child(
-                    controls::secondary_button("open_settings_btn", "Settings")
+                    controls::secondary_button("open_settings_btn", "Settings…")
                         .h(px(SETTINGS_SURFACE_HEIGHT))
-                        .text_color(accent())
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|_, _, _, cx| cx.stop_propagation()),
@@ -1058,7 +1070,8 @@ impl HudView {
             right_section
                 .when(holding, |row| {
                     row.child(
-                        controls::secondary_button("stop_recording", "Stop")
+                        controls::primary_button("stop_recording", "Stop")
+                            .h(px(SETTINGS_SURFACE_HEIGHT))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|_, _, _, cx| cx.stop_propagation()),
@@ -1151,9 +1164,17 @@ impl HudView {
                 .items_center()
                 .justify_center()
                 .text_size(px(TYPE_DESC))
-                .font_weight(FontWeight::NORMAL)
-                .bg(theme::transparent())
-                .text_color(if active { accent() } else { muted() })
+                .font_weight(if active {
+                    FontWeight::MEDIUM
+                } else {
+                    FontWeight::NORMAL
+                })
+                .bg(if active {
+                    selected()
+                } else {
+                    theme::transparent()
+                })
+                .text_color(if active { text() } else { muted() })
                 .whitespace_nowrap()
                 .cursor_pointer()
                 .hover(|style| {
@@ -1285,6 +1306,18 @@ impl HudView {
         } else {
             faded_content.into_any_element()
         };
+        let panel_body = div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .h_full()
+            .px(pad())
+            .pt(pad())
+            .pb(pad())
+            .rounded(r_window())
+            .bg(shell_surface())
+            .overflow_hidden()
+            .child(header);
 
         div()
             .id("stats_settings_container")
@@ -1318,19 +1351,8 @@ impl HudView {
                     cx.notify();
                 }
             }))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .w_full()
-                    .h_full()
-                    .px(pad())
-                    .pt(pad())
-                    .pb(pad())
-                    .rounded(r_window())
-                    .bg(shell_surface())
-                    .overflow_hidden()
-                    .child(header)
+            .child({
+                let panel = panel_body
                     .when_some(self.recovery_message.clone(), |panel, message| {
                         panel.child(
                             div()
@@ -1385,30 +1407,30 @@ impl HudView {
                                 ),
                         )
                     })
-                    .child(faded_content),
-            )
+                    .child(faded_content);
+                if client_animations_enabled() {
+                    panel
+                        .with_animation(
+                            "panel_presence",
+                            Animation::new(Duration::from_millis(PANEL_OPEN_MS))
+                                .with_easing(ease_out_quint()),
+                            |this, delta| this.opacity(delta),
+                        )
+                        .into_any_element()
+                } else {
+                    panel.into_any_element()
+                }
+            })
             .into_any_element()
     }
 
     fn render_stats_tab(&mut self, cx: &mut Context<'_, Self>) -> AnyElement {
-        let grid = div()
-            .flex()
-            .w_full()
-            .gap(px(12.0))
-            .px(px(2.0))
-            .pt(px(4.0))
-            .child(controls::stat_block(
-                "Transcriptions",
-                format!("{}", self.stats.total_transcriptions),
-            ))
-            .child(controls::stat_block(
-                "Words",
-                format!("{}", self.stats.total_words),
-            ))
-            .child(controls::stat_block(
-                "Recorded time",
-                format_time_saved(self.stats.total_seconds),
-            ));
+        let summary = format!(
+            "{} transcriptions · {} words · {} recorded",
+            self.stats.total_transcriptions,
+            self.stats.total_words,
+            format_time_saved(self.stats.total_seconds),
+        );
 
         let mut history_items = Vec::new();
         if self.stats.history.is_empty() {
@@ -1438,6 +1460,7 @@ impl HudView {
             );
         } else {
             for (idx, item) in self.stats.history.iter().enumerate() {
+                let latest = idx == 0;
                 let text_val = item.text.clone();
                 let is_copied = self.copied_key.as_deref() == Some(item.timestamp.as_str());
                 let btn_text = if is_copied { "Copied" } else { "Copy" };
@@ -1537,10 +1560,12 @@ impl HudView {
                         .child(
                             div()
                                 .w_full()
-                                .text_size(px(12.0))
-                                .line_height(px(16.0))
+                                .text_size(px(if latest { TYPE_LABEL } else { 12.0 }))
+                                .line_height(px(if latest { 18.0 } else { 16.0 }))
                                 .text_color(rgb(TEXT))
-                                .when(!expanded, |text| text.line_clamp(2))
+                                .when(!expanded, |text| {
+                                    text.line_clamp(if latest { 4 } else { 2 })
+                                })
                                 .child(text_val),
                         )
                         .when(can_expand, |row| {
@@ -1558,7 +1583,6 @@ impl HudView {
         }
 
         let has_recents = !self.stats.history.is_empty();
-        let recents_count = self.stats.history.len().to_string();
         let mut history_header = div()
             .flex()
             .items_center()
@@ -1567,23 +1591,11 @@ impl HudView {
             .gap(px(8.0))
             .child(
                 div()
-                    .flex()
-                    .items_center()
-                    .gap(px(6.0))
-                    .child(
-                        div()
-                            .text_size(px(TYPE_META))
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(rgb(MUTED))
-                            .child("Recent"),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(TYPE_META))
-                            .font_family("Consolas")
-                            .text_color(rgb(MUTED))
-                            .child(recents_count),
-                    ),
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .text_size(px(TYPE_META))
+                    .text_color(muted())
+                    .child(summary),
             );
         if has_recents && !self.clear_history_pending {
             history_header = history_header.child(
@@ -1595,36 +1607,59 @@ impl HudView {
                 )),
             );
         }
-        if self.clear_history_pending {
-            history_header =
-                history_header.child(
+        let confirm = self.clear_history_pending.then(|| {
+            div()
+                .flex()
+                .flex_col()
+                .w_full()
+                .gap(px(8.0))
+                .p(px(12.0))
+                .rounded(r_section())
+                .bg(well())
+                .child(
+                    div()
+                        .text_size(px(TYPE_LABEL))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(text())
+                        .child("Clear history?"),
+                )
+                .child(
                     div()
                         .flex()
-                        .gap(px(4.0))
-                        .child(
-                            controls::secondary_button("confirm_clear", "Clear all?")
-                                .text_color(love())
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.clear_recents();
-                                    cx.notify();
-                                })),
-                        )
+                        .justify_end()
+                        .gap(px(8.0))
                         .child(controls::ghost_button("cancel_clear", "Cancel").on_click(
                             cx.listener(|this, _, _, cx| {
                                 this.clear_history_pending = false;
                                 cx.notify();
                             }),
-                        )),
-                );
-        }
+                        ))
+                        .child(
+                            controls::secondary_button("confirm_clear", "Clear")
+                                .text_color(love())
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.clear_recents();
+                                    cx.notify();
+                                })),
+                        ),
+                )
+                .into_any_element()
+        });
 
+        let latest_item = if history_items.is_empty() || self.stats.history.is_empty() {
+            None
+        } else {
+            Some(history_items.remove(0))
+        };
         let history_section = div()
             .flex()
             .flex_col()
             .flex_1()
             .min_h(px(0.0))
             .gap(px(GAP_TIGHT))
+            .when_some(latest_item, |section, latest| section.child(latest))
             .child(history_header)
+            .when_some(confirm, |section, card| section.child(card))
             .child(
                 div()
                     .id("history_scroller")
@@ -1643,7 +1678,6 @@ impl HudView {
             .flex_1()
             .min_h(px(0.0))
             .gap(px(GAP_SECTION))
-            .child(grid)
             .child(history_section)
             .into_any_element()
     }
@@ -1690,14 +1724,26 @@ impl HudView {
             toggle_track.into_any_element(),
         );
 
+        let startup_on = self.autostart_enabled;
+        let startup_epoch = self.startup_epoch;
+        let animate_startup = startup_epoch > 0 && client_animations_enabled();
+        let startup_knob = controls::toggle_knob();
+        let startup_knob = if animate_startup {
+            startup_knob
+                .with_animation(
+                    ElementId::NamedInteger("startup_knob".into(), startup_epoch),
+                    Animation::new(Duration::from_millis(MOTION_MS)).with_easing(ease_out_quint()),
+                    move |knob, progress| knob.ml(px(toggle_offset(startup_on, progress))),
+                )
+                .into_any_element()
+        } else {
+            startup_knob
+                .ml(px(toggle_offset(startup_on, 1.0)))
+                .into_any_element()
+        };
         let startup_toggle = controls::toggle_hit(
             "autostart_hit_target",
-            controls::toggle_track(
-                self.autostart_enabled,
-                controls::toggle_knob()
-                    .ml(px(toggle_offset(self.autostart_enabled, 1.0)))
-                    .into_any_element(),
-            ),
+            controls::toggle_track(self.autostart_enabled, startup_knob),
         )
         .on_click(cx.listener(|this, _, _, cx| {
             this.toggle_autostart();
@@ -1785,10 +1831,22 @@ impl HudView {
                     .text_size(px(TYPE_META))
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(text())
-                    .child("Press shortcut...")
+                    .child("Press shortcut…")
                     .into_any_element()
             } else {
-                controls::shortcut_keys(&hotkey_str)
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(controls::shortcut_keys(&hotkey_str))
+                    .child(
+                        div()
+                            .text_size(px(TYPE_META))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(text())
+                            .child("Change shortcut…"),
+                    )
+                    .into_any_element()
             })
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.toggle_hotkey_capture();
@@ -2083,31 +2141,44 @@ impl HudView {
                     auto_paste_row.into_any_element(),
                 ],
             ))
-            .child(model_row)
-            .when_some(self.model_error.clone(), |view, error| {
-                view.child(
-                    div()
-                        .px(px(2.0))
-                        .text_size(px(TYPE_DESC))
-                        .line_height(px(15.0))
-                        .text_color(love())
-                        .child(error),
-                )
-            })
-            .child(language_row)
-            .child(controls::grouped_section(
-                "App",
-                [startup_row.into_any_element()],
-            ))
-            .when_some(self.autostart_error.clone(), |view, error| {
-                view.child(
-                    div()
-                        .text_size(px(TYPE_DESC))
-                        .text_color(love())
-                        .child(error),
-                )
-            })
-            .child(update_row)
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .w_full()
+                    .gap(px(GAP_SECTION))
+                    .child(controls::section_label("Recognition"))
+                    .child(model_row)
+                    .when_some(self.model_error.clone(), |view, error| {
+                        view.child(
+                            div()
+                                .px(px(2.0))
+                                .text_size(px(TYPE_DESC))
+                                .line_height(px(15.0))
+                                .text_color(love())
+                                .child(error),
+                        )
+                    })
+                    .child(language_row),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .w_full()
+                    .gap(px(GAP_TIGHT))
+                    .child(controls::section_label("App"))
+                    .child(startup_row)
+                    .when_some(self.autostart_error.clone(), |view, error| {
+                        view.child(
+                            div()
+                                .text_size(px(TYPE_DESC))
+                                .text_color(love())
+                                .child(error),
+                        )
+                    })
+                    .child(update_row),
+            )
             .into_any_element()
     }
 }
