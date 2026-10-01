@@ -233,27 +233,6 @@ impl AudioRecorder {
         }
     }
 
-    /// Samples captured since the last drain. Empty once recording has stopped.
-    #[allow(dead_code)]
-    pub fn drain(&self) -> Vec<f32> {
-        drain_samples(&self.is_recording, &self.buffer)
-    }
-
-    #[allow(dead_code)]
-    pub fn stop(&self) -> Vec<f32> {
-        stop_samples(
-            &self.is_recording,
-            &self.current_rms,
-            &self.envelope,
-            &self.buffer,
-        )
-    }
-
-    #[allow(dead_code)]
-    pub fn is_recording(&self) -> bool {
-        self.is_recording.load(Ordering::Relaxed)
-    }
-
     pub fn audio_level(&self) -> f32 {
         *self.current_rms.lock()
     }

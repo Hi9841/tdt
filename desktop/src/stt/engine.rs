@@ -372,21 +372,6 @@ impl SttEngine {
         Ok(())
     }
 
-    #[allow(dead_code)]
-    pub fn current_language(&self) -> String {
-        self.current_language.lock().clone()
-    }
-
-    #[allow(dead_code)]
-    pub fn transcribe(&self, samples: &[f32]) -> Result<String, String> {
-        if samples.is_empty() {
-            return Ok(String::new());
-        }
-        let mut utterance = self.start_utterance()?;
-        self.push_audio(&mut utterance, samples);
-        self.finish_utterance(utterance)
-    }
-
     fn transcribe_offline(&self, samples: &[f32]) -> Result<String, String> {
         if samples.is_empty() {
             return Ok(String::new());

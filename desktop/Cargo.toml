@@ -1,6 +1,6 @@
 [package]
 name = "voice-stt-desktop"
-version = "0.2.8"
+version = "0.2.9"
 edition = "2021"
 description = "TDT (Talk Don't Type), native offline speech-to-text built with Rust, GPUI, and Sherpa-ONNX"
 license = "Apache-2.0"
@@ -21,7 +21,6 @@ gpui = "0.2.2"
 sherpa-onnx = "1.13.8"
 cpal = "0.15"
 arboard = "3.4"
-enigo = { version = "0.3", default-features = false }
 tray-icon = "0.19"
 crossbeam-channel = "0.5"
 parking_lot = "0.12"

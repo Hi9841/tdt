@@ -164,6 +164,29 @@ fn send_action(action: HotkeyAction) {
     }
 }
 
+static USER_TYPED: AtomicBool = AtomicBool::new(false);
+
+/// The next dictation starts clean. Called when the shortcut key goes down.
+pub fn reset_user_typed() {
+    USER_TYPED.store(false, Ordering::SeqCst);
+}
+
+/// A physical non-modifier key arrived, or a key was already down at release.
+pub fn note_user_typed() {
+    USER_TYPED.store(true, Ordering::SeqCst);
+}
+
+pub fn user_typed() -> bool {
+    USER_TYPED.load(Ordering::SeqCst)
+}
+
+/// Mouse buttons are 0x01 through 0x06. The shortcut key and modifiers are not typing.
+pub fn note_physical_key(vk: u16, binding_vk: u16) {
+    if vk > 0x06 && !is_modifier_vk(vk) && vk != binding_vk {
+        note_user_typed();
+    }
+}
+
 fn finish_press() {
     let Some(start) = PRESS_START.lock().take() else {
         return;
@@ -182,7 +205,7 @@ pub struct HotkeyListener {
 
 impl HotkeyListener {
     #[cfg(target_os = "windows")]
-    pub fn start() -> (Self, Receiver<HotkeyAction>) {
+    pub fn start() -> Result<(Self, Receiver<HotkeyAction>), String> {
         use windows::Win32::Foundation::{HINSTANCE, HWND};
         use windows::Win32::UI::WindowsAndMessaging::{
             DispatchMessageW, GetMessageW, SetWindowsHookExW, UnhookWindowsHookEx, MSG,
@@ -190,6 +213,7 @@ impl HotkeyListener {
         };
 
         let (sender, receiver) = crossbeam_channel::unbounded();
+        let (ready_tx, ready_rx) = crossbeam_channel::bounded(1);
         let running = Arc::new(AtomicBool::new(true));
         let running_thread = Arc::clone(&running);
         *SENDER.lock() = Some(sender);
@@ -201,27 +225,39 @@ impl HotkeyListener {
                 HINSTANCE::default(),
                 0,
             );
-            if let Ok(h) = hook {
-                HOOK_PTR.store(h.0, Ordering::SeqCst);
-                let mut msg = MSG::default();
-                while running_thread.load(Ordering::Relaxed)
-                    && GetMessageW(&mut msg, HWND::default(), 0, 0).as_bool()
-                {
-                    let _ = DispatchMessageW(&msg);
+            match hook {
+                Ok(h) => {
+                    HOOK_PTR.store(h.0, Ordering::SeqCst);
+                    let _ = ready_tx.send(Ok(()));
+                    let mut msg = MSG::default();
+                    while running_thread.load(Ordering::Relaxed)
+                        && GetMessageW(&mut msg, HWND::default(), 0, 0).as_bool()
+                    {
+                        let _ = DispatchMessageW(&msg);
+                    }
+                    let _ = UnhookWindowsHookEx(h);
+                    HOOK_PTR.store(std::ptr::null_mut(), Ordering::SeqCst);
                 }
-                let _ = UnhookWindowsHookEx(h);
-                HOOK_PTR.store(std::ptr::null_mut(), Ordering::SeqCst);
+                Err(error) => {
+                    let _ = ready_tx.send(Err(format!(
+                        "Could not install the keyboard hook. Restart TDT. {error}"
+                    )));
+                }
             }
         });
 
-        (Self { _running: running }, receiver)
+        match ready_rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(Ok(())) => Ok((Self { _running: running }, receiver)),
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err("Could not install the keyboard hook. Restart TDT.".to_string()),
+        }
     }
 
     #[cfg(not(target_os = "windows"))]
-    pub fn start() -> (Self, Receiver<HotkeyAction>) {
+    pub fn start() -> Result<(Self, Receiver<HotkeyAction>), String> {
         let (_sender, receiver) = crossbeam_channel::unbounded();
         let running = Arc::new(AtomicBool::new(true));
-        (Self { _running: running }, receiver)
+        Ok((Self { _running: running }, receiver))
     }
 }
 
@@ -239,8 +275,8 @@ fn key_down(vk: i32) -> bool {
 #[cfg(target_os = "windows")]
 pub fn input_mask() -> [bool; 256] {
     let mut mask = [false; 256];
-    for vk in 1..256 {
-        mask[vk] = key_down(vk as i32);
+    for (vk, slot) in mask.iter_mut().enumerate().skip(1) {
+        *slot = key_down(vk as i32);
     }
     mask
 }
@@ -347,9 +383,13 @@ unsafe extern "system" fn hotkey_hook_proc(
                 let mut start_guard = PRESS_START.lock();
                 if start_guard.is_none() {
                     *start_guard = Some(Instant::now());
+                    reset_user_typed();
                     send_action(HotkeyAction::PressStarted);
                 }
                 return LRESULT(1);
+            }
+            if is_down {
+                note_physical_key(vk, binding.vk);
             }
             if is_up && vk == binding.vk {
                 if PRESS_START.lock().is_some() {
@@ -438,7 +478,8 @@ fn vk_label(vk: u16) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        capture_timed_out, is_hold, tap_should_stop, HotkeyBinding, CAPTURE_TIMEOUT, HOLD_THRESHOLD,
+        capture_timed_out, is_hold, note_physical_key, reset_user_typed, tap_should_stop,
+        user_typed, HotkeyBinding, CAPTURE_TIMEOUT, HOLD_THRESHOLD,
     };
     use std::time::{Duration, Instant};
 
@@ -493,5 +534,17 @@ mod tests {
     fn reject_letter_without_modifier() {
         assert!(HotkeyBinding::parse("A").is_none());
         assert!(HotkeyBinding::parse("Esc").is_none());
+    }
+
+    #[test]
+    fn a_letter_marks_typing_and_the_shortcut_does_not() {
+        reset_user_typed();
+        note_physical_key(0x41, 0xBA);
+        assert!(user_typed());
+        reset_user_typed();
+        note_physical_key(0x11, 0xBA);
+        note_physical_key(0xBA, 0xBA);
+        note_physical_key(0x01, 0xBA);
+        assert!(!user_typed());
     }
 }

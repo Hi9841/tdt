@@ -2,7 +2,6 @@
 #![allow(dead_code)]
 
 use super::theme::{self, *};
-use crate::stt::models;
 use gpui::*;
 
 pub fn ghost_button(id: &'static str, label: impl Into<SharedString>) -> Stateful<Div> {
@@ -20,7 +19,6 @@ pub fn ghost_button(id: &'static str, label: impl Into<SharedString>) -> Statefu
         .font_weight(medium())
         .text_color(muted())
         .whitespace_nowrap()
-        .cursor_pointer()
         .hover(|s| {
             s.bg(hover())
                 .text_color(text())
@@ -58,7 +56,6 @@ pub fn secondary_button(id: &'static str, label: impl Into<SharedString>) -> Sta
         .font_weight(medium())
         .text_color(text())
         .whitespace_nowrap()
-        .cursor_pointer()
         .hover(|s| s.bg(hover()))
         .active(|s| s.bg(pressed()))
         .focus(|s| s.bg(pressed()))
@@ -80,7 +77,6 @@ pub fn primary_button(id: &'static str, label: impl Into<SharedString>) -> State
         .font_weight(semibold())
         .text_color(rgb(BG))
         .whitespace_nowrap()
-        .cursor_pointer()
         .hover(|s| s.bg(rgb(PRIMARY_HOVER)))
         .active(|s| s.bg(rgb(PRIMARY_ACTIVE)))
         .focus(|s| s.bg(rgb(PRIMARY_HOVER)))
@@ -204,7 +200,6 @@ pub fn choice_chip(id: ElementId, label: impl Into<SharedString>, is_on: bool) -
         })
         .text_color(if is_on { text() } else { muted() })
         .whitespace_nowrap()
-        .cursor_pointer()
         .hover(|s| s.opacity(0.88))
         .active(|s| s.opacity(0.66))
         .focus(|s| s.border_color(focus_ring()))
@@ -306,7 +301,6 @@ pub fn toggle_hit(id: &'static str, track: Div) -> Stateful<Div> {
         .justify_center()
         .min_w(px(44.0))
         .min_h(px(44.0))
-        .cursor_pointer()
         .rounded(r_chip())
         .hover(|s| s.opacity(0.88))
         .focus(|s| s.opacity(0.78))
@@ -333,56 +327,4 @@ pub fn toggle_knob() -> Div {
         .h(px(TOGGLE_KNOB))
         .rounded_full()
         .bg(rgb(BG))
-}
-
-pub fn stat_block(label: &'static str, value: impl Into<SharedString>) -> Div {
-    div()
-        .flex()
-        .flex_col()
-        .flex_1()
-        .min_w(px(0.0))
-        .gap(px(2.0))
-        .child(
-            div()
-                .text_size(px(TYPE_META))
-                .font_weight(medium())
-                .text_color(muted())
-                .child(label),
-        )
-        .child(
-            div()
-                .text_size(px(TYPE_STAT))
-                .line_height(px(24.0))
-                .font_family("Consolas")
-                .font_weight(semibold())
-                .text_color(text())
-                .child(value.into()),
-        )
-}
-
-pub fn download_copy(
-    done: u64,
-    total: u64,
-    file: Option<&str>,
-    file_index: usize,
-    file_count: usize,
-) -> String {
-    let pct = models::percent(done, total);
-    match file {
-        Some(name) if file_count > 1 => format!(
-            "{}% - {} of {} - {} - {} of {}",
-            pct,
-            file_index,
-            file_count,
-            models::file_label(name),
-            models::format_mb(done),
-            models::format_mb(total)
-        ),
-        _ => format!(
-            "{}% - {} of {}",
-            pct,
-            models::format_mb(done),
-            models::format_mb(total)
-        ),
-    }
 }
