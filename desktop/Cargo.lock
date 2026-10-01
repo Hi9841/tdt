@@ -1782,25 +1782,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "66b7e2430c6dff6a955451e2cfc438f09cea1965a9d6f87f7e3b90decc014099"
 
 [[package]]
-name = "enigo"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0cf6f550bbbdd5fe66f39d429cb2604bcdacbf00dca0f5bbe2e9306a0009b7c6"
-dependencies = [
- "core-foundation 0.10.0",
- "core-graphics 0.24.0",
- "foreign-types-shared",
- "libc",
- "log",
- "objc2 0.5.2",
- "objc2-app-kit 0.2.2",
- "objc2-foundation 0.2.2",
- "windows 0.58.0",
- "xkbcommon",
- "xkeysym",
-]
-
-[[package]]
 name = "enumflags2"
 version = "0.7.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7056,14 +7037,13 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "voice-stt-desktop"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "arboard",
  "cpal",
  "crossbeam-channel",
  "directories",
  "embed-resource",
- "enigo",
  "gpui",
  "parking_lot",
  "serde",

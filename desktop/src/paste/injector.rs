@@ -54,6 +54,21 @@ pub fn inserted_key_count(text: &str) -> usize {
     text.chars().filter(|character| *character != '\r').count()
 }
 
+/// Modifier virtual keys to release before Unicode injection. Order is stable.
+const MODIFIER_VKS: [u16; 11] = [
+    0x10, 0x11, 0x12, 0x5B, 0x5C, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5,
+];
+
+pub fn modifier_vks_to_release(down: impl Fn(u16) -> bool) -> Vec<u16> {
+    MODIFIER_VKS.into_iter().filter(|vk| down(*vk)).collect()
+}
+
+/// Once the user has typed, leave the document alone. The final text stays
+/// on the clipboard instead of backspacing whatever is now under the caret.
+pub fn keyboard_edit_allowed(user_typed: bool) -> bool {
+    !user_typed
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum EarlyClaim {
     /// No early insert ran. Type the final text normally.
@@ -295,12 +310,26 @@ impl PasteInjector {
         should_paste: bool,
         target_hwnd: Option<isize>,
         claim: EarlyClaim,
+        user_typed: bool,
     ) -> Result<DeliveryOutcome, String> {
         let inserted = match claim {
             EarlyClaim::Inserted(text) => Some(text),
             EarlyClaim::None | EarlyClaim::NotInserted => None,
         };
-        match final_edit(inserted.as_deref(), final_text, should_paste) {
+        let edit = final_edit(inserted.as_deref(), final_text, should_paste);
+        if !keyboard_edit_allowed(user_typed) {
+            return match edit {
+                FinalEdit::NoSpeech { .. } => Ok(DeliveryOutcome::NoSpeech),
+                _ => {
+                    self.copy_to_clipboard(final_text.trim())?;
+                    Ok(DeliveryOutcome::CopiedFallback(
+                        "You typed while TDT was finishing. The final text is on the clipboard."
+                            .to_string(),
+                    ))
+                }
+            };
+        }
+        match edit {
             FinalEdit::NoSpeech { erase } => {
                 if let Some(erase) = erase {
                     let _ = self.replace_typed(&erase, "", target_hwnd);
@@ -416,26 +445,41 @@ impl PasteInjector {
 
     fn type_prepared(&self, text: &str) -> Result<(), String> {
         // Inject Unicode text directly. A synthetic Ctrl+V is interpreted as an image
-        // paste by some apps (including Codex), even when CF_UNICODETEXT is present.
+        // paste by some apps, even when CF_UNICODETEXT is present.
         #[cfg(target_os = "windows")]
         {
             type_text_windows(text)?;
         }
-
         #[cfg(not(target_os = "windows"))]
         {
-            use enigo::{Direction, Enigo, Key, Keyboard, Settings};
-            if let Ok(mut enigo) = Enigo::new(&Settings::default()) {
-                let _ = enigo.key(Key::Control, Direction::Press);
-                thread::sleep(Duration::from_millis(15));
-                let _ = enigo.key(Key::Unicode('v'), Direction::Click);
-                thread::sleep(Duration::from_millis(15));
-                let _ = enigo.key(Key::Control, Direction::Release);
-            }
+            let _ = text;
         }
 
         Ok(())
     }
+}
+
+#[cfg(target_os = "windows")]
+fn release_physical_modifiers() {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, KEYEVENTF_KEYUP};
+
+    let down = modifier_vks_to_release(|vk| unsafe {
+        GetAsyncKeyState(i32::from(vk)) as u16 & 0x8000 != 0
+    });
+    if down.is_empty() {
+        return;
+    }
+    let inputs: Vec<_> = down
+        .into_iter()
+        .map(|vk| {
+            keyboard_input(
+                windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY(vk),
+                0,
+                KEYEVENTF_KEYUP,
+            )
+        })
+        .collect();
+    let _ = send_inputs(&inputs);
 }
 
 #[cfg(target_os = "windows")]
@@ -444,6 +488,7 @@ fn type_text_windows(text: &str) -> Result<(), String> {
         KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, VIRTUAL_KEY, VK_RETURN, VK_TAB,
     };
 
+    release_physical_modifiers();
     let mut inputs = Vec::with_capacity(text.encode_utf16().count() * 2);
     for character in text.chars() {
         match character {
@@ -471,6 +516,7 @@ fn type_text_windows(text: &str) -> Result<(), String> {
 fn backspace_windows(count: usize) -> Result<(), String> {
     use windows::Win32::UI::Input::KeyboardAndMouse::VK_BACK;
 
+    release_physical_modifiers();
     let mut inputs = Vec::with_capacity(count * 2);
     for _ in 0..count {
         push_key(&mut inputs, VK_BACK);
@@ -529,7 +575,10 @@ fn send_inputs(
 
 #[cfg(test)]
 mod revision_tests {
-    use super::{final_edit, inserted_key_count, EarlyClaim, FinalEdit, PasteGate};
+    use super::{
+        final_edit, inserted_key_count, keyboard_edit_allowed, modifier_vks_to_release, EarlyClaim,
+        FinalEdit, PasteGate,
+    };
     use std::sync::Arc;
 
     #[test]
@@ -574,6 +623,24 @@ mod revision_tests {
             final_edit(None, "", true),
             FinalEdit::NoSpeech { erase: None }
         );
+    }
+
+    #[test]
+    fn held_ctrl_is_released_before_typing() {
+        let mut down = [false; 256];
+        assert!(modifier_vks_to_release(|vk| down[vk as usize]).is_empty());
+        down[0x11] = true;
+        down[0xA2] = true;
+        assert_eq!(
+            modifier_vks_to_release(|vk| down[vk as usize]),
+            vec![0x11, 0xA2]
+        );
+    }
+
+    #[test]
+    fn typing_during_finish_blocks_keyboard_edits() {
+        assert!(!keyboard_edit_allowed(true));
+        assert!(keyboard_edit_allowed(false));
     }
 
     #[test]

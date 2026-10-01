@@ -108,19 +108,22 @@ pub fn should_activate_overlay_after_open(
     current_fg == 0 || current_fg == overlay || previous == Some(current_fg)
 }
 
-/// External dictation target: live foreground if it is not the overlay,
-/// otherwise a still-valid captured previous hwnd. Never returns the overlay.
+/// External dictation target. An unidentified overlay types nowhere, because
+/// the live foreground may be the TDT window itself. A known overlay is never
+/// returned. Otherwise this is the live foreground, or a still-valid previous
+/// hwnd captured when settings opened.
 pub fn dictation_target_from_handles(
     overlay: Option<isize>,
     current_fg: isize,
     previous: Option<isize>,
     previous_is_live: bool,
 ) -> Option<isize> {
-    if current_fg != 0 && overlay != Some(current_fg) {
+    let overlay = overlay.filter(|hwnd| *hwnd != 0)?;
+    if current_fg != 0 && current_fg != overlay {
         return Some(current_fg);
     }
     match previous {
-        Some(prev) if prev != 0 && overlay != Some(prev) && previous_is_live => Some(prev),
+        Some(prev) if prev != 0 && prev != overlay && previous_is_live => Some(prev),
         _ => None,
     }
 }
@@ -1165,6 +1168,24 @@ mod tests {
             other,
             Some(editor)
         ));
+    }
+
+    #[test]
+    fn dictation_target_unknown_overlay_types_nowhere() {
+        let maybe_tdt = 11isize;
+        let editor = 22isize;
+        assert_eq!(
+            dictation_target_from_handles(None, maybe_tdt, Some(editor), true),
+            None
+        );
+        assert_eq!(
+            dictation_target_from_handles(None, maybe_tdt, None, false),
+            None
+        );
+        assert_eq!(
+            dictation_target_from_handles(Some(0), maybe_tdt, Some(editor), true),
+            None
+        );
     }
 
     #[test]

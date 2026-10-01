@@ -16,8 +16,9 @@ use audio::{play_sound, AudioRecorder, SoundEffect, SpeechTail, MAX_TAIL, VIS_BA
 use config::{AppConfig, AppStats};
 use gpui::*;
 use hotkey::{
-    current_binding, input_appeared, input_mask, is_modifier_vk, poll_capture_timeout, set_binding,
-    tap_should_stop, HotkeyAction, HotkeyBinding, HotkeyListener,
+    current_binding, input_appeared, input_mask, is_modifier_vk, note_user_typed,
+    poll_capture_timeout, set_binding, tap_should_stop, user_typed, HotkeyAction, HotkeyBinding,
+    HotkeyListener,
 };
 use parking_lot::Mutex;
 use paste::{DeliveryOutcome, EarlyClaim, PasteGate, PasteInjector};
@@ -61,7 +62,7 @@ fn queue_early_paste(
     injector: &Arc<PasteInjector>,
     target: Option<isize>,
 ) {
-    if discard.load(Ordering::SeqCst) || !*auto_paste.lock() {
+    if discard.load(Ordering::SeqCst) || !*auto_paste.lock() || user_typed() {
         return;
     }
     let text = partial.lock().trim().to_string();
@@ -73,6 +74,7 @@ fn queue_early_paste(
     let discard = Arc::clone(discard);
     std::thread::spawn(move || {
         let inserted = !discard.load(Ordering::SeqCst)
+            && !user_typed()
             && matches!(
                 injector.deliver(&text, true, target),
                 Ok(DeliveryOutcome::Pasted)
@@ -88,24 +90,33 @@ fn deliver_transcript(
     should_paste: bool,
     target: Option<isize>,
     claim: EarlyClaim,
+    user_typed: bool,
 ) {
     if !result.text.trim().is_empty() {
         let mut stats = AppStats::load();
         stats.record_and_save(&result.text, result.duration_secs, result.latency_ms);
     }
-    let (auto_pasted, notice) = match injector.apply_final(&result.text, should_paste, target, claim) {
+    let (auto_pasted, notice) = match injector.apply_final(
+        &result.text,
+        should_paste,
+        target,
+        claim,
+        user_typed,
+    ) {
         Ok(DeliveryOutcome::NoSpeech) => {
             let _ = tx.send(InternalEvent::NoSpeech);
             return;
         }
         Ok(DeliveryOutcome::Copied) => (false, None),
         Ok(DeliveryOutcome::Pasted) => (true, None),
-        Ok(DeliveryOutcome::CopiedFallback(_)) => (
+        Ok(DeliveryOutcome::CopiedFallback(reason)) => (
             false,
-            Some(
+            Some(if reason.starts_with("You typed") {
+                reason
+            } else {
                 "Copied. Could not insert all text. Check the destination before pasting with Ctrl+V."
-                    .to_string(),
-            ),
+                    .to_string()
+            }),
         ),
         Err(error) => {
             let _ = tx.send(InternalEvent::TranscribeError(format!(
@@ -222,12 +233,28 @@ fn main() {
     // 3. Initialize paste injector
     let injector = Arc::new(PasteInjector::new());
 
-    // 4. Initialize hotkey hook
-    let (_hotkey_guard, hotkey_rx) = if preview::is_active() {
-        (None, crossbeam_channel::never())
+    // 4. Initialize hotkey hook. A failed install must not look like a working shortcut.
+    let _hotkey_guard;
+    let hotkey_rx;
+    let hotkey_error;
+    if preview::is_active() {
+        _hotkey_guard = None;
+        hotkey_rx = crossbeam_channel::never();
+        hotkey_error = None;
     } else {
-        let (guard, rx) = HotkeyListener::start();
-        (Some(guard), rx)
+        match HotkeyListener::start() {
+            Ok((guard, rx)) => {
+                _hotkey_guard = Some(guard);
+                hotkey_rx = rx;
+                hotkey_error = None;
+            }
+            Err(error) => {
+                append_log(&format!("Hotkey hook failed: {error}"));
+                _hotkey_guard = None;
+                hotkey_rx = crossbeam_channel::never();
+                hotkey_error = Some(error);
+            }
+        }
     };
 
     // 5. Launch GPUI application with floating bubble window
@@ -576,7 +603,7 @@ fn main() {
                                                         let should_paste = *paste_flag.lock();
                                                         let target = *target_flag.lock();
                                                         let claim = early_worker.claim_final();
-                                                        deliver_transcript(result, inj_worker, events, should_paste, target, claim);
+                                                        deliver_transcript(result, inj_worker, events, should_paste, target, claim, user_typed());
                                                     }
                                                     Err(error) => {
                                                         if discard_worker.load(Ordering::SeqCst) {
@@ -672,6 +699,7 @@ fn main() {
                                                     && vk as u16 != current_binding().vk
                                             });
                                             if typing {
+                                                note_user_typed();
                                                 stop_now = true;
                                             } else if let Some(live) = session.as_mut() {
                                                 live.tail.lock().mark_release();
@@ -698,6 +726,7 @@ fn main() {
                         if is_recording_state {
                             if let Some(baseline) = session.as_ref().and_then(|live| live.baseline.as_ref()) {
                                 if input_appeared(baseline) {
+                                    note_user_typed();
                                     stop_now = true;
                                 }
                             }
@@ -889,6 +918,7 @@ fn main() {
                     cx,
                 );
                 if let Some(error) = microphone_error { view.set_error(error); }
+                if let Some(error) = hotkey_error { view.set_error(error); }
                 view
             })
         }) {

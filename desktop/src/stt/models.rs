@@ -86,10 +86,6 @@ const UNIFIED_FILES: &[ModelFile] = &[
     },
 ];
 
-/// Previous default, kept so existing `config.json` files migrate cleanly.
-#[allow(dead_code)]
-pub const LEGACY_DEFAULT_MODEL_ID: &str = "sensevoice-small";
-
 /// Retired ids kept for migration only; they resolve to Parakeet INT8.
 fn migrated_id(_id: &str) -> &'static str {
     DEFAULT_MODEL_ID
