@@ -225,15 +225,14 @@ impl SttEngine {
         let mut utterance = self.start_utterance()?;
         let mut samples_seen = 0usize;
         let mut stopped_at = None;
-        // Kept only so a too-short utterance can be retried offline. Bounded by
-        // the same ceiling the fallback accepts, so a long recording costs
-        // 128 KB rather than a second copy of the whole take.
+        // Kept so an empty streaming result can be retried. A long take is
+        // already capped by the recorder at two minutes.
         let mut captured: Vec<f32> = Vec::new();
         loop {
             match rx.recv_timeout(Duration::from_millis(20)) {
                 Ok(LiveAudio::Chunk(samples)) => {
                     samples_seen += samples.len();
-                    if captured.len() < SHORT_FALLBACK_MAX_SAMPLES {
+                    if captured.len() < MAX_CAPTURED_SAMPLES {
                         captured.extend_from_slice(&samples);
                     }
                     self.push_audio(&mut utterance, &samples);
@@ -256,6 +255,14 @@ impl SttEngine {
         // too brief to fill the encoder's context, not that the room was quiet.
         let text = if streaming && text.trim().is_empty() {
             self.retry_short_utterance(&captured).unwrap_or(text)
+        } else {
+            text
+        };
+        // The wave is logarithmic, so a quiet voice still draws bars while
+        // Parakeet returns an empty string. Bring that take up to a level the
+        // model actually decodes, and leave true silence alone.
+        let text = if text.trim().is_empty() {
+            self.transcribe_boosted(&captured).unwrap_or(text)
         } else {
             text
         };
@@ -294,6 +301,11 @@ impl SttEngine {
         if *current != text {
             *current = text;
         }
+    }
+
+    fn transcribe_boosted(&self, samples: &[f32]) -> Option<String> {
+        let boosted = boost_quiet_speech(samples)?;
+        self.decode_padded_streaming(&boosted)
     }
 
     fn is_streaming_recognizer(&self) -> bool {
@@ -424,6 +436,55 @@ fn inference_threads() -> i32 {
 /// point where the streaming path reliably produces a transcript.
 const SHORT_FALLBACK_MIN_SAMPLES: usize = 2_400;
 const SHORT_FALLBACK_MAX_SAMPLES: usize = 32_000;
+/// Same ceiling as the recorder. The quiet-speech retry needs the whole take,
+/// not only the first two seconds.
+const MAX_CAPTURED_SAMPLES: usize = 120 * 16_000;
+
+/// 25 ms at 16 kHz. Matches the wave's frame.
+const SPEECH_FRAME_SAMPLES: usize = 400;
+/// A syllable at this level ticks the wave and still comes back empty.
+const VISIBLE_FRAME_RMS: f32 = 0.0015;
+const BOOST_TARGET_RMS: f32 = 0.05;
+const BOOST_MAX_GAIN: f32 = 24.0;
+
+/// Amplify a take whose bars are visible but whose level is too low for Parakeet.
+/// `None` for silence, a short blip, or audio that is already loud enough.
+pub(crate) fn boost_quiet_speech(samples: &[f32]) -> Option<Vec<f32>> {
+    let mut audible = Vec::new();
+    for frame in samples.chunks(SPEECH_FRAME_SAMPLES) {
+        if frame.len() < SPEECH_FRAME_SAMPLES / 2 {
+            continue;
+        }
+        let level = frame_rms(frame);
+        if level >= VISIBLE_FRAME_RMS {
+            audible.push(level);
+        }
+    }
+    // 200 ms of visible frames. A single click is not a phrase.
+    if audible.len() < 8 {
+        return None;
+    }
+    audible.sort_by(|left, right| left.total_cmp(right));
+    let level = audible[(audible.len() * 3) / 4];
+    if !level.is_finite() || level >= BOOST_TARGET_RMS {
+        return None;
+    }
+    let gain = (BOOST_TARGET_RMS / level).min(BOOST_MAX_GAIN);
+    if gain < 1.25 {
+        return None;
+    }
+    Some(
+        samples
+            .iter()
+            .map(|sample| (sample * gain).clamp(-1.0, 1.0))
+            .collect(),
+    )
+}
+
+fn frame_rms(frame: &[f32]) -> f32 {
+    let sum = frame.iter().map(|sample| sample * sample).sum::<f32>();
+    (sum / frame.len() as f32).sqrt()
+}
 
 /// Trailing zeros so a short take fills one 1120 ms streaming chunk.
 /// None outside the short-utterance band (same bounds as the offline retry).
@@ -595,5 +656,129 @@ mod tests {
 
         assert!(!engine.is_loaded(), "model must stay unloaded while idle");
         fs::remove_dir_all(model_dir).expect("temporary model directory should be removed");
+    }
+
+    /// Words that start after the first 1120 ms chunk used to be dropped, so the
+    /// wave moved and the bubble still said no speech.
+    #[test]
+    fn speech_after_a_pause_is_not_an_empty_transcript() {
+        let Some(local) = std::env::var_os("LOCALAPPDATA") else {
+            return;
+        };
+        let dir = std::path::PathBuf::from(local)
+            .join("TDT")
+            .join("models")
+            .join("parakeet-unified-en-0.6b-q8");
+        if !dir.join("encoder.int8.onnx").is_file() {
+            return;
+        }
+        let Some(speech) = pcm16_wav(std::path::Path::new(
+            r"C:\Users\hi\AppData\Local\Temp\tdt-speech.wav",
+        )) else {
+            return;
+        };
+        let speech = trim_audible(&speech);
+        let quiet: Vec<f32> = speech.iter().map(|sample| sample * 0.01).collect();
+        let text = decode_samples(&dir, &quiet);
+        assert!(
+            text.to_ascii_lowercase().contains("fox"),
+            "the wave shows this level, transcript was {text:?}"
+        );
+    }
+
+    #[test]
+    fn quiet_visible_speech_is_boosted_and_silence_is_not() {
+        assert!(super::boost_quiet_speech(&vec![0.0; 16_000]).is_none());
+        let whisper: Vec<f32> = (0..16_000)
+            .map(|index| 0.001 * (index as f32 * 0.15).sin())
+            .collect();
+        assert!(
+            super::boost_quiet_speech(&whisper).is_none(),
+            "a flat wave is not speech"
+        );
+        let audible: Vec<f32> = (0..16_000)
+            .map(|index| 0.012 * (index as f32 * 0.2).sin())
+            .collect();
+        let boosted = super::boost_quiet_speech(&audible).expect("visible sine");
+        let before = super::frame_rms(&audible[..400]);
+        let after = super::frame_rms(&boosted[..400]);
+        assert!(after > before * 2.0);
+        assert!(after <= super::BOOST_TARGET_RMS + 0.001);
+        let loud: Vec<f32> = audible.iter().map(|sample| sample * 20.0).collect();
+        assert!(super::boost_quiet_speech(&loud).is_none());
+    }
+
+    fn decode_samples(dir: &std::path::Path, samples: &[f32]) -> String {
+        let engine = SttEngine::new(DEFAULT, dir, "en").expect("engine");
+        engine.prepare().expect("load");
+        let partials = parking_lot::Mutex::new(String::new());
+        let (tx, rx) = crossbeam_channel::unbounded();
+        for chunk in samples.chunks(1_600) {
+            tx.send(super::LiveAudio::Chunk(chunk.to_vec()))
+                .expect("chunk");
+        }
+        tx.send(super::LiveAudio::Finish(std::time::Instant::now()))
+            .expect("finish");
+        drop(tx);
+        engine
+            .transcribe_live_reporting(&rx, Some(&partials))
+            .expect("decode")
+            .text
+    }
+
+    fn pcm16_wav(path: &std::path::Path) -> Option<Vec<f32>> {
+        let bytes = fs::read(path).ok()?;
+        if bytes.len() < 44 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+            return None;
+        }
+        let mut offset = 12usize;
+        let mut channels = 1u16;
+        let mut rate = 0u32;
+        let mut bits = 16u16;
+        let mut data: Option<&[u8]> = None;
+        while offset + 8 <= bytes.len() {
+            let id = &bytes[offset..offset + 4];
+            let size = u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().ok()?) as usize;
+            let body = offset + 8;
+            if body + size > bytes.len() {
+                break;
+            }
+            if id == b"fmt " && size >= 16 {
+                channels = u16::from_le_bytes(bytes[body + 2..body + 4].try_into().ok()?);
+                rate = u32::from_le_bytes(bytes[body + 4..body + 8].try_into().ok()?);
+                bits = u16::from_le_bytes(bytes[body + 14..body + 16].try_into().ok()?);
+            } else if id == b"data" {
+                data = Some(&bytes[body..body + size]);
+            }
+            offset = body + size + (size % 2);
+        }
+        let data = data?;
+        if bits != 16 || channels == 0 || rate != 16_000 {
+            return None;
+        }
+        let width = channels as usize;
+        let mut mono = Vec::with_capacity(data.len() / (2 * width));
+        for frame in data.chunks_exact(2 * width) {
+            let mut sum = 0.0f32;
+            for channel in 0..width {
+                let sample = i16::from_le_bytes([frame[channel * 2], frame[channel * 2 + 1]]);
+                sum += f32::from(sample) / f32::from(i16::MAX);
+            }
+            mono.push(sum / width as f32);
+        }
+        Some(mono)
+    }
+
+    fn trim_audible(samples: &[f32]) -> Vec<f32> {
+        let start = samples
+            .iter()
+            .position(|sample| sample.abs() > 0.02)
+            .unwrap_or(0);
+        let end = samples
+            .iter()
+            .rposition(|sample| sample.abs() > 0.02)
+            .map(|index| index + 1)
+            .unwrap_or(samples.len());
+        samples[start..end].to_vec()
     }
 }
