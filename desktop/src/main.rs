@@ -36,7 +36,7 @@ use tray_icon::{MouseButton, MouseButtonState, TrayIconEvent};
 use ui::preview;
 use ui::tray::tooltip_text;
 use ui::window_util::{
-    find_app_hwnd, follow_current_virtual_desktop, lock_overlay_chrome,
+    ensure_overlay_topmost, find_app_hwnd, follow_current_virtual_desktop, lock_overlay_chrome,
     position_bubble_on_preferred_monitor, BUBBLE_HEIGHT, BUBBLE_WIDTH,
 };
 use ui::{HudStatus, HudView, SystemTray};
@@ -369,6 +369,7 @@ fn main() {
                             .await;
                         follow_current_virtual_desktop();
                         lock_overlay_chrome();
+                        ensure_overlay_topmost();
                         poll_capture_timeout();
                         if take_show_request() {
                             let _ = this.update(cx, |view, cx| {

@@ -2,8 +2,9 @@
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT, WPARAM};
 #[cfg(target_os = "windows")]
 use windows::Win32::Graphics::Dwm::{
-    DwmSetWindowAttribute, DWMNCRP_DISABLED, DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE,
-    DWMWA_NCRENDERING_POLICY, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND,
+    DwmGetWindowAttribute, DwmSetWindowAttribute, DWMNCRP_DISABLED, DWMWA_BORDER_COLOR,
+    DWMWA_CLOAKED, DWMWA_COLOR_NONE, DWMWA_NCRENDERING_POLICY, DWMWA_WINDOW_CORNER_PREFERENCE,
+    DWMWCP_DONOTROUND,
 };
 #[cfg(target_os = "windows")]
 use windows::Win32::Graphics::Gdi::{
@@ -20,13 +21,14 @@ use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetFocus};
 use windows::Win32::UI::Shell::{IVirtualDesktopManager, VirtualDesktopManager};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetClassNameW, GetClientRect, GetForegroundWindow, GetWindowLongW, GetWindowRect,
-    GetWindowThreadProcessId, IsWindow, PostMessageW, SetForegroundWindow, SetWindowLongW,
-    SetWindowPos, ShowWindow, SystemParametersInfoW, GWL_EXSTYLE, GWL_STYLE, HTCAPTION,
-    HWND_TOPMOST, SPI_GETCLIENTAREAANIMATION, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOCOPYBITS,
-    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, SW_SHOWNOACTIVATE,
-    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WM_NCLBUTTONDOWN, WS_CAPTION, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_THICKFRAME,
+    EnumWindows, GetClassNameW, GetClientRect, GetForegroundWindow, GetWindow, GetWindowLongW,
+    GetWindowRect, GetWindowThreadProcessId, IsWindow, IsWindowVisible, PostMessageW,
+    SetForegroundWindow, SetWindowLongW, SetWindowPos, ShowWindow, SystemParametersInfoW,
+    GWL_EXSTYLE, GWL_STYLE, GW_HWNDPREV, HTCAPTION, HWND_TOPMOST, SPI_GETCLIENTAREAANIMATION,
+    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+    SWP_SHOWWINDOW, SW_HIDE, SW_SHOWNOACTIVATE, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+    WM_NCLBUTTONDOWN, WS_CAPTION, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_THICKFRAME,
 };
 
 pub const BUBBLE_WIDTH: f32 = 400.0;
@@ -67,6 +69,29 @@ fn remembered_hwnd() -> &'static parking_lot::Mutex<Option<isize>> {
 fn previous_foreground() -> &'static parking_lot::Mutex<Option<isize>> {
     static HWND: parking_lot::Mutex<Option<isize>> = parking_lot::Mutex::new(None);
     &HWND
+}
+
+/// Shell popups the pill must not cover. The taskbar is absent on purpose:
+/// a topmost taskbar was painting over the pill and leaving it there.
+pub fn overlay_should_yield_to(class_name: &str) -> bool {
+    matches!(
+        class_name,
+        "#32768"
+            | "Windows.UI.Core.CoreWindow"
+            | "XamlExplorerHostIslandWindow"
+            | "MultitaskingViewFrame"
+            | "ForegroundStaging"
+            | "NotifyIconOverflowWindow"
+            | "TopLevelWindowForOverflowXamlIsland"
+            | "Shell_InputSwitchTopLevelWindow"
+    )
+}
+
+/// Raise when topmost style was dropped, or when an app or the taskbar is
+/// above the pill. `covered_by_app_or_taskbar` is false when nothing is above
+/// or the only windows above are shell popups from `overlay_should_yield_to`.
+pub fn overlay_should_raise(style_is_current: bool, covered_by_app_or_taskbar: bool) -> bool {
+    !style_is_current || covered_by_app_or_taskbar
 }
 
 /// Compute the overlay extended style. Always keeps topmost + toolwindow.
@@ -154,6 +179,86 @@ pub fn apply_overlay_window_style(hwnd: HWND) {
         );
         apply_overlay_dwm(hwnd);
     }
+}
+
+/// Put the pill back at the top of the topmost band. The startup pass runs
+/// once and can miss the HWND; the taskbar can also step above a window that
+/// already has WS_EX_TOPMOST. Call this from the existing overlay poll.
+#[cfg(target_os = "windows")]
+pub fn ensure_overlay_topmost() {
+    if is_overlay_hidden() {
+        return;
+    }
+    let Some(hwnd) = find_app_hwnd() else {
+        return;
+    };
+    let ex = unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) };
+    let expanded = overlay_expanded().load(std::sync::atomic::Ordering::SeqCst);
+    let style_is_current = overlay_extended_style(ex, expanded) == ex;
+    let covered = covered_by_app_or_taskbar(hwnd);
+    if !overlay_should_raise(style_is_current, covered) {
+        return;
+    }
+    if !style_is_current {
+        apply_overlay_window_style(hwnd);
+        return;
+    }
+    unsafe {
+        let _ = SetWindowPos(
+            hwnd,
+            HWND_TOPMOST,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOCOPYBITS,
+        );
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn window_class_name(hwnd: HWND) -> String {
+    let mut class_name = [0u16; 256];
+    let len = unsafe { GetClassNameW(hwnd, &mut class_name) };
+    if len <= 0 {
+        String::new()
+    } else {
+        String::from_utf16_lossy(&class_name[..len as usize])
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn window_is_cloaked(hwnd: HWND) -> bool {
+    let mut cloaked = 0u32;
+    unsafe {
+        DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_CLOAKED,
+            &mut cloaked as *mut u32 as *mut _,
+            std::mem::size_of::<u32>() as u32,
+        )
+        .is_ok()
+            && cloaked != 0
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn covered_by_app_or_taskbar(hwnd: HWND) -> bool {
+    let mut above = unsafe { GetWindow(hwnd, GW_HWNDPREV) }.ok();
+    for _ in 0..128 {
+        let Some(current) = above else {
+            return false;
+        };
+        let visible = unsafe { IsWindowVisible(current).as_bool() };
+        if current != hwnd && visible && !window_is_cloaked(current) {
+            let class_name = window_class_name(current);
+            if !overlay_should_yield_to(&class_name) {
+                return true;
+            }
+        }
+        above = unsafe { GetWindow(current, GW_HWNDPREV) }.ok();
+    }
+    false
 }
 
 #[cfg(target_os = "windows")]
@@ -300,7 +405,7 @@ pub fn set_overlay_hidden(hidden: bool) {
         unsafe {
             let _ = ShowWindow(hwnd, if hidden { SW_HIDE } else { SW_SHOWNOACTIVATE });
             if !hidden {
-                apply_overlay_dwm(hwnd);
+                apply_overlay_window_style(hwnd);
             }
         }
     }
@@ -622,9 +727,7 @@ pub fn find_app_hwnd() -> Option<HWND> {
 
 #[cfg(target_os = "windows")]
 fn is_gpui_overlay_window(hwnd: HWND) -> bool {
-    let mut class_name = [0u16; 64];
-    let len = unsafe { GetClassNameW(hwnd, &mut class_name) };
-    len > 0 && String::from_utf16_lossy(&class_name[..len as usize]) == "Zed::Window"
+    window_class_name(hwnd) == "Zed::Window"
 }
 
 #[cfg(target_os = "windows")]
@@ -896,6 +999,7 @@ pub fn follow_current_virtual_desktop() {
             }
             if let Ok(desktop_id) = vdm.GetWindowDesktopId(fg) {
                 let _ = vdm.MoveWindowToDesktop(hwnd, &desktop_id);
+                apply_overlay_window_style(hwnd);
             }
         }
     }
@@ -1117,6 +1221,19 @@ mod tests {
         assert_eq!(expanded & topmost, topmost);
         assert_eq!(expanded & tool, tool);
         assert_eq!(expanded & layered, layered);
+    }
+
+    #[test]
+    fn overlay_yields_to_shell_popups_and_raises_over_the_taskbar() {
+        assert!(overlay_should_yield_to("#32768"));
+        assert!(overlay_should_yield_to("Windows.UI.Core.CoreWindow"));
+        assert!(overlay_should_yield_to("MultitaskingViewFrame"));
+        assert!(!overlay_should_yield_to("Shell_TrayWnd"));
+        assert!(!overlay_should_yield_to("Shell_SecondaryTrayWnd"));
+        assert!(!overlay_should_yield_to("Chrome_WidgetWin_1"));
+        assert!(!overlay_should_raise(true, false));
+        assert!(overlay_should_raise(false, false));
+        assert!(overlay_should_raise(true, true));
     }
 
     #[test]
