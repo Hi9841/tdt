@@ -1176,6 +1176,7 @@ impl HudView {
                 })
                 .text_color(if active { text() } else { muted() })
                 .whitespace_nowrap()
+                .cursor_pointer()
                 .hover(|style| {
                     if active {
                         style
@@ -1492,6 +1493,7 @@ impl HudView {
                             theme::transparent()
                         })
                         .text_color(if is_copied { success() } else { muted() })
+                        .cursor_pointer()
                         .hover(|style| {
                             if is_copied {
                                 style
@@ -1523,7 +1525,7 @@ impl HudView {
                         .px(px(10.0))
                         .py(px(10.0))
                         .rounded(r_chip())
-                        .when(can_expand, |row| row.tab_index(0))
+                        .when(can_expand, |row| row.tab_index(0).cursor_pointer())
                         .focus(|style| style.bg(pressed()))
                         .hover(|style| style.bg(hover()))
                         .active(|style| style.bg(pressed()))
@@ -1820,6 +1822,7 @@ impl HudView {
             } else {
                 theme::transparent()
             })
+            .cursor_pointer()
             .hover(|style| style.opacity(0.82))
             .focus(|style| style.bg(pressed()))
             .active(|style| style.opacity(0.66))
