@@ -7,7 +7,7 @@ use crate::ui::controls;
 use crate::ui::preview::{self, Spec as PreviewSpec};
 use crate::ui::text::{clip_text, format_latency_ms, format_mmss, format_time_saved};
 use crate::ui::theme::{
-    self, accent, foam, gold, hover, love, muted, pad, pressed, r_chip, r_section, r_window,
+    self, accent, foam, gold, love, muted, pad, r_chip, r_section, r_window,
     selected, shell_surface, success, text, well, GAP_SECTION, GAP_TIGHT, H_CTRL, H_TAB, MOTION_MS,
     MUTED, TAB_FADE_MS, TEXT, TYPE_DESC, TYPE_LABEL, TYPE_META, TYPE_TITLE,
 };
@@ -1177,13 +1177,6 @@ impl HudView {
                 .text_color(if active { text() } else { muted() })
                 .whitespace_nowrap()
                 .cursor_pointer()
-                .hover(|style| {
-                    if active {
-                        style
-                    } else {
-                        style.text_color(text())
-                    }
-                })
                 .active(|style| style.opacity(0.66))
                 .child(label)
                 .on_mouse_down(
@@ -1476,7 +1469,6 @@ impl HudView {
                     div()
                         .id(ElementId::NamedInteger(anim_key.into(), idx as u64))
                         .tab_index(0)
-                        .focus(|style| style.bg(pressed()).text_color(text()))
                         .flex_none()
                         .h(px(H_CTRL))
                         .px(px(8.0))
@@ -1494,14 +1486,8 @@ impl HudView {
                         })
                         .text_color(if is_copied { success() } else { muted() })
                         .cursor_pointer()
-                        .hover(|style| {
-                            if is_copied {
-                                style
-                            } else {
-                                style.bg(hover()).text_color(text())
-                            }
-                        })
-                        .active(|style| style.bg(pressed()))
+                        .active(|style| style.opacity(0.7))
+                        .focus(|style| style.text_color(text()))
                         .child(btn_text)
                         .on_mouse_down(
                             MouseButton::Left,
@@ -1526,9 +1512,8 @@ impl HudView {
                         .py(px(10.0))
                         .rounded(r_chip())
                         .when(can_expand, |row| row.tab_index(0).cursor_pointer())
-                        .focus(|style| style.bg(pressed()))
-                        .hover(|style| style.bg(hover()))
-                        .active(|style| style.bg(pressed()))
+                        .focus(|style| style.opacity(0.85))
+                        .active(|style| style.opacity(0.7))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             if can_expand {
                                 this.toggle_history_preview(&click_key);
@@ -1823,8 +1808,7 @@ impl HudView {
                 theme::transparent()
             })
             .cursor_pointer()
-            .hover(|style| style.opacity(0.82))
-            .focus(|style| style.bg(pressed()))
+            .focus(|style| style.opacity(0.85))
             .active(|style| style.opacity(0.66))
             .child(if capturing {
                 div()
@@ -1928,43 +1912,26 @@ impl HudView {
             .flex()
             .flex_col()
             .w_full()
-            .pt(px(10.0))
-            .gap(px(10.0))
-            .child(controls::section_label("Updates"))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap(px(12.0))
-                    .w_full()
-                    .px(px(2.0))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .text_size(px(TYPE_DESC))
-                            .line_height(px(16.0))
-                            .text_color(muted())
-                            .child(update_sub),
-                    )
-                    .child(
-                        update_btn
-                            .when(update_busy, |btn| btn.text_color(muted()).bg(well()))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                if matches!(
-                                    *this.update.lock(),
-                                    UpdatePhase::Checking | UpdatePhase::Downloading { .. }
-                                ) {
-                                    return;
-                                }
-                                this.start_update_install();
-                                cx.notify();
-                            })),
-                    ),
-            )
+            .gap(px(GAP_TIGHT))
+            .child(settings_row(
+                "Updates",
+                update_sub,
+                update_btn
+                    .when(update_busy, |btn| btn.text_color(muted()).bg(well()))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if matches!(
+                            *this.update.lock(),
+                            UpdatePhase::Checking | UpdatePhase::Downloading { .. }
+                        ) {
+                            return;
+                        }
+                        this.start_update_install();
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+            ))
             .when_some(update_meter, |row, meter| {
-                row.child(div().px(px(2.0)).pt(px(6.0)).child(meter))
+                row.child(div().px(px(2.0)).child(meter))
             });
 
         let spec = models::resolve(&self.selected_model);
