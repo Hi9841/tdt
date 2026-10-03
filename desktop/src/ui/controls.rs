@@ -20,24 +20,8 @@ pub fn ghost_button(id: &'static str, label: impl Into<SharedString>) -> Statefu
         .text_color(muted())
         .whitespace_nowrap()
         .cursor_pointer()
-        .hover(|s| {
-            s.bg(hover())
-                .text_color(text())
-                .text_size(px(TYPE_META))
-                .font_weight(medium())
-        })
-        .active(|s| {
-            s.bg(pressed())
-                .text_color(text())
-                .text_size(px(TYPE_META))
-                .font_weight(medium())
-        })
-        .focus(|s| {
-            s.bg(pressed())
-                .text_color(text())
-                .text_size(px(TYPE_META))
-                .font_weight(medium())
-        })
+        .active(|s| s.opacity(0.7))
+        .focus(|s| s.text_color(text()))
         .child(label.into())
 }
 
@@ -58,9 +42,8 @@ pub fn secondary_button(id: &'static str, label: impl Into<SharedString>) -> Sta
         .text_color(text())
         .whitespace_nowrap()
         .cursor_pointer()
-        .hover(|s| s.bg(hover()))
-        .active(|s| s.bg(pressed()))
-        .focus(|s| s.bg(pressed()))
+        .active(|s| s.opacity(0.66))
+        .focus(|s| s.text_color(text()))
         .child(label.into())
 }
 
@@ -80,9 +63,8 @@ pub fn primary_button(id: &'static str, label: impl Into<SharedString>) -> State
         .text_color(rgb(BG))
         .whitespace_nowrap()
         .cursor_pointer()
-        .hover(|s| s.bg(rgb(PRIMARY_HOVER)))
-        .active(|s| s.bg(rgb(PRIMARY_ACTIVE)))
-        .focus(|s| s.bg(rgb(PRIMARY_HOVER)))
+        .active(|s| s.opacity(0.72))
+        .focus(|s| s.opacity(0.88))
         .child(label.into())
 }
 
@@ -204,11 +186,8 @@ pub fn choice_chip(id: ElementId, label: impl Into<SharedString>, is_on: bool) -
         .text_color(if is_on { text() } else { muted() })
         .whitespace_nowrap()
         .cursor_pointer()
-        .hover(|s| s.opacity(0.88))
         .active(|s| s.opacity(0.66))
-        .focus(|s| s.border_color(focus_ring()))
-        .border_1()
-        .border_color(theme::transparent())
+        .focus(|s| s.text_color(text()))
         .child(label)
 }
 
@@ -307,9 +286,8 @@ pub fn toggle_hit(id: &'static str, track: Div) -> Stateful<Div> {
         .min_h(px(44.0))
         .cursor_pointer()
         .rounded(r_chip())
-        .hover(|s| s.opacity(0.88))
-        .focus(|s| s.opacity(0.78))
         .active(|s| s.opacity(0.72))
+        .focus(|s| s.opacity(0.85))
         .child(track)
 }
 
