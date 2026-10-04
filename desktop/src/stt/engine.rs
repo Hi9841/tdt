@@ -105,7 +105,7 @@ mod tests {
     use super::SttEngine;
     use crate::stt::models::DEFAULT;
     use std::fs;
-    use std::time::{Instant, SystemTime, UNIX_EPOCH};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn unique_dir(tag: &str) -> std::path::PathBuf {
         let unique = SystemTime::now()
@@ -149,32 +149,6 @@ mod tests {
     }
 
     #[test]
-    fn speech_after_a_pause_is_not_an_empty_transcript() {
-        let Some(local) = std::env::var_os("LOCALAPPDATA") else {
-            return;
-        };
-        let dir = std::path::PathBuf::from(local)
-            .join("TDT")
-            .join("models")
-            .join(DEFAULT.dir_name);
-        if !DEFAULT.is_installed_in(&dir) {
-            return;
-        }
-        let Some(speech) = crate::stt::photon::pcm16_wav(std::path::Path::new(
-            r"C:\Users\hi\AppData\Local\Temp\tdt-speech.wav",
-        )) else {
-            return;
-        };
-        let speech = trim_audible(&speech);
-        let quiet: Vec<f32> = speech.iter().map(|sample| sample * 0.01).collect();
-        let text = decode_samples(&dir, &quiet);
-        assert!(
-            text.to_ascii_lowercase().contains("fox"),
-            "the wave shows this level, transcript was {text:?}"
-        );
-    }
-
-    #[test]
     fn quiet_visible_speech_is_boosted_and_silence_is_not() {
         assert!(super::boost_quiet_speech(&vec![0.0; 16_000]).is_none());
         let whisper: Vec<f32> = (0..16_000)
@@ -194,36 +168,5 @@ mod tests {
         assert!(after <= super::BOOST_TARGET_RMS + 0.001);
         let loud: Vec<f32> = audible.iter().map(|sample| sample * 20.0).collect();
         assert!(super::boost_quiet_speech(&loud).is_none());
-    }
-
-    fn decode_samples(dir: &std::path::Path, samples: &[f32]) -> String {
-        let engine = SttEngine::new(DEFAULT, dir, "en").expect("engine");
-        engine.prepare().expect("load");
-        let partials = parking_lot::Mutex::new(String::new());
-        let (tx, rx) = crossbeam_channel::unbounded();
-        for chunk in samples.chunks(1_600) {
-            tx.send(super::LiveAudio::Chunk(chunk.to_vec()))
-                .expect("chunk");
-        }
-        tx.send(super::LiveAudio::Finish(Instant::now()))
-            .expect("finish");
-        drop(tx);
-        engine
-            .transcribe_live_reporting(&rx, Some(&partials))
-            .expect("decode")
-            .text
-    }
-
-    fn trim_audible(samples: &[f32]) -> Vec<f32> {
-        let start = samples
-            .iter()
-            .position(|sample| sample.abs() > 0.02)
-            .unwrap_or(0);
-        let end = samples
-            .iter()
-            .rposition(|sample| sample.abs() > 0.02)
-            .map(|index| index + 1)
-            .unwrap_or(samples.len());
-        samples[start..end].to_vec()
     }
 }

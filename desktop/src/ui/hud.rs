@@ -70,14 +70,6 @@ pub enum WindowViewMode {
     StatsAndSettings,
 }
 
-/// The bubble and the settings panel are the same window. Closing settings
-/// returns to the bubble. Neither mode dismisses the app.
-pub fn window_hidden_for_mode(mode: WindowViewMode) -> bool {
-    match mode {
-        WindowViewMode::Bubble | WindowViewMode::StatsAndSettings => false,
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SettingsTab {
     Stats,
@@ -516,11 +508,7 @@ impl HudView {
                 if view.panel_motion == Some(PanelMotion::Closing { started_at }) {
                     view.mode = WindowViewMode::Bubble;
                     view.panel_motion = None;
-                    if window_hidden_for_mode(view.mode) {
-                        set_overlay_hidden(true);
-                    } else {
-                        view.reveal_overlay();
-                    }
+                    view.reveal_overlay();
                     cx.notify();
                 }
             });
@@ -2049,9 +2037,7 @@ const _: () = assert!(SETTINGS_SURFACE_HEIGHT <= BUBBLE_HEIGHT - 14.0);
 
 #[cfg(test)]
 mod motion_tests {
-    use super::{
-        history_text_overflows, window_hidden_for_mode, WindowViewMode, HISTORY_EXPAND_CHARS,
-    };
+    use super::{history_text_overflows, HISTORY_EXPAND_CHARS};
 
     #[test]
     fn a_notice_does_not_keep_the_pill_on_the_result() {
@@ -2072,12 +2058,6 @@ mod motion_tests {
             Duration::from_secs(4) + Duration::from_millis(1),
             true
         ));
-    }
-
-    #[test]
-    fn closing_settings_keeps_the_bubble_on_screen() {
-        assert!(!window_hidden_for_mode(WindowViewMode::StatsAndSettings));
-        assert!(!window_hidden_for_mode(WindowViewMode::Bubble));
     }
 
     #[test]

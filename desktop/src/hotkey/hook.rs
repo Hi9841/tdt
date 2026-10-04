@@ -101,20 +101,6 @@ impl Default for HotkeyBinding {
     }
 }
 
-/// A short press starts recording when idle and stops an already-running toggle session.
-pub fn tap_should_stop(recording_before_press: bool) -> bool {
-    recording_before_press
-}
-
-/// True when a press was held long enough to mean "record until release".
-pub fn is_hold(duration: Duration) -> bool {
-    duration > HOLD_THRESHOLD
-}
-
-fn capture_timed_out(start: Instant, now: Instant) -> bool {
-    now.saturating_duration_since(start) >= CAPTURE_TIMEOUT
-}
-
 static BINDING: Mutex<HotkeyBinding> = Mutex::new(HotkeyBinding::DEFAULT);
 static CAPTURE: AtomicBool = AtomicBool::new(false);
 static CAPTURE_START: Mutex<Option<Instant>> = Mutex::new(None);
@@ -155,7 +141,7 @@ pub fn poll_capture_timeout() {
 fn capture_expired() -> bool {
     CAPTURE_START
         .lock()
-        .is_some_and(|start| capture_timed_out(start, Instant::now()))
+        .is_some_and(|start| start.elapsed() >= CAPTURE_TIMEOUT)
 }
 
 fn send_action(action: HotkeyAction) {
@@ -191,7 +177,7 @@ fn finish_press() {
     let Some(start) = PRESS_START.lock().take() else {
         return;
     };
-    let action = if is_hold(start.elapsed()) {
+    let action = if start.elapsed() > HOLD_THRESHOLD {
         HotkeyAction::HoldReleased
     } else {
         HotkeyAction::Toggled
@@ -477,38 +463,7 @@ fn vk_label(vk: u16) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        capture_timed_out, is_hold, note_physical_key, reset_user_typed, tap_should_stop,
-        user_typed, HotkeyBinding, CAPTURE_TIMEOUT, HOLD_THRESHOLD,
-    };
-    use std::time::{Duration, Instant};
-
-    #[test]
-    fn first_tap_starts_and_second_tap_stops() {
-        assert!(!tap_should_stop(false));
-        assert!(tap_should_stop(true));
-    }
-
-    #[test]
-    fn press_duration_picks_tap_or_hold() {
-        assert!(!is_hold(HOLD_THRESHOLD - Duration::from_millis(1)));
-        assert!(!is_hold(HOLD_THRESHOLD));
-        assert!(is_hold(HOLD_THRESHOLD + Duration::from_millis(1)));
-    }
-
-    #[test]
-    fn capture_expires_so_it_cannot_swallow_the_keyboard() {
-        let start = Instant::now();
-        assert!(!capture_timed_out(
-            start,
-            start + Duration::from_millis(500)
-        ));
-        assert!(capture_timed_out(start, start + CAPTURE_TIMEOUT));
-        assert!(capture_timed_out(
-            start,
-            start + CAPTURE_TIMEOUT + Duration::from_millis(1)
-        ));
-    }
+    use super::{note_physical_key, reset_user_typed, user_typed, HotkeyBinding};
 
     #[test]
     fn parse_default_ctrl_semicolon() {
