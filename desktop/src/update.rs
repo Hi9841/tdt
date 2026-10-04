@@ -1,4 +1,3 @@
-use serde::Deserialize;
 use sha2::Digest;
 use std::fs::File;
 use std::io::{Read, Write};
@@ -27,18 +26,6 @@ pub enum UpdatePhase {
         installer: PathBuf,
     },
     Failed(String),
-}
-
-#[derive(Deserialize)]
-struct GithubRelease {
-    tag_name: String,
-    assets: Vec<GithubAsset>,
-}
-
-#[derive(Clone, Deserialize)]
-struct GithubAsset {
-    name: String,
-    browser_download_url: String,
 }
 
 pub fn github_repo() -> String {
@@ -83,52 +70,24 @@ pub fn check_latest() -> Result<UpdatePhase, String> {
     }
 
     let repo = github_repo();
-
-    // If an authenticated token is present in the environment (e.g. GITHUB_TOKEN or GH_TOKEN),
-    // try the official GitHub REST API first since it carries a 5,000 req/hr rate limit.
-    if github_token().is_some() {
-        if let Ok(phase) = resolve_latest_api(&repo) {
-            return Ok(phase);
-        }
-    }
-
-    // Use web-based release resolution (zero rate limit on GitHub web redirect).
-    match resolve_latest_web(&repo) {
-        Ok(phase) => Ok(phase),
-        Err(web_err) => {
-            if is_no_release(&web_err) {
-                return Ok(UpdatePhase::UpToDate);
-            }
-            // Fall back to GitHub REST API if web redirect fails
-            match resolve_latest_api(&repo) {
-                Ok(phase) => Ok(phase),
-                Err(api_err) => {
-                    if is_no_release(&api_err) {
-                        return Ok(UpdatePhase::UpToDate);
-                    }
-                    Err(clean_error_message(&api_err))
-                }
-            }
-        }
-    }
-}
-
-fn resolve_latest_web(repo: &str) -> Result<UpdatePhase, String> {
     let url = format!("https://github.com/{repo}/releases/latest");
     let response = check_redirect_agent()
         .get(&url)
         .call()
         .map_err(|e| match e {
             ureq::Error::Status(404, _) => "404 Not Found".to_string(),
-            other => format!("{other}"),
+            other => clean_error_message(&format!("{other}")),
         })?;
 
-    let location = response
-        .header("location")
-        .ok_or_else(|| "Missing location redirect".to_string())?;
+    let location = match response.header("location") {
+        Some(loc) => loc,
+        None => return Ok(UpdatePhase::UpToDate),
+    };
 
-    let tag = parse_tag_from_location(location)
-        .ok_or_else(|| format!("Could not parse release tag from '{location}'"))?;
+    let tag = match parse_tag_from_location(location) {
+        Some(t) => t,
+        None => return Ok(UpdatePhase::UpToDate),
+    };
 
     let latest = tag.trim().trim_start_matches('v').to_string();
     if !version_newer(&latest, current_version()) {
@@ -142,7 +101,7 @@ fn resolve_latest_web(repo: &str) -> Result<UpdatePhase, String> {
         Err(err) if is_no_release(&err) => {
             return Ok(UpdatePhase::UpToDate);
         }
-        Err(err) => return Err(err),
+        Err(err) => return Err(clean_error_message(&err)),
     };
 
     let asset_name = if expected_hash_for(&sums_body, "TDT.exe").is_some() {
@@ -150,7 +109,7 @@ fn resolve_latest_web(repo: &str) -> Result<UpdatePhase, String> {
     } else if expected_hash_for(&sums_body, "TDT-Setup.exe").is_some() {
         "TDT-Setup.exe".to_string()
     } else {
-        return Err("Latest release has no TDT.exe or TDT-Setup.exe asset".to_string());
+        return Ok(UpdatePhase::UpToDate);
     };
 
     let asset_url = format!("https://github.com/{repo}/releases/download/{tag}/{asset_name}");
@@ -159,34 +118,6 @@ fn resolve_latest_web(repo: &str) -> Result<UpdatePhase, String> {
         asset_url,
         asset_name,
         sums_url: Some(sums_url),
-    })
-}
-
-fn resolve_latest_api(repo: &str) -> Result<UpdatePhase, String> {
-    let url = format!("https://api.github.com/repos/{repo}/releases/latest");
-    let body = match http_get_string(&url) {
-        Ok(body) => body,
-        Err(error) if is_no_release(&error) => return Ok(UpdatePhase::UpToDate),
-        Err(error) => return Err(error),
-    };
-    let release: GithubRelease =
-        serde_json::from_str(&body).map_err(|e| format!("Invalid GitHub release JSON: {e}"))?;
-    let latest = release.tag_name.trim().trim_start_matches('v').to_string();
-    if !version_newer(&latest, current_version()) {
-        return Ok(UpdatePhase::UpToDate);
-    }
-    let asset = pick_update_asset(&release.assets)
-        .ok_or_else(|| "Latest release has no TDT.exe or TDT-Setup.exe asset".to_string())?;
-    let sums_url = release
-        .assets
-        .iter()
-        .find(|asset| asset.name.eq_ignore_ascii_case("SHA256SUMS.txt"))
-        .map(|asset| asset.browser_download_url.clone());
-    Ok(UpdatePhase::Available {
-        version: latest,
-        asset_url: asset.browser_download_url.clone(),
-        asset_name: asset.name.clone(),
-        sums_url,
     })
 }
 
@@ -366,34 +297,6 @@ pub fn replace_running_exe(new_exe: &Path, version: &str) -> Result<(), String> 
     Ok(())
 }
 
-fn pick_update_asset(assets: &[GithubAsset]) -> Option<&GithubAsset> {
-    assets
-        .iter()
-        .find(|asset| is_app_binary(&asset.name))
-        .or_else(|| pick_setup_asset(assets))
-}
-
-fn pick_setup_asset(assets: &[GithubAsset]) -> Option<&GithubAsset> {
-    assets
-        .iter()
-        .find(|asset| asset.name.eq_ignore_ascii_case("TDT-Setup.exe"))
-        .or_else(|| {
-            assets.iter().find(|asset| {
-                let lower = asset.name.to_ascii_lowercase();
-                lower.ends_with(".exe") && lower.contains("setup")
-            })
-        })
-}
-
-#[cfg(test)]
-fn is_setup_asset(name: &str) -> bool {
-    pick_setup_asset(&[GithubAsset {
-        name: name.to_string(),
-        browser_download_url: String::new(),
-    }])
-    .is_some()
-}
-
 fn parse_semver(raw: &str) -> Option<(u64, u64, u64)> {
     let trimmed = raw.trim().trim_start_matches('v');
     let mut parts = trimmed.split('.');
@@ -426,13 +329,6 @@ fn looks_like_pe(bytes: &[u8]) -> bool {
     bytes.len() >= 2 && bytes[0] == b'M' && bytes[1] == b'Z'
 }
 
-fn github_token() -> Option<String> {
-    std::env::var("GITHUB_TOKEN")
-        .or_else(|_| std::env::var("GH_TOKEN"))
-        .ok()
-        .filter(|t| !t.trim().is_empty())
-}
-
 fn check_redirect_agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(10))
@@ -455,17 +351,12 @@ pub fn parse_tag_from_location(location: &str) -> Option<&str> {
     }
 }
 
-pub fn is_rate_limit(error: &str) -> bool {
-    error.contains("403") || error.contains("rate limit") || error.contains("429")
-}
-
 pub fn clean_error_message(error: &str) -> String {
-    if is_rate_limit(error) {
-        "Update check rate-limited; try again later.".to_string()
-    } else if error.contains("timed out")
+    if error.contains("timed out")
         || error.contains("Connection refused")
         || error.contains("dns")
         || error.contains("Could not reach")
+        || error.contains("network")
     {
         "Could not reach GitHub; check your connection.".to_string()
     } else {
@@ -492,21 +383,11 @@ fn download_agent() -> ureq::Agent {
 }
 
 fn http_get_string(url: &str) -> Result<String, String> {
-    let mut req = check_agent().get(url);
-    if url.contains("api.github.com") {
-        req = req
-            .set("Accept", "application/vnd.github+json")
-            .set("X-GitHub-Api-Version", "2022-11-28");
-        if let Some(token) = github_token() {
-            req = req.set("Authorization", &format!("Bearer {token}"));
-        }
-    }
-    match req.call() {
+    match check_agent().get(url).call() {
         Ok(response) => response
             .into_string()
             .map_err(|e| format!("Read failed: {e}")),
         Err(ureq::Error::Status(404, _)) => Err("404 Not Found".to_string()),
-        Err(ureq::Error::Status(403, _)) => Err("GitHub API rate limit exceeded".to_string()),
         Err(error) => Err(format!("{error}")),
     }
 }
@@ -521,36 +402,6 @@ mod tests {
         assert!(version_newer("v1.0.0", "0.9.9"));
         assert!(!version_newer("0.1.0", "0.1.0"));
         assert!(!version_newer("0.1.0", "0.2.0"));
-    }
-
-    #[test]
-    fn setup_asset_matches_installer_names() {
-        assert!(is_setup_asset("TDT-Setup.exe"));
-        assert!(is_setup_asset("tdt-0.1.0-setup.exe"));
-        assert!(!is_setup_asset("notes.md"));
-        assert!(!is_setup_asset("TDT.exe"));
-    }
-
-    #[test]
-    fn update_asset_prefers_slim_app_binary() {
-        let setup = GithubAsset {
-            name: "TDT-Setup.exe".into(),
-            browser_download_url: "https://example.invalid/TDT-Setup.exe".into(),
-        };
-        let app = GithubAsset {
-            name: "TDT.exe".into(),
-            browser_download_url: "https://example.invalid/TDT.exe".into(),
-        };
-        assert!(is_app_binary("TDT.exe"));
-        assert!(!is_app_binary("TDT-Setup.exe"));
-        assert_eq!(
-            pick_update_asset(&[setup.clone(), app.clone()]).map(|asset| asset.name.as_str()),
-            Some("TDT.exe")
-        );
-        assert_eq!(
-            pick_update_asset(&[setup]).map(|asset| asset.name.as_str()),
-            Some("TDT-Setup.exe")
-        );
     }
 
     #[test]
@@ -612,20 +463,7 @@ mod tests {
     }
 
     #[test]
-    fn is_rate_limit_detects_rate_limiting() {
-        assert!(is_rate_limit("GitHub API rate limit exceeded"));
-        assert!(is_rate_limit("status code 403"));
-        assert!(is_rate_limit("status code 429"));
-        assert!(!is_rate_limit("404 Not Found"));
-        assert!(!is_rate_limit("connection reset by peer"));
-    }
-
-    #[test]
     fn clean_error_message_is_user_friendly() {
-        let rate_err = clean_error_message("https://api.github.com/repos/... status code 403");
-        assert_eq!(rate_err, "Update check rate-limited; try again later.");
-        assert!(!rate_err.contains("api.github.com"));
-
         let net_err = clean_error_message("Connection timed out after 30s");
         assert_eq!(net_err, "Could not reach GitHub; check your connection.");
 
