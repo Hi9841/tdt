@@ -1,0 +1,428 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>TDT Speech Recognition Benchmark - Parakeet Redux vs INT8/Q8</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          fontFamily: {
+            sans: ['Inter', 'sans-serif'],
+            mono: ['JetBrains Mono', 'monospace'],
+          },
+          colors: {
+            border: '#27272a',
+            background: '#09090b',
+            foreground: '#fafafa',
+            muted: {
+              DEFAULT: '#27272a',
+              foreground: '#a1a1aa'
+            },
+            card: {
+              DEFAULT: '#121215',
+              foreground: '#fafafa'
+            },
+            primary: {
+              DEFAULT: '#38bdf8',
+              foreground: '#09090b'
+            }
+          }
+        }
+      }
+    }
+  </script>
+  <style>
+    body {
+      font-family: 'Inter', sans-serif;
+      background-color: #09090b;
+      color: #fafafa;
+      -webkit-font-smoothing: antialiased;
+    }
+    .metric-bar-bg {
+      background-color: #1f1f23;
+    }
+  </style>
+</head>
+<body class="min-h-screen bg-background text-foreground antialiased p-6 md:p-12">
+  <div class="max-w-5xl mx-auto space-y-8">
+    
+    <!-- Top Header -->
+    <div class="flex flex-col md:flex-row md:items-end justify-between gap-4 border-b border-border pb-6">
+      <div>
+        <div class="inline-flex items-center gap-2 px-2.5 py-1 rounded-full text-xs font-semibold bg-zinc-800/80 border border-zinc-700/60 text-zinc-300 mb-3">
+          <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
+          TDT v0.2.15 • Windows ASR Diagnostic
+        </div>
+        <h1 class="text-3xl md:text-4xl font-extrabold tracking-tight text-white">ASR Benchmark & Accuracy</h1>
+        <p class="text-muted-foreground mt-1 text-sm md:text-base">
+          Moondream Parakeet Redux (Photon) vs. FluidAudio Parakeet INT8/Q8 (Sherpa-ONNX) on Windows x86_64
+        </p>
+      </div>
+      <div class="flex items-center gap-2">
+        <span class="text-xs text-zinc-400 font-mono bg-zinc-900 border border-zinc-800 px-3 py-1.5 rounded-lg">
+          Local Offline Inference
+        </span>
+      </div>
+    </div>
+
+    <!-- 4 Key Metrics Cards (Shadcn Card layout) -->
+    <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+      
+      <!-- Card 1: Command Latency -->
+      <div class="rounded-xl border border-border bg-card p-5 shadow-sm space-y-3">
+        <div class="flex items-center justify-between text-muted-foreground text-xs font-medium">
+          <span>Voice Command Latency</span>
+          <span class="inline-flex items-center px-2 py-0.5 rounded text-[11px] font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+            9.5× Faster
+          </span>
+        </div>
+        <div class="flex items-baseline gap-2">
+          <span class="text-3xl font-bold font-mono tracking-tight text-white">86</span>
+          <span class="text-sm font-medium text-zinc-400">ms</span>
+        </div>
+        <div class="text-xs text-muted-foreground pt-1 border-t border-zinc-800/80">
+          "Open Spotify" (1.8s audio) vs <span class="font-mono text-zinc-300">820 ms</span> in Sherpa
+        </div>
+      </div>
+
+      <!-- Card 2: English Accuracy -->
+      <div class="rounded-xl border border-border bg-card p-5 shadow-sm space-y-3">
+        <div class="flex items-center justify-between text-muted-foreground text-xs font-medium">
+          <span>English Accuracy</span>
+          <span class="inline-flex items-center px-2 py-0.5 rounded text-[11px] font-semibold bg-sky-500/10 text-sky-400 border border-sky-500/20">
+            99.7% Parity
+          </span>
+        </div>
+        <div class="flex items-baseline gap-2">
+          <span class="text-3xl font-bold font-mono tracking-tight text-white">93.5%</span>
+          <span class="text-xs text-zinc-400 font-mono">(6.55% WER)</span>
+        </div>
+        <div class="text-xs text-muted-foreground pt-1 border-t border-zinc-800/80">
+          Open ASR benchmark vs <span class="font-mono text-zinc-300">6.26%</span> original model
+        </div>
+      </div>
+
+      <!-- Card 3: Multilingual Accuracy -->
+      <div class="rounded-xl border border-border bg-card p-5 shadow-sm space-y-3">
+        <div class="flex items-center justify-between text-muted-foreground text-xs font-medium">
+          <span>25-Language Accuracy</span>
+          <span class="inline-flex items-center px-2 py-0.5 rounded text-[11px] font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+            +1.1% Better
+          </span>
+        </div>
+        <div class="flex items-baseline gap-2">
+          <span class="text-3xl font-bold font-mono tracking-tight text-white">89.4%</span>
+          <span class="text-xs text-zinc-400 font-mono">(10.56% WER)</span>
+        </div>
+        <div class="text-xs text-muted-foreground pt-1 border-t border-zinc-800/80">
+          FLEURS benchmark outperforms original <span class="font-mono text-zinc-300">11.62%</span>
+        </div>
+      </div>
+
+      <!-- Card 4: Resource Efficiency -->
+      <div class="rounded-xl border border-border bg-card p-5 shadow-sm space-y-3">
+        <div class="flex items-center justify-between text-muted-foreground text-xs font-medium">
+          <span>Model Storage Size</span>
+          <span class="inline-flex items-center px-2 py-0.5 rounded text-[11px] font-semibold bg-purple-500/10 text-purple-400 border border-purple-500/20">
+            72% Smaller
+          </span>
+        </div>
+        <div class="flex items-baseline gap-2">
+          <span class="text-3xl font-bold font-mono tracking-tight text-white">178</span>
+          <span class="text-sm font-medium text-zinc-400">MB</span>
+        </div>
+        <div class="text-xs text-muted-foreground pt-1 border-t border-zinc-800/80">
+          1.58-bit ternary vs <span class="font-mono text-zinc-300">632 MB</span> on disk
+        </div>
+      </div>
+
+    </div>
+
+    <!-- Main Content: Simple Linear Visual Comparison Charts -->
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+
+      <!-- Section 1: Response Latency (Simple Bar Comparison) -->
+      <div class="rounded-xl border border-border bg-card p-6 shadow-sm space-y-6">
+        <div>
+          <div class="flex items-center justify-between">
+            <h2 class="text-lg font-semibold text-white">Response Latency</h2>
+            <span class="text-xs text-zinc-400">Lower is better</span>
+          </div>
+          <p class="text-xs text-muted-foreground mt-1">
+            End-to-end turnaround time from hotkey release to transcript output
+          </p>
+        </div>
+
+        <div class="space-y-6">
+          
+          <!-- Test 1: Sub-second Audio (0.65s) -->
+          <div class="space-y-2">
+            <div class="flex justify-between items-center text-xs">
+              <span class="font-medium text-zinc-200">Sub-second dictation ("Hi" • 0.65s)</span>
+              <span class="font-mono text-emerald-400 font-semibold">20.8× faster</span>
+            </div>
+            
+            <!-- Redux bar -->
+            <div class="space-y-1">
+              <div class="flex justify-between text-[11px] text-zinc-400">
+                <span class="text-sky-300 font-medium">Parakeet Redux (Photon)</span>
+                <span class="font-mono text-white font-semibold">110 ms</span>
+              </div>
+              <div class="w-full h-3 rounded-full metric-bar-bg overflow-hidden">
+                <div class="h-full bg-gradient-to-r from-sky-500 to-emerald-400 rounded-full" style="width: 5%;"></div>
+              </div>
+            </div>
+
+            <!-- Sherpa bar -->
+            <div class="space-y-1">
+              <div class="flex justify-between text-[11px] text-zinc-400">
+                <span>Parakeet INT8/Q8 (Sherpa)</span>
+                <span class="font-mono text-zinc-400">2,290 ms</span>
+              </div>
+              <div class="w-full h-3 rounded-full metric-bar-bg overflow-hidden">
+                <div class="h-full bg-zinc-600 rounded-full" style="width: 100%;"></div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Test 2: Voice Command (1.79s) -->
+          <div class="space-y-2">
+            <div class="flex justify-between items-center text-xs">
+              <span class="font-medium text-zinc-200">Voice command ("Open Spotify" • 1.79s)</span>
+              <span class="font-mono text-emerald-400 font-semibold">9.5× faster</span>
+            </div>
+            
+            <!-- Redux bar -->
+            <div class="space-y-1">
+              <div class="flex justify-between text-[11px] text-zinc-400">
+                <span class="text-sky-300 font-medium">Parakeet Redux (Photon)</span>
+                <span class="font-mono text-white font-semibold">86 ms</span>
+              </div>
+              <div class="w-full h-3 rounded-full metric-bar-bg overflow-hidden">
+                <div class="h-full bg-gradient-to-r from-sky-500 to-emerald-400 rounded-full" style="width: 10.5%;"></div>
+              </div>
+            </div>
+
+            <!-- Sherpa bar -->
+            <div class="space-y-1">
+              <div class="flex justify-between text-[11px] text-zinc-400">
+                <span>Parakeet INT8/Q8 (Sherpa)</span>
+                <span class="font-mono text-zinc-400">820 ms</span>
+              </div>
+              <div class="w-full h-3 rounded-full metric-bar-bg overflow-hidden">
+                <div class="h-full bg-zinc-600 rounded-full" style="width: 100%;"></div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Test 3: Phrase Dictation (3.39s) -->
+          <div class="space-y-2">
+            <div class="flex justify-between items-center text-xs">
+              <span class="font-medium text-zinc-200">Phrase dictation ("Search for Tesla..." • 3.39s)</span>
+              <span class="font-mono text-emerald-400 font-semibold">11.7× faster</span>
+            </div>
+            
+            <!-- Redux bar -->
+            <div class="space-y-1">
+              <div class="flex justify-between text-[11px] text-zinc-400">
+                <span class="text-sky-300 font-medium">Parakeet Redux (Photon)</span>
+                <span class="font-mono text-white font-semibold">119 ms</span>
+              </div>
+              <div class="w-full h-3 rounded-full metric-bar-bg overflow-hidden">
+                <div class="h-full bg-gradient-to-r from-sky-500 to-emerald-400 rounded-full" style="width: 8.5%;"></div>
+              </div>
+            </div>
+
+            <!-- Sherpa bar -->
+            <div class="space-y-1">
+              <div class="flex justify-between text-[11px] text-zinc-400">
+                <span>Parakeet INT8/Q8 (Sherpa)</span>
+                <span class="font-mono text-zinc-400">1,393 ms</span>
+              </div>
+              <div class="w-full h-3 rounded-full metric-bar-bg overflow-hidden">
+                <div class="h-full bg-zinc-600 rounded-full" style="width: 100%;"></div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Test 4: Long Recording (32.25s) -->
+          <div class="space-y-2">
+            <div class="flex justify-between items-center text-xs">
+              <span class="font-medium text-zinc-200">Continuous speech (Article paragraph • 32.25s)</span>
+              <span class="font-mono text-emerald-400 font-semibold">13.8× faster</span>
+            </div>
+            
+            <!-- Redux bar -->
+            <div class="space-y-1">
+              <div class="flex justify-between text-[11px] text-zinc-400">
+                <span class="text-sky-300 font-medium">Parakeet Redux (Photon)</span>
+                <span class="font-mono text-white font-semibold">803 ms (0.8s)</span>
+              </div>
+              <div class="w-full h-3 rounded-full metric-bar-bg overflow-hidden">
+                <div class="h-full bg-gradient-to-r from-sky-500 to-emerald-400 rounded-full" style="width: 7.2%;"></div>
+              </div>
+            </div>
+
+            <!-- Sherpa bar -->
+            <div class="space-y-1">
+              <div class="flex justify-between text-[11px] text-zinc-400">
+                <span>Parakeet INT8/Q8 (Sherpa)</span>
+                <span class="font-mono text-zinc-400">11,088 ms (11.1s)</span>
+              </div>
+              <div class="w-full h-3 rounded-full metric-bar-bg overflow-hidden">
+                <div class="h-full bg-zinc-600 rounded-full" style="width: 100%;"></div>
+              </div>
+            </div>
+          </div>
+
+        </div>
+      </div>
+
+      <!-- Section 2: Recognition Accuracy (WER Comparison) -->
+      <div class="rounded-xl border border-border bg-card p-6 shadow-sm space-y-6">
+        <div>
+          <div class="flex items-center justify-between">
+            <h2 class="text-lg font-semibold text-white">Recognition Accuracy</h2>
+            <span class="text-xs text-zinc-400">Higher accuracy is better</span>
+          </div>
+          <p class="text-xs text-muted-foreground mt-1">
+            Word Error Rate (WER) benchmarks comparing ternary 1.58-bit to original full model
+          </p>
+        </div>
+
+        <div class="space-y-5">
+
+          <!-- Accuracy Benchmark 1: English Open ASR -->
+          <div class="p-4 rounded-lg bg-zinc-900/60 border border-zinc-800 space-y-2.5">
+            <div class="flex justify-between items-center text-xs">
+              <span class="font-semibold text-white">English Speech (Open ASR 7-set Leaderboard)</span>
+              <span class="text-[11px] font-mono text-zinc-400">WER: Lower is better</span>
+            </div>
+            
+            <div class="grid grid-cols-2 gap-3 pt-1">
+              <div class="p-2.5 rounded-md bg-zinc-950/60 border border-zinc-800/80">
+                <div class="text-[11px] text-zinc-400">Original Parakeet (1.2 GB)</div>
+                <div class="text-base font-bold font-mono text-zinc-200 mt-0.5">6.26% <span class="text-xs text-zinc-500 font-normal">WER</span></div>
+                <div class="text-[11px] text-emerald-400 font-medium mt-0.5">93.74% Accuracy</div>
+              </div>
+              <div class="p-2.5 rounded-md bg-sky-950/20 border border-sky-800/40">
+                <div class="text-[11px] text-sky-400">Parakeet Redux (178 MB)</div>
+                <div class="text-base font-bold font-mono text-white mt-0.5">6.55% <span class="text-xs text-zinc-400 font-normal">WER</span></div>
+                <div class="text-[11px] text-sky-300 font-medium mt-0.5">93.45% Accuracy (±0.29%)</div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Accuracy Benchmark 2: Multilingual FLEURS -->
+          <div class="p-4 rounded-lg bg-zinc-900/60 border border-zinc-800 space-y-2.5">
+            <div class="flex justify-between items-center text-xs">
+              <span class="font-semibold text-white">25 Languages (FLEURS Benchmark)</span>
+              <span class="text-[11px] font-semibold text-emerald-400">Redux Outperforms</span>
+            </div>
+            
+            <div class="grid grid-cols-2 gap-3 pt-1">
+              <div class="p-2.5 rounded-md bg-zinc-950/60 border border-zinc-800/80">
+                <div class="text-[11px] text-zinc-400">Original Parakeet (1.2 GB)</div>
+                <div class="text-base font-bold font-mono text-zinc-200 mt-0.5">11.62% <span class="text-xs text-zinc-500 font-normal">WER</span></div>
+                <div class="text-[11px] text-zinc-400 font-medium mt-0.5">88.38% Accuracy</div>
+              </div>
+              <div class="p-2.5 rounded-md bg-emerald-950/20 border border-emerald-800/40">
+                <div class="text-[11px] text-emerald-400">Parakeet Redux (178 MB)</div>
+                <div class="text-base font-bold font-mono text-white mt-0.5">10.56% <span class="text-xs text-zinc-400 font-normal">WER</span></div>
+                <div class="text-[11px] text-emerald-300 font-medium mt-0.5">89.44% Accuracy (+1.06%)</div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Accuracy Benchmark 3: Long-form TED-LIUM -->
+          <div class="p-4 rounded-lg bg-zinc-900/60 border border-zinc-800 space-y-2.5">
+            <div class="flex justify-between items-center text-xs">
+              <span class="font-semibold text-white">Long-Form Audio (TED-LIUM)</span>
+              <span class="text-[11px] font-semibold text-emerald-400">Redux Outperforms</span>
+            </div>
+            
+            <div class="grid grid-cols-2 gap-3 pt-1">
+              <div class="p-2.5 rounded-md bg-zinc-950/60 border border-zinc-800/80">
+                <div class="text-[11px] text-zinc-400">Original Parakeet (1.2 GB)</div>
+                <div class="text-base font-bold font-mono text-zinc-200 mt-0.5">2.71% <span class="text-xs text-zinc-500 font-normal">WER</span></div>
+                <div class="text-[11px] text-zinc-400 font-medium mt-0.5">97.29% Accuracy</div>
+              </div>
+              <div class="p-2.5 rounded-md bg-emerald-950/20 border border-emerald-800/40">
+                <div class="text-[11px] text-emerald-400">Parakeet Redux (178 MB)</div>
+                <div class="text-base font-bold font-mono text-white mt-0.5">2.51% <span class="text-xs text-zinc-400 font-normal">WER</span></div>
+                <div class="text-[11px] text-emerald-300 font-medium mt-0.5">97.49% Accuracy (+0.20%)</div>
+              </div>
+            </div>
+          </div>
+
+        </div>
+      </div>
+
+    </div>
+
+    <!-- Bottom Resource Footprint Bar (Shadcn style) -->
+    <div class="rounded-xl border border-border bg-card p-6 shadow-sm">
+      <h2 class="text-lg font-semibold text-white mb-4">Resource & Footprint Comparison</h2>
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+        
+        <!-- On-disk Storage -->
+        <div class="space-y-2">
+          <div class="flex justify-between text-xs">
+            <span class="text-zinc-300 font-medium">Model Download Size (Disk)</span>
+            <span class="text-purple-400 font-semibold font-mono">72% Savings</span>
+          </div>
+          <div class="space-y-1.5">
+            <div class="flex justify-between text-[11px]">
+              <span class="text-purple-300">Parakeet Redux (1.58-bit ternary)</span>
+              <span class="font-mono text-white font-semibold">178 MB</span>
+            </div>
+            <div class="w-full h-2.5 rounded-full metric-bar-bg overflow-hidden">
+              <div class="h-full bg-purple-500 rounded-full" style="width: 28%;"></div>
+            </div>
+            <div class="flex justify-between text-[11px] text-zinc-500 pt-0.5">
+              <span>Parakeet Unified INT8/Q8</span>
+              <span class="font-mono">632 MB</span>
+            </div>
+            <div class="w-full h-2.5 rounded-full metric-bar-bg overflow-hidden">
+              <div class="h-full bg-zinc-600 rounded-full" style="width: 100%;"></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Main Process RAM -->
+        <div class="space-y-2">
+          <div class="flex justify-between text-xs">
+            <span class="text-zinc-300 font-medium">Main Process RAM (Working Set)</span>
+            <span class="text-emerald-400 font-semibold font-mono">93% Lower</span>
+          </div>
+          <div class="space-y-1.5">
+            <div class="flex justify-between text-[11px]">
+              <span class="text-emerald-300">TDT with Photon Worker</span>
+              <span class="font-mono text-white font-semibold">52 MB</span>
+            </div>
+            <div class="w-full h-2.5 rounded-full metric-bar-bg overflow-hidden">
+              <div class="h-full bg-emerald-500 rounded-full" style="width: 7%;"></div>
+            </div>
+            <div class="flex justify-between text-[11px] text-zinc-500 pt-0.5">
+              <span>TDT with In-Process Sherpa</span>
+              <span class="font-mono">775 MB</span>
+            </div>
+            <div class="w-full h-2.5 rounded-full metric-bar-bg overflow-hidden">
+              <div class="h-full bg-zinc-600 rounded-full" style="width: 100%;"></div>
+            </div>
+          </div>
+        </div>
+
+      </div>
+    </div>
+
+  </div>
+</body>
+</html>

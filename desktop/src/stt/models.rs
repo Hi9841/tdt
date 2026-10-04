@@ -12,6 +12,13 @@ pub struct ModelFile {
     pub sha256: &'static str,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EngineBackend {
+    #[allow(dead_code)]
+    Sherpa,
+    Photon,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct ModelSpec {
     pub id: &'static str,
@@ -22,6 +29,7 @@ pub struct ModelSpec {
     pub size_bytes: u64,
     pub hf_repo: &'static str,
     pub dir_name: &'static str,
+    pub backend: EngineBackend,
     pub files: &'static [ModelFile],
 }
 
@@ -54,66 +62,56 @@ pub struct DownloadProgress {
     pub file_count: usize,
 }
 
-/// Recommended default: FluidAudio's English Parakeet Unified 0.6B, INT8 streaming.
-pub const DEFAULT_MODEL_ID: &str = "parakeet-unified-en-0.6b-int8";
+/// Recommended default: Moondream Parakeet Redux 1.58-bit ternary, Photon runtime.
+pub const DEFAULT_MODEL_ID: &str = "parakeet-redux";
 
-/// Existing installs stored this id for the same FluidAudio Unified package.
+#[allow(dead_code)]
+pub const PARAKEET_REDUX_ID: &str = DEFAULT_MODEL_ID;
+
+/// Retired ids kept for backwards-compatibility migration.
+#[allow(dead_code)]
+pub const PARAKEET_INT8_ID: &str = "parakeet-unified-en-0.6b-int8";
+#[allow(dead_code)]
 pub const PARAKEET_Q8_ID: &str = "parakeet-unified-en-0.6b-q8";
 
-/// Shared on-disk folder. INT8 and Q8 are the same sherpa-onnx streaming export.
-const UNIFIED_DIR: &str = "parakeet-unified-en-0.6b-q8";
+const REDUX_DIR: &str = "parakeet-redux";
+const REDUX_REPO: &str = "moondream/parakeet-redux";
 
-/// FluidAudio Windows path: sherpa-onnx INT8 streaming export of
-/// nvidia/parakeet-unified-en-0.6b (1120 ms). One download covers both chips.
-const UNIFIED_REPO: &str =
-    "csukuangfj2/sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-streaming-1120ms";
-
-const UNIFIED_FILES: &[ModelFile] = &[
+const REDUX_FILES: &[ModelFile] = &[
     ModelFile {
-        name: "encoder.int8.onnx",
-        sha256: "1C03F1192DE41771384AF22972CA10203613BA56197A024F275B86727CD35911",
+        name: "config.json",
+        sha256: "503C653B2E3BB788ADBCB04F5ABDEE532D958686564081BAEED133FF10143F6E",
     },
     ModelFile {
-        name: "decoder.int8.onnx",
-        sha256: "34FEA72425D2506600772BA191A6D3F99C0710ABDB68D9A3DC89FA8CB2AA473A",
+        name: "model.safetensors",
+        sha256: "78EC25733EE0D0C1586D1346FC86DB9D0C2E436E3A8AB1D32A82D1BB8F848D21",
     },
     ModelFile {
-        name: "joiner.int8.onnx",
-        sha256: "869F43F7D24595C55581AD3BF249A935FB8A71389FBDAA7504B9F46F93140F8A",
+        name: "ternary.json",
+        sha256: "1221C6D3CE901FFE09C089DA758A8DB8B76189F80CFF41C5AFC244FC61E2051D",
     },
     ModelFile {
-        name: "tokens.txt",
-        sha256: "DC0B4584AB2E4DDBF888425C076C61B736E7356A015250DB7D307E6F1A8188FF",
+        name: "tokenizer.json",
+        sha256: "BD321B096832A3F270BD3B2A88823957920F1A5C5ADA71114A26EA729D0CBE91",
     },
 ];
 
-/// Retired ids kept for migration only; they resolve to Parakeet INT8.
+/// Retired ids (INT8, Q8, Whisper, Moonshine, SenseVoice) resolve to Parakeet Redux.
 fn migrated_id(_id: &str) -> &'static str {
     DEFAULT_MODEL_ID
 }
 
-pub const CATALOG: &[ModelSpec] = &[
-    ModelSpec {
-        id: DEFAULT_MODEL_ID,
-        label: "Parakeet INT8",
-        blurb: "FluidAudio English Unified. INT8 streaming. Recommended.",
-        size_label: "632 MB",
-        size_bytes: 663_048_980,
-        hf_repo: UNIFIED_REPO,
-        dir_name: UNIFIED_DIR,
-        files: UNIFIED_FILES,
-    },
-    ModelSpec {
-        id: PARAKEET_Q8_ID,
-        label: "Parakeet Q8",
-        blurb: "FluidAudio English Unified. Same 8-bit streaming weights as INT8.",
-        size_label: "632 MB",
-        size_bytes: 663_048_980,
-        hf_repo: UNIFIED_REPO,
-        dir_name: UNIFIED_DIR,
-        files: UNIFIED_FILES,
-    },
-];
+pub const CATALOG: &[ModelSpec] = &[ModelSpec {
+    id: DEFAULT_MODEL_ID,
+    label: "Parakeet Redux",
+    blurb: "Moondream 1.58-bit ternary. Photon runtime. Recommended.",
+    size_label: "178 MB",
+    size_bytes: 179_005_408,
+    hf_repo: REDUX_REPO,
+    dir_name: REDUX_DIR,
+    backend: EngineBackend::Photon,
+    files: REDUX_FILES,
+}];
 
 pub const DEFAULT: &ModelSpec = &CATALOG[0];
 
@@ -227,6 +225,8 @@ pub fn file_label(name: &str) -> String {
     name.rsplit(['/', '\\'])
         .next()
         .unwrap_or(name)
+        .trim_end_matches(".safetensors")
+        .trim_end_matches(".json")
         .trim_end_matches(".onnx")
         .trim_end_matches(".txt")
         .replace(".int8", "")
@@ -444,23 +444,35 @@ mod tests {
         for spec in CATALOG {
             assert!(!spec.id.is_empty());
             assert!(spec.size_bytes > 0);
-            assert!(spec.files.iter().any(|file| file.name.contains("tokens")));
-            for part in ["encoder", "decoder", "joiner"] {
-                assert!(
-                    spec.files.iter().any(|file| file.name.starts_with(part)),
-                    "parakeet {part} missing",
-                );
+            match spec.backend {
+                super::EngineBackend::Sherpa => {
+                    assert!(spec.files.iter().any(|file| file.name.contains("tokens")));
+                    for part in ["encoder", "decoder", "joiner"] {
+                        assert!(
+                            spec.files.iter().any(|file| file.name.starts_with(part)),
+                            "parakeet {part} missing",
+                        );
+                    }
+                }
+                super::EngineBackend::Photon => {
+                    for expected in [
+                        "config.json",
+                        "model.safetensors",
+                        "ternary.json",
+                        "tokenizer.json",
+                    ] {
+                        assert!(
+                            spec.files.iter().any(|file| file.name == expected),
+                            "photon file {expected} missing",
+                        );
+                    }
+                }
             }
             assert!(!ids.contains(&spec.id), "duplicate model id {}", spec.id);
             ids.push(spec.id);
         }
         assert!(ids.contains(&DEFAULT_MODEL_ID));
-        assert!(ids.contains(&super::PARAKEET_Q8_ID));
-        assert_eq!(
-            CATALOG.len(),
-            2,
-            "catalog keeps Parakeet INT8 and Parakeet Q8",
-        );
+        assert_eq!(CATALOG.len(), 1, "catalog offers Parakeet Redux as default",);
         assert_eq!(
             by_id(DEFAULT_MODEL_ID).map(|spec| spec.id),
             Some(DEFAULT_MODEL_ID)
@@ -468,31 +480,28 @@ mod tests {
     }
 
     #[test]
-    fn default_is_parakeet_int8_with_q8_alias() {
+    fn default_is_parakeet_redux() {
         assert_eq!(resolve("").id, DEFAULT_MODEL_ID);
-        assert_eq!(DEFAULT_MODEL_ID, "parakeet-unified-en-0.6b-int8");
+        assert_eq!(DEFAULT_MODEL_ID, "parakeet-redux");
         assert_eq!(DEFAULT.id, DEFAULT_MODEL_ID);
         assert_eq!(
             CATALOG.iter().map(|spec| spec.label).collect::<Vec<_>>(),
-            vec!["Parakeet INT8", "Parakeet Q8"]
+            vec!["Parakeet Redux"]
         );
-        let int8 = by_id(DEFAULT_MODEL_ID).expect("int8");
-        let q8 = by_id(super::PARAKEET_Q8_ID).expect("q8");
-        assert_eq!(int8.dir_name, q8.dir_name);
-        assert_eq!(int8.hf_repo, q8.hf_repo);
-        assert_eq!(
-            int8.files.iter().map(|file| file.name).collect::<Vec<_>>(),
-            q8.files.iter().map(|file| file.name).collect::<Vec<_>>()
-        );
-        assert!(int8
+        let redux = by_id(DEFAULT_MODEL_ID).expect("redux");
+        assert_eq!(redux.dir_name, "parakeet-redux");
+        assert_eq!(redux.backend, super::EngineBackend::Photon);
+        assert!(redux
             .files
             .iter()
-            .all(|file| file.name.contains("int8") || file.name.contains("tokens")));
+            .any(|file| file.name == "model.safetensors"));
     }
 
     #[test]
-    fn retired_ids_migrate_to_parakeet_int8() {
+    fn retired_ids_migrate_to_parakeet_redux() {
         for id in [
+            "parakeet-unified-en-0.6b-int8",
+            "parakeet-unified-en-0.6b-q8",
             "whisper-small",
             "whisper-medium",
             "sensevoice-small",
@@ -502,11 +511,10 @@ mod tests {
         ] {
             assert_eq!(resolve(id).id, DEFAULT_MODEL_ID, "{id}");
         }
-        assert_eq!(resolve(super::PARAKEET_Q8_ID).id, super::PARAKEET_Q8_ID);
     }
 
     #[test]
-    fn unknown_id_falls_back_to_parakeet_int8() {
+    fn unknown_id_falls_back_to_parakeet_redux() {
         assert_eq!(resolve("nope").id, DEFAULT_MODEL_ID);
         assert_eq!(
             by_id(DEFAULT_MODEL_ID).map(|spec| spec.id),
@@ -517,7 +525,7 @@ mod tests {
     #[test]
     fn install_check_requires_every_catalog_file() {
         let spec: &ModelSpec =
-            by_id(DEFAULT_MODEL_ID).expect("parakeet q8 default is in the catalog");
+            by_id(DEFAULT_MODEL_ID).expect("parakeet redux default is in the catalog");
         let dir = unique_dir("install");
         fs::create_dir_all(&dir).expect("temp dir");
         assert!(!spec.is_installed_in(&dir));
@@ -548,5 +556,17 @@ mod tests {
         assert_eq!(file_label("medium-decoder.int8.onnx"), "medium-decoder");
         assert_eq!(file_label("tokens.txt"), "tokens");
         assert_eq!(file_label("model.onnx"), "model");
+        assert_eq!(file_label("model.safetensors"), "model");
+        assert_eq!(file_label("tokenizer.json"), "tokenizer");
+        assert_eq!(file_label("ternary.json"), "ternary");
+    }
+
+    #[test]
+    fn parakeet_redux_spec_is_valid() {
+        let redux = by_id(super::PARAKEET_REDUX_ID).expect("redux spec");
+        assert_eq!(redux.backend, super::EngineBackend::Photon);
+        assert_eq!(redux.dir_name, "parakeet-redux");
+        assert_eq!(redux.files.len(), 4);
+        assert_eq!(format_mb(redux.size_bytes), "171 MB");
     }
 }

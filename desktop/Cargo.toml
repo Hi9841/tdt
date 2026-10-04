@@ -1,6 +1,6 @@
 [package]
 name = "voice-stt-desktop"
-version = "0.2.15"
+version = "0.2.16"
 edition = "2021"
 description = "TDT (Talk Don't Type), native offline speech-to-text built with Rust, GPUI, and Sherpa-ONNX"
 license = "Apache-2.0"
@@ -12,9 +12,17 @@ authors = ["Hi9841"]
 keywords = ["speech-to-text", "dictation", "sensevoice", "offline"]
 categories = ["accessibility", "multimedia::audio", "os::windows-apis"]
 
+[lib]
+name = "voice_stt_desktop"
+path = "src/lib.rs"
+
 [[bin]]
 name = "TDT"
 path = "src/main.rs"
+
+[[bin]]
+name = "bench-asr"
+path = "src/bin/bench_asr.rs"
 
 [dependencies]
 # Ely pins this Zed revision. A crates.io gpui would be a different type universe.

@@ -1,9 +1,8 @@
-# Download the FluidAudio Parakeet Unified model used by TDT.
-# INT8 and Q8 share models/parakeet-unified-en-0.6b-q8.
+# Download the Moondream Parakeet Redux model used by TDT.
 [CmdletBinding()]
 param(
-    [ValidateSet("parakeet-unified-en-0.6b-int8", "parakeet-unified-en-0.6b-q8", "all")]
-    [string]$Model = "parakeet-unified-en-0.6b-int8",
+    [ValidateSet("parakeet-redux", "all", "parakeet-unified-en-0.6b-int8", "parakeet-unified-en-0.6b-q8")]
+    [string]$Model = "parakeet-redux",
     [string]$ModelsRoot = ""
 )
 
@@ -27,12 +26,24 @@ $Unified = @{
         @{ Name = "tokens.txt"; Sha256 = "DC0B4584AB2E4DDBF888425C076C61B736E7356A015250DB7D307E6F1A8188FF" }
     )
 }
+$Redux = @{
+    Repo = "moondream/parakeet-redux"
+    Dir = "parakeet-redux"
+    Files = @(
+        @{ Name = "config.json"; Sha256 = "503C653B2E3BB788ADBCB04F5ABDEE532D958686564081BAEED133FF10143F6E" },
+        @{ Name = "model.safetensors"; Sha256 = "78EC25733EE0D0C1586D1346FC86DB9D0C2E436E3A8AB1D32A82D1BB8F848D21" },
+        @{ Name = "ternary.json"; Sha256 = "1221C6D3CE901FFE09C089DA758A8DB8B76189F80CFF41C5AFC244FC61E2051D" },
+        @{ Name = "tokenizer.json"; Sha256 = "BD321B096832A3F270BD3B2A88823957920F1A5C5ADA71114A26EA729D0CBE91" }
+    )
+}
 $Catalog = @{
     "parakeet-unified-en-0.6b-int8" = $Unified.Clone()
     "parakeet-unified-en-0.6b-q8" = $Unified.Clone()
+    "parakeet-redux" = $Redux.Clone()
 }
 $Catalog["parakeet-unified-en-0.6b-int8"].Label = "Parakeet INT8"
 $Catalog["parakeet-unified-en-0.6b-q8"].Label = "Parakeet Q8"
+$Catalog["parakeet-redux"].Label = "Parakeet Redux"
 
 function Install-TdtModel([string]$Id) {
     $spec = $Catalog[$Id]
