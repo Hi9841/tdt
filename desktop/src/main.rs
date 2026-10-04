@@ -194,7 +194,7 @@ fn main() {
             Some(dir) => match SttEngine::new(model_spec, &dir, &config.language) {
                 Ok(engine) => {
                     append_log(&format!(
-                        "Sherpa-ONNX {} model found at: {}",
+                        "{} speech model found at: {}",
                         model_spec.label,
                         dir.display()
                     ));

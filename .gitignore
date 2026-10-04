@@ -9,15 +9,8 @@ packaging/tdt-setup/target/
 *.pdb
 
 # Models (download with models/download-models.ps1)
-models/sensevoice/*.onnx
-models/sensevoice/tokens.txt
+models/*/
 models/**/*.download
-models/moonshine-medium-streaming/
-models/parakeet-tdt-0.6b-v3/
-models/parakeet-unified-en-0.6b-q8/
-models/whisper-small/
-models/whisper-medium/
-models/parakeet-redux/
 
 # Logs and local captures
 *.log

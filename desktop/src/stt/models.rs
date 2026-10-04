@@ -12,13 +12,6 @@ pub struct ModelFile {
     pub sha256: &'static str,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EngineBackend {
-    #[allow(dead_code)]
-    Sherpa,
-    Photon,
-}
-
 #[derive(Debug, Clone, Copy)]
 pub struct ModelSpec {
     pub id: &'static str,
@@ -29,7 +22,6 @@ pub struct ModelSpec {
     pub size_bytes: u64,
     pub hf_repo: &'static str,
     pub dir_name: &'static str,
-    pub backend: EngineBackend,
     pub files: &'static [ModelFile],
 }
 
@@ -109,7 +101,6 @@ pub const CATALOG: &[ModelSpec] = &[ModelSpec {
     size_bytes: 179_005_408,
     hf_repo: REDUX_REPO,
     dir_name: REDUX_DIR,
-    backend: EngineBackend::Photon,
     files: REDUX_FILES,
 }];
 
@@ -133,30 +124,6 @@ impl ModelSpec {
 
     pub fn is_installed_in(&self, dir: &Path) -> bool {
         self.files.iter().all(|file| dir.join(file.name).is_file())
-    }
-
-    pub fn tokens_path(&self, dir: &Path) -> PathBuf {
-        let name = self
-            .files
-            .iter()
-            .find(|file| file.name.contains("tokens"))
-            .map(|file| file.name)
-            .unwrap_or("tokens.txt");
-        dir.join(name)
-    }
-
-    pub fn transducer_part(&self, dir: &Path, kind: &str) -> PathBuf {
-        let name = self
-            .files
-            .iter()
-            .find(|file| file.name.starts_with(kind))
-            .map(|file| file.name)
-            .unwrap_or(match kind {
-                "encoder" => "encoder.int8.onnx",
-                "decoder" => "decoder.int8.onnx",
-                _ => "joiner.int8.onnx",
-            });
-        dir.join(name)
     }
 
     pub fn require_installed(&self, dir: &Path) -> Result<(), String> {
@@ -444,29 +411,16 @@ mod tests {
         for spec in CATALOG {
             assert!(!spec.id.is_empty());
             assert!(spec.size_bytes > 0);
-            match spec.backend {
-                super::EngineBackend::Sherpa => {
-                    assert!(spec.files.iter().any(|file| file.name.contains("tokens")));
-                    for part in ["encoder", "decoder", "joiner"] {
-                        assert!(
-                            spec.files.iter().any(|file| file.name.starts_with(part)),
-                            "parakeet {part} missing",
-                        );
-                    }
-                }
-                super::EngineBackend::Photon => {
-                    for expected in [
-                        "config.json",
-                        "model.safetensors",
-                        "ternary.json",
-                        "tokenizer.json",
-                    ] {
-                        assert!(
-                            spec.files.iter().any(|file| file.name == expected),
-                            "photon file {expected} missing",
-                        );
-                    }
-                }
+            for expected in [
+                "config.json",
+                "model.safetensors",
+                "ternary.json",
+                "tokenizer.json",
+            ] {
+                assert!(
+                    spec.files.iter().any(|file| file.name == expected),
+                    "photon file {expected} missing",
+                );
             }
             assert!(!ids.contains(&spec.id), "duplicate model id {}", spec.id);
             ids.push(spec.id);
@@ -490,7 +444,6 @@ mod tests {
         );
         let redux = by_id(DEFAULT_MODEL_ID).expect("redux");
         assert_eq!(redux.dir_name, "parakeet-redux");
-        assert_eq!(redux.backend, super::EngineBackend::Photon);
         assert!(redux
             .files
             .iter()
@@ -564,7 +517,6 @@ mod tests {
     #[test]
     fn parakeet_redux_spec_is_valid() {
         let redux = by_id(super::PARAKEET_REDUX_ID).expect("redux spec");
-        assert_eq!(redux.backend, super::EngineBackend::Photon);
         assert_eq!(redux.dir_name, "parakeet-redux");
         assert_eq!(redux.files.len(), 4);
         assert_eq!(format_mb(redux.size_bytes), "171 MB");

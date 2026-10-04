@@ -94,7 +94,7 @@ fn load_bench_clips(dir: &Path) -> Vec<BenchClip> {
 fn run_engine_benchmark(spec: &ModelSpec, clips: &[BenchClip]) {
     println!("\n=======================================================");
     println!("Benchmarking Model: {} ({})", spec.label, spec.id);
-    println!("Backend: {:?}", spec.backend);
+    println!("Backend: Photon");
     println!("=======================================================");
 
     let model_dir = match find_dir(spec, None) {
