@@ -100,6 +100,47 @@ pub fn shell_surface() -> Background {
         linear_color_stop(rgba(SHELL_BOTTOM), 1.0),
     )
 }
+
+/// Ely components read this palette. The shell itself stays the translucent gradient.
+pub fn install(cx: &mut gpui::App) {
+    use ely_gpui_component::theme::{Density, Mode, Theme};
+    let palette = prism_palette();
+    Theme::set_mode_now(Mode::Dark, cx);
+    Theme::update(cx, |theme| {
+        theme.density = Density::Compact;
+        theme.colors = palette.clone();
+    });
+    Theme::set_palette(Mode::Dark, Some(palette), cx);
+}
+
+fn prism_palette() -> ely_gpui_component::theme::Palette {
+    use ely_gpui_component::theme::Palette;
+    let mut palette = Palette::dark(false);
+    palette.bg = rgb(BG).into();
+    palette.surface = rgba(WELL).into();
+    palette.sunken = rgba(HOVER).into();
+    palette.overlay = rgba(HOVER).into();
+    palette.hover = rgba(HOVER).into();
+    palette.active = rgba(PRESSED).into();
+    palette.border = rgba(0xffffff22).into();
+    palette.border_strong = rgba(0xffffff38).into();
+    palette.fg = text();
+    palette.fg_muted = muted();
+    palette.fg_subtle = rgb(0x9aa0aa).into();
+    palette.fg_disabled = rgb(0x6e737c).into();
+    palette.accent = accent();
+    palette.accent_hover = rgb(PRIMARY_HOVER).into();
+    palette.on_accent = rgb(BG).into();
+    palette.focus = focus_ring();
+    palette.link = foam();
+    palette.selection = selected();
+    palette.success = success();
+    palette.warning = gold();
+    palette.danger = love();
+    palette.info = foam();
+    palette.glass = rgba(SHELL_TOP).into();
+    palette
+}
 pub fn focus_ring() -> Hsla {
     rgba(FOCUS).into()
 }
