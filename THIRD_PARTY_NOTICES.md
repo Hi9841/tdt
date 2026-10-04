@@ -14,6 +14,11 @@ licenses remain applicable to those components.
   Settings labels that package Parakeet INT8 and Parakeet Q8. Both chips
   download the same files into
   `%LOCALAPPDATA%\TDT\models\parakeet-unified-en-0.6b-q8\`.
+- Moondream Parakeet Redux: 1.58-bit ternary transducer weights from
+  https://huggingface.co/moondream/parakeet-redux (CC-BY-4.0).
+  Downloaded on demand into `%LOCALAPPDATA%\TDT\models\parakeet-redux\`.
+- Photon / Moondream: Apache-2.0. Local ternary neural network runtime
+  by Moondream used for Parakeet Redux inference.
 - GPUI, CPAL, and Rust crates: each crate's license is recorded in Cargo's
   lockfile and upstream package metadata. See `desktop/Cargo.toml` and
   https://crates.io/

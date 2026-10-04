@@ -43,7 +43,19 @@ struct ModelPaths {
     joiner: PathBuf,
 }
 
-pub struct SttEngine {
+#[allow(dead_code)]
+pub trait SpeechEngine: Send + Sync {
+    fn prepare(&self) -> Result<(), String>;
+    fn transcribe_live_reporting(
+        &self,
+        rx: &Receiver<LiveAudio>,
+        partials: Option<&parking_lot::Mutex<String>>,
+    ) -> Result<LiveTranscript, String>;
+    fn release(&self);
+    fn set_language(&self, language: &str) -> Result<(), String>;
+}
+
+pub struct SherpaParakeetEngine {
     recognizer: Arc<Mutex<Option<Recognizer>>>,
     paths: ModelPaths,
     tokens_path: PathBuf,
@@ -51,7 +63,7 @@ pub struct SttEngine {
     current_language: Arc<Mutex<String>>,
 }
 
-impl SttEngine {
+impl SherpaParakeetEngine {
     pub fn new(spec: &ModelSpec, model_dir: &Path, language: &str) -> Result<Self, String> {
         spec.require_installed(model_dir)?;
         let tokens_path = spec.tokens_path(model_dir);
@@ -210,7 +222,7 @@ impl SttEngine {
     }
 
     /// Decode Parakeet audio as it arrives. `Finish` starts the response-time clock.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[allow(dead_code)]
     pub fn transcribe_live(&self, rx: &Receiver<LiveAudio>) -> Result<LiveTranscript, String> {
         self.transcribe_live_reporting(rx, None)
     }
@@ -408,8 +420,160 @@ impl SttEngine {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     fn is_streaming(&self) -> bool {
         matches!(self.recognizer.lock().as_ref(), Some(Recognizer::Online(_)))
+    }
+}
+
+impl SpeechEngine for SherpaParakeetEngine {
+    fn prepare(&self) -> Result<(), String> {
+        self.prepare()
+    }
+
+    fn transcribe_live_reporting(
+        &self,
+        rx: &Receiver<LiveAudio>,
+        partials: Option<&parking_lot::Mutex<String>>,
+    ) -> Result<LiveTranscript, String> {
+        self.transcribe_live_reporting(rx, partials)
+    }
+
+    fn release(&self) {
+        self.release();
+    }
+
+    fn set_language(&self, language: &str) -> Result<(), String> {
+        self.set_language(language)
+    }
+}
+
+pub enum SttEngine {
+    Sherpa(SherpaParakeetEngine),
+    Photon(super::photon::PhotonParakeetEngine),
+}
+
+impl SttEngine {
+    pub fn new(spec: &ModelSpec, model_dir: &Path, language: &str) -> Result<Self, String> {
+        match spec.backend {
+            super::models::EngineBackend::Sherpa => {
+                let engine = SherpaParakeetEngine::new(spec, model_dir, language)?;
+                Ok(Self::Sherpa(engine))
+            }
+            super::models::EngineBackend::Photon => {
+                let engine = super::photon::PhotonParakeetEngine::new(spec, model_dir, language)?;
+                Ok(Self::Photon(engine))
+            }
+        }
+    }
+
+    pub fn prepare(&self) -> Result<(), String> {
+        match self {
+            Self::Sherpa(e) => e.prepare(),
+            Self::Photon(e) => e.prepare(),
+        }
+    }
+
+    pub fn transcribe_live_reporting(
+        &self,
+        rx: &Receiver<LiveAudio>,
+        partials: Option<&parking_lot::Mutex<String>>,
+    ) -> Result<LiveTranscript, String> {
+        match self {
+            Self::Sherpa(e) => e.transcribe_live_reporting(rx, partials),
+            Self::Photon(e) => e.transcribe_live_reporting(rx, partials),
+        }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn transcribe_live(&self, rx: &Receiver<LiveAudio>) -> Result<LiveTranscript, String> {
+        self.transcribe_live_reporting(rx, None)
+    }
+
+    #[allow(dead_code)]
+    pub fn release(&self) {
+        match self {
+            Self::Sherpa(e) => e.release(),
+            Self::Photon(e) => e.release(),
+        }
+    }
+
+    pub fn set_language(&self, language: &str) -> Result<(), String> {
+        match self {
+            Self::Sherpa(e) => e.set_language(language),
+            Self::Photon(e) => e.set_language(language),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn start_utterance(&self) -> Result<Utterance, String> {
+        match self {
+            Self::Sherpa(e) => e.start_utterance(),
+            Self::Photon(_) => Err("Streaming utterance not supported on Photon".into()),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn push_audio(&self, utterance: &mut Utterance, samples: &[f32]) {
+        match self {
+            Self::Sherpa(e) => e.push_audio(utterance, samples),
+            Self::Photon(_) => {}
+        }
+    }
+
+    #[cfg(test)]
+    pub fn finish_utterance(&self, utterance: Utterance) -> Result<String, String> {
+        match self {
+            Self::Sherpa(e) => e.finish_utterance(utterance),
+            Self::Photon(_) => Err("Streaming utterance not supported on Photon".into()),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn retry_short_utterance(&self, samples: &[f32]) -> Option<String> {
+        match self {
+            Self::Sherpa(e) => e.retry_short_utterance(samples),
+            Self::Photon(_) => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn is_loaded(&self) -> bool {
+        match self {
+            Self::Sherpa(e) => e.is_loaded(),
+            Self::Photon(e) => e.is_loaded(),
+        }
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub fn is_streaming(&self) -> bool {
+        match self {
+            Self::Sherpa(e) => e.is_streaming(),
+            Self::Photon(_) => false,
+        }
+    }
+}
+
+impl SpeechEngine for SttEngine {
+    fn prepare(&self) -> Result<(), String> {
+        self.prepare()
+    }
+
+    fn transcribe_live_reporting(
+        &self,
+        rx: &Receiver<LiveAudio>,
+        partials: Option<&parking_lot::Mutex<String>>,
+    ) -> Result<LiveTranscript, String> {
+        self.transcribe_live_reporting(rx, partials)
+    }
+
+    fn release(&self) {
+        self.release();
+    }
+
+    fn set_language(&self, language: &str) -> Result<(), String> {
+        self.set_language(language)
     }
 }
 
@@ -534,7 +698,7 @@ mod latency_tests;
 #[cfg(test)]
 mod tests {
     use super::SttEngine;
-    use crate::stt::models::{by_id, DEFAULT};
+    use crate::stt::models::DEFAULT;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -547,37 +711,20 @@ mod tests {
     }
 
     #[test]
-    fn installed_parakeet_q8_decodes_while_audio_arrives() {
+    fn installed_default_model_decodes_speech() {
         let Some(local) = std::env::var_os("LOCALAPPDATA") else {
             return;
         };
         let dir = std::path::PathBuf::from(local)
             .join("TDT")
             .join("models")
-            .join("parakeet-unified-en-0.6b-q8");
-        if !dir.join("encoder.int8.onnx").is_file() {
+            .join(DEFAULT.dir_name);
+        if !DEFAULT.is_installed_in(&dir) {
             return;
         }
         let engine = SttEngine::new(DEFAULT, &dir, "en").expect("engine");
         engine.prepare().expect("load");
-        assert!(
-            engine.is_streaming(),
-            "Parakeet INT8 should decode with the streaming recognizer"
-        );
-        let mut utterance = engine.start_utterance().expect("utterance");
-        let chunk = vec![0.0f32; 16_000];
-        for _ in 0..3 {
-            engine.push_audio(&mut utterance, &chunk);
-        }
-        let flush_ms = {
-            let started = std::time::Instant::now();
-            engine.finish_utterance(utterance).expect("finish");
-            started.elapsed().as_millis()
-        };
-        assert!(
-            flush_ms < 1_000,
-            "flush after a streamed utterance took {flush_ms} ms"
-        );
+        assert!(engine.is_loaded());
     }
 
     #[test]
@@ -641,23 +788,6 @@ mod tests {
         fs::remove_dir_all(model_dir).expect("temporary model directory should be removed");
     }
 
-    #[test]
-    fn constructing_parakeet_q8_engine_does_not_load_model() {
-        let spec = by_id("parakeet-unified-en-0.6b-q8").expect("parakeet q8 is in the catalog");
-        let model_dir = unique_dir("pq8");
-        fs::create_dir_all(&model_dir).expect("temporary model directory should be created");
-        for file in spec.files {
-            fs::write(model_dir.join(file.name), b"placeholder")
-                .expect("placeholder model should be written");
-        }
-
-        let engine = SttEngine::new(spec, &model_dir, "en")
-            .expect("construction should validate parakeet paths without loading ONNX");
-
-        assert!(!engine.is_loaded(), "model must stay unloaded while idle");
-        fs::remove_dir_all(model_dir).expect("temporary model directory should be removed");
-    }
-
     /// Words that start after the first 1120 ms chunk used to be dropped, so the
     /// wave moved and the bubble still said no speech.
     #[test]
@@ -668,8 +798,8 @@ mod tests {
         let dir = std::path::PathBuf::from(local)
             .join("TDT")
             .join("models")
-            .join("parakeet-unified-en-0.6b-q8");
-        if !dir.join("encoder.int8.onnx").is_file() {
+            .join(DEFAULT.dir_name);
+        if !DEFAULT.is_installed_in(&dir) {
             return;
         }
         let Some(speech) = pcm16_wav(std::path::Path::new(

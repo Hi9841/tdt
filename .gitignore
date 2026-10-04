@@ -17,6 +17,7 @@ models/parakeet-tdt-0.6b-v3/
 models/parakeet-unified-en-0.6b-q8/
 models/whisper-small/
 models/whisper-medium/
+models/parakeet-redux/
 
 # Logs and local captures
 *.log

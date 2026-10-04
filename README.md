@@ -5,12 +5,12 @@ https://github.com/user-attachments/assets/8bb3021b-f878-4d41-9b1d-32040b7e1897
 
 
 TDT is an offline speech-to-text app for Windows. Audio is
-processed locally with Sherpa-ONNX and recognized text is copied to
-the system clipboard. The default model is Parakeet INT8. Settings can
-switch between Parakeet INT8 and Parakeet Q8. Both are FluidAudio's English
-Parakeet Unified 0.6B, using the same 8-bit streaming weights. Extra models
-download on demand and stay on disk. The selected model loads and warms up in the
-background when TDT starts, then stays in memory so recordings skip model load time.
+processed locally with the high-performance Moondream Photon runtime, and
+recognized text is copied to the system clipboard. The default model is
+Parakeet Redux (a compact 178 MB 1.58-bit ternary model running on Photon).
+The model downloads on demand and stays on disk. The selected model loads and
+warms up in the background when TDT starts, then stays in memory so recordings
+skip model load time.
 
 License: Apache-2.0. Source: https://github.com/Hi9841/tdt
 
@@ -25,12 +25,12 @@ That writes:
 
 - `dist/TDT.exe` slim app binary used by in-app updates
 - `dist/TDT-Setup.exe` per-user installer (app only, no speech model)
-- `dist/TDT-0.2.15-windows-x64.zip` portable copy (app only, no speech model)
+- `dist/TDT-0.2.16-windows-x64.zip` portable copy (app only, no speech model)
 - `dist/SHA256SUMS.txt`
 
 The installer copies TDT and the license files into `%LOCALAPPDATA%\TDT`,
 adds a Start Menu shortcut, and opens the app. Speech models are not bundled.
-Open Settings and download Parakeet INT8 on first run, or keep a model you already
+Open Settings and download Parakeet Redux on first run, or keep a model you already
 have. No admin rights. Uninstall from Settings > Apps, or:
 
 ```powershell
@@ -61,11 +61,17 @@ Click the tray icon to open settings. Its menu offers **Stop recording**,
 drag its icon onto the visible taskbar area. Windows controls which tray icons
 remain visible.
 
-In Settings, pick Parakeet INT8 or Parakeet Q8. Missing models show Download model.
-Both chips use the same FluidAudio Unified package, about 632 MB. To fetch it:
+In Settings, Parakeet Redux is the default model. If missing, it shows Download model (178 MB).
+To fetch the model directly via PowerShell:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\models\download-models.ps1 -Model parakeet-unified-en-0.6b-int8
+powershell -ExecutionPolicy Bypass -File .\models\download-models.ps1
+```
+
+To run the comparative ASR benchmark across all installed engines:
+
+```powershell
+cargo run --release --bin bench-asr --manifest-path .\desktop\Cargo.toml
 ```
 
 ```powershell

@@ -1152,7 +1152,7 @@ impl HudView {
             .segment("stats", "Stats", None)
             .segment("settings", "Settings", None)
             .on_change(move |key, _, cx| {
-                let _ = tabs.update(cx, |this, cx| {
+                tabs.update(cx, |this, cx| {
                     this.active_tab = if key.as_ref() == "settings" {
                         SettingsTab::Settings
                     } else {
@@ -1317,7 +1317,7 @@ impl HudView {
                             .on_dismiss({
                                 let hud = hud.clone();
                                 move |_, cx| {
-                                    let _ = hud.update(cx, |this, cx| {
+                                    hud.update(cx, |this, cx| {
                                         this.recovery_message = None;
                                         if matches!(
                                             this.status,
@@ -1334,7 +1334,7 @@ impl HudView {
                             alert = alert.action(
                                 controls::secondary_button("retry_microphone", "Retry microphone")
                                     .on_click(move |_, _, cx| {
-                                        let _ = hud.update(cx, |this, cx| {
+                                        hud.update(cx, |this, cx| {
                                             this.retry_microphone = true;
                                             cx.notify();
                                         });
@@ -1597,7 +1597,7 @@ impl HudView {
         let auto_paste_switch = Switch::new("auto_paste", is_auto_paste).on_change({
             let hud = hud.clone();
             move |on, _, cx| {
-                let _ = hud.update(cx, |this, cx| {
+                hud.update(cx, |this, cx| {
                     if this.auto_paste_enabled != on {
                         this.toggle_auto_paste();
                     }
@@ -1619,7 +1619,7 @@ impl HudView {
         let startup_switch = Switch::new("start_with_windows", self.autostart_enabled).on_change({
             let hud = hud.clone();
             move |on, _, cx| {
-                let _ = hud.update(cx, |this, cx| {
+                hud.update(cx, |this, cx| {
                     if this.autostart_enabled != on {
                         this.toggle_autostart();
                     }
@@ -1653,7 +1653,7 @@ impl HudView {
                 let Some(code) = values.first().cloned() else {
                     return;
                 };
-                let _ = hud.update(cx, |this, cx| {
+                hud.update(cx, |this, cx| {
                     if this.selected_language != code.as_ref() {
                         this.select_language(&code);
                     }
@@ -1849,7 +1849,7 @@ impl HudView {
                 let Some(id) = values.first().cloned() else {
                     return;
                 };
-                let _ = hud.update(cx, |this, cx| {
+                hud.update(cx, |this, cx| {
                     if this.selected_model != id.as_ref() {
                         this.select_model(&id);
                     }
