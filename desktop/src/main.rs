@@ -14,7 +14,6 @@ mod update;
 
 use audio::{play_sound, AudioRecorder, SoundEffect, SpeechTail, MAX_TAIL, VIS_BARS};
 use config::{AppConfig, AppStats};
-use ely_gpui_component::theme::{Mode, Theme};
 use ely_gpui_component::Assets;
 use gpui::*;
 use hotkey::{
@@ -269,7 +268,7 @@ fn main() {
 
     app.run(move |cx: &mut App| {
         ely_gpui_component::init(cx);
-        Theme::set_mode_now(Mode::Dark, cx);
+        ui::theme::install(cx);
         // Windows requires the event loop to exist before creating the tray icon.
         let mut tray = if preview::is_active() && !preview::wants_tray() { None } else { match SystemTray::new(auto_paste, &hotkey_label) {
             Ok(tray) => Some(tray),
