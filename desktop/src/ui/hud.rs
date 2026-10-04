@@ -632,7 +632,7 @@ impl HudView {
                         self.active_model = Some(model.id);
                         self.model_error = None;
                         self.recovery_message = None;
-                        if matches!(self.status, HudStatus::Error { .. }) {
+                        if matches!(self.status, HudStatus::Error { .. } | HudStatus::NoSpeech) {
                             self.status = HudStatus::Idle;
                         }
                     }
@@ -1888,14 +1888,6 @@ impl HudView {
         } else {
             None
         };
-        let setup_note = if self.model_ready() {
-            None
-        } else {
-            Some(format!(
-                "Download {} to get started. Setup needs internet; your speech stays on this device.",
-                models::DEFAULT.label
-            ))
-        };
         let show_activate = installed
             && self.active_model.as_deref() != Some(spec.id)
             && self.model_loading.is_none();
@@ -1951,9 +1943,6 @@ impl HudView {
                     .child(controls::group_label("Recognition"))
                     .child(controls::labeled("Model", model_sub))
                     .child(model_chips)
-                    .when_some(setup_note, |column, note| {
-                        column.child(InlineMessage::new(Severity::Warning, note))
-                    })
                     .when_some(running_note, |column, note| {
                         column.child(InlineMessage::new(Severity::Info, note))
                     })
@@ -1996,6 +1985,16 @@ impl HudView {
             })
             .into_any_element()
     }
+}
+
+/// A finished dictation returns to Ready. A notice stays long enough to read, then leaves.
+pub fn success_returns_to_idle(elapsed: Duration, has_notice: bool) -> bool {
+    let hold = if has_notice {
+        Duration::from_secs(4)
+    } else {
+        Duration::from_millis(1800)
+    };
+    elapsed > hold
 }
 
 fn preview_wave(loud: bool) -> [f32; WAVE_BARS] {
@@ -2053,6 +2052,27 @@ mod motion_tests {
     use super::{
         history_text_overflows, window_hidden_for_mode, WindowViewMode, HISTORY_EXPAND_CHARS,
     };
+
+    #[test]
+    fn a_notice_does_not_keep_the_pill_on_the_result() {
+        use std::time::Duration;
+        assert!(!super::success_returns_to_idle(
+            Duration::from_millis(1800),
+            false
+        ));
+        assert!(super::success_returns_to_idle(
+            Duration::from_millis(1801),
+            false
+        ));
+        assert!(!super::success_returns_to_idle(
+            Duration::from_secs(4),
+            true
+        ));
+        assert!(super::success_returns_to_idle(
+            Duration::from_secs(4) + Duration::from_millis(1),
+            true
+        ));
+    }
 
     #[test]
     fn closing_settings_keeps_the_bubble_on_screen() {
