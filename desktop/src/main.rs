@@ -360,6 +360,7 @@ fn main() {
                     let mut recording_before_press = false;
                     let mut recording_session = 0u64;
                     let mut limit_notice = false;
+                    let mut no_speech_at: Option<Instant> = None;
                     let mut session: Option<LiveTake> = None;
 
                     loop {
@@ -671,6 +672,7 @@ fn main() {
                                         });
                                         play_sound(SoundEffect::StartListening);
                                         is_recording_state = true;
+                                        no_speech_at = None;
                                         let started_at = Instant::now();
                                         let _ = this.update(cx, |view, cx| {
                                             view.recovery_message = None;
@@ -791,7 +793,7 @@ fn main() {
                                     let finished_at = Instant::now();
                                     let _ = this.update(cx, |view, cx| {
                                         view.stats = AppStats::load();
-                                        if notice.is_some() { view.recovery_message = notice; }
+                                        view.recovery_message = notice;
                                         view.status = HudStatus::Success {
                                             text,
                                             auto_pasted,
@@ -819,6 +821,7 @@ fn main() {
                                 }
                                 InternalEvent::NoSpeech => {
                                     is_processing_state = false;
+                                    no_speech_at = Some(Instant::now());
                                     let _ = this.update(cx, |view, cx| {
                                         view.status = HudStatus::NoSpeech;
                                         view.recovery_message = Some("No speech detected. Try again and check your microphone.".into());
@@ -839,6 +842,13 @@ fn main() {
                         // Avoid locking the audio visualization buffer when it
                         // cannot be displayed.
                         let vis_peaks = if is_recording_state { rec.borrow().as_ref().map(AudioRecorder::vis_peaks) } else { None };
+                        let clear_no_speech = !preview::is_active()
+                            && no_speech_at.is_some_and(|at| {
+                                ui::hud::success_returns_to_idle(at.elapsed(), true)
+                            });
+                        if clear_no_speech {
+                            no_speech_at = None;
+                        }
 
                         let _ = this.update(cx, |view, cx| {
                             if !preview::is_active() {
@@ -876,14 +886,22 @@ fn main() {
                                 HudStatus::Transcribing { .. } => {}
                                 HudStatus::Success { finished_at, .. } => {
                                     if !preview::is_active()
-                                        && view.recovery_message.is_none()
-                                        && finished_at.elapsed() > Duration::from_millis(1800)
+                                        && ui::hud::success_returns_to_idle(
+                                            finished_at.elapsed(),
+                                            view.recovery_message.is_some(),
+                                        )
                                     {
                                         view.status = HudStatus::Idle;
+                                        view.recovery_message = None;
                                         cx.notify();
                                     }
                                 }
-                                HudStatus::Error { .. } | HudStatus::NoSpeech | HudStatus::Idle => {}
+                                HudStatus::NoSpeech if clear_no_speech => {
+                                    view.status = HudStatus::Idle;
+                                    view.recovery_message = None;
+                                    cx.notify();
+                                }
+                                HudStatus::NoSpeech | HudStatus::Error { .. } | HudStatus::Idle => {}
                             }
                             if let Some(tray) = tray.as_mut() {
                                 tray.update(&view.status, &view.hotkey_label);
