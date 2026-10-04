@@ -16,6 +16,7 @@ pub struct ModelFile {
 pub struct ModelSpec {
     pub id: &'static str,
     pub label: &'static str,
+    #[allow(dead_code)]
     pub blurb: &'static str,
     pub size_label: &'static str,
     pub size_bytes: u64,
