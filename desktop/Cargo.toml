@@ -1,6 +1,6 @@
 [package]
 name = "voice-stt-desktop"
-version = "0.2.16"
+version = "0.2.17"
 edition = "2021"
 description = "TDT (Talk Don't Type), native offline speech-to-text built with Rust, GPUI, and Moondream Photon"
 license = "Apache-2.0"
