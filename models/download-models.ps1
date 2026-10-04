@@ -16,19 +16,10 @@ if (-not $ModelsRoot) {
         $ModelsRoot = Join-Path (Get-Location) "models"
     }
 }
-$Unified = @{
-    Repo = "csukuangfj2/sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-streaming-1120ms"
-    Dir = "parakeet-unified-en-0.6b-q8"
-    Files = @(
-        @{ Name = "encoder.int8.onnx"; Sha256 = "1C03F1192DE41771384AF22972CA10203613BA56197A024F275B86727CD35911" },
-        @{ Name = "decoder.int8.onnx"; Sha256 = "34FEA72425D2506600772BA191A6D3F99C0710ABDB68D9A3DC89FA8CB2AA473A" },
-        @{ Name = "joiner.int8.onnx"; Sha256 = "869F43F7D24595C55581AD3BF249A935FB8A71389FBDAA7504B9F46F93140F8A" },
-        @{ Name = "tokens.txt"; Sha256 = "DC0B4584AB2E4DDBF888425C076C61B736E7356A015250DB7D307E6F1A8188FF" }
-    )
-}
 $Redux = @{
     Repo = "moondream/parakeet-redux"
     Dir = "parakeet-redux"
+    Label = "Parakeet Redux"
     Files = @(
         @{ Name = "config.json"; Sha256 = "503C653B2E3BB788ADBCB04F5ABDEE532D958686564081BAEED133FF10143F6E" },
         @{ Name = "model.safetensors"; Sha256 = "78EC25733EE0D0C1586D1346FC86DB9D0C2E436E3A8AB1D32A82D1BB8F848D21" },
@@ -37,13 +28,10 @@ $Redux = @{
     )
 }
 $Catalog = @{
-    "parakeet-unified-en-0.6b-int8" = $Unified.Clone()
-    "parakeet-unified-en-0.6b-q8" = $Unified.Clone()
-    "parakeet-redux" = $Redux.Clone()
+    "parakeet-redux" = $Redux
+    "parakeet-unified-en-0.6b-int8" = $Redux
+    "parakeet-unified-en-0.6b-q8" = $Redux
 }
-$Catalog["parakeet-unified-en-0.6b-int8"].Label = "Parakeet INT8"
-$Catalog["parakeet-unified-en-0.6b-q8"].Label = "Parakeet Q8"
-$Catalog["parakeet-redux"].Label = "Parakeet Redux"
 
 function Install-TdtModel([string]$Id) {
     $spec = $Catalog[$Id]

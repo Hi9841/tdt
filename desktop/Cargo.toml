@@ -2,7 +2,7 @@
 name = "voice-stt-desktop"
 version = "0.2.16"
 edition = "2021"
-description = "TDT (Talk Don't Type), native offline speech-to-text built with Rust, GPUI, and Sherpa-ONNX"
+description = "TDT (Talk Don't Type), native offline speech-to-text built with Rust, GPUI, and Moondream Photon"
 license = "Apache-2.0"
 readme = "../README.md"
 homepage = "https://github.com/Hi9841/tdt"
@@ -29,7 +29,6 @@ path = "src/bin/bench_asr.rs"
 gpui = { git = "https://github.com/zed-industries/zed", rev = "1a28cff4b409169bac058bca40dfbfeb7621d19b", default-features = false, features = ["stacker"] }
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "1a28cff4b409169bac058bca40dfbfeb7621d19b", features = ["font-kit"] }
 ely-gpui-component = { git = "https://github.com/ZacharyZhang-NY/Ely-GPUI-Components" }
-sherpa-onnx = "1.13.8"
 cpal = "0.15"
 arboard = "3.4"
 # Linux AppIndicator pulls an old glib stack that cannot share a lockfile with Zed's GPUI.

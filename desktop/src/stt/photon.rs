@@ -482,28 +482,6 @@ impl PhotonParakeetEngine {
     }
 }
 
-impl super::engine::SpeechEngine for PhotonParakeetEngine {
-    fn prepare(&self) -> Result<(), String> {
-        self.prepare()
-    }
-
-    fn transcribe_live_reporting(
-        &self,
-        rx: &Receiver<LiveAudio>,
-        partials: Option<&Mutex<String>>,
-    ) -> Result<LiveTranscript, String> {
-        self.transcribe_live_reporting(rx, partials)
-    }
-
-    fn release(&self) {
-        self.release()
-    }
-
-    fn set_language(&self, language: &str) -> Result<(), String> {
-        self.set_language(language)
-    }
-}
-
 #[allow(dead_code)]
 pub fn pcm16_wav(path: &std::path::Path) -> Option<Vec<f32>> {
     let bytes = fs::read(path).ok()?;
