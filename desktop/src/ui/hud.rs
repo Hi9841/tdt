@@ -7,15 +7,22 @@ use crate::ui::controls;
 use crate::ui::preview::{self, Spec as PreviewSpec};
 use crate::ui::text::{clip_text, format_latency_ms, format_mmss, format_time_saved};
 use crate::ui::theme::{
-    self, accent, foam, gold, love, muted, pad, r_chip, r_section, r_window,
-    selected, shell_surface, success, text, well, GAP_SECTION, GAP_TIGHT, H_CTRL, H_TAB, MOTION_MS,
-    MUTED, TAB_FADE_MS, TEXT, TYPE_DESC, TYPE_LABEL, TYPE_META, TYPE_TITLE,
+    self, accent, gold, love, muted, pad, r_chip, r_section, r_window, selected, shell_surface,
+    success, text, well, GAP_SECTION, GAP_TIGHT, H_CTRL, MOTION_MS, MUTED, TAB_FADE_MS, TEXT,
+    TYPE_DESC, TYPE_LABEL, TYPE_META, TYPE_TITLE,
 };
 use crate::ui::window_util::{
     client_animations_enabled, set_overlay_hidden, set_window_mode, start_window_drag,
     BUBBLE_HEIGHT, BUBBLE_WIDTH, PANEL_CLOSE_MS, PANEL_OPEN_MS,
 };
 use crate::update::{self, UpdatePhase};
+use ely_gpui_component::buttons::SegmentedControl;
+use ely_gpui_component::feedback::{Alert, InlineMessage};
+use ely_gpui_component::forms::{Choice, ChoiceChips, Switch};
+use ely_gpui_component::layout::ScrollArea;
+use ely_gpui_component::primitives::{FocusScope, Severity};
+use ely_gpui_component::settings::{SettingsRow, SettingsSection};
+use ely_gpui_component::theme::ControlSize;
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use parking_lot::Mutex;
@@ -105,10 +112,6 @@ pub struct HudView {
     pub copied_key: Option<String>,
     expanded_history_key: Option<String>,
     pub copied_at: Option<Instant>,
-    /// Bumped on each auto-paste toggle so the knob animation restarts.
-    pub toggle_epoch: u64,
-    /// Bumped on each startup toggle so that knob restarts on its own channel.
-    startup_epoch: u64,
     pub injector: PasteInjector,
     pub selected_language: String,
     pub selected_model: String,
@@ -132,6 +135,7 @@ pub struct HudView {
     model_ready_tx: crossbeam_channel::Sender<Result<PreparedModel, String>>,
     model_ready_rx: crossbeam_channel::Receiver<Result<PreparedModel, String>>,
     preview_ready: Option<bool>,
+    root_focus: FocusHandle,
     panel_focus: FocusHandle,
     panel_needs_focus: bool,
 }
@@ -190,8 +194,6 @@ impl HudView {
             copied_key: None,
             expanded_history_key: None,
             copied_at: None,
-            toggle_epoch: 0,
-            startup_epoch: 0,
             injector: PasteInjector::new(),
             selected_language,
             selected_model,
@@ -215,6 +217,7 @@ impl HudView {
             model_ready_tx,
             model_ready_rx,
             preview_ready: None,
+            root_focus: cx.focus_handle(),
             panel_focus: cx.focus_handle().tab_stop(false),
             panel_needs_focus: open_panel,
         };
@@ -796,7 +799,6 @@ impl HudView {
 
     fn toggle_auto_paste(&mut self) {
         self.auto_paste_enabled = !self.auto_paste_enabled;
-        self.toggle_epoch = self.toggle_epoch.wrapping_add(1);
         if preview::is_active() {
             return;
         }
@@ -809,7 +811,6 @@ impl HudView {
     fn toggle_autostart(&mut self) {
         if preview::is_active() {
             self.autostart_enabled = !self.autostart_enabled;
-            self.startup_epoch = self.startup_epoch.wrapping_add(1);
             return;
         }
         let enabled = !crate::autostart::is_enabled();
@@ -817,7 +818,6 @@ impl HudView {
             Ok(()) => {
                 self.autostart_enabled = enabled;
                 self.autostart_error = None;
-                self.startup_epoch = self.startup_epoch.wrapping_add(1);
             }
             Err(error) => {
                 eprintln!("{error}");
@@ -866,15 +866,19 @@ impl HudView {
 
 impl Render for HudView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
-        if self.mode == WindowViewMode::StatsAndSettings {
-            if self.panel_needs_focus {
-                window.focus(&self.panel_focus);
-                self.panel_needs_focus = false;
-            }
+        if self.mode == WindowViewMode::StatsAndSettings && self.panel_needs_focus {
+            window.focus(&self.panel_focus, cx);
+            self.panel_needs_focus = false;
+        }
+        let body = if self.mode == WindowViewMode::StatsAndSettings {
             self.render_stats_settings(cx)
         } else {
             self.render_bubble(cx)
-        }
+        };
+        FocusScope::new(&self.root_focus)
+            .root()
+            .size_full()
+            .child(body)
     }
 }
 
@@ -926,7 +930,10 @@ impl HudView {
             HudStatus::Success { text, .. } => overlay_snippet(text, theme::text()),
             HudStatus::Error { message, .. } => overlay_snippet(message, text()),
             HudStatus::NoSpeech => overlay_snippet("No speech detected", text()),
-            HudStatus::Transcribing { .. } => controls::activity_bar(),
+            HudStatus::Transcribing { .. } => div()
+                .w(px(72.0))
+                .child(controls::indeterminate_bar("bubble_transcribe"))
+                .into_any_element(),
             HudStatus::Listening { partial, .. } if !partial.is_empty() => {
                 overlay_snippet(partial, text())
             }
@@ -1026,61 +1033,50 @@ impl HudView {
 
         let right_section = if matches!(&self.status, HudStatus::Idle) {
             right_section
-                .child(
-                    controls::ghost_button("hide_overlay_btn", "Hide")
-                        .h(px(SETTINGS_SURFACE_HEIGHT))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|_, _, _, cx| cx.stop_propagation()),
-                        )
-                        .on_click(cx.listener(|this, _, _, cx| {
+                .child(controls::hold_click(
+                    "hold_hide",
+                    controls::ghost_button("hide_overlay_btn", "Hide").on_click(cx.listener(
+                        |this, _, _, cx| {
                             cx.stop_propagation();
                             this.hide_overlay(cx);
                             cx.notify();
-                        })),
-                )
-                .child(
-                    controls::secondary_button("open_settings_btn", "Settings…")
-                        .h(px(SETTINGS_SURFACE_HEIGHT))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|_, _, _, cx| cx.stop_propagation()),
-                        )
-                        .on_click(cx.listener(|this, _, _, cx| {
+                        },
+                    )),
+                ))
+                .child(controls::hold_click(
+                    "hold_settings",
+                    controls::secondary_button("open_settings_btn", "Settings").on_click(
+                        cx.listener(|this, _, _, cx| {
                             cx.stop_propagation();
                             this.open_settings(cx);
                             cx.notify();
-                        })),
-                )
+                        }),
+                    ),
+                ))
         } else if matches!(self.status, HudStatus::Error { .. } | HudStatus::NoSpeech)
             || self.recovery_message.is_some() && matches!(self.status, HudStatus::Success { .. })
         {
-            right_section.child(
-                controls::secondary_button("recovery_details", "Details")
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|_, _, _, cx| cx.stop_propagation()),
-                    )
-                    .on_click(cx.listener(|this, _, _, cx| {
+            right_section.child(controls::hold_click(
+                "hold_details",
+                controls::secondary_button("recovery_details", "Details").on_click(cx.listener(
+                    |this, _, _, cx| {
                         this.open_settings(cx);
                         cx.notify();
-                    })),
-            )
+                    },
+                )),
+            ))
         } else if !timer_str.is_empty() {
             right_section
                 .when(holding, |row| {
-                    row.child(
-                        controls::primary_button("stop_recording", "Stop")
-                            .h(px(SETTINGS_SURFACE_HEIGHT))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|_, _, _, cx| cx.stop_propagation()),
-                            )
-                            .on_click(cx.listener(|this, _, _, cx| {
+                    row.child(controls::hold_click(
+                        "hold_stop",
+                        controls::primary_button("stop_recording", "Stop").on_click(cx.listener(
+                            |this, _, _, cx| {
                                 this.stop_requested = true;
                                 cx.notify();
-                            })),
-                    )
+                            },
+                        )),
+                    ))
                 })
                 .child(
                     div()
@@ -1147,47 +1143,25 @@ impl HudView {
     }
 
     fn render_stats_settings(&mut self, cx: &mut Context<'_, Self>) -> AnyElement {
-        let tab_btn = |id: &'static str,
-                       label: &'static str,
-                       active: bool,
-                       tab: SettingsTab,
-                       cx: &mut Context<'_, Self>| {
-            div()
-                .id(id)
-                .tab_index(0)
-                .focus(|style| style.text_color(foam()))
-                .flex_none()
-                .h(px(H_TAB))
-                .px(px(10.0))
-                .rounded(r_chip())
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_size(px(TYPE_DESC))
-                .font_weight(if active {
-                    FontWeight::MEDIUM
-                } else {
-                    FontWeight::NORMAL
-                })
-                .bg(if active {
-                    selected()
-                } else {
-                    theme::transparent()
-                })
-                .text_color(if active { text() } else { muted() })
-                .whitespace_nowrap()
-                .cursor_pointer()
-                .active(|style| style.opacity(0.66))
-                .child(label)
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|_, _, _, cx| cx.stop_propagation()),
-                )
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.active_tab = tab;
-                    cx.notify();
-                }))
+        let tab_key = match self.active_tab {
+            SettingsTab::Stats => "stats",
+            SettingsTab::Settings => "settings",
         };
+        let tabs = cx.entity();
+        let panel_tabs = SegmentedControl::new("panel_tabs", tab_key)
+            .size(ControlSize::Sm)
+            .segment("stats", "History", None)
+            .segment("settings", "Settings", None)
+            .on_change(move |key, _, cx| {
+                let _ = tabs.update(cx, |this, cx| {
+                    this.active_tab = if key.as_ref() == "settings" {
+                        SettingsTab::Settings
+                    } else {
+                        SettingsTab::Stats
+                    };
+                    cx.notify();
+                });
+            });
 
         let header = div()
             .flex()
@@ -1237,31 +1211,15 @@ impl HudView {
                             .p(px(2.0))
                             .rounded(r_section())
                             .bg(theme::transparent())
-                            .child(tab_btn(
-                                "tab_stats",
-                                "History",
-                                self.active_tab == SettingsTab::Stats,
-                                SettingsTab::Stats,
-                                cx,
-                            ))
-                            .child(tab_btn(
-                                "tab_settings",
-                                "Settings",
-                                self.active_tab == SettingsTab::Settings,
-                                SettingsTab::Settings,
-                                cx,
-                            )),
+                            .child(panel_tabs),
                     )
                     .child(
-                        controls::ghost_button("close_settings_btn", "Close")
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|_, _, _, cx| cx.stop_propagation()),
-                            )
-                            .on_click(cx.listener(|this, _, _, cx| {
+                        controls::ghost_button("close_settings_btn", "Close").on_click(
+                            cx.listener(|this, _, _, cx| {
                                 this.close_stats_settings(cx);
                                 cx.notify();
-                            })),
+                            }),
+                        ),
                     ),
             );
 
@@ -1282,11 +1240,17 @@ impl HudView {
             .w_full()
             .min_h(px(0.0));
         let faded_content = if self.active_tab == SettingsTab::Stats {
-            faded_content.overflow_hidden()
+            faded_content.overflow_hidden().child(content)
         } else {
-            faded_content.overflow_y_scroll()
+            faded_content.overflow_hidden().child(
+                ScrollArea::new("settings_scroll")
+                    .shadows()
+                    .flex_1()
+                    .w_full()
+                    .min_h(px(0.0))
+                    .child(content),
+            )
         };
-        let faded_content = faded_content.child(content);
         let faded_content = if client_animations_enabled() {
             faded_content
                 .with_animation(
@@ -1325,9 +1289,9 @@ impl HudView {
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 if event.keystroke.key == "tab" && !this.hotkey_capturing {
                     if event.keystroke.modifiers.shift {
-                        window.focus_prev();
+                        window.focus_prev(cx);
                     } else {
-                        window.focus_next();
+                        window.focus_next(cx);
                     }
                     cx.stop_propagation();
                     cx.notify();
@@ -1347,58 +1311,38 @@ impl HudView {
             .child({
                 let panel = panel_body
                     .when_some(self.recovery_message.clone(), |panel, message| {
-                        panel.child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .flex_none()
-                                .gap(px(6.0))
-                                .p(px(8.0))
-                                .rounded(r_chip())
-                                .bg(well())
-                                .child(
-                                    div()
-                                        .text_size(px(TYPE_DESC))
-                                        .line_height(px(16.0))
-                                        .text_color(gold())
-                                        .child(message.clone()),
-                                )
-                                .child(
-                                    div()
-                                        .flex()
-                                        .flex_wrap()
-                                        .gap(px(6.0))
-                                        .when(
-                                            message.to_lowercase().contains("microphone"),
-                                            |row| {
-                                                row.child(
-                                                    controls::secondary_button(
-                                                        "retry_microphone",
-                                                        "Retry microphone",
-                                                    )
-                                                    .on_click(cx.listener(|this, _, _, cx| {
-                                                        this.retry_microphone = true;
-                                                        cx.notify();
-                                                    })),
-                                                )
-                                            },
-                                        )
-                                        .child(
-                                            controls::ghost_button("dismiss_notice", "Dismiss")
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.recovery_message = None;
-                                                    if matches!(
-                                                        this.status,
-                                                        HudStatus::Error { .. }
-                                                            | HudStatus::NoSpeech
-                                                    ) {
-                                                        this.status = HudStatus::Idle;
-                                                    }
-                                                    cx.notify();
-                                                })),
-                                        ),
-                                ),
-                        )
+                        let retry = message.to_lowercase().contains("microphone");
+                        let hud = cx.entity();
+                        let mut alert = Alert::new("recovery", Severity::Warning, "Action needed")
+                            .body(message)
+                            .on_dismiss({
+                                let hud = hud.clone();
+                                move |_, cx| {
+                                    let _ = hud.update(cx, |this, cx| {
+                                        this.recovery_message = None;
+                                        if matches!(
+                                            this.status,
+                                            HudStatus::Error { .. } | HudStatus::NoSpeech
+                                        ) {
+                                            this.status = HudStatus::Idle;
+                                        }
+                                        cx.notify();
+                                    });
+                                }
+                            });
+                        if retry {
+                            let hud = hud.clone();
+                            alert = alert.action(
+                                controls::secondary_button("retry_microphone", "Retry microphone")
+                                    .on_click(move |_, _, cx| {
+                                        let _ = hud.update(cx, |this, cx| {
+                                            this.retry_microphone = true;
+                                            cx.notify();
+                                        });
+                                    }),
+                            );
+                        }
+                        panel.child(alert)
                     })
                     .child(faded_content);
                 if client_animations_enabled() {
@@ -1619,14 +1563,12 @@ impl HudView {
                                 cx.notify();
                             }),
                         ))
-                        .child(
-                            controls::secondary_button("confirm_clear", "Clear")
-                                .text_color(love())
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.clear_recents();
-                                    cx.notify();
-                                })),
-                        ),
+                        .child(controls::danger_button("confirm_clear", "Clear").on_click(
+                            cx.listener(|this, _, _, cx| {
+                                this.clear_recents();
+                                cx.notify();
+                            }),
+                        )),
                 )
                 .into_any_element()
         });
@@ -1646,15 +1588,19 @@ impl HudView {
             .child(history_header)
             .when_some(confirm, |section, card| section.child(card))
             .child(
-                div()
-                    .id("history_scroller")
-                    .flex()
-                    .flex_col()
+                ScrollArea::new("history_scroller")
+                    .shadows()
                     .flex_1()
+                    .w_full()
                     .min_h(px(0.0))
-                    .overflow_y_scroll()
-                    .gap(px(GAP_TIGHT))
-                    .children(history_items),
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .w_full()
+                            .gap(px(GAP_TIGHT))
+                            .children(history_items),
+                    ),
             );
 
         div()
@@ -1675,29 +1621,18 @@ impl HudView {
             controls::setting_row(title, subtitle, trailing)
         };
 
-        let on = is_auto_paste;
-        let epoch = self.toggle_epoch;
-        let animate_toggle = epoch > 0 && client_animations_enabled();
-        let knob = controls::toggle_knob();
-        let knob = if animate_toggle {
-            knob.with_animation(
-                ElementId::NamedInteger("toggle_knob".into(), epoch),
-                Animation::new(Duration::from_millis(MOTION_MS)).with_easing(ease_out_quint()),
-                move |knob, progress| knob.ml(px(toggle_offset(on, progress))),
-            )
-            .into_any_element()
-        } else {
-            knob.ml(px(toggle_offset(on, 1.0))).into_any_element()
-        };
-        let toggle_track = controls::toggle_hit(
-            "auto_paste_hit_target",
-            controls::toggle_track(is_auto_paste, knob),
-        )
-        .on_click(cx.listener(|this, _, _, cx| {
-            this.toggle_auto_paste();
-            cx.notify();
-        }));
-
+        let hud = cx.entity();
+        let auto_paste_switch = Switch::new("auto_paste", is_auto_paste).on_change({
+            let hud = hud.clone();
+            move |on, _, cx| {
+                let _ = hud.update(cx, |this, cx| {
+                    if this.auto_paste_enabled != on {
+                        this.toggle_auto_paste();
+                    }
+                    cx.notify();
+                });
+            }
+        });
         let auto_paste_row = settings_row(
             "Auto-paste",
             if is_auto_paste {
@@ -1706,38 +1641,24 @@ impl HudView {
                 "Copy text to clipboard without inserting it."
             }
             .to_string(),
-            toggle_track.into_any_element(),
+            auto_paste_switch.into_any_element(),
         );
 
-        let startup_on = self.autostart_enabled;
-        let startup_epoch = self.startup_epoch;
-        let animate_startup = startup_epoch > 0 && client_animations_enabled();
-        let startup_knob = controls::toggle_knob();
-        let startup_knob = if animate_startup {
-            startup_knob
-                .with_animation(
-                    ElementId::NamedInteger("startup_knob".into(), startup_epoch),
-                    Animation::new(Duration::from_millis(MOTION_MS)).with_easing(ease_out_quint()),
-                    move |knob, progress| knob.ml(px(toggle_offset(startup_on, progress))),
-                )
-                .into_any_element()
-        } else {
-            startup_knob
-                .ml(px(toggle_offset(startup_on, 1.0)))
-                .into_any_element()
-        };
-        let startup_toggle = controls::toggle_hit(
-            "autostart_hit_target",
-            controls::toggle_track(self.autostart_enabled, startup_knob),
-        )
-        .on_click(cx.listener(|this, _, _, cx| {
-            this.toggle_autostart();
-            cx.notify();
-        }));
+        let startup_switch = Switch::new("start_with_windows", self.autostart_enabled).on_change({
+            let hud = hud.clone();
+            move |on, _, cx| {
+                let _ = hud.update(cx, |this, cx| {
+                    if this.autostart_enabled != on {
+                        this.toggle_autostart();
+                    }
+                    cx.notify();
+                });
+            }
+        });
         let startup_row = settings_row(
             "Start with Windows",
             "Launch TDT when you sign in".to_string(),
-            startup_toggle.into_any_element(),
+            startup_switch.into_any_element(),
         );
 
         let languages = [
@@ -1748,43 +1669,26 @@ impl HudView {
             ("ko", "Korean"),
             ("yue", "Cantonese"),
         ];
-
-        let mut lang_buttons = Vec::new();
-        for (i, (code, label)) in languages.iter().enumerate() {
-            let is_selected = self.selected_language == *code;
-            let code_str = code.to_string();
-
-            lang_buttons.push(
-                controls::choice_chip(
-                    ElementId::NamedInteger("lang_btn".into(), i as u64),
-                    *label,
-                    is_selected,
-                )
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.select_language(&code_str);
+        let selected_language = self.selected_language.clone();
+        let language_chips = ChoiceChips::new(
+            "language",
+            languages.map(|(code, label)| Choice::new(code, label)),
+        )
+        .selected([selected_language.as_str()])
+        .on_change({
+            let hud = hud.clone();
+            move |values, _, cx| {
+                let Some(code) = values.first().cloned() else {
+                    return;
+                };
+                let _ = hud.update(cx, |this, cx| {
+                    if this.selected_language != code.as_ref() {
+                        this.select_language(&code);
+                    }
                     cx.notify();
-                })),
-            );
-        }
-
-        let language_row = {
-            let mut rows = Vec::new();
-            let mut row = Vec::new();
-            for button in lang_buttons {
-                row.push(button.into_any_element());
-                if row.len() == 3 {
-                    rows.push(controls::chip_row(std::mem::take(&mut row)));
-                }
+                });
             }
-            if !row.is_empty() {
-                rows.push(controls::chip_row(row));
-            }
-            controls::labeled_block(
-                "Language",
-                "Auto-detect, or lock to one language",
-                [controls::chip_well(rows).into_any_element()],
-            )
-        };
+        });
 
         let capturing = self.hotkey_capturing;
         let hotkey_sub = if capturing {
@@ -1834,7 +1738,7 @@ impl HudView {
             })
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.toggle_hotkey_capture();
-                window.focus(&this.panel_focus);
+                window.focus(&this.panel_focus, cx);
                 cx.notify();
             }));
 
@@ -1904,35 +1808,26 @@ impl HudView {
         } else {
             controls::secondary_button("check_updates_btn", update_action)
         };
+        let update_btn =
+            update_btn
+                .disabled(update_busy)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if matches!(
+                        *this.update.lock(),
+                        UpdatePhase::Checking | UpdatePhase::Downloading { .. }
+                    ) {
+                        return;
+                    }
+                    this.start_update_install();
+                    cx.notify();
+                }));
         let update_meter = match &phase {
-            UpdatePhase::Downloading { done, total } => Some(controls::progress_bar(*done, *total)),
+            UpdatePhase::Downloading { done, total } => {
+                Some(controls::progress_bar("update_progress", *done, *total))
+            }
             _ => None,
         };
-        let update_row = div()
-            .flex()
-            .flex_col()
-            .w_full()
-            .gap(px(GAP_TIGHT))
-            .child(settings_row(
-                "Updates",
-                update_sub,
-                update_btn
-                    .when(update_busy, |btn| btn.text_color(muted()).bg(well()))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if matches!(
-                            *this.update.lock(),
-                            UpdatePhase::Checking | UpdatePhase::Downloading { .. }
-                        ) {
-                            return;
-                        }
-                        this.start_update_install();
-                        cx.notify();
-                    }))
-                    .into_any_element(),
-            ))
-            .when_some(update_meter, |row, meter| {
-                row.child(div().px(px(2.0)).child(meter))
-            });
+        let update_row = settings_row("Updates", update_sub, update_btn.into_any_element());
 
         let spec = models::resolve(&self.selected_model);
         let installed = self.installed_models.iter().any(|id| id == spec.id);
@@ -1998,33 +1893,28 @@ impl HudView {
             _ if installed => format!("Installed: {}. Select to use it.", spec.label),
             _ => format!("{}, not downloaded, {}", spec.label, spec.size_label),
         };
-        let mut model_buttons = Vec::new();
-        for (i, option) in CATALOG.iter().enumerate() {
-            let is_selected = self.selected_model == option.id;
-            let option_id = option.id;
-            model_buttons.push(
-                controls::choice_chip(
-                    ElementId::NamedInteger("model_btn".into(), i as u64),
-                    option.label,
-                    is_selected,
-                )
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.select_model(option_id);
+        let selected_model = self.selected_model.clone();
+        let model_chips = ChoiceChips::new(
+            "model",
+            CATALOG
+                .iter()
+                .map(|option| Choice::new(option.id, option.label)),
+        )
+        .selected([selected_model.as_str()])
+        .on_change({
+            let hud = hud.clone();
+            move |values, _, cx| {
+                let Some(id) = values.first().cloned() else {
+                    return;
+                };
+                let _ = hud.update(cx, |this, cx| {
+                    if this.selected_model != id.as_ref() {
+                        this.select_model(&id);
+                    }
                     cx.notify();
-                })),
-            );
-        }
-        let mut model_rows = Vec::new();
-        let mut row = Vec::new();
-        for button in model_buttons {
-            row.push(button.into_any_element());
-            if row.len() == 2 {
-                model_rows.push(controls::chip_row(std::mem::take(&mut row)));
+                });
             }
-        }
-        if !row.is_empty() {
-            model_rows.push(controls::chip_row(row));
-        }
+        });
         let download_action = match &phase {
             DownloadPhase::Downloading { done, total, .. } => {
                 format!("{}%", models::percent(*done, *total))
@@ -2035,128 +1925,110 @@ impl HudView {
         let show_download = !installed || matches!(phase, DownloadPhase::Failed { .. });
         let model_meter = match &phase {
             DownloadPhase::Downloading { done, total, .. } => {
-                Some(controls::progress_bar(*done, *total))
+                Some(controls::progress_bar("model_progress", *done, *total))
             }
             _ => None,
         };
-        let mut model_body = vec![controls::chip_well(model_rows).into_any_element()];
-        if self.model_loading.as_deref() != Some(spec.id) {
-            if let Some(active) = self
-                .active_model
+        let running_note = if self.model_loading.as_deref() != Some(spec.id) {
+            self.active_model
                 .as_ref()
                 .filter(|active| active.as_str() != self.selected_model)
-            {
-                let note = if installed {
-                    format!("{} is still running.", models::resolve(active).label)
-                } else {
-                    format!(
-                        "{} keeps running until you download this model.",
-                        models::resolve(active).label
-                    )
-                };
-                model_body.push(
-                    div()
-                        .text_size(px(TYPE_DESC))
-                        .text_color(foam())
-                        .child(note)
-                        .into_any_element(),
-                );
-            }
-        }
-        if !self.model_ready() {
-            model_body.insert(0, div().text_size(px(TYPE_DESC)).line_height(px(16.0)).text_color(gold()).child(format!("Set up dictation: download {} to get started. Setup needs internet; your speech stays on this device.", models::DEFAULT.label)).into_any_element());
-        }
-        if installed
+                .map(|active| {
+                    if installed {
+                        format!("{} is still running.", models::resolve(active).label)
+                    } else {
+                        format!(
+                            "{} keeps running until you download this model.",
+                            models::resolve(active).label
+                        )
+                    }
+                })
+        } else {
+            None
+        };
+        let setup_note = if self.model_ready() {
+            None
+        } else {
+            Some(format!(
+                "Download {} to get started. Setup needs internet; your speech stays on this device.",
+                models::DEFAULT.label
+            ))
+        };
+        let show_activate = installed
             && self.active_model.as_deref() != Some(spec.id)
-            && self.model_loading.is_none()
-        {
-            model_body.push(
-                controls::secondary_button("activate_model", "Use this model")
-                    .on_click(cx.listener(|this, _, _, cx| {
+            && self.model_loading.is_none();
+
+        let mut recognition = SettingsSection::new("Recognition")
+            .description("What recognizes your speech.")
+            .row(
+                SettingsRow::new("Model")
+                    .description(model_sub)
+                    .control(model_chips),
+            );
+        if let Some(note) = setup_note {
+            recognition = recognition.row(SettingsRow::new("Setup").description(note));
+        }
+        if let Some(note) = running_note {
+            recognition = recognition.row(SettingsRow::new("Current model").description(note));
+        }
+        if show_activate {
+            recognition = recognition.row(SettingsRow::new("Switch").control(
+                controls::secondary_button("activate_model", "Use this model").on_click(
+                    cx.listener(|this, _, _, cx| {
                         let id = this.selected_model.clone();
                         this.install_engine(&id);
                         cx.notify();
-                    }))
-                    .into_any_element(),
-            );
+                    }),
+                ),
+            ));
         }
         if let Some(meter) = model_meter {
-            model_body.push(meter);
+            recognition = recognition.row(SettingsRow::new("Download progress").control(meter));
         }
         if show_download {
-            model_body.push(
-                controls::secondary_button("download_model_btn", download_action)
-                    .when(downloading, |button| button.text_color(muted()).bg(well()))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.start_model_download();
-                        cx.notify();
-                    }))
-                    .into_any_element(),
+            recognition = recognition.row(
+                SettingsRow::new("Get model").control(
+                    controls::secondary_button("download_model_btn", download_action)
+                        .loading(downloading)
+                        .disabled(downloading)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.start_model_download();
+                            cx.notify();
+                        })),
+                ),
             );
         }
-        let model_row = controls::labeled_block("Model", model_sub, model_body);
+        recognition = recognition.row(
+            SettingsRow::new("Language")
+                .description("Auto-detect, or lock to one language.")
+                .control(language_chips),
+        );
+
+        let mut app_section = SettingsSection::new("App").row(startup_row).row(update_row);
+        if let Some(meter) = update_meter {
+            app_section = app_section.row(SettingsRow::new("Update progress").control(meter));
+        }
 
         div()
             .flex()
             .flex_col()
             .w_full()
             .gap(px(GAP_SECTION))
-            .child(controls::grouped_section(
-                "Dictation",
-                [
-                    hotkey_row.into_any_element(),
-                    auto_paste_row.into_any_element(),
-                ],
-            ))
             .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .w_full()
-                    .gap(px(GAP_SECTION))
-                    .child(controls::section_label("Recognition"))
-                    .child(model_row)
-                    .when_some(self.model_error.clone(), |view, error| {
-                        view.child(
-                            div()
-                                .px(px(2.0))
-                                .text_size(px(TYPE_DESC))
-                                .line_height(px(15.0))
-                                .text_color(love())
-                                .child(error),
-                        )
-                    })
-                    .child(language_row),
+                SettingsSection::new("Dictation")
+                    .description("How dictation starts, and where the text goes.")
+                    .row(hotkey_row)
+                    .row(auto_paste_row),
             )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .w_full()
-                    .gap(px(GAP_TIGHT))
-                    .child(controls::section_label("App"))
-                    .child(startup_row)
-                    .when_some(self.autostart_error.clone(), |view, error| {
-                        view.child(
-                            div()
-                                .text_size(px(TYPE_DESC))
-                                .text_color(love())
-                                .child(error),
-                        )
-                    })
-                    .child(update_row),
-            )
+            .child(recognition)
+            .when_some(self.model_error.clone(), |column, error| {
+                column.child(InlineMessage::new(Severity::Danger, error))
+            })
+            .child(app_section)
+            .when_some(self.autostart_error.clone(), |column, error| {
+                column.child(InlineMessage::new(Severity::Danger, error))
+            })
             .into_any_element()
-    }
-}
-
-fn toggle_offset(on: bool, progress: f32) -> f32 {
-    let progress = progress.clamp(0.0, 1.0);
-    let travel = 16.0;
-    if on {
-        travel * progress
-    } else {
-        travel * (1.0 - progress)
     }
 }
 
@@ -2213,28 +2085,13 @@ const _: () = assert!(SETTINGS_SURFACE_HEIGHT <= BUBBLE_HEIGHT - 14.0);
 #[cfg(test)]
 mod motion_tests {
     use super::{
-        history_text_overflows, toggle_offset, window_hidden_for_mode, WindowViewMode,
-        HISTORY_EXPAND_CHARS,
+        history_text_overflows, window_hidden_for_mode, WindowViewMode, HISTORY_EXPAND_CHARS,
     };
 
     #[test]
     fn closing_settings_keeps_the_bubble_on_screen() {
         assert!(!window_hidden_for_mode(WindowViewMode::StatsAndSettings));
         assert!(!window_hidden_for_mode(WindowViewMode::Bubble));
-    }
-
-    #[test]
-    fn toggle_finishes_inside_track_in_both_directions() {
-        assert_eq!(toggle_offset(true, 0.0), 0.0);
-        assert_eq!(toggle_offset(true, 1.0), 16.0);
-        assert_eq!(toggle_offset(false, 0.0), 16.0);
-        assert_eq!(toggle_offset(false, 1.0), 0.0);
-        for step in 0..=100 {
-            let progress = step as f32 / 100.0;
-            for on in [true, false] {
-                assert!((0.0..=16.0).contains(&toggle_offset(on, progress)));
-            }
-        }
     }
 
     #[test]
