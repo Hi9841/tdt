@@ -14,6 +14,8 @@ mod update;
 
 use audio::{play_sound, AudioRecorder, SoundEffect, SpeechTail, MAX_TAIL, VIS_BARS};
 use config::{AppConfig, AppStats};
+use ely_gpui_component::theme::{Mode, Theme};
+use ely_gpui_component::Assets;
 use gpui::*;
 use hotkey::{
     current_binding, input_appeared, input_mask, is_modifier_vk, note_user_typed,
@@ -257,14 +259,17 @@ fn main() {
         }
     };
 
-    // 5. Launch GPUI application with floating bubble window
-    let app = Application::new();
+    // 5. Launch GPUI application with floating bubble window.
+    // Ely's components read fonts and colors registered by init.
+    let app = gpui_platform::application().with_assets(Assets);
     let recorder_clone = Rc::clone(&recorder);
     let injector_clone = Arc::clone(&injector);
     let stt_clone = stt_engine.clone();
     let stt_for_view = stt_engine.clone();
 
     app.run(move |cx: &mut App| {
+        ely_gpui_component::init(cx);
+        Theme::set_mode_now(Mode::Dark, cx);
         // Windows requires the event loop to exist before creating the tray icon.
         let mut tray = if preview::is_active() && !preview::wants_tray() { None } else { match SystemTray::new(auto_paste, &hotkey_label) {
             Ok(tray) => Some(tray),
