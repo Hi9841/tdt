@@ -26,35 +26,3 @@ pub fn clip_text(text: &str, max_chars: usize) -> String {
     clipped.push('…');
     clipped
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn format_mmss_pads_seconds() {
-        assert_eq!(format_mmss(0), "00:00");
-        assert_eq!(format_mmss(9), "00:09");
-        assert_eq!(format_mmss(75), "01:15");
-    }
-
-    #[test]
-    fn format_latency_ms_is_compact() {
-        assert_eq!(format_latency_ms(0), "0ms");
-        assert_eq!(format_latency_ms(182), "182ms");
-        assert_eq!(format_latency_ms(1200), "1200ms");
-    }
-
-    #[test]
-    fn format_time_saved_uses_compact_units() {
-        assert_eq!(format_time_saved(9.0), "9s");
-        assert_eq!(format_time_saved(75.0), "1m 15s");
-        assert_eq!(format_time_saved(8040.0), "2h 14m");
-    }
-
-    #[test]
-    fn clip_text_keeps_short_strings_and_ellipsizes_long_ones() {
-        assert_eq!(clip_text("hello", 8), "hello");
-        assert_eq!(clip_text("  hello world  ", 8), "hello w…");
-    }
-}

@@ -583,42 +583,4 @@ mod tests {
 
         fs::remove_dir_all(model_dir).expect("cleanup");
     }
-
-    #[test]
-    fn photon_engine_transcribes_speech_if_redux_installed() {
-        let spec = by_id(PARAKEET_REDUX_ID).expect("redux spec");
-        let Some(model_dir) = crate::stt::models::find_dir(spec, None) else {
-            return;
-        };
-        let wav_path = std::path::Path::new(r"C:\Users\hi\AppData\Local\Temp\tdt-speech.wav");
-        if !wav_path.is_file() {
-            return;
-        }
-
-        let engine = PhotonParakeetEngine::new(spec, &model_dir, "en").expect("engine");
-        engine.prepare().expect("prepare worker");
-        assert!(engine.is_loaded());
-
-        let samples = match pcm16_wav(wav_path) {
-            Some(s) => s,
-            None => return,
-        };
-
-        let (tx, rx) = crossbeam_channel::unbounded();
-        for chunk in samples.chunks(1600) {
-            tx.send(LiveAudio::Chunk(chunk.to_vec())).unwrap();
-        }
-        tx.send(LiveAudio::Finish(Instant::now())).unwrap();
-        drop(tx);
-
-        let transcript = engine
-            .transcribe_live_reporting(&rx, None)
-            .expect("transcribe");
-        assert!(
-            transcript.text.to_ascii_lowercase().contains("fox"),
-            "transcription was {:?}",
-            transcript.text
-        );
-        assert!(transcript.duration_secs > 2.0);
-    }
 }

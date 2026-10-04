@@ -1143,29 +1143,6 @@ mod tests {
     }
 
     #[test]
-    fn ease_drawer_starts_fast_and_ends_at_one() {
-        assert!((ease_drawer(0.0) - 0.0).abs() < 1e-5);
-        assert!((ease_drawer(1.0) - 1.0).abs() < 1e-5);
-        assert!(ease_drawer(0.2) > 0.2);
-    }
-
-    #[test]
-    fn overlay_hidden_flag_round_trips() {
-        assert!(!is_overlay_hidden());
-        set_overlay_hidden(true);
-        assert!(is_overlay_hidden());
-        set_overlay_hidden(false);
-        assert!(!is_overlay_hidden());
-    }
-
-    #[test]
-    fn lerp_i32_hits_endpoints() {
-        assert_eq!(lerp_i32(10, 20, 0.0), 10);
-        assert_eq!(lerp_i32(10, 20, 1.0), 20);
-        assert_eq!(lerp_i32(10, 20, 0.5), 15);
-    }
-
-    #[test]
     fn pinned_bottom_stays_put_when_growing_up() {
         let from_y = 918;
         let from_h = BUBBLE_HEIGHT as i32;

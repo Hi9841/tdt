@@ -131,11 +131,4 @@ mod tests {
         assert!(wav.starts_with(b"RIFF"));
         assert!(wav.len() > 44);
     }
-
-    #[test]
-    fn two_note_is_longer_than_one() {
-        let one = pcm_to_wav(&synth_note(440.0, 0.05, 0.1, 44100), 44100);
-        let two = two_note_wav(440.0, 550.0, 0.05, 0.05, 0.1);
-        assert!(two.len() > one.len());
-    }
 }

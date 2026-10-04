@@ -18,8 +18,7 @@ use ely_gpui_component::Assets;
 use gpui::*;
 use hotkey::{
     current_binding, input_appeared, input_mask, is_modifier_vk, note_user_typed,
-    poll_capture_timeout, set_binding, tap_should_stop, user_typed, HotkeyAction, HotkeyBinding,
-    HotkeyListener,
+    poll_capture_timeout, set_binding, user_typed, HotkeyAction, HotkeyBinding, HotkeyListener,
 };
 use parking_lot::Mutex;
 use paste::{DeliveryOutcome, EarlyClaim, PasteGate, PasteInjector};
@@ -690,7 +689,7 @@ fn main() {
                                     // started, otherwise it has just started one.
                                     let should_stop = if matches!(action, HotkeyAction::Toggled)
                                     {
-                                        let stop = tap_should_stop(recording_before_press);
+                                        let stop = recording_before_press;
                                         recording_before_press = false;
                                         stop
                                     } else {

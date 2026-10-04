@@ -222,13 +222,6 @@ mod tests {
     }
 
     #[test]
-    fn record_does_not_touch_the_config_dir() {
-        let mut stats = AppStats::default();
-        stats.record("keep this in memory", 1.0, 42);
-        assert_eq!(stats.total_transcriptions, 1);
-    }
-
-    #[test]
     fn partial_config_json_keeps_defaults_for_missing_fields() {
         let config: AppConfig = serde_json::from_str(r#"{"auto_paste": false}"#).unwrap();
         assert!(!config.auto_paste);

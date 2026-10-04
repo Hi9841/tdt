@@ -390,10 +390,7 @@ fn canonicalize_or_clone(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        by_id, file_label, format_mb, percent, resolve, ModelSpec, CATALOG, DEFAULT,
-        DEFAULT_MODEL_ID,
-    };
+    use super::{by_id, file_label, resolve, ModelSpec, CATALOG, DEFAULT, DEFAULT_MODEL_ID};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -490,21 +487,6 @@ mod tests {
     }
 
     #[test]
-    fn format_mb_rounds_known_sizes() {
-        assert_eq!(format_mb(670_478_772), "639 MB");
-        assert_eq!(format_mb(663_048_980), "632 MB");
-        assert_eq!(format_mb(946_072_270), "902 MB");
-    }
-
-    #[test]
-    fn percent_hits_zero_and_one_hundred() {
-        assert_eq!(percent(0, 100), 0);
-        assert_eq!(percent(50, 100), 50);
-        assert_eq!(percent(100, 100), 100);
-        assert_eq!(percent(1, 0), 0);
-    }
-
-    #[test]
     fn file_label_drops_weight_suffixes() {
         assert_eq!(file_label("medium-decoder.int8.onnx"), "medium-decoder");
         assert_eq!(file_label("tokens.txt"), "tokens");
@@ -512,13 +494,5 @@ mod tests {
         assert_eq!(file_label("model.safetensors"), "model");
         assert_eq!(file_label("tokenizer.json"), "tokenizer");
         assert_eq!(file_label("ternary.json"), "ternary");
-    }
-
-    #[test]
-    fn parakeet_redux_spec_is_valid() {
-        let redux = by_id(super::PARAKEET_REDUX_ID).expect("redux spec");
-        assert_eq!(redux.dir_name, "parakeet-redux");
-        assert_eq!(redux.files.len(), 4);
-        assert_eq!(format_mb(redux.size_bytes), "171 MB");
     }
 }

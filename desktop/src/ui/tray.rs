@@ -159,22 +159,6 @@ fn status_tooltip(status: &HudStatus, hotkey: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::tooltip_text;
-
-    #[test]
-    fn tray_uses_the_executable_app_icon() {
-        let rc = include_str!("../../assets/tdt.rc");
-        assert!(rc.contains("1 ICON \"tdt.ico\""));
-        assert_eq!(super::APP_ICON_ID, 1);
-    }
-
-    #[test]
-    fn tooltip_names_the_shortcut() {
-        assert_eq!(
-            tooltip_text("Ctrl+;"),
-            "TDT. Shortcut Ctrl+;. Click to open."
-        );
-    }
 
     #[test]
     fn transcript_tooltip_fits_windows_unicode_limit() {

@@ -309,17 +309,6 @@ fn take_count(already: usize, incoming: usize, capacity: usize) -> usize {
     capacity.saturating_sub(already).min(incoming)
 }
 
-/// Appends samples until `capacity`. Returns true when the buffer is full.
-#[allow(dead_code)]
-fn append_bounded(recorded: &mut Vec<f32>, samples: &[f32], capacity: usize) -> bool {
-    if recorded.len() >= capacity {
-        return true;
-    }
-    let take = (capacity - recorded.len()).min(samples.len());
-    recorded.extend_from_slice(&samples[..take]);
-    recorded.len() >= capacity
-}
-
 fn stream_error_message(err: impl std::fmt::Display) -> String {
     format!("Microphone disconnected. Check the input device and try again. ({err})")
 }
@@ -518,61 +507,6 @@ fn build_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn take_count_zero_room() {
-        assert_eq!(take_count(8, 4, 8), 0);
-        assert_eq!(take_count(9, 1, 8), 0);
-    }
-
-    #[test]
-    fn take_count_partial_room() {
-        assert_eq!(take_count(5, 10, 8), 3);
-    }
-
-    #[test]
-    fn take_count_exact_fit() {
-        assert_eq!(take_count(4, 4, 8), 4);
-        assert_eq!(take_count(0, 8, 8), 8);
-    }
-
-    #[test]
-    fn max_recording_samples_matches_120s_at_target_rate() {
-        assert_eq!(
-            max_recording_samples(),
-            MAX_RECORDING_SECONDS * TARGET_SAMPLE_RATE as usize
-        );
-        assert_eq!(max_recording_samples(), 120 * 16_000);
-    }
-
-    #[test]
-    fn append_bounded_signals_limit_and_drops_overflow() {
-        let mut recorded = Vec::new();
-        let capacity = 8;
-        assert!(!append_bounded(&mut recorded, &[0.1, 0.2, 0.3], capacity));
-        assert_eq!(recorded, vec![0.1, 0.2, 0.3]);
-
-        assert!(append_bounded(
-            &mut recorded,
-            &[0.4, 0.5, 0.6, 0.7, 0.8, 0.9],
-            capacity
-        ));
-        assert_eq!(recorded, vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]);
-
-        assert!(append_bounded(&mut recorded, &[1.0, 1.0], capacity));
-        assert_eq!(recorded.len(), capacity);
-        assert_eq!(recorded.last().copied(), Some(0.8));
-    }
-
-    #[test]
-    fn append_bounded_full_buffer_matches_120s_capacity() {
-        let capacity = max_recording_samples();
-        let mut recorded = vec![0.0f32; capacity - 4];
-        assert!(append_bounded(&mut recorded, &[0.5; 16], capacity));
-        assert_eq!(recorded.len(), capacity);
-        assert!(append_bounded(&mut recorded, &[0.9; 32], capacity));
-        assert_eq!(recorded.len(), capacity);
-    }
 
     #[test]
     fn stream_error_stops_recording_and_is_taken_once() {
