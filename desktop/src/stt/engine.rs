@@ -22,8 +22,8 @@ pub struct SttEngine {
 }
 
 impl SttEngine {
-    pub fn new(spec: &ModelSpec, model_dir: &Path, language: &str) -> Result<Self, String> {
-        let inner = PhotonParakeetEngine::new(spec, model_dir, language)?;
+    pub fn new(spec: &ModelSpec, model_dir: &Path) -> Result<Self, String> {
+        let inner = PhotonParakeetEngine::new(spec, model_dir)?;
         Ok(Self { inner })
     }
 
@@ -41,10 +41,6 @@ impl SttEngine {
     #[allow(dead_code)]
     pub fn release(&self) {
         self.inner.release();
-    }
-
-    pub fn set_language(&self, language: &str) -> Result<(), String> {
-        self.inner.set_language(language)
     }
 
     #[cfg(test)]
@@ -126,7 +122,7 @@ mod tests {
         if !DEFAULT.is_installed_in(&dir) {
             return;
         }
-        let engine = SttEngine::new(DEFAULT, &dir, "en").expect("engine");
+        let engine = SttEngine::new(DEFAULT, &dir).expect("engine");
         engine.prepare().expect("load");
         assert!(engine.is_loaded());
     }
@@ -140,7 +136,7 @@ mod tests {
                 .expect("placeholder model should be written");
         }
 
-        let engine = SttEngine::new(DEFAULT, &model_dir, "auto")
+        let engine = SttEngine::new(DEFAULT, &model_dir)
             .expect("construction should validate paths without loading model");
 
         assert!(!engine.is_loaded(), "model must stay unloaded while idle");

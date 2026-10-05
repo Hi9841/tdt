@@ -47,7 +47,7 @@ fn bench_model(spec: &ModelSpec, clips: &[Clip]) {
     };
 
     let t0 = Instant::now();
-    let Ok(engine) = SttEngine::new(spec, &model_dir, "en") else {
+    let Ok(engine) = SttEngine::new(spec, &model_dir) else {
         println!("Failed to create engine.");
         return;
     };

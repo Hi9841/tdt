@@ -103,7 +103,6 @@ pub struct HudView {
     expanded_history_key: Option<String>,
     pub copied_at: Option<Instant>,
     pub injector: PasteInjector,
-    pub selected_language: String,
     pub selected_model: String,
     pub stt_engine: SharedEngine,
     pub auto_paste_state: Arc<Mutex<bool>>,
@@ -154,7 +153,6 @@ impl HudView {
         } else {
             AppConfig::load()
         };
-        let selected_language = config.language.clone();
         let selected_model = models::resolve(&config.model_id).id.to_string();
         let active_model = stt_engine.lock().is_some().then(|| selected_model.clone());
         let installed_models = CATALOG
@@ -185,7 +183,6 @@ impl HudView {
             expanded_history_key: None,
             copied_at: None,
             injector: PasteInjector::new(),
-            selected_language,
             selected_model,
             stt_engine,
             auto_paste_state,
@@ -229,7 +226,7 @@ impl HudView {
         self.auto_paste_enabled = true;
         self.autostart_enabled = false;
         self.autostart_error = None;
-        self.selected_language = "auto".into();
+
         self.selected_model = models::DEFAULT_MODEL_ID.into();
         self.hotkey_capturing = false;
         *self.model_phase.lock() = DownloadPhase::Idle;
@@ -356,9 +353,6 @@ impl HudView {
                     "Could not change startup. Check Windows startup permissions and try again."
                         .into(),
                 );
-            }
-            PreviewSpec::PanelSettingsLang(code) => {
-                self.selected_language = code.to_string();
             }
             PreviewSpec::PanelSettingsHotkeyCapture => {
                 self.hotkey_capturing = true;
@@ -570,25 +564,6 @@ impl HudView {
         self.copied_at = Some(Instant::now());
     }
 
-    fn select_language(&mut self, code: &str) {
-        if self.model_busy() || self.model_loading.is_some() {
-            self.model_error = Some(
-                "Wait until dictation or model setup finishes before changing language.".into(),
-            );
-            return;
-        }
-        self.selected_language = code.to_string();
-        if preview::is_active() {
-            return;
-        }
-        if let Some(engine) = self.stt_engine.lock().clone() {
-            let _ = engine.set_language(code);
-        }
-        let mut cfg = AppConfig::load();
-        cfg.language = code.to_string();
-        let _ = cfg.save();
-    }
-
     fn model_busy(&self) -> bool {
         matches!(
             self.status,
@@ -661,11 +636,10 @@ impl HudView {
         };
         self.model_loading = Some(id.into());
         self.model_error = None;
-        let language = self.selected_language.clone();
         let tx = self.model_ready_tx.clone();
         let ping = self.update_ping.clone();
         std::thread::spawn(move || {
-            let result = SttEngine::new(spec, &dir, &language)
+            let result = SttEngine::new(spec, &dir)
                 .and_then(|engine| {
                     engine.prepare()?;
                     Ok(PreparedModel {
@@ -1615,35 +1589,6 @@ impl HudView {
             startup_switch.into_any_element(),
         );
 
-        let languages = [
-            ("auto", "Auto"),
-            ("en", "English"),
-            ("zh", "Chinese"),
-            ("ja", "Japanese"),
-            ("ko", "Korean"),
-            ("yue", "Cantonese"),
-        ];
-        let selected_language = self.selected_language.clone();
-        let language_chips = ChoiceChips::new(
-            "language",
-            languages.map(|(code, label)| Choice::new(code, label)),
-        )
-        .selected([selected_language.as_str()])
-        .on_change({
-            let hud = hud.clone();
-            move |values, _, cx| {
-                let Some(code) = values.first().cloned() else {
-                    return;
-                };
-                hud.update(cx, |this, cx| {
-                    if this.selected_language != code.as_ref() {
-                        this.select_language(&code);
-                    }
-                    cx.notify();
-                });
-            }
-        });
-
         let capturing = self.hotkey_capturing;
         let hotkey_sub = if capturing {
             "Press the new shortcut. Esc cancels.".to_string()
@@ -1936,21 +1881,6 @@ impl HudView {
             .when_some(self.model_error.clone(), |column, error| {
                 column.child(InlineMessage::new(Severity::Danger, error))
             })
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .w_full()
-                    .gap(px(GAP_TIGHT))
-                    .child(controls::group_label("Language"))
-                    .child(
-                        div()
-                            .text_size(px(TYPE_DESC))
-                            .text_color(muted())
-                            .child("Auto-detect, or lock to one language."),
-                    )
-                    .child(language_chips),
-            )
             .child(
                 div()
                     .flex()

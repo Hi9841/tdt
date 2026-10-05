@@ -49,7 +49,6 @@ pub enum Spec {
     PanelSettingsAutoPasteOff,
     PanelSettingsStartupOn,
     PanelSettingsStartupError,
-    PanelSettingsLang(&'static str),
     PanelSettingsHotkeyCapture,
     PanelSettingsUpdateChecking,
     PanelSettingsUpdateUpToDate,
@@ -87,11 +86,6 @@ pub const CATALOG: &[&str] = &[
     "panel.settings.autopaste.off",
     "panel.settings.startup.on",
     "panel.settings.startup.error",
-    "panel.settings.lang.en",
-    "panel.settings.lang.zh",
-    "panel.settings.lang.ja",
-    "panel.settings.lang.ko",
-    "panel.settings.lang.yue",
     "panel.settings.hotkey.capture",
     "panel.settings.update.checking",
     "panel.settings.update.uptodate",
@@ -132,11 +126,6 @@ pub fn parse_name(name: &str) -> Option<Spec> {
         "panel.settings.autopaste.off" => Spec::PanelSettingsAutoPasteOff,
         "panel.settings.startup.on" => Spec::PanelSettingsStartupOn,
         "panel.settings.startup.error" => Spec::PanelSettingsStartupError,
-        "panel.settings.lang.en" => Spec::PanelSettingsLang("en"),
-        "panel.settings.lang.zh" => Spec::PanelSettingsLang("zh"),
-        "panel.settings.lang.ja" => Spec::PanelSettingsLang("ja"),
-        "panel.settings.lang.ko" => Spec::PanelSettingsLang("ko"),
-        "panel.settings.lang.yue" => Spec::PanelSettingsLang("yue"),
         "panel.settings.hotkey.capture" => Spec::PanelSettingsHotkeyCapture,
         "panel.settings.update.checking" => Spec::PanelSettingsUpdateChecking,
         "panel.settings.update.uptodate" => Spec::PanelSettingsUpdateUpToDate,
@@ -192,7 +181,6 @@ pub fn update_phase(spec: &Spec) -> Option<UpdatePhase> {
         | Spec::PanelSettingsAutoPasteOff
         | Spec::PanelSettingsStartupOn
         | Spec::PanelSettingsStartupError
-        | Spec::PanelSettingsLang(_)
         | Spec::PanelSettingsHotkeyCapture => UpdatePhase::Idle,
         _ => return None,
     })
