@@ -21,14 +21,16 @@ use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetFocus};
 use windows::Win32::UI::Shell::{IVirtualDesktopManager, VirtualDesktopManager};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetClassNameW, GetClientRect, GetForegroundWindow, GetWindow, GetWindowLongW,
-    GetWindowRect, GetWindowThreadProcessId, IsWindow, IsWindowVisible, PostMessageW,
-    SetForegroundWindow, SetWindowLongW, SetWindowPos, ShowWindow, SystemParametersInfoW,
-    GWL_EXSTYLE, GWL_STYLE, GW_HWNDPREV, HTCAPTION, HWND_TOPMOST, SPI_GETCLIENTAREAANIMATION,
-    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
-    SWP_SHOWWINDOW, SW_HIDE, SW_SHOWNOACTIVATE, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
-    WM_NCLBUTTONDOWN, WS_CAPTION, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_THICKFRAME,
+    EnumWindows, GetClassNameW, GetClientRect, GetForegroundWindow, GetSystemMetrics, GetWindow,
+    GetWindowLongW, GetWindowRect, GetWindowThreadProcessId, IsWindow, IsWindowVisible, LoadImageW,
+    PostMessageW, SendMessageW, SetForegroundWindow, SetWindowLongW, SetWindowPos, ShowWindow,
+    SystemParametersInfoW, GWL_EXSTYLE, GWL_STYLE, GW_HWNDPREV, HTCAPTION, HWND_TOPMOST, ICON_BIG,
+    ICON_SMALL, IMAGE_ICON, LR_DEFAULTSIZE, LR_SHARED, SM_CXICON, SM_CXSMICON,
+    SPI_GETCLIENTAREAANIMATION, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOMOVE,
+    SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, SW_SHOWNOACTIVATE,
+    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WM_NCLBUTTONDOWN, WM_SETICON, WS_CAPTION,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP,
+    WS_THICKFRAME,
 };
 
 pub const BUBBLE_WIDTH: f32 = 400.0;
@@ -178,6 +180,40 @@ pub fn apply_overlay_window_style(hwnd: HWND) {
             SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOCOPYBITS | SWP_NOACTIVATE,
         );
         apply_overlay_dwm(hwnd);
+        set_window_icon(hwnd);
+    }
+}
+
+/// Put TDT's icon on the window so the taskbar, Alt-Tab, Task Manager and
+/// Start Menu search stop showing the blank default Zed::Window icon. The
+/// image is resource ordinal 1 — the same "1 ICON ..." the .lnk and tray use.
+#[cfg(target_os = "windows")]
+pub fn set_window_icon(hwnd: HWND) {
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    if hwnd.is_invalid() {
+        return;
+    }
+    unsafe {
+        let Ok(instance) = GetModuleHandleW(None) else {
+            return;
+        };
+        // MAKEINTRESOURCE(1): the ordinal declared by assets/tdt.rc.
+        const TDT_ICON: windows::core::PCWSTR = windows::core::PCWSTR(1usize as _);
+        let small = GetSystemMetrics(SM_CXSMICON).max(16);
+        let big = GetSystemMetrics(SM_CXICON).max(16);
+        if let Ok(icon) = LoadImageW(
+            instance,
+            TDT_ICON,
+            IMAGE_ICON,
+            big,
+            big,
+            LR_DEFAULTSIZE | LR_SHARED,
+        ) {
+            let _ = SendMessageW(hwnd, WM_SETICON, WPARAM(ICON_BIG as _), LPARAM(icon.0));
+        }
+        if let Ok(icon) = LoadImageW(instance, TDT_ICON, IMAGE_ICON, small, small, LR_SHARED) {
+            let _ = SendMessageW(hwnd, WM_SETICON, WPARAM(ICON_SMALL as _), LPARAM(icon.0));
+        }
     }
 }
 
