@@ -81,6 +81,7 @@ enum PythonLauncher {
 
 impl PythonLauncher {
     fn build_command(&self, script_path: &Path) -> Command {
+        #[allow(unused_mut)]
         let mut cmd = match self {
             Self::Direct(exe) => {
                 let mut c = Command::new(exe);
@@ -192,6 +193,10 @@ fn find_python_launcher() -> Result<PythonLauncher, String> {
     // 4. UV package manager (supports running without system-wide python packages)
     let uv_candidates = [
         PathBuf::from("uv"),
+        // Official installer default: %USERPROFILE%\.local\bin\uv.exe
+        directories::BaseDirs::new()
+            .map(|b| b.home_dir().join(".local").join("bin").join("uv.exe"))
+            .unwrap_or_default(),
         directories::BaseDirs::new()
             .map(|b| b.home_dir().join(".cargo").join("bin").join("uv.exe"))
             .unwrap_or_default(),
@@ -228,7 +233,7 @@ fn find_python_launcher() -> Result<PythonLauncher, String> {
         }
     }
 
-    Err("Could not find a Python runtime with moondream or the `uv` tool. Run models\\download-models.ps1 -Model parakeet-redux to set it up.".into())
+    Err("Could not find a Python runtime for the speech model. Install uv (powershell -c \"irm https://astral.sh/uv/install.ps1 | iex\") or Python with `pip install moondream`, then restart TDT.".into())
 }
 
 struct PhotonWorkerClient {
