@@ -1164,7 +1164,7 @@ dependencies = [
 
 [[package]]
 name = "coreaudio-sys"
-version = "0.2.18"
+version = "0.2.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b9b4739a805a62757a83e5654fa3faabec0442666b263bb2287d5a8185bfd953"
 dependencies = [
@@ -6622,7 +6622,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "voice-stt-desktop"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "arboard",
  "cpal",
