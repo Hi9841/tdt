@@ -46,7 +46,6 @@ pub enum HudStatus {
     NoSpeech,
     Listening {
         audio_level: f32,
-        partial: String,
         started_at: Instant,
     },
     Transcribing {
@@ -255,7 +254,6 @@ impl HudView {
             PreviewSpec::BubbleListening { loud } => {
                 self.status = HudStatus::Listening {
                     audio_level: if loud { 0.8 } else { 0.12 },
-                    partial: String::new(),
                     started_at: Instant::now() - Duration::from_secs(12),
                 };
                 self.wave_peaks = preview_wave(loud);
@@ -302,7 +300,6 @@ impl HudView {
             PreviewSpec::BubbleLimit => {
                 self.status = HudStatus::Listening {
                     audio_level: 0.5,
-                    partial: String::new(),
                     started_at: Instant::now() - Duration::from_secs(115),
                 };
                 self.wave_peaks = preview_wave(true);
@@ -922,9 +919,6 @@ impl HudView {
                 .w(px(72.0))
                 .child(controls::indeterminate_bar("bubble_transcribe"))
                 .into_any_element(),
-            HudStatus::Listening { partial, .. } if !partial.is_empty() => {
-                overlay_snippet(partial, text())
-            }
             _ => waveform,
         };
 

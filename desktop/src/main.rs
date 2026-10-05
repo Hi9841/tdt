@@ -21,7 +21,7 @@ use hotkey::{
     poll_capture_timeout, set_binding, user_typed, HotkeyAction, HotkeyBinding, HotkeyListener,
 };
 use parking_lot::Mutex;
-use paste::{DeliveryOutcome, EarlyClaim, PasteGate, PasteInjector};
+use paste::{DeliveryOutcome, PasteInjector};
 use std::cell::RefCell;
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -54,42 +54,12 @@ enum InternalEvent {
     NoSpeech,
 }
 
-fn queue_early_paste(
-    early: &Arc<PasteGate>,
-    partial: &Mutex<String>,
-    discard: &Arc<AtomicBool>,
-    auto_paste: &Mutex<bool>,
-    injector: &Arc<PasteInjector>,
-    target: Option<isize>,
-) {
-    if discard.load(Ordering::SeqCst) || !*auto_paste.lock() || user_typed() {
-        return;
-    }
-    let text = partial.lock().trim().to_string();
-    if text.is_empty() || !early.begin() {
-        return;
-    }
-    let early = Arc::clone(early);
-    let injector = Arc::clone(injector);
-    let discard = Arc::clone(discard);
-    std::thread::spawn(move || {
-        let inserted = !discard.load(Ordering::SeqCst)
-            && !user_typed()
-            && matches!(
-                injector.deliver(&text, true, target),
-                Ok(DeliveryOutcome::Pasted)
-            );
-        early.finish(text, inserted);
-    });
-}
-
 fn deliver_transcript(
     result: LiveTranscript,
     injector: Arc<PasteInjector>,
     tx: crossbeam_channel::Sender<InternalEvent>,
     should_paste: bool,
     target: Option<isize>,
-    claim: EarlyClaim,
     user_typed: bool,
 ) {
     if !result.text.trim().is_empty() {
@@ -100,7 +70,6 @@ fn deliver_transcript(
         &result.text,
         should_paste,
         target,
-        claim,
         user_typed,
     ) {
         Ok(DeliveryOutcome::NoSpeech) => {
@@ -349,8 +318,6 @@ fn main() {
                         done: Arc<AtomicBool>,
                         hit_limit: Arc<AtomicBool>,
                         discard: Arc<AtomicBool>,
-                        early: Arc<PasteGate>,
-                        partial: Arc<Mutex<String>>,
                         baseline: Option<[bool; 256]>,
                         released_at: Option<Instant>,
                     }
@@ -587,28 +554,23 @@ fn main() {
                                         let halt = Arc::new(AtomicBool::new(false));
                                         let done = Arc::new(AtomicBool::new(false));
                                         let hit_limit = Arc::new(AtomicBool::new(false));
-                                        let partial = Arc::new(Mutex::new(String::new()));
                                         let discard = Arc::new(AtomicBool::new(false));
-                                        let early = Arc::new(PasteGate::new());
                                         let (tx, rx) = crossbeam_channel::unbounded();
                                         if let Some(engine) = stt.lock().clone() {
                                             let events = internal_tx.clone();
                                             let inj_worker = Arc::clone(&inj);
                                             let paste_flag = Arc::clone(&auto_paste_flag);
                                             let target_flag = Arc::clone(&target_hwnd);
-                                            let partial_worker = Arc::clone(&partial);
                                             let discard_worker = Arc::clone(&discard);
-                                            let early_worker = Arc::clone(&early);
                                             std::thread::spawn(move || {
-                                                match engine.transcribe_live_reporting(&rx, Some(&partial_worker)) {
+                                                match engine.transcribe_live_reporting(&rx) {
                                                     Ok(result) => {
                                                         if discard_worker.load(Ordering::SeqCst) {
                                                             return;
                                                         }
                                                         let should_paste = *paste_flag.lock();
                                                         let target = *target_flag.lock();
-                                                        let claim = early_worker.claim_final();
-                                                        deliver_transcript(result, inj_worker, events, should_paste, target, claim, user_typed());
+                                                        deliver_transcript(result, inj_worker, events, should_paste, target, user_typed());
                                                     }
                                                     Err(error) => {
                                                         if discard_worker.load(Ordering::SeqCst) {
@@ -664,8 +626,6 @@ fn main() {
                                             done,
                                             hit_limit,
                                             discard,
-                                            early,
-                                            partial,
                                             baseline: None,
                                             released_at: None,
                                         });
@@ -677,7 +637,6 @@ fn main() {
                                             view.recovery_message = None;
                                             view.status = HudStatus::Listening {
                                                 audio_level: 0.0,
-                                                partial: String::new(),
                                                 started_at,
                                             };
                                             cx.notify();
@@ -712,14 +671,6 @@ fn main() {
                                                 live.released_at = Some(Instant::now());
                                                 live.release.store(true, Ordering::SeqCst);
                                                 live.baseline = Some(baseline);
-                                                queue_early_paste(
-                                                    &live.early,
-                                                    &live.partial,
-                                                    &live.discard,
-                                                    &auto_paste_flag,
-                                                    &inj,
-                                                    *target_hwnd.lock(),
-                                                );
                                             } else {
                                                 stop_now = true;
                                             }
@@ -751,14 +702,6 @@ fn main() {
                         }
                         if stop_now && is_recording_state {
                             if let Some(live) = session.as_mut() {
-                                queue_early_paste(
-                                    &live.early,
-                                    &live.partial,
-                                    &live.discard,
-                                    &auto_paste_flag,
-                                    &inj,
-                                    *target_hwnd.lock(),
-                                );
                                 live.halt.store(true, Ordering::SeqCst);
                                 live.baseline = None;
                             }
@@ -833,11 +776,6 @@ fn main() {
 
                         // 4. Animation frame & audio level updates
                         let current_level = if is_recording_state { rec.borrow().as_ref().map_or(0.0, AudioRecorder::audio_level) } else { 0.0 };
-                        let partial_now = if is_recording_state {
-                            session.as_ref().map(|live| live.partial.lock().clone())
-                        } else {
-                            None
-                        };
                         // Avoid locking the audio visualization buffer when it
                         // cannot be displayed.
                         let vis_peaks = if is_recording_state { rec.borrow().as_ref().map(AudioRecorder::vis_peaks) } else { None };
@@ -861,7 +799,7 @@ fn main() {
                             }
 
                             match &mut view.status {
-                                HudStatus::Listening { audio_level, partial, .. } => {
+                                HudStatus::Listening { audio_level, .. } => {
                                     if preview::is_active() {
                                         cx.notify();
                                     } else {
@@ -870,11 +808,6 @@ fn main() {
                                             // Already smoothed in audio time. A second frame-based
                                             // filter would smear syllables across historical bars.
                                             view.wave_peaks = peaks;
-                                        }
-                                        if let Some(next) = partial_now.as_ref() {
-                                            if next != partial {
-                                                *partial = next.clone();
-                                            }
                                         }
                                         cx.notify();
                                     }
