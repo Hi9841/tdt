@@ -236,8 +236,9 @@ fn download_file_name(url: &str) -> String {
 fn expected_hash_for(sums: &str, file_name: &str) -> Option<String> {
     for line in sums.lines() {
         let mut parts = line.split_whitespace();
-        let hash = parts.next()?;
-        let name = parts.next()?;
+        let (Some(hash), Some(name)) = (parts.next(), parts.next()) else {
+            continue;
+        };
         if name.eq_ignore_ascii_case(file_name) {
             return Some(hash.to_ascii_lowercase());
         }
@@ -422,6 +423,15 @@ mod tests {
             Some("abc123".to_string())
         );
         assert_eq!(expected_hash_for(sums, "missing.zip"), None);
+    }
+
+    #[test]
+    fn sums_parsing_skips_malformed_lines() {
+        let sums = "\nnot-a-hash\ndef456  tdt-setup.exe\n\nfeed99  TDT.exe\n";
+        assert_eq!(
+            expected_hash_for(sums, "TDT.exe"),
+            Some("feed99".to_string())
+        );
     }
 
     #[test]
