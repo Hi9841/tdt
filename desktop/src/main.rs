@@ -8,7 +8,6 @@ mod autostart;
 mod config;
 mod hotkey;
 mod paste;
-mod stt;
 mod ui;
 mod update;
 
@@ -30,7 +29,6 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use stt::{models, LiveAudio, LiveTranscript, SharedEngine, SttEngine};
 use tray_icon::menu::MenuEvent;
 use tray_icon::{MouseButton, MouseButtonState, TrayIconEvent};
 use ui::preview;
@@ -41,13 +39,13 @@ use ui::window_util::{
 };
 use ui::{HudStatus, HudView, SystemTray};
 use update::UpdatePhase;
+use voice_stt_desktop::stt::{models, LiveAudio, LiveTranscript, SharedEngine, SttEngine};
 
 enum InternalEvent {
     TranscribeSuccess {
         text: String,
         auto_pasted: bool,
         notice: Option<String>,
-        _duration_secs: f32,
         latency_ms: u64,
     },
     TranscribeError(String),
@@ -98,7 +96,6 @@ fn deliver_transcript(
         text: result.text,
         auto_pasted,
         notice,
-        _duration_secs: result.duration_secs,
         latency_ms: result.latency_ms,
     });
 }

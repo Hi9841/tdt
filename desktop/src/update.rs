@@ -147,7 +147,7 @@ pub fn download_installer(
     let mut file = File::create(&path).map_err(|e| format!("Could not write update: {e}"))?;
     let mut hasher = sha2::Sha256::new();
 
-    let response = download_agent()
+    let response = voice_stt_desktop::stt::models::download_agent(&user_agent())
         .get(asset_url)
         .set("Accept", "application/octet-stream")
         .call()
@@ -374,15 +374,6 @@ fn check_agent() -> ureq::Agent {
         .build()
 }
 
-fn download_agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(20))
-        .timeout_read(Duration::from_secs(7200))
-        .timeout_write(Duration::from_secs(60))
-        .user_agent(&user_agent())
-        .build()
-}
-
 fn http_get_string(url: &str) -> Result<String, String> {
     match check_agent().get(url).call() {
         Ok(response) => response
@@ -479,12 +470,5 @@ mod tests {
 
         let other = clean_error_message("something weird");
         assert_eq!(other, "Could not check for updates.");
-    }
-
-    #[test]
-    #[ignore = "requires live internet connection"]
-    fn check_latest_does_not_fail_on_rate_limit() {
-        let res = check_latest();
-        assert!(res.is_ok(), "check_latest should succeed: {:?}", res);
     }
 }
