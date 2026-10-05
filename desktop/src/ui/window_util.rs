@@ -209,10 +209,20 @@ pub fn set_window_icon(hwnd: HWND) {
             big,
             LR_DEFAULTSIZE | LR_SHARED,
         ) {
-            let _ = SendMessageW(hwnd, WM_SETICON, WPARAM(ICON_BIG as _), LPARAM(icon.0));
+            let _ = SendMessageW(
+                hwnd,
+                WM_SETICON,
+                WPARAM(ICON_BIG as _),
+                LPARAM(icon.0 as isize),
+            );
         }
         if let Ok(icon) = LoadImageW(instance, TDT_ICON, IMAGE_ICON, small, small, LR_SHARED) {
-            let _ = SendMessageW(hwnd, WM_SETICON, WPARAM(ICON_SMALL as _), LPARAM(icon.0));
+            let _ = SendMessageW(
+                hwnd,
+                WM_SETICON,
+                WPARAM(ICON_SMALL as _),
+                LPARAM(icon.0 as isize),
+            );
         }
     }
 }
