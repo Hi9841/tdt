@@ -76,20 +76,40 @@ pub fn set_enabled(enable: bool) -> Result<(), String> {
 
 fn enable_startup() -> Result<(), String> {
     let exe = current_tdt_exe()?;
-    match write_shortcut(&exe, &shortcut_path()) {
+    let lnk = shortcut_path();
+    // A claimed-successful write that left no file must fall back to the Run
+    // key, not silently report enabled.
+    let shortcut_result = if lnk.as_os_str().is_empty() {
+        Err("Could not find the Startup folder.".into())
+    } else {
+        write_shortcut(&exe, &lnk).and_then(|_| {
+            if lnk.is_file() {
+                Ok(())
+            } else {
+                Err("The Startup shortcut was not written.".into())
+            }
+        })
+    };
+    match shortcut_result {
         Ok(()) => {
             let _ = delete_value(RUN_SUBKEY, VALUE_NAME);
             let _ = delete_value(APPROVED_RUN, VALUE_NAME);
             write_approved(APPROVED_FOLDER, SHORTCUT_NAME)?;
             Ok(())
         }
-        Err(shortcut_error) => match write_run_key(&exe) {
-            Ok(()) => {
-                write_approved(APPROVED_RUN, VALUE_NAME)?;
-                Ok(())
+        Err(shortcut_error) => {
+            // Never both: a stale .lnk beside the Run key launches TDT twice.
+            if !lnk.as_os_str().is_empty() {
+                let _ = remove_shortcut(&lnk);
             }
-            Err(run_error) => Err(format!("{shortcut_error}. {run_error}")),
-        },
+            match write_run_key(&exe) {
+                Ok(()) => {
+                    write_approved(APPROVED_RUN, VALUE_NAME)?;
+                    Ok(())
+                }
+                Err(run_error) => Err(format!("{shortcut_error}. {run_error}")),
+            }
+        }
     }
 }
 
@@ -134,10 +154,20 @@ fn win32_launch_path(path: &Path) -> PathBuf {
 }
 
 fn shortcut_path() -> PathBuf {
-    startup_folder().join(SHORTCUT_NAME)
+    let folder = startup_folder();
+    if folder.as_os_str().is_empty() {
+        return PathBuf::new();
+    }
+    folder.join(SHORTCUT_NAME)
 }
 
 fn startup_folder() -> PathBuf {
+    // SHGetKnownFolderPath is the canonical answer and follows profile
+    // redirection; APPDATA is only a fallback. No "." fallback — it would
+    // drop the .lnk beside the exe where Explorer never reads it.
+    if let Some(folder) = known_startup_folder() {
+        return folder;
+    }
     if let Some(appdata) = std::env::var_os("APPDATA") {
         return PathBuf::from(appdata)
             .join("Microsoft")
@@ -146,7 +176,18 @@ fn startup_folder() -> PathBuf {
             .join("Programs")
             .join("Startup");
     }
-    PathBuf::from(".")
+    PathBuf::new()
+}
+
+fn known_startup_folder() -> Option<PathBuf> {
+    use windows::Win32::System::Com::CoTaskMemFree;
+    use windows::Win32::UI::Shell::{FOLDERID_Startup, SHGetKnownFolderPath, KF_FLAG_DEFAULT};
+    unsafe {
+        let rendered = SHGetKnownFolderPath(&FOLDERID_Startup, KF_FLAG_DEFAULT, None).ok()?;
+        let path = rendered.to_string().ok();
+        CoTaskMemFree(Some(rendered.as_ptr() as *const _));
+        path.filter(|value| !value.is_empty()).map(PathBuf::from)
+    }
 }
 
 fn write_shortcut(exe: &Path, path: &Path) -> Result<(), String> {
