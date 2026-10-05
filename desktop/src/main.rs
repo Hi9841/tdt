@@ -159,7 +159,7 @@ fn main() {
     let model_spec = models::resolve(&config.model_id);
     let stt_engine: SharedEngine = Arc::new(Mutex::new(
         match models::find_dir(model_spec, config.model_dir.as_deref()) {
-            Some(dir) => match SttEngine::new(model_spec, &dir, &config.language) {
+            Some(dir) => match SttEngine::new(model_spec, &dir) {
                 Ok(engine) => {
                     append_log(&format!(
                         "{} speech model found at: {}",

@@ -2,7 +2,7 @@
 """Persistent Photon speech worker for TDT.
 
 Communicates over standard I/O with JSON-lines:
-  -> {"cmd": "init", "model_dir": "...", "language": "en"}
+  -> {"cmd": "init", "model_dir": "..."}
   <- {"status": "ready"}
   -> {"cmd": "transcribe", "audio": "<base64_wav>"}
   <- {"status": "ok", "text": "...", "duration": 1.23, "inference_ms": 45.6}

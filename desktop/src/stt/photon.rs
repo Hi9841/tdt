@@ -325,24 +325,15 @@ impl Drop for PhotonWorkerClient {
 
 pub struct PhotonParakeetEngine {
     model_dir: PathBuf,
-    label: String,
-    current_language: Arc<Mutex<String>>,
     worker: Arc<Mutex<Option<PhotonWorkerClient>>>,
 }
 
 impl PhotonParakeetEngine {
-    pub fn new(spec: &ModelSpec, model_dir: &Path, language: &str) -> Result<Self, String> {
+    pub fn new(spec: &ModelSpec, model_dir: &Path) -> Result<Self, String> {
         spec.require_installed(model_dir)?;
-        let lang_str = if language.is_empty() {
-            "auto".to_string()
-        } else {
-            language.to_string()
-        };
 
         Ok(Self {
             model_dir: model_dir.to_path_buf(),
-            label: spec.label.to_string(),
-            current_language: Arc::new(Mutex::new(lang_str)),
             worker: Arc::new(Mutex::new(None)),
         })
     }
@@ -465,21 +456,6 @@ impl PhotonParakeetEngine {
         *self.worker.lock() = None;
     }
 
-    pub fn set_language(&self, language: &str) -> Result<(), String> {
-        let language = if language.is_empty() {
-            "auto".to_string()
-        } else {
-            language.to_string()
-        };
-        let mut current_lang = self.current_language.lock();
-        *current_lang = language.clone();
-        drop(current_lang);
-
-        self.release();
-        println!("{} language set to: {}", self.label, language);
-        Ok(())
-    }
-
     #[cfg(test)]
     pub fn is_loaded(&self) -> bool {
         self.worker.lock().is_some()
@@ -578,7 +554,7 @@ mod tests {
             fs::write(model_dir.join(file.name), b"mock-data").expect("mock file");
         }
 
-        let engine = PhotonParakeetEngine::new(spec, &model_dir, "en")
+        let engine = PhotonParakeetEngine::new(spec, &model_dir)
             .expect("construction should validate without launching python");
         assert!(
             !engine.is_loaded(),

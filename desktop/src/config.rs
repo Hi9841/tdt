@@ -9,7 +9,6 @@ pub struct AppConfig {
     pub hotkey: String,
     pub model_dir: Option<PathBuf>,
     pub model_id: String,
-    pub language: String,
 }
 
 impl Default for AppConfig {
@@ -19,7 +18,6 @@ impl Default for AppConfig {
             hotkey: "Ctrl+;".to_string(),
             model_dir: None,
             model_id: crate::stt::DEFAULT_MODEL_ID.to_string(),
-            language: "auto".to_string(),
         }
     }
 }
@@ -226,7 +224,6 @@ mod tests {
         let config: AppConfig = serde_json::from_str(r#"{"auto_paste": false}"#).unwrap();
         assert!(!config.auto_paste);
         assert_eq!(config.hotkey, AppConfig::default().hotkey);
-        assert_eq!(config.language, "auto");
         assert_eq!(config.model_id, crate::stt::DEFAULT_MODEL_ID);
     }
 
