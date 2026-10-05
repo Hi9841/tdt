@@ -2,7 +2,6 @@ use crate::audio::VIS_BARS;
 use crate::config::{AppConfig, AppStats};
 use crate::hotkey;
 use crate::paste::PasteInjector;
-use crate::stt::{models, DownloadPhase, SharedEngine, SttEngine, CATALOG};
 use crate::ui::controls;
 use crate::ui::preview::{self, Spec as PreviewSpec};
 use crate::ui::text::{clip_text, format_latency_ms, format_mmss, format_time_saved};
@@ -27,6 +26,7 @@ use gpui::*;
 use parking_lot::Mutex;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use voice_stt_desktop::stt::{models, DownloadPhase, SharedEngine, SttEngine, CATALOG};
 
 /// Compact actions leave seven pixels above and below inside the overlay.
 const SETTINGS_SURFACE_HEIGHT: f32 = 28.0;
@@ -1623,27 +1623,23 @@ impl HudView {
         let hotkey_row = settings_row("Shortcut", hotkey_sub, hotkey_control);
 
         let phase = self.update.lock().clone();
-        let (_update_title, update_sub, update_action, update_busy) = match &phase {
+        let (update_sub, update_action, update_busy) = match &phase {
             UpdatePhase::Idle => (
-                "Updates",
                 format!("Current version v{}", update::current_version()),
                 "Check for updates".to_string(),
                 false,
             ),
             UpdatePhase::Checking => (
-                "Updates",
                 "Checking for updates...".to_string(),
                 "Checking".to_string(),
                 true,
             ),
             UpdatePhase::UpToDate => (
-                "Updates",
                 format!("You're up to date - v{}", update::current_version()),
                 "Check again".to_string(),
                 false,
             ),
             UpdatePhase::Available { version, .. } => (
-                "Updates",
                 format!("v{version} is ready."),
                 "Download and restart".to_string(),
                 false,
@@ -1651,7 +1647,6 @@ impl HudView {
             UpdatePhase::Downloading { done, total } => {
                 let pct = models::percent(*done, *total);
                 (
-                    "Updates",
                     format!(
                         "{}% - {} of {}",
                         pct,
@@ -1663,17 +1658,11 @@ impl HudView {
                 )
             }
             UpdatePhase::Ready { .. } => (
-                "Updates",
                 "Update downloaded. Install when ready.".to_string(),
                 "Install update".to_string(),
                 false,
             ),
-            UpdatePhase::Failed(error) => (
-                "Updates",
-                clip_text(error, 48),
-                "Try again".to_string(),
-                false,
-            ),
+            UpdatePhase::Failed(error) => (clip_text(error, 48), "Try again".to_string(), false),
         };
 
         let update_btn = if matches!(

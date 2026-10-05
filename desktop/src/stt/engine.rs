@@ -38,7 +38,6 @@ impl SttEngine {
         self.inner.transcribe_live_reporting(rx)
     }
 
-    #[allow(dead_code)]
     pub fn release(&self) {
         self.inner.release();
     }

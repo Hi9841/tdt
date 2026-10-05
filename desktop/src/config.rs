@@ -17,7 +17,7 @@ impl Default for AppConfig {
             auto_paste: true,
             hotkey: "Ctrl+;".to_string(),
             model_dir: None,
-            model_id: crate::stt::DEFAULT_MODEL_ID.to_string(),
+            model_id: voice_stt_desktop::stt::DEFAULT_MODEL_ID.to_string(),
         }
     }
 }
@@ -224,7 +224,7 @@ mod tests {
         let config: AppConfig = serde_json::from_str(r#"{"auto_paste": false}"#).unwrap();
         assert!(!config.auto_paste);
         assert_eq!(config.hotkey, AppConfig::default().hotkey);
-        assert_eq!(config.model_id, crate::stt::DEFAULT_MODEL_ID);
+        assert_eq!(config.model_id, voice_stt_desktop::stt::DEFAULT_MODEL_ID);
     }
 
     #[test]

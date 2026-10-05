@@ -16,8 +16,6 @@ pub struct ModelFile {
 pub struct ModelSpec {
     pub id: &'static str,
     pub label: &'static str,
-    #[allow(dead_code)]
-    pub blurb: &'static str,
     pub size_label: &'static str,
     pub size_bytes: u64,
     pub hf_repo: &'static str,
@@ -57,15 +55,6 @@ pub struct DownloadProgress {
 /// Recommended default: Moondream Parakeet Redux 1.58-bit ternary, Photon runtime.
 pub const DEFAULT_MODEL_ID: &str = "parakeet-redux";
 
-#[allow(dead_code)]
-pub const PARAKEET_REDUX_ID: &str = DEFAULT_MODEL_ID;
-
-/// Retired ids kept for backwards-compatibility migration.
-#[allow(dead_code)]
-pub const PARAKEET_INT8_ID: &str = "parakeet-unified-en-0.6b-int8";
-#[allow(dead_code)]
-pub const PARAKEET_Q8_ID: &str = "parakeet-unified-en-0.6b-q8";
-
 const REDUX_DIR: &str = "parakeet-redux";
 const REDUX_REPO: &str = "moondream/parakeet-redux";
 
@@ -88,15 +77,9 @@ const REDUX_FILES: &[ModelFile] = &[
     },
 ];
 
-/// Retired ids (INT8, Q8, Whisper, Moonshine, SenseVoice) resolve to Parakeet Redux.
-fn migrated_id(_id: &str) -> &'static str {
-    DEFAULT_MODEL_ID
-}
-
 pub const CATALOG: &[ModelSpec] = &[ModelSpec {
     id: DEFAULT_MODEL_ID,
     label: "Parakeet Redux",
-    blurb: "Moondream 1.58-bit ternary. Photon runtime. Recommended.",
     size_label: "178 MB",
     size_bytes: 179_005_408,
     hf_repo: REDUX_REPO,
@@ -110,11 +93,9 @@ pub fn by_id(id: &str) -> Option<&'static ModelSpec> {
     CATALOG.iter().find(|spec| spec.id == id.trim())
 }
 
+/// Retired ids (INT8, Q8, Whisper, Moonshine, SenseVoice) resolve to Parakeet Redux.
 pub fn resolve(id: &str) -> &'static ModelSpec {
-    if let Some(spec) = by_id(id) {
-        return spec;
-    }
-    by_id(migrated_id(id)).unwrap_or(DEFAULT)
+    by_id(id).unwrap_or(DEFAULT)
 }
 
 impl ModelSpec {
@@ -278,7 +259,7 @@ fn download_file(
         let _ = fs::remove_file(&tmp);
     }
 
-    let response = download_agent()
+    let response = model_download_agent()
         .get(url)
         .set("Accept", "application/octet-stream")
         .call()
@@ -340,16 +321,23 @@ fn file_len(path: &Path) -> u64 {
     fs::metadata(path).map(|meta| meta.len()).unwrap_or(0)
 }
 
-fn download_agent() -> ureq::Agent {
+/// Shared long-read HTTP agent: model downloads and update downloads both need
+/// a generous read timeout for large files.
+#[doc(hidden)]
+pub fn download_agent(user_agent: &str) -> ureq::Agent {
     ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(20))
         .timeout_read(Duration::from_secs(7200))
         .timeout_write(Duration::from_secs(60))
-        .user_agent(&format!(
-            "TDT/{} (+https://github.com/Hi9841/tdt)",
-            env!("CARGO_PKG_VERSION")
-        ))
+        .user_agent(user_agent)
         .build()
+}
+
+fn model_download_agent() -> ureq::Agent {
+    download_agent(&format!(
+        "TDT/{} (+https://github.com/Hi9841/tdt)",
+        env!("CARGO_PKG_VERSION")
+    ))
 }
 
 fn preferred_root() -> PathBuf {

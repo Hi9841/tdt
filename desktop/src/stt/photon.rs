@@ -462,7 +462,6 @@ impl PhotonParakeetEngine {
     }
 }
 
-#[allow(dead_code)]
 pub fn pcm16_wav(path: &std::path::Path) -> Option<Vec<f32>> {
     let bytes = fs::read(path).ok()?;
     if bytes.len() < 44 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
@@ -509,7 +508,7 @@ pub fn pcm16_wav(path: &std::path::Path) -> Option<Vec<f32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stt::models::{by_id, PARAKEET_REDUX_ID};
+    use crate::stt::models::{by_id, DEFAULT_MODEL_ID};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -547,7 +546,7 @@ mod tests {
 
     #[test]
     fn constructing_photon_engine_does_not_load_model() {
-        let spec = by_id(PARAKEET_REDUX_ID).expect("redux spec");
+        let spec = by_id(DEFAULT_MODEL_ID).expect("redux spec");
         let model_dir = unique_dir("redux-mock");
         fs::create_dir_all(&model_dir).expect("temp dir");
         for file in spec.files {
