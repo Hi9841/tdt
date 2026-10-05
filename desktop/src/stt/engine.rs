@@ -34,9 +34,8 @@ impl SttEngine {
     pub fn transcribe_live_reporting(
         &self,
         rx: &Receiver<LiveAudio>,
-        partials: Option<&parking_lot::Mutex<String>>,
     ) -> Result<LiveTranscript, String> {
-        self.inner.transcribe_live_reporting(rx, partials)
+        self.inner.transcribe_live_reporting(rx)
     }
 
     #[allow(dead_code)]

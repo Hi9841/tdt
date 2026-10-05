@@ -359,7 +359,6 @@ impl PhotonParakeetEngine {
     pub fn transcribe_live_reporting(
         &self,
         rx: &Receiver<LiveAudio>,
-        _partials: Option<&Mutex<String>>,
     ) -> Result<LiveTranscript, String> {
         self.prepare()?;
         let mut samples_seen = 0usize;

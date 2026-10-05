@@ -66,7 +66,7 @@ fn bench_model(spec: &ModelSpec, clips: &[Clip]) {
         drop(tx);
 
         let t_infer = Instant::now();
-        match engine.transcribe_live_reporting(&rx, None) {
+        match engine.transcribe_live_reporting(&rx) {
             Ok(res) => {
                 let ms = t_infer.elapsed().as_millis().max(1);
                 let rtf = (clip.duration_secs * 1000.0) / ms as f32;
