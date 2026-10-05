@@ -5,6 +5,10 @@ on:
     branches: [main, master]
   pull_request:
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   desktop:
     runs-on: windows-latest
@@ -13,14 +17,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
       - name: Format
         run: cargo fmt --manifest-path desktop/Cargo.toml -- --check
       - name: Test
-        run: cargo test --manifest-path desktop/Cargo.toml
+        run: cargo test --locked --manifest-path desktop/Cargo.toml
       - name: Clippy
-        run: cargo clippy --manifest-path desktop/Cargo.toml --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --manifest-path desktop/Cargo.toml --all-targets --all-features -- -D warnings
       - name: Installer stub
         run: |
           cargo fmt --manifest-path packaging/tdt-setup/Cargo.toml -- --check
-          cargo test --manifest-path packaging/tdt-setup/Cargo.toml
-          cargo clippy --manifest-path packaging/tdt-setup/Cargo.toml --all-targets -- -D warnings
+          cargo test --locked --manifest-path packaging/tdt-setup/Cargo.toml
+          cargo clippy --locked --manifest-path packaging/tdt-setup/Cargo.toml --all-targets -- -D warnings
