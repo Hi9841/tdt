@@ -47,13 +47,33 @@ function Install-TdtModel([string]$Id) {
         if (-not (Test-Path -LiteralPath $destination)) {
             $temporary = "$destination.download"
             Write-Host "Downloading $($file.Name)..." -ForegroundColor Yellow
-            Invoke-WebRequest -Uri "$baseUrl/$($file.Name)?download=true" -OutFile $temporary
+            $ok = $false
+            for ($attempt = 1; $attempt -le 3 -and -not $ok; $attempt++) {
+                try {
+                    Invoke-WebRequest -UseBasicParsing -Uri "$baseUrl/$($file.Name)?download=true" -OutFile $temporary
+                    $ok = $true
+                } catch {
+                    Write-Host "Attempt $attempt failed: $_" -ForegroundColor DarkYellow
+                    Start-Sleep -Seconds $attempt
+                }
+            }
+            if (-not $ok) { throw "Could not download $($file.Name)." }
+
+            if ($file.Sha256) {
+                $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $temporary).Hash.ToUpperInvariant()
+                if ($actual -ne $file.Sha256) {
+                    Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
+                    throw "SHA256 mismatch for $($file.Name): expected $($file.Sha256), got $actual"
+                }
+            }
             Move-Item -LiteralPath $temporary -Destination $destination -Force
         }
 
         if ($file.Sha256) {
             $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $destination).Hash.ToUpperInvariant()
             if ($actual -ne $file.Sha256) {
+                # Delete the bad file so the next run re-downloads it.
+                Remove-Item -LiteralPath $destination -Force -ErrorAction SilentlyContinue
                 throw "SHA256 mismatch for $($file.Name): expected $($file.Sha256), got $actual"
             }
         }
@@ -63,7 +83,8 @@ function Install-TdtModel([string]$Id) {
 }
 
 $ids = if ($Model -eq "all") {
-    @("parakeet-unified-en-0.6b-int8")
+    # Redux is the only published model; the legacy aliases point at it.
+    @("parakeet-redux")
 } else {
     @($Model)
 }

@@ -118,7 +118,10 @@ pub fn current_binding() -> HotkeyBinding {
 }
 
 pub fn begin_capture() {
-    PRESS_START.lock().take();
+    // A press was possibly still active; never leave the app thinking it is.
+    if PRESS_START.lock().take().is_some() {
+        send_action(HotkeyAction::HoldReleased);
+    }
     *CAPTURE_START.lock() = Some(Instant::now());
     CAPTURE.store(true, Ordering::SeqCst);
 }
@@ -186,7 +189,7 @@ fn finish_press() {
 }
 
 pub struct HotkeyListener {
-    _running: Arc<AtomicBool>,
+    running: Arc<AtomicBool>,
 }
 
 impl HotkeyListener {
@@ -202,13 +205,25 @@ impl HotkeyListener {
         let (ready_tx, ready_rx) = crossbeam_channel::bounded(1);
         let running = Arc::new(AtomicBool::new(true));
         let running_thread = Arc::clone(&running);
-        *SENDER.lock() = Some(sender);
+        {
+            let mut guard = SENDER.lock();
+            if guard.is_some() {
+                return Err("Hotkey listener is already running.".to_string());
+            }
+            *guard = Some(sender);
+        }
 
         std::thread::spawn(move || unsafe {
+            HOOK_THREAD_ID.store(
+                windows::Win32::System::Threading::GetCurrentThreadId(),
+                Ordering::SeqCst,
+            );
+            use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+            let module = GetModuleHandleW(None).unwrap_or_default();
             let hook = SetWindowsHookExW(
                 WH_KEYBOARD_LL,
                 Some(hotkey_hook_proc),
-                HINSTANCE::default(),
+                HINSTANCE(module.0),
                 0,
             );
             match hook {
@@ -223,6 +238,9 @@ impl HotkeyListener {
                     }
                     let _ = UnhookWindowsHookEx(h);
                     HOOK_PTR.store(std::ptr::null_mut(), Ordering::SeqCst);
+                    if running_thread.load(Ordering::Relaxed) {
+                        eprintln!("Keyboard hook message loop exited unexpectedly.");
+                    }
                 }
                 Err(error) => {
                     let _ = ready_tx.send(Err(format!(
@@ -233,9 +251,31 @@ impl HotkeyListener {
         });
 
         match ready_rx.recv_timeout(Duration::from_secs(2)) {
-            Ok(Ok(())) => Ok((Self { _running: running }, receiver)),
+            Ok(Ok(())) => Ok((
+                Self {
+                    running: running.clone(),
+                },
+                receiver,
+            )),
             Ok(Err(error)) => Err(error),
             Err(_) => Err("Could not install the keyboard hook. Restart TDT.".to_string()),
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn shutdown_thread(&self) {
+        self.running.store(false, Ordering::SeqCst);
+        let thread_id = HOOK_THREAD_ID.load(Ordering::SeqCst);
+        if thread_id != 0 {
+            unsafe {
+                use windows::Win32::UI::WindowsAndMessaging::{PostThreadMessageW, WM_QUIT};
+                let _ = PostThreadMessageW(
+                    thread_id,
+                    WM_QUIT,
+                    windows::Win32::Foundation::WPARAM(0),
+                    windows::Win32::Foundation::LPARAM(0),
+                );
+            }
         }
     }
 
@@ -243,9 +283,19 @@ impl HotkeyListener {
     pub fn start() -> Result<(Self, Receiver<HotkeyAction>), String> {
         let (_sender, receiver) = crossbeam_channel::unbounded();
         let running = Arc::new(AtomicBool::new(true));
-        Ok((Self { _running: running }, receiver))
+        Ok((Self { running }, receiver))
     }
 }
+
+#[cfg(target_os = "windows")]
+impl Drop for HotkeyListener {
+    fn drop(&mut self) {
+        self.shutdown_thread();
+    }
+}
+
+#[cfg(target_os = "windows")]
+static HOOK_THREAD_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 #[cfg(target_os = "windows")]
 static HOOK_PTR: std::sync::atomic::AtomicPtr<core::ffi::c_void> =
@@ -359,6 +409,11 @@ unsafe extern "system" fn hotkey_hook_proc(
                         set_binding(captured);
                         end_capture();
                         send_action(HotkeyAction::Captured(captured));
+                    } else {
+                        // A lone letter is not a valid global hotkey; end
+                        // capture instead of swallowing keys for seconds.
+                        end_capture();
+                        send_action(HotkeyAction::CaptureCancelled);
                     }
                 }
                 return LRESULT(1);
@@ -383,6 +438,9 @@ unsafe extern "system" fn hotkey_hook_proc(
                     return LRESULT(1);
                 }
             } else if is_up && is_required_modifier(vk, binding) {
+                // Releasing a required modifier ends the press even if the
+                // main key is still held; the later keyup of the main key is
+                // then ignored on purpose (no repeat-press handling).
                 finish_press();
             }
         }

@@ -222,36 +222,49 @@ pub fn shortcut_keys(hotkey: &str) -> AnyElement {
 }
 
 fn display_to_gpui(hotkey: &str) -> String {
-    let parts: Vec<&str> = hotkey
-        .split('+')
+    // `+` can itself be the shortcut's key ("Ctrl++"), so split off the key
+    // from the right and only treat the rest as modifiers.
+    let (mods_part, key_part) = if let Some(stripped) = hotkey.strip_suffix("++") {
+        (stripped, "+")
+    } else if hotkey == "+" {
+        ("", "+")
+    } else {
+        match hotkey.rsplit_once('+') {
+            Some((left, right)) if !right.trim().is_empty() => (left, right),
+            // A trailing "+" ("Ctrl+") names no key; treat the whole thing
+            // as modifiers like the old parser did.
+            _ => (hotkey, ""),
+        }
+    };
+    let parts: Vec<&str> = std::iter::once(mods_part)
+        .flat_map(|part| part.split('+'))
         .map(str::trim)
         .filter(|part| !part.is_empty())
         .collect();
-    if parts.is_empty() {
-        return "ctrl-semicolon".into();
-    }
-    let mut mods = Vec::new();
-    let mut key = String::new();
-    for (index, part) in parts.iter().enumerate() {
-        let last = index + 1 == parts.len();
-        if !last {
-            mods.push(match part.to_ascii_lowercase().as_str() {
-                "control" => "ctrl".to_string(),
-                "windows" => "win".to_string(),
-                other => other.to_string(),
-            });
-            continue;
+    let mut mods: Vec<String> = parts
+        .iter()
+        .map(|part| match part.to_ascii_lowercase().as_str() {
+            "control" => "ctrl".to_string(),
+            "windows" => "win".to_string(),
+            other => other.to_string(),
+        })
+        .collect();
+    let key = match key_part {
+        "Backspace" => "backspace",
+        "Tab" => "tab",
+        "Enter" => "enter",
+        "Space" => "space",
+        ";" => ";",
+        "-" => "-",
+        "+" => "+",
+        other => {
+            if other.is_empty() {
+                return mods.join("-");
+            }
+            mods.push(other.to_ascii_lowercase());
+            return mods.join("-");
         }
-        key = match *part {
-            "Backspace" => "backspace".into(),
-            "Tab" => "tab".into(),
-            "Enter" => "enter".into(),
-            "Space" => "space".into(),
-            ";" => ";".into(),
-            "-" => "-".into(),
-            other => other.to_ascii_lowercase(),
-        };
-    }
+    };
     if key == "-" {
         let mut source = mods.join("-");
         if !source.is_empty() {
@@ -260,7 +273,7 @@ fn display_to_gpui(hotkey: &str) -> String {
         source.push('-');
         return source;
     }
-    mods.push(key);
+    mods.push(key.to_string());
     mods.join("-")
 }
 
@@ -275,5 +288,6 @@ mod tests {
         assert_eq!(display_to_gpui("Ctrl+-"), "ctrl--");
         assert_eq!(display_to_gpui("F5"), "f5");
         assert_eq!(display_to_gpui("Ctrl+Win+A"), "ctrl-win-a");
+        assert_eq!(display_to_gpui("Ctrl++"), "ctrl-+");
     }
 }

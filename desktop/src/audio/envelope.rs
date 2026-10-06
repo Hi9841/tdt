@@ -22,6 +22,7 @@ impl Default for SpeechEnvelope {
 
 impl SpeechEnvelope {
     pub fn push(&mut self, mono: &[f32], sample_rate: u32) {
+        debug_assert!(sample_rate > 0, "envelope needs a real sample rate");
         let frame_samples = (sample_rate as f32 * FRAME_SECONDS).round().max(1.0) as usize;
         for &sample in mono {
             let sample = if sample.is_finite() {

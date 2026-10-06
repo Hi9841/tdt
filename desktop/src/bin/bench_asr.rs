@@ -10,18 +10,27 @@ struct Clip {
 }
 
 fn load_clips(dir: &Path) -> Vec<Clip> {
+    // Recursive: nested bench folders hold grouped clips and must not be
+    // silently skipped.
     let mut clips = Vec::new();
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return clips;
-    };
-    let mut paths: Vec<_> = entries
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("wav"))
-        .collect();
-    paths.sort();
+    load_clips_into(dir, &mut clips);
+    clips.sort_by(|a, b| a.name.cmp(&b.name));
+    clips
+}
 
-    for path in paths {
+fn load_clips_into(dir: &Path, clips: &mut Vec<Clip>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            load_clips_into(&path, clips);
+            continue;
+        }
+        if path.extension().and_then(|s| s.to_str()) != Some("wav") {
+            continue;
+        }
         let name = path
             .file_name()
             .unwrap_or_default()
@@ -36,7 +45,6 @@ fn load_clips(dir: &Path) -> Vec<Clip> {
             });
         }
     }
-    clips
 }
 
 fn bench_model(spec: &ModelSpec, clips: &[Clip]) {
@@ -69,13 +77,13 @@ fn bench_model(spec: &ModelSpec, clips: &[Clip]) {
         match engine.transcribe_live_reporting(&rx) {
             Ok(res) => {
                 let ms = t_infer.elapsed().as_millis().max(1);
-                let rtf = (clip.duration_secs * 1000.0) / ms as f32;
+                let speedup_x = (clip.duration_secs * 1000.0) / ms as f32;
                 println!(
                     "[{:.2}s] {} -> {} ms ({:.1}x): {:?}",
                     clip.duration_secs,
                     clip.name,
                     ms,
-                    rtf,
+                    speedup_x,
                     res.text.trim()
                 );
             }

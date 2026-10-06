@@ -2,6 +2,62 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
+fn config_dir() -> Option<PathBuf> {
+    let new = directories::ProjectDirs::from("com", "tdt", "TDT")
+        .map(|dirs| dirs.config_dir().to_path_buf());
+    if let Some(new_dir) = &new {
+        if !new_dir.join("config.json").exists() && !new_dir.join("stats.json").exists() {
+            if let Some(old_dir) = directories::ProjectDirs::from("com", "voicestt", "VoiceSTT")
+                .map(|dirs| dirs.config_dir().to_path_buf())
+            {
+                for name in ["config.json", "stats.json"] {
+                    let old = old_dir.join(name);
+                    let newer = new_dir.join(name);
+                    if old.exists() && !newer.exists() {
+                        let _ = fs::create_dir_all(new_dir);
+                        let _ = fs::copy(&old, &newer);
+                    }
+                }
+            }
+        }
+    }
+    new
+}
+
+fn load_json<T: serde::de::DeserializeOwned>(path: &std::path::Path) -> Result<Option<T>, ()> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let content = fs::read_to_string(path).map_err(|_| ())?;
+    match serde_json::from_str(&content) {
+        Ok(value) => Ok(Some(value)),
+        Err(error) => {
+            let backup = path.with_extension("json.bak");
+            let _ = fs::copy(path, &backup);
+            eprintln!(
+                "TDT: could not parse {} ({error}); backed up to {}",
+                path.display(),
+                backup.display()
+            );
+            Err(())
+        }
+    }
+}
+
+fn write_json_atomic<T: Serialize>(
+    path: &std::path::Path,
+    value: &T,
+) -> Result<(), std::io::Error> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let json = serde_json::to_string_pretty(value).map_err(std::io::Error::other)?;
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, json)?;
+    fs::rename(&tmp, path)?;
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
@@ -24,32 +80,39 @@ impl Default for AppConfig {
 
 impl AppConfig {
     pub fn config_path() -> PathBuf {
-        let base = directories::ProjectDirs::from("com", "voicestt", "VoiceSTT")
-            .map(|dirs| dirs.config_dir().to_path_buf())
-            .unwrap_or_else(|| PathBuf::from("."));
+        let base = config_dir().unwrap_or_else(|| PathBuf::from("."));
         base.join("config.json")
     }
 
     pub fn load() -> Self {
         let path = Self::config_path();
-        if path.exists() {
-            if let Ok(content) = fs::read_to_string(&path) {
-                if let Ok(config) = serde_json::from_str(&content) {
-                    return config;
-                }
+        match load_json(&path) {
+            Ok(Some(config)) => {
+                let mut config: AppConfig = config;
+                config.sanitize();
+                config
+            }
+            Ok(None) => Self::default(),
+            Err(()) => Self::default(),
+        }
+    }
+
+    fn sanitize(&mut self) {
+        if self.hotkey.trim().is_empty() {
+            self.hotkey = AppConfig::default().hotkey;
+        }
+        if self.model_id.trim().is_empty() {
+            self.model_id = AppConfig::default().model_id;
+        }
+        if let Some(dir) = &self.model_dir {
+            if !dir.is_dir() {
+                self.model_dir = None;
             }
         }
-        Self::default()
     }
 
     pub fn save(&self) -> Result<(), std::io::Error> {
-        let path = Self::config_path();
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let json = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
-        fs::write(path, json)?;
-        Ok(())
+        write_json_atomic(&Self::config_path(), self)
     }
 }
 
@@ -75,22 +138,16 @@ pub const MAX_HISTORY: usize = 10;
 
 impl AppStats {
     pub fn stats_path() -> PathBuf {
-        let base = directories::ProjectDirs::from("com", "voicestt", "VoiceSTT")
-            .map(|dirs| dirs.config_dir().to_path_buf())
-            .unwrap_or_else(|| PathBuf::from("."));
+        let base = config_dir().unwrap_or_else(|| PathBuf::from("."));
         base.join("stats.json")
     }
 
     pub fn load() -> Self {
         let path = Self::stats_path();
-        if path.exists() {
-            if let Ok(content) = fs::read_to_string(&path) {
-                if let Ok(stats) = serde_json::from_str(&content) {
-                    return stats;
-                }
-            }
+        match load_json(&path) {
+            Ok(Some(stats)) => stats,
+            _ => Self::default(),
         }
-        Self::default()
     }
 
     /// Update the running totals in memory. Callers decide when to persist, so
@@ -130,13 +187,7 @@ impl AppStats {
     }
 
     pub fn save(&self) -> Result<(), std::io::Error> {
-        let path = Self::stats_path();
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let json = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
-        fs::write(path, json)?;
-        Ok(())
+        write_json_atomic(&Self::stats_path(), self)
     }
 }
 
@@ -173,7 +224,10 @@ pub(crate) fn local_hms() -> String {
         unsafe {
             GetLocalTime(&mut time);
         }
-        format!("{:02}:{:02}:{:02}", time.hour, time.minute, time.second)
+        format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+            time.year, time.month, time.day, time.hour, time.minute, time.second
+        )
     }
 
     #[cfg(not(windows))]

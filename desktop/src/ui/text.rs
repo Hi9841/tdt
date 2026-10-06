@@ -22,7 +22,10 @@ pub fn clip_text(text: &str, max_chars: usize) -> String {
     if trimmed.chars().count() <= max_chars {
         return trimmed.to_string();
     }
-    let mut clipped: String = trimmed.chars().take(max_chars.saturating_sub(1)).collect();
+    if max_chars == 0 {
+        return String::new();
+    }
+    let mut clipped: String = trimmed.chars().take(max_chars - 1).collect();
     clipped.push('…');
     clipped
 }

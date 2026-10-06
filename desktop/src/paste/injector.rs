@@ -98,6 +98,9 @@ impl PasteInjector {
     }
 
     pub fn copy_to_clipboard(&self, text: &str) -> Result<(), String> {
+        // The transcript intentionally replaces the clipboard: copy-to-
+        // clipboard is a documented feature, not a side effect, so the
+        // previous contents are never restored.
         let mut last_err = String::new();
         for _ in 0..4 {
             let mut guard = self.clipboard.lock();
@@ -179,7 +182,10 @@ impl PasteInjector {
                 };
                 unsafe {
                     let hwnd = HWND(raw as _);
-                    let _ = SetForegroundWindow(hwnd);
+                    // SetForegroundWindow is frequently denied to background
+                    // apps; the retry loop below is the real check. A denial
+                    // here just means focus arrives via the loop or not at all.
+                    let foreground_allowed = SetForegroundWindow(hwnd).as_bool();
                     let _ = BringWindowToTop(hwnd);
 
                     let mut focused = false;
@@ -191,6 +197,12 @@ impl PasteInjector {
                         thread::sleep(Duration::from_millis(15));
                     }
                     if !focused {
+                        if !foreground_allowed {
+                            return Err(
+                                "Windows would not give TDT the focus (background app). Focus the target app and the transcript stays on the clipboard for Ctrl+V"
+                                    .to_string(),
+                            );
+                        }
                         return Err(
                             "Could not restore the target application focus; text remains on the clipboard"
                                 .to_string(),

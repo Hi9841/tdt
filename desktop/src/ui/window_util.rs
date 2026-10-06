@@ -291,7 +291,8 @@ fn window_is_cloaked(hwnd: HWND) -> bool {
 #[cfg(target_os = "windows")]
 fn covered_by_app_or_taskbar(hwnd: HWND) -> bool {
     let mut above = unsafe { GetWindow(hwnd, GW_HWNDPREV) }.ok();
-    for _ in 0..128 {
+    const MAX_WINDOW_WALK: usize = 128;
+    for _ in 0..MAX_WINDOW_WALK {
         let Some(current) = above else {
             return false;
         };
@@ -713,6 +714,21 @@ fn anim_generation() -> &'static std::sync::atomic::AtomicU64 {
 
 #[cfg(target_os = "windows")]
 pub fn client_animations_enabled() -> bool {
+    // Cached; the Win32 call is cheap but this runs on every render and the
+    // value only changes via the system settings dialog.
+    static CACHE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+    static LAST_CHECK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    fn now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+    let now = now_ms();
+    let last = LAST_CHECK.load(std::sync::atomic::Ordering::Relaxed);
+    if now.saturating_sub(last) < 500 {
+        return CACHE.load(std::sync::atomic::Ordering::Relaxed);
+    }
     let mut enabled = BOOL(1);
     unsafe {
         let _ = SystemParametersInfoW(
@@ -722,6 +738,8 @@ pub fn client_animations_enabled() -> bool {
             SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
         );
     }
+    CACHE.store(enabled.as_bool(), std::sync::atomic::Ordering::Relaxed);
+    LAST_CHECK.store(now, std::sync::atomic::Ordering::Relaxed);
     enabled.as_bool()
 }
 
@@ -890,7 +908,6 @@ pub fn set_window_mode(is_expanded: bool) {
                 }
                 save_bubble_rect(rect.left, rect.top, (rect.right - rect.left).max(1));
                 apply_overlay_window_style(hwnd);
-                activate_overlay_window(hwnd);
             }
         }
 
@@ -907,12 +924,16 @@ pub fn set_window_mode(is_expanded: bool) {
             unsafe {
                 let mut rect = RECT::default();
                 let _ = GetWindowRect(hwnd, &mut rect);
-                let work = monitor_work_area(hwnd).unwrap_or((
-                    rect.left,
-                    rect.top,
-                    rect.right,
-                    rect.bottom,
-                ));
+                let work =
+                    monitor_work_area(hwnd).unwrap_or((i32::MIN, i32::MIN, i32::MAX, i32::MAX));
+                let empty = work.2 <= work.0 || work.3 <= work.1;
+                if empty {
+                    overlay_animating().store(false, std::sync::atomic::Ordering::SeqCst);
+                    if !is_expanded {
+                        overlay_expanded().store(false, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    return;
+                }
 
                 let from_x = rect.left;
                 let from_y = rect.top;
@@ -1024,29 +1045,37 @@ pub fn follow_current_virtual_desktop() {
             return;
         };
         unsafe {
-            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-            let Ok(vdm) = CoCreateInstance::<_, IVirtualDesktopManager>(
-                &VirtualDesktopManager,
-                None,
-                CLSCTX_ALL,
-            ) else {
-                return;
-            };
-            if vdm
-                .IsWindowOnCurrentVirtualDesktop(hwnd)
-                .ok()
-                .is_some_and(|v| v.as_bool())
-            {
-                return;
+            thread_local! {
+                static VDM: Option<IVirtualDesktopManager> = unsafe {
+                    let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+                    CoCreateInstance::<_, IVirtualDesktopManager>(
+                        &VirtualDesktopManager,
+                        None,
+                        CLSCTX_ALL,
+                    )
+                    .ok()
+                };
             }
-            let fg = GetForegroundWindow();
-            if fg.is_invalid() || fg == hwnd {
-                return;
-            }
-            if let Ok(desktop_id) = vdm.GetWindowDesktopId(fg) {
-                let _ = vdm.MoveWindowToDesktop(hwnd, &desktop_id);
-                apply_overlay_window_style(hwnd);
-            }
+            VDM.with(|vdm| {
+                let Some(vdm) = vdm else {
+                    return;
+                };
+                if vdm
+                    .IsWindowOnCurrentVirtualDesktop(hwnd)
+                    .ok()
+                    .is_some_and(|v| v.as_bool())
+                {
+                    return;
+                }
+                let fg = GetForegroundWindow();
+                if fg.is_invalid() || fg == hwnd {
+                    return;
+                }
+                if let Ok(desktop_id) = vdm.GetWindowDesktopId(fg) {
+                    let _ = vdm.MoveWindowToDesktop(hwnd, &desktop_id);
+                    apply_overlay_window_style(hwnd);
+                }
+            });
         }
     }
 }

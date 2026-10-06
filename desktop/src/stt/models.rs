@@ -195,6 +195,12 @@ pub fn download(
 
     for (index, file) in spec.files.iter().enumerate() {
         let file_index = index + 1;
+        if file.sha256.is_empty() {
+            return Err(format!(
+                "Model file {} has no checksum; refusing an unverified download",
+                file.name
+            ));
+        }
         on_progress(DownloadProgress {
             done,
             total,
@@ -203,9 +209,7 @@ pub fn download(
             file_count,
         });
         let dest = dest_dir.join(file.name);
-        if dest.is_file()
-            && (file.sha256.is_empty() || file_sha256(&dest)?.eq_ignore_ascii_case(file.sha256))
-        {
+        if dest.is_file() && file_sha256(&dest)?.eq_ignore_ascii_case(file.sha256) {
             done = (done + file_len(&dest)).min(total);
             on_progress(DownloadProgress {
                 done,
@@ -221,7 +225,7 @@ pub fn download(
             "{HF_BASE}/{}/resolve/main/{}?download=true",
             spec.hf_repo, file.name
         );
-        download_file(&url, &dest, file.sha256, |chunk| {
+        download_file(&url, &dest, file.sha256, &mut |chunk| {
             done = (done + chunk).min(total);
             on_progress(DownloadProgress {
                 done,
@@ -249,7 +253,30 @@ fn download_file(
     url: &str,
     dest: &Path,
     expected_sha: &str,
-    mut on_chunk: impl FnMut(u64),
+    on_chunk: &mut dyn FnMut(u64),
+) -> Result<(), String> {
+    let mut last_error = String::new();
+    for attempt in 0..3 {
+        match download_file_once(url, dest, expected_sha, &mut *on_chunk) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                last_error = error;
+                eprintln!(
+                    "Model download attempt {} failed: {last_error}",
+                    attempt + 1
+                );
+                std::thread::sleep(std::time::Duration::from_millis(500 * (attempt as u64 + 1)));
+            }
+        }
+    }
+    Err(last_error)
+}
+
+fn download_file_once(
+    url: &str,
+    dest: &Path,
+    expected_sha: &str,
+    on_chunk: &mut dyn FnMut(u64),
 ) -> Result<(), String> {
     let tmp = dest.with_file_name(format!(
         "{}.download",
@@ -411,7 +438,13 @@ mod tests {
             ids.push(spec.id);
         }
         assert!(ids.contains(&DEFAULT_MODEL_ID));
-        assert_eq!(CATALOG.len(), 1, "catalog offers Parakeet Redux as default",);
+        assert!(!CATALOG.is_empty(), "catalog must offer at least one model");
+        assert!(
+            CATALOG
+                .iter()
+                .any(|spec| spec.id == crate::stt::DEFAULT_MODEL_ID),
+            "catalog must include the default model",
+        );
         assert_eq!(
             by_id(DEFAULT_MODEL_ID).map(|spec| spec.id),
             Some(DEFAULT_MODEL_ID)

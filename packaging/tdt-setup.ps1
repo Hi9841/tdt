@@ -25,7 +25,13 @@ function Stop-TdtProcesses {
         Write-SetupLog "Stopping $($_.ProcessName) pid=$($_.Id)"
         Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
     }
-    Start-Sleep -Milliseconds 400
+    # Poll until the processes are gone instead of a fixed sleep, so the copy
+    # below does not race a still-running process holding file locks.
+    for ($i = 0; $i -lt 20; $i++) {
+        $alive = Get-Process -Name TDT, voice-stt-desktop -ErrorAction SilentlyContinue
+        if (-not $alive) { break }
+        Start-Sleep -Milliseconds 250
+    }
 }
 
 if (-not $Version) {
@@ -50,7 +56,19 @@ if ($Uninstall) {
     Remove-Item "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run\TDT" -Force -ErrorAction SilentlyContinue
     Remove-Item "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder\TDT.lnk" -Force -ErrorAction SilentlyContinue
     Remove-Item $UninstallReg -Recurse -Force -ErrorAction SilentlyContinue
+    # The downloaded model tree is expensive to re-fetch; do not wipe it.
+    $models = Join-Path $InstallDir "models"
+    $keepModels = Test-Path -LiteralPath $models
+    if ($keepModels) {
+        $stash = Join-Path $env:LOCALAPPDATA "TDT-models-stash"
+        if (Test-Path -LiteralPath $stash) { Remove-Item $stash -Recurse -Force -ErrorAction SilentlyContinue }
+        Move-Item -LiteralPath $models -Destination $stash -Force
+    }
     Remove-Item $InstallDir -Recurse -Force -ErrorAction SilentlyContinue
+    if ($keepModels) {
+        $_ = New-Item -ItemType Directory -Path $InstallDir -Force
+        Move-Item -LiteralPath $stash -Destination $models -Force
+    }
     Write-SetupLog "TDT removed."
     exit 0
 }

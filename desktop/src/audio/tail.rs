@@ -28,6 +28,8 @@ pub struct SpeechTail {
     carry: Vec<f32>,
     samples: usize,
     release_sample: Option<usize>,
+    release_at: Option<std::time::Instant>,
+    noise_cache: Option<(usize, f32)>,
 }
 
 impl SpeechTail {
@@ -43,6 +45,7 @@ impl SpeechTail {
     pub fn mark_release(&mut self) {
         if self.release_sample.is_none() {
             self.release_sample = Some(self.samples);
+            self.release_at = Some(std::time::Instant::now());
         }
     }
 
@@ -55,7 +58,7 @@ impl SpeechTail {
         Duration::from_secs_f64(samples as f64 / SAMPLE_RATE as f64)
     }
 
-    pub fn should_stop(&self) -> bool {
+    pub fn should_stop(&mut self) -> bool {
         let elapsed = self.since_release();
         if elapsed.is_zero() && self.release_sample.is_none() {
             return false;
@@ -63,16 +66,26 @@ impl SpeechTail {
         if elapsed >= MAX_TAIL {
             return true;
         }
+        // A stalled audio callback must not hold the tail open forever.
+        if let Some(release_at) = self.release_at {
+            if release_at.elapsed() >= MAX_TAIL {
+                return true;
+            }
+        }
         elapsed >= MIN_AFTER_RELEASE && self.quiet_for() >= QUIET_HOLD
     }
 
-    fn quiet_for(&self) -> Duration {
+    fn quiet_for(&mut self) -> Duration {
         let Some(noise) = self.room_noise() else {
             return Duration::ZERO;
         };
         let peak = self.frames.iter().copied().fold(DB_FLOOR, f32::max);
         let mut quiet_frames = 0usize;
-        for db in self.frames.iter().rev() {
+        let start = self
+            .release_sample
+            .map(|sample| (sample / FRAME_SAMPLES).min(self.frames.len()))
+            .unwrap_or(0);
+        for db in self.frames[start..].iter().rev() {
             if !frame_is_quiet(*db, noise, peak) {
                 break;
             }
@@ -81,12 +94,19 @@ impl SpeechTail {
         Duration::from_millis((quiet_frames * FRAME_MS) as u64)
     }
 
-    fn room_noise(&self) -> Option<f32> {
+    fn room_noise(&mut self) -> Option<f32> {
         if self.frames.is_empty() {
             return None;
         }
+        if let Some((len, value)) = self.noise_cache {
+            if len == self.frames.len() {
+                return Some(value);
+            }
+        }
         let opening = &self.frames[..self.frames.len().min(OPENING_FRAMES)];
-        Some(percentile_15(&self.frames).min(median(opening)))
+        let value = percentile_15(&self.frames).min(median(opening));
+        self.noise_cache = Some((self.frames.len(), value));
+        Some(value)
     }
 }
 
@@ -148,16 +168,19 @@ mod tests {
     }
 
     #[test]
-    fn already_quiet_stops_40ms_after_release() {
+    fn pre_release_silence_does_not_count_toward_the_tail() {
         let mut tail = SpeechTail::default();
         tail.push_samples(&silence(200));
         tail.mark_release();
         tail.push_samples(&silence(30));
         assert!(!tail.should_stop());
         tail.push_samples(&silence(10));
+        // Post-release quiet alone must reach QUIET_HOLD before stopping;
+        // pre-release silence does not count toward the tail.
+        assert!(!tail.should_stop());
+        tail.push_samples(&silence(120));
         assert!(tail.should_stop());
-        assert!(tail.since_release() >= MIN_AFTER_RELEASE);
-        assert!(tail.since_release() < QUIET_HOLD);
+        assert!(tail.since_release() >= QUIET_HOLD);
     }
 
     #[test]

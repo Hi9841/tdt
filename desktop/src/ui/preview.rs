@@ -147,7 +147,11 @@ pub fn fixture_stats(count: usize) -> AppStats {
                 format!("Short transcript {index}: ready when you are")
             },
             latency_ms: 90 + (index as u64) * 15,
-            timestamp: format!("12:{:02}:{:02}", index, 10 + index),
+            timestamp: format!(
+                "2026-10-06 12:{:02}:{:02}",
+                (index * 15) / 60,
+                (index * 15) % 60
+            ),
         })
         .collect();
     AppStats {
