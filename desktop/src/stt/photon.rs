@@ -134,8 +134,11 @@ fn locate_script_file() -> Result<PathBuf, String> {
     };
 
     if needs_write {
-        fs::write(&script_file, WORKER_SCRIPT)
+        let tmp = script_file.with_extension("py.tmp");
+        fs::write(&tmp, WORKER_SCRIPT)
             .map_err(|e| format!("Could not write photon_worker.py: {e}"))?;
+        fs::rename(&tmp, &script_file)
+            .map_err(|e| format!("Could not install photon_worker.py: {e}"))?;
     }
 
     Ok(script_file)
@@ -153,6 +156,22 @@ fn test_command_silent(mut cmd: Command) -> bool {
 }
 
 fn find_python_launcher() -> Result<PythonLauncher, String> {
+    static CACHE: std::sync::Mutex<Option<Result<PythonLauncher, String>>> =
+        std::sync::Mutex::new(None);
+    {
+        let cache = CACHE.lock().unwrap();
+        if let Some(cached) = &*cache {
+            return cached.clone();
+        }
+    }
+    let found = find_python_launcher_uncached();
+    if found.is_ok() {
+        *CACHE.lock().unwrap() = Some(found.clone());
+    }
+    found
+}
+
+fn find_python_launcher_uncached() -> Result<PythonLauncher, String> {
     // 1. Explicit environment variable
     for env_var in ["VOICE_STT_PHOTON_PYTHON", "VOICE_STT_PYTHON"] {
         if let Some(path_str) = std::env::var_os(env_var) {
@@ -160,6 +179,7 @@ fn find_python_launcher() -> Result<PythonLauncher, String> {
             if path.is_file() {
                 return Ok(PythonLauncher::Direct(path));
             }
+            eprintln!("{env_var} is set but {path:?} is not a file; ignoring.");
         }
     }
 
@@ -317,7 +337,10 @@ impl PhotonWorkerClient {
 
 impl Drop for PhotonWorkerClient {
     fn drop(&mut self) {
-        let _ = self.send_request(&json!({"cmd": "shutdown"}));
+        // Do not wait for a response; a hung worker must not hang shutdown.
+        let payload = b"{\"cmd\": \"shutdown\"}\n";
+        let _ = self.stdin.write_all(payload);
+        let _ = self.stdin.flush();
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -352,14 +375,14 @@ impl PhotonParakeetEngine {
         rx: &Receiver<LiveAudio>,
     ) -> Result<LiveTranscript, String> {
         self.prepare()?;
-        let mut samples_seen = 0usize;
         let mut stopped_at = None;
         let mut captured: Vec<f32> = Vec::new();
+        let mut last_any = std::time::Instant::now();
 
         loop {
             match rx.recv_timeout(Duration::from_millis(20)) {
                 Ok(LiveAudio::Chunk(samples)) => {
-                    samples_seen += samples.len();
+                    last_any = std::time::Instant::now();
                     if captured.len() < MAX_CAPTURED_SAMPLES {
                         captured.extend_from_slice(&samples);
                     }
@@ -368,13 +391,20 @@ impl PhotonParakeetEngine {
                     stopped_at = Some(at);
                     break;
                 }
-                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Timeout) => {
+                    // A stalled producer must not hang transcription forever.
+                    if last_any.elapsed() > Duration::from_secs(120) {
+                        return Err("Audio capture stalled; transcription aborted.".to_string());
+                    }
+                }
                 Err(RecvTimeoutError::Disconnected) => break,
             }
         }
 
         let stopped_at = stopped_at.unwrap_or_else(Instant::now);
-        let duration_secs = samples_seen as f32 / 16000.0;
+        // Duration actually fed to the model, not the full take when the
+        // capture cap truncated it.
+        let duration_secs = captured.len() as f32 / 16000.0;
 
         if captured.is_empty() {
             return Ok(LiveTranscript {
@@ -401,6 +431,7 @@ impl PhotonParakeetEngine {
             Ok(r) => r,
             Err(e) => {
                 // If worker connection severed, clear dead client
+                eprintln!("Photon worker died mid-transcription: {e}");
                 *guard = None;
                 return Err(format!("Photon transcription failed: {e}"));
             }
@@ -542,6 +573,15 @@ mod tests {
         let data_len = u32::from_le_bytes(wav[40..44].try_into().unwrap());
         assert_eq!(data_len, 3200);
         assert_eq!(wav.len(), 44 + 3200);
+    }
+
+    #[test]
+    fn spawn_fails_cleanly_without_a_model() {
+        let missing = unique_dir("redux-missing").join("no-such-dir");
+        assert!(
+            PhotonWorkerClient::spawn(&missing).is_err(),
+            "spawn should fail without model files"
+        );
     }
 
     #[test]

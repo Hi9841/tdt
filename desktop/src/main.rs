@@ -39,7 +39,7 @@ use ui::window_util::{
 };
 use ui::{HudStatus, HudView, SystemTray};
 use update::UpdatePhase;
-use voice_stt_desktop::stt::{models, LiveAudio, LiveTranscript, SharedEngine, SttEngine};
+use voice_stt_desktop::stt::{models, EngineSlot, LiveAudio, LiveTranscript, SttEngine};
 
 enum InternalEvent {
     TranscribeSuccess {
@@ -105,7 +105,10 @@ fn main() {
     std::panic::set_hook(Box::new(|info| {
         let msg = format!("TDT crashed: {info}");
         append_log(&msg);
-        show_error(&msg);
+        // Best effort: a panic here would abort without a useful log.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            show_error(&msg);
+        }));
     }));
 
     let _instance = if preview::is_active() {
@@ -132,12 +135,29 @@ fn main() {
     };
     // Persist the exact resolved internal model id so app restarts reopen the
     // same STT backend (and migrate retired ids forward).
-    config.model_id = models::resolve(&config.model_id).id.to_string();
-    if !preview::is_active() {
+    let resolved_id = models::resolve(&config.model_id).id.to_string();
+    if !preview::is_active() && resolved_id != config.model_id {
+        config.model_id = resolved_id;
         let _ = config.save();
+    } else {
+        config.model_id = resolved_id;
     }
     let auto_paste = config.auto_paste;
-    let hotkey_binding = HotkeyBinding::parse(&config.hotkey).unwrap_or_default();
+    let hotkey_binding = match HotkeyBinding::parse(&config.hotkey) {
+        Some(binding) => binding,
+        None => {
+            eprintln!(
+                "Could not parse the configured hotkey '{}'; using the default.",
+                config.hotkey
+            );
+            let binding = HotkeyBinding::default();
+            config.hotkey = binding.display();
+            if !preview::is_active() {
+                let _ = config.save();
+            }
+            binding
+        }
+    };
     set_binding(hotkey_binding);
     let hotkey_label = hotkey_binding.display();
 
@@ -154,7 +174,8 @@ fn main() {
 
     // 2. Initialize STT Engine
     let model_spec = models::resolve(&config.model_id);
-    let stt_engine: SharedEngine = Arc::new(Mutex::new(
+    let stt_engine = EngineSlot::default();
+    stt_engine.set(
         match models::find_dir(model_spec, config.model_dir.as_deref()) {
             Some(dir) => match SttEngine::new(model_spec, &dir) {
                 Ok(engine) => {
@@ -181,13 +202,13 @@ fn main() {
                 None
             }
         },
-    ));
+    );
 
     // Load and warm the selected model while the app opens, so a short first
     // dictation does not pay the full initialization cost after release.
     // prepare() serializes with recording and retries on failure.
     if !preview::is_active() {
-        if let Some(engine) = stt_engine.lock().clone() {
+        if let Some(engine) = stt_engine.get() {
             std::thread::spawn(move || {
                 if let Err(error) = engine.prepare() {
                     append_log(&format!("Could not prepare the speech model: {error}"));
@@ -286,6 +307,14 @@ fn main() {
                 }
                 std::thread::sleep(Duration::from_millis(5));
             }
+            // The overlay window can appear late on cold starts; keep looking
+            // at a slower cadence instead of skipping styling for the session.
+            let mut attempts = 0;
+            while overlay.is_none() && attempts < 20 {
+                std::thread::sleep(Duration::from_millis(500));
+                overlay = find_app_hwnd();
+                attempts += 1;
+            }
             let Some(hwnd) = overlay else {
                 return;
             };
@@ -344,12 +373,7 @@ fn main() {
                                 view.show_from_tray(cx);
                             });
                         }
-                        while update_ping_rx.try_recv().is_ok() {
-                            let _ = this.update(cx, |view, cx| {
-                                view.take_ready_model();
-                                cx.notify();
-                            });
-                        }
+                        while update_ping_rx.try_recv().is_ok() {}
                         let _ = this.update(cx, |view, cx| {
                             view.take_ready_model();
                             if view.retry_microphone {
@@ -428,6 +452,10 @@ fn main() {
                             }
                         }
                         if quitting {
+                            if let Some(live) = session.take() {
+                                live.discard.store(true, Ordering::SeqCst);
+                                live.halt.store(true, Ordering::SeqCst);
+                            }
                             break;
                         }
 
@@ -447,15 +475,13 @@ fn main() {
                         let actions: Vec<_> = hotkey_rx.try_iter().collect();
                         let stream_error = rec.borrow().as_ref().and_then(AudioRecorder::take_error);
                         if let Some(error) = stream_error {
-                            if let Some(live) = session.as_ref() {
+                            if let Some(live) = session.take() {
                                 live.discard.store(true, Ordering::SeqCst);
                                 live.halt.store(true, Ordering::SeqCst);
                             }
                             *rec.borrow_mut() = None;
                             is_recording_state = false;
-                            if let Some(live) = session.as_mut() {
-                                live.baseline = None;
-                            }
+                            is_processing_state = false;
                             let _ = this.update(cx, |view, cx| { view.set_error(error); cx.notify(); });
                         }
                         let hit_limit = is_recording_state
@@ -463,7 +489,11 @@ fn main() {
                         let at_limit = is_recording_state
                             && (hit_limit
                                 || rec.borrow().as_ref().is_some_and(AudioRecorder::limit_reached));
-                        let stop_requested = this.update(cx, |view, _| std::mem::take(&mut view.stop_requested)).unwrap_or(false);
+                        let stop_requested = if is_recording_state {
+                            this.update(cx, |view, _| std::mem::take(&mut view.stop_requested)).unwrap_or(false)
+                        } else {
+                            false
+                        };
                         let mut stop_now = false;
                         if is_recording_state && (at_limit || stop_requested) {
                             limit_notice = at_limit;
@@ -498,6 +528,10 @@ fn main() {
                                     });
                                 }
                                 HotkeyAction::PressStarted => {
+                                    // Snapshot the before-press state; it is
+                                    // cleared on every release below, so a
+                                    // swallowed press can never stop a session
+                                    // it did not start.
                                     recording_before_press = is_recording_state;
                                     // Do not overlap recordings with an in-flight
                                     // transcription. The current recorder and STT
@@ -507,7 +541,7 @@ fn main() {
                                         .is_some_and(|live| !live.done.load(Ordering::SeqCst));
                                     if !is_recording_state && !is_processing_state && !pump_busy {
                                         let _ = this.update(cx, |view, _| view.reveal_overlay());
-                                        if stt.lock().is_none() {
+                                        if stt.get().is_none() {
                                             let _ = this.update(cx, |view, cx| {
                                                 view.set_error("Download a speech model in Settings before recording.".into());
                                                 view.open_settings(cx);
@@ -540,7 +574,7 @@ fn main() {
                                         }
                                         *target_hwnd.lock() = ui::window_util::dictation_target_window();
                                         let _ = this.update(cx, |view, cx| view.close_stats_settings(cx));
-                                        if let Some(recorder) = rec.borrow().as_ref() { recorder.start(); }
+                                        if let Some(recorder) = rec.borrow().as_ref() { recorder.resume_input(); recorder.start(); }
                                         let Some(handle) = rec.borrow().as_ref().map(|recorder| recorder.handle()) else {
                                             continue;
                                         };
@@ -553,7 +587,7 @@ fn main() {
                                         let hit_limit = Arc::new(AtomicBool::new(false));
                                         let discard = Arc::new(AtomicBool::new(false));
                                         let (tx, rx) = crossbeam_channel::unbounded();
-                                        if let Some(engine) = stt.lock().clone() {
+                                        if let Some(engine) = stt.get() {
                                             let events = internal_tx.clone();
                                             let inj_worker = Arc::clone(&inj);
                                             let paste_flag = Arc::clone(&auto_paste_flag);
@@ -649,6 +683,7 @@ fn main() {
                                         recording_before_press = false;
                                         stop
                                     } else {
+                                        recording_before_press = false;
                                         true
                                     };
                                     if should_stop && is_recording_state && !stop_now {
@@ -772,6 +807,13 @@ fn main() {
                         }
 
                         // 4. Animation frame & audio level updates
+                        // Fully idle means no recording and no transcription:
+                        // park the microphone until the next press.
+                        if !is_recording_state && !is_processing_state {
+                            if let Some(active) = rec.borrow().as_ref() {
+                                active.pause_input();
+                            }
+                        }
                         let current_level = if is_recording_state { rec.borrow().as_ref().map_or(0.0, AudioRecorder::audio_level) } else { 0.0 };
                         // Avoid locking the audio visualization buffer when it
                         // cannot be displayed.
@@ -849,13 +891,22 @@ fn main() {
                     *update_for_boot.lock() = UpdatePhase::Checking;
                     let _ = update_ping_boot.send(());
                     let next = match update::check_latest() {
-                        Ok(phase) => phase,
-                        Err(error) => UpdatePhase::Failed(error),
+                        Ok(phase) => Some(phase),
+                        Err(error) => {
+                            // A failed boot-time check is logged, not shown;
+                            // the settings UI keeps its idle state.
+                            eprintln!("Boot-time update check failed: {error}");
+                            None
+                        }
                     };
                     // A user-initiated check superseded this boot check; do not
                     // clobber its result.
                     if update::update_check_is_current(ticket) {
-                        *update_for_boot.lock() = next;
+                        if let Some(next) = next {
+                            *update_for_boot.lock() = next;
+                        } else {
+                            *update_for_boot.lock() = UpdatePhase::Idle;
+                        }
                         let _ = update_ping_boot.send(());
                     }
                 });
@@ -996,12 +1047,31 @@ fn log_file() -> PathBuf {
         .unwrap_or_else(|| std::env::temp_dir().join("tdt.log"))
 }
 
+const MAX_LOG_BYTES: u64 = 512 * 1024;
+
 fn append_log(message: &str) {
-    if let Ok(mut file) = OpenOptions::new()
+    let path = log_file();
+    let mut path = path;
+    let mut file = OpenOptions::new()
         .create(true)
         .append(true)
-        .open(log_file())
-    {
+        .open(&path)
+        .or_else(|_| {
+            // The exe directory may be read-only (Program Files); fall back
+            // to the temp dir once.
+            path = std::env::temp_dir().join("tdt.log");
+            OpenOptions::new().create(true).append(true).open(&path)
+        });
+    if let Ok(ref mut file) = file {
+        if let Ok(metadata) = file.metadata() {
+            if metadata.len() > MAX_LOG_BYTES {
+                // Keep the latest half rather than growing forever.
+                if let Ok(contents) = std::fs::read(&path) {
+                    let keep = &contents[contents.len() / 2..];
+                    let _ = std::fs::write(&path, keep);
+                }
+            }
+        }
         let _ = writeln!(file, "{message}");
     }
 }

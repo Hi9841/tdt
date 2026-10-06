@@ -26,7 +26,7 @@ use gpui::*;
 use parking_lot::Mutex;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use voice_stt_desktop::stt::{models, DownloadPhase, SharedEngine, SttEngine, CATALOG};
+use voice_stt_desktop::stt::{models, DownloadPhase, EngineSlot, SttEngine, CATALOG};
 
 /// Compact actions leave seven pixels above and below inside the overlay.
 const SETTINGS_SURFACE_HEIGHT: f32 = 28.0;
@@ -104,7 +104,7 @@ pub struct HudView {
     pub copied_at: Option<Instant>,
     pub injector: PasteInjector,
     pub selected_model: String,
-    pub stt_engine: SharedEngine,
+    pub stt_engine: EngineSlot,
     pub auto_paste_state: Arc<Mutex<bool>>,
     panel_motion: Option<PanelMotion>,
     update: Arc<Mutex<UpdatePhase>>,
@@ -115,6 +115,7 @@ pub struct HudView {
     pub stop_requested: bool,
     pub retry_microphone: bool,
     pub recovery_message: Option<String>,
+    pub recovery_is_microphone: bool,
     clear_history_pending: bool,
     active_model: Option<String>,
     installed_models: Vec<String>,
@@ -133,7 +134,7 @@ impl HudView {
     pub fn new(
         auto_paste_enabled: bool,
         hotkey_label: String,
-        stt_engine: SharedEngine,
+        stt_engine: EngineSlot,
         auto_paste_state: Arc<Mutex<bool>>,
         update: Arc<Mutex<UpdatePhase>>,
         update_ping: crossbeam_channel::Sender<()>,
@@ -154,7 +155,7 @@ impl HudView {
             AppConfig::load()
         };
         let selected_model = models::resolve(&config.model_id).id.to_string();
-        let active_model = stt_engine.lock().is_some().then(|| selected_model.clone());
+        let active_model = stt_engine.is_some().then(|| selected_model.clone());
         let installed_models = CATALOG
             .iter()
             .filter(|model| models::find_dir(model, config.model_dir.as_deref()).is_some())
@@ -195,6 +196,7 @@ impl HudView {
             stop_requested: false,
             retry_microphone: false,
             recovery_message: None,
+            recovery_is_microphone: false,
             clear_history_pending: false,
             active_model,
             installed_models,
@@ -283,6 +285,7 @@ impl HudView {
             PreviewSpec::BubbleNoSpeech => {
                 self.status = HudStatus::NoSpeech;
                 self.recovery_message = Some("No speech detected. Try again and check your microphone.".into());
+                self.recovery_is_microphone = true;
             }
             PreviewSpec::BubbleCopyFailed => self.set_error("Could not copy text. Open History to copy the saved transcript.".into()),
             PreviewSpec::BubblePasteFallback => {
@@ -293,6 +296,7 @@ impl HudView {
                     finished_at: Instant::now(),
                 };
                 self.recovery_message = Some("Copied. Could not insert all text. Check the destination before pasting with Ctrl+V.".into());
+                self.recovery_is_microphone = false;
             }
             PreviewSpec::BubbleLimit => {
                 self.status = HudStatus::Listening {
@@ -582,16 +586,21 @@ impl HudView {
         if self.model_busy() {
             return;
         }
-        if let Some(model) = self.prepared_model.take() {
-            if model.id == self.selected_model {
+        let matches_selection = self
+            .prepared_model
+            .as_ref()
+            .is_some_and(|model| model.id == self.selected_model);
+        if matches_selection {
+            if let Some(model) = self.prepared_model.take() {
                 let mut config = AppConfig::load();
                 config.model_id = model.id.clone();
                 match config.save() {
                     Ok(()) => {
-                        *self.stt_engine.lock() = Some(model.engine);
+                        self.stt_engine.set(Some(model.engine));
                         self.active_model = Some(model.id);
                         self.model_error = None;
                         self.recovery_message = None;
+                        self.recovery_is_microphone = false;
                         if matches!(self.status, HudStatus::Error { .. } | HudStatus::NoSpeech) {
                             self.status = HudStatus::Idle;
                         }
@@ -809,6 +818,7 @@ impl HudView {
     }
 
     pub fn set_error(&mut self, message: String) {
+        self.recovery_is_microphone = message.to_lowercase().contains("microphone");
         self.recovery_message = Some(message.clone());
         self.status = HudStatus::Error {
             message,
@@ -818,7 +828,7 @@ impl HudView {
 
     fn model_ready(&self) -> bool {
         self.preview_ready
-            .unwrap_or_else(|| self.stt_engine.lock().is_some())
+            .unwrap_or_else(|| self.stt_engine.is_some())
     }
 }
 
@@ -849,11 +859,7 @@ impl HudView {
             let mut bars = Vec::with_capacity(WAVE_BARS);
             let bar_color = accent();
             for peak in self.wave_peaks {
-                let height = if holding {
-                    wave_height(peak)
-                } else {
-                    WAVE_FLAT + 2.0
-                };
+                let height = wave_height(peak);
                 bars.push(
                     div()
                         .w(px(WAVE_BAR_W))
@@ -1009,7 +1015,7 @@ impl HudView {
                         })),
                 ))
         } else if matches!(self.status, HudStatus::Error { .. } | HudStatus::NoSpeech)
-            || self.recovery_message.is_some() && matches!(self.status, HudStatus::Success { .. })
+            || (self.recovery_message.is_some() && matches!(self.status, HudStatus::Success { .. }))
         {
             right_section.child(controls::hold_click(
                 "hold_details",
@@ -1032,32 +1038,12 @@ impl HudView {
                             })),
                     ))
                 })
-                .child(
-                    div()
-                        .text_size(px(TYPE_META))
-                        .line_height(px(14.0))
-                        .font_family("Consolas")
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(muted())
-                        .text_right()
-                        .whitespace_nowrap()
-                        .child(timer_str),
-                )
+                .child(meta_label(timer_str))
         } else {
             right_section
         };
         let right_section = if let Some(label) = latency_label {
-            right_section.child(
-                div()
-                    .text_size(px(TYPE_META))
-                    .line_height(px(14.0))
-                    .font_family("Consolas")
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(muted())
-                    .text_right()
-                    .whitespace_nowrap()
-                    .child(label),
-            )
+            right_section.child(meta_label(label))
         } else {
             right_section
         };
@@ -1266,7 +1252,7 @@ impl HudView {
             .child({
                 let panel = panel_body
                     .when_some(self.recovery_message.clone(), |panel, message| {
-                        let retry = message.to_lowercase().contains("microphone");
+                        let retry = self.recovery_is_microphone;
                         let hud = cx.entity();
                         let mut alert = Alert::new("recovery", Severity::Warning, "Action needed")
                             .body(message)
@@ -1275,6 +1261,7 @@ impl HudView {
                                 move |_, cx| {
                                     hud.update(cx, |this, cx| {
                                         this.recovery_message = None;
+                                        this.recovery_is_microphone = false;
                                         if matches!(
                                             this.status,
                                             HudStatus::Error { .. } | HudStatus::NoSpeech
@@ -1362,7 +1349,7 @@ impl HudView {
                     IconName::Copy
                 };
                 let copy_btn = IconButton::new(
-                    ElementId::NamedInteger("history_copy".into(), idx as u64),
+                    ElementId::Name(format!("history_copy:{}", item.timestamp).into()),
                     copy_icon,
                 )
                 .variant(ButtonVariant::Ghost)
@@ -1376,7 +1363,9 @@ impl HudView {
 
                 history_items.push(
                     div()
-                        .id(ElementId::NamedInteger("history_row".into(), idx as u64))
+                        .id(ElementId::Name(
+                            format!("history_row:{}", item.timestamp).into(),
+                        ))
                         .flex()
                         .flex_col()
                         .w_full()
@@ -1622,8 +1611,9 @@ impl HudView {
             .into_any_element();
         let hotkey_row = settings_row("Shortcut", hotkey_sub, hotkey_control);
 
-        let phase = self.update.lock().clone();
-        let (update_sub, update_action, update_busy) = match &phase {
+        let guard = self.update.lock();
+        let phase = &*guard;
+        let (update_sub, update_action, update_busy) = match phase {
             UpdatePhase::Idle => (
                 format!("Current version v{}", update::current_version()),
                 "Check for updates".to_string(),
@@ -1666,7 +1656,7 @@ impl HudView {
         };
 
         let update_btn = if matches!(
-            phase,
+            *phase,
             UpdatePhase::Available { .. } | UpdatePhase::Ready { .. }
         ) {
             controls::primary_button("check_updates_btn", update_action)
@@ -1686,51 +1676,35 @@ impl HudView {
                     this.start_update_install();
                     cx.notify();
                 }));
-        let update_meter = match &phase {
+        let update_meter = match phase {
             UpdatePhase::Downloading { done, total } => {
                 Some(controls::progress_bar("update_progress", *done, *total))
             }
             _ => None,
         };
+        drop(guard);
         let update_row = settings_row("Updates", update_sub, update_btn.into_any_element());
 
         let spec = models::resolve(&self.selected_model);
         let installed = self.installed_models.iter().any(|id| id == spec.id);
-        let phase = match &*self.model_phase.lock() {
+        let model_guard = self.model_phase.lock();
+        let model_phase = &*model_guard;
+        let downloading = matches!(
+            model_phase,
+            DownloadPhase::Downloading { id, .. } if id == spec.id
+        );
+        let model_sub = match model_phase {
             DownloadPhase::Downloading {
                 id,
-                done,
-                total,
-                file,
-                file_index,
-                file_count,
-            } if id == spec.id => DownloadPhase::Downloading {
-                id: id.clone(),
-                done: *done,
-                total: *total,
-                file: file.clone(),
-                file_index: *file_index,
-                file_count: *file_count,
-            },
-            DownloadPhase::Failed { id, message } if id == spec.id => DownloadPhase::Failed {
-                id: id.clone(),
-                message: message.clone(),
-            },
-            DownloadPhase::Ready { id } if id == spec.id => DownloadPhase::Ready { id: id.clone() },
-            _ => DownloadPhase::Idle,
-        };
-        let downloading = matches!(phase, DownloadPhase::Downloading { .. });
-        let model_sub = match &phase {
-            DownloadPhase::Downloading {
                 file,
                 file_index,
                 file_count,
                 ..
-            } => format!(
+            } if id == spec.id => format!(
                 "Downloading {} ({file_index} of {file_count}).",
                 models::file_label(file)
             ),
-            DownloadPhase::Failed { message, .. } => message.clone(),
+            DownloadPhase::Failed { id, message } if id == spec.id => message.clone(),
             _ if self.model_loading.as_deref() == Some(spec.id) => {
                 match self
                     .active_model
@@ -1773,20 +1747,27 @@ impl HudView {
                 });
             }
         });
-        let download_action = match &phase {
-            DownloadPhase::Downloading { done, total, .. } => {
+        let download_action = match model_phase {
+            DownloadPhase::Downloading {
+                id, done, total, ..
+            } if id == spec.id => {
                 format!("{}%", models::percent(*done, *total))
             }
-            DownloadPhase::Failed { .. } => "Try again".to_string(),
+            DownloadPhase::Failed { id, .. } if id == spec.id => "Try again".to_string(),
             _ => "Download".to_string(),
         };
-        let show_download = !installed || matches!(phase, DownloadPhase::Failed { .. });
-        let model_meter = match &phase {
-            DownloadPhase::Downloading { done, total, .. } => {
-                Some(controls::progress_bar("model_progress", *done, *total))
-            }
+        let show_download = !installed
+            || matches!(
+                model_phase,
+                DownloadPhase::Failed { id, .. } if id == spec.id
+            );
+        let model_meter = match model_phase {
+            DownloadPhase::Downloading {
+                id, done, total, ..
+            } if id == spec.id => Some(controls::progress_bar("model_progress", *done, *total)),
             _ => None,
         };
+        drop(model_guard);
         let running_note = if self.model_loading.as_deref() != Some(spec.id) {
             self.active_model
                 .as_ref()
@@ -1896,6 +1877,18 @@ pub fn success_returns_to_idle(elapsed: Duration, has_notice: bool) -> bool {
         Duration::from_millis(1800)
     };
     elapsed > hold
+}
+
+fn meta_label(text: String) -> Div {
+    div()
+        .text_size(px(TYPE_META))
+        .line_height(px(14.0))
+        .font_family("Consolas")
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(muted())
+        .text_right()
+        .whitespace_nowrap()
+        .child(text)
 }
 
 fn preview_wave(loud: bool) -> [f32; WAVE_BARS] {

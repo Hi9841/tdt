@@ -36,11 +36,17 @@ try:
             try:
                 return orig_resident_form(device)
             except NotImplementedError:
+                # stderr, never stdout: stdout is the JSON protocol.
+                print(
+                    "native ternary kernel unavailable; falling back to dense",
+                    file=sys.stderr,
+                    flush=True,
+                )
                 return "dense"
 
         kt.resident_form = safe_resident_form
-except Exception:
-    pass
+except Exception as exc:  # import failure is fine; only patching is conditional
+    print(f"kestrel_kernels patch skipped: {exc}", file=sys.stderr, flush=True)
 
 
 def main() -> None:
@@ -66,6 +72,12 @@ def main() -> None:
                 kwargs: dict[str, object] = {"device": "cpu"}
                 if model_dir and os.path.isdir(model_dir):
                     kwargs["model_path"] = model_dir
+                else:
+                    # Fail loudly: without a local model, md.photon would hit
+                    # the network, which breaks the offline promise.
+                    raise RuntimeError(
+                        f"Model directory is missing or not a directory: {model_dir!r}"
+                    )
 
                 client = md.photon("moondream/parakeet-redux", **kwargs)
 

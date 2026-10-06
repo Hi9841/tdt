@@ -68,8 +68,9 @@ pub(crate) fn boost_quiet_speech(samples: &[f32]) -> Option<Vec<f32>> {
             audible.push(level);
         }
     }
-    // 200 ms of visible frames. A single click is not a phrase.
-    if audible.len() < 8 {
+    // 200 ms of audible frames. A single click is not a phrase.
+    const MIN_AUDIBLE_FRAMES: usize = 8;
+    if audible.len() < MIN_AUDIBLE_FRAMES {
         return None;
     }
     audible.sort_by(|left, right| left.total_cmp(right));
@@ -77,8 +78,9 @@ pub(crate) fn boost_quiet_speech(samples: &[f32]) -> Option<Vec<f32>> {
     if !level.is_finite() || level >= BOOST_TARGET_RMS {
         return None;
     }
+    const MIN_USEFUL_GAIN: f32 = 1.25;
     let gain = (BOOST_TARGET_RMS / level).min(BOOST_MAX_GAIN);
-    if gain < 1.25 {
+    if gain < MIN_USEFUL_GAIN {
         return None;
     }
     Some(

@@ -39,7 +39,10 @@ const APPROVED_ENABLED: [u8; 12] = [0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
 /// True when TDT will launch at sign-in and Task Manager does not have it Disabled.
 pub fn is_enabled() -> bool {
     let shortcut = shortcut_path();
-    if shortcut.exists() && !is_approved_disabled(APPROVED_FOLDER, SHORTCUT_NAME) {
+    if !shortcut.as_os_str().is_empty()
+        && shortcut.exists()
+        && !is_approved_disabled(APPROVED_FOLDER, SHORTCUT_NAME)
+    {
         return true;
     }
     read_value_exists(RUN_SUBKEY, VALUE_NAME) && !is_approved_disabled(APPROVED_RUN, VALUE_NAME)
@@ -56,7 +59,54 @@ pub fn refresh_if_enabled() {
     if !is_tdt_exe_name(&exe) {
         return;
     }
+    let shortcut = shortcut_path();
+    if shortcut.as_os_str().is_empty() {
+        return;
+    }
+    let unchanged = shortcut_target(&shortcut)
+        .map(|target| target.eq_ignore_ascii_case(&exe.to_string_lossy()))
+        .unwrap_or(false);
+    if unchanged {
+        return;
+    }
     let _ = enable_startup();
+}
+
+fn shortcut_target(path: &Path) -> Option<String> {
+    if !path.exists() {
+        return None;
+    }
+    let path = path.to_path_buf();
+    std::thread::spawn(move || {
+        if unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.is_err() {
+            return None;
+        }
+        let target = unsafe {
+            let link: IShellLinkW =
+                CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).ok()?;
+            let persist: IPersistFile = link.cast().ok()?;
+            persist
+                .Load(
+                    &HSTRING::from(path.to_string_lossy().as_ref()),
+                    windows::Win32::System::Com::STGM_READ,
+                )
+                .ok()?;
+            let mut buffer = [0u16; 260];
+            link.GetPath(
+                &mut buffer,
+                std::ptr::null_mut(),
+                windows::Win32::UI::Shell::SLGP_RAWPATH.0 as u32,
+            )
+            .ok()?;
+            let len = buffer.iter().position(|&c| c == 0).unwrap_or(buffer.len());
+            Some(String::from_utf16_lossy(&buffer[..len]))
+        };
+        unsafe { windows::Win32::System::Com::CoUninitialize() };
+        target
+    })
+    .join()
+    .ok()
+    .flatten()
 }
 
 fn is_tdt_exe_name(path: &Path) -> bool {
@@ -94,7 +144,12 @@ fn enable_startup() -> Result<(), String> {
         Ok(()) => {
             let _ = delete_value(RUN_SUBKEY, VALUE_NAME);
             let _ = delete_value(APPROVED_RUN, VALUE_NAME);
-            write_approved(APPROVED_FOLDER, SHORTCUT_NAME)?;
+            if let Err(error) = write_approved(APPROVED_FOLDER, SHORTCUT_NAME) {
+                if !lnk.as_os_str().is_empty() {
+                    let _ = remove_shortcut(&lnk);
+                }
+                return Err(error);
+            }
             Ok(())
         }
         Err(shortcut_error) => {
@@ -115,8 +170,11 @@ fn enable_startup() -> Result<(), String> {
 
 fn disable_startup() -> Result<(), String> {
     let mut errors = Vec::new();
-    if let Err(error) = remove_shortcut(&shortcut_path()) {
-        errors.push(error);
+    let shortcut = shortcut_path();
+    if !shortcut.as_os_str().is_empty() {
+        if let Err(error) = remove_shortcut(&shortcut) {
+            errors.push(error);
+        }
     }
     if let Err(error) = delete_value(APPROVED_FOLDER, SHORTCUT_NAME) {
         errors.push(error);
@@ -207,26 +265,34 @@ fn write_shortcut_sta(exe: &Path, path: &Path) -> Result<(), String> {
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
-    unsafe {
-        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-        let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)
-            .map_err(|error| format!("Could not create a startup shortcut: {error}"))?;
-        let exe_hs = HSTRING::from(exe.to_string_lossy().as_ref());
-        link.SetPath(&exe_hs)
-            .map_err(|error| format!("Could not set the startup target: {error}"))?;
-        link.SetWorkingDirectory(&HSTRING::from(workdir.to_string_lossy().as_ref()))
-            .map_err(|error| format!("Could not set the startup folder: {error}"))?;
-        link.SetDescription(&HSTRING::from("TDT - Talk Don't Type"))
-            .map_err(|error| format!("Could not set the startup description: {error}"))?;
-        link.SetIconLocation(&exe_hs, 0)
-            .map_err(|error| format!("Could not set the startup icon: {error}"))?;
-        let persist: IPersistFile = link
-            .cast()
-            .map_err(|error| format!("Could not save the startup shortcut: {error}"))?;
-        persist
-            .Save(&HSTRING::from(path.to_string_lossy().as_ref()), TRUE)
-            .map_err(|error| format!("Could not write the Startup shortcut: {error}"))?;
+    let init = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+    if init.is_err() {
+        return Err("Could not initialize COM for the startup shortcut.".into());
     }
+    let result: Result<(), String> = (|| {
+        unsafe {
+            let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)
+                .map_err(|error| format!("Could not create a startup shortcut: {error}"))?;
+            let exe_hs = HSTRING::from(exe.to_string_lossy().as_ref());
+            link.SetPath(&exe_hs)
+                .map_err(|error| format!("Could not set the startup target: {error}"))?;
+            link.SetWorkingDirectory(&HSTRING::from(workdir.to_string_lossy().as_ref()))
+                .map_err(|error| format!("Could not set the startup folder: {error}"))?;
+            link.SetDescription(&HSTRING::from("TDT - Talk Don't Type"))
+                .map_err(|error| format!("Could not set the startup description: {error}"))?;
+            link.SetIconLocation(&exe_hs, 0)
+                .map_err(|error| format!("Could not set the startup icon: {error}"))?;
+            let persist: IPersistFile = link
+                .cast()
+                .map_err(|error| format!("Could not save the startup shortcut: {error}"))?;
+            persist
+                .Save(&HSTRING::from(path.to_string_lossy().as_ref()), TRUE)
+                .map_err(|error| format!("Could not write the Startup shortcut: {error}"))?;
+        }
+        Ok(())
+    })();
+    unsafe { windows::Win32::System::Com::CoUninitialize() };
+    result?;
     notify_path(path, SHCNE_CREATE);
     Ok(())
 }
@@ -355,7 +421,7 @@ fn is_approved_disabled(subkey: &str, value: &str) -> bool {
             Some(&mut data_len),
         );
         let _ = RegCloseKey(key);
-        queried == ERROR_SUCCESS && data_len > 0 && data[0] != 0x02
+        queried == ERROR_SUCCESS && data_len >= 12 && data[0] != 0x02
     }
 }
 
@@ -491,10 +557,10 @@ mod tests {
     #[test]
     fn refresh_if_enabled_is_noop_when_disabled() {
         let shortcut = shortcut_path();
-        let had_shortcut = shortcut.exists();
+        let had_shortcut = !shortcut.as_os_str().is_empty() && shortcut.exists();
         if !had_shortcut && !read_value_exists(RUN_SUBKEY, VALUE_NAME) {
             refresh_if_enabled();
-            assert!(!shortcut.exists());
+            assert!(shortcut.as_os_str().is_empty() || !shortcut.exists());
             assert!(!read_value_exists(RUN_SUBKEY, VALUE_NAME));
         }
     }

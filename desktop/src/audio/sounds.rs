@@ -40,6 +40,10 @@ pub fn play_sound(effect: SoundEffect) {
         use windows::Win32::Media::Audio::{PlaySoundW, SND_ASYNC, SND_MEMORY, SND_NODEFAULT};
 
         unsafe {
+            // SND_ASYNC replaces any in-flight sound: a success chime cuts off
+            // the start blip. That overlap is accepted UI behavior, not a bug.
+            // The PCWSTR cast is only an address under SND_MEMORY; the WAV
+            // bytes are never read as UTF-16.
             let _ = PlaySoundW(
                 PCWSTR(wav_bytes.as_ptr() as *const u16),
                 None,

@@ -16,27 +16,6 @@ pub struct SystemTray {
     last_tooltip: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TrayState {
-    Idle,
-    Listening,
-    Transcribing,
-    Success,
-    Attention,
-}
-
-impl TrayState {
-    pub fn from_status(status: &HudStatus) -> Self {
-        match status {
-            HudStatus::Idle => Self::Idle,
-            HudStatus::Listening { .. } => Self::Listening,
-            HudStatus::Transcribing { .. } => Self::Transcribing,
-            HudStatus::Success { .. } => Self::Success,
-            HudStatus::Error { .. } | HudStatus::NoSpeech => Self::Attention,
-        }
-    }
-}
-
 impl SystemTray {
     pub fn new(auto_paste_enabled: bool, hotkey_label: &str) -> Result<Self, String> {
         let tray_menu = Menu::new();
@@ -101,8 +80,7 @@ impl SystemTray {
     }
 
     pub fn update(&mut self, status: &HudStatus, hotkey: &str) {
-        let state = TrayState::from_status(status);
-        let recording = state == TrayState::Listening;
+        let recording = matches!(status, HudStatus::Listening { .. });
         if self.stop_item.is_enabled() != recording {
             self.stop_item.set_enabled(recording);
         }
@@ -151,8 +129,12 @@ fn status_tooltip(status: &HudStatus, hotkey: &str) -> String {
     let mut units = 0;
     text.chars()
         .take_while(|ch| {
-            units += ch.len_utf16();
-            units <= 127
+            let len = ch.len_utf16();
+            if units + len > 127 {
+                return false;
+            }
+            units += len;
+            true
         })
         .collect()
 }

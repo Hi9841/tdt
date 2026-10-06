@@ -26,6 +26,7 @@ pub struct AudioRecorder {
     device_name: String,
     opened_ms: u64,
     last_callback_ms: Arc<AtomicU64>,
+    paused: AtomicBool,
     _stream: cpal::Stream,
 }
 
@@ -38,6 +39,7 @@ pub struct CaptureHandle {
     samples_ready: Arc<Condvar>,
     current_rms: Arc<Mutex<f32>>,
     envelope: Arc<Mutex<SpeechEnvelope>>,
+    captured: Arc<AtomicUsize>,
 }
 
 impl AudioRecorder {
@@ -90,7 +92,12 @@ fn open_named(host: &cpal::Host, device_name: &str) -> Result<AudioRecorder, Str
 
     let input_sample_rate = config.sample_rate.0;
     let channels = config.channels.max(1) as usize;
-    let error_cb = stream_error_callback(Arc::clone(&last_error), Arc::clone(&parts.is_recording));
+    let error_cb = stream_error_callback(
+        Arc::clone(&last_error),
+        Arc::clone(&parts.is_recording),
+        Arc::clone(&parts.rms),
+        Arc::clone(&parts.envelope),
+    );
 
     let stream = build_stream(
         &device,
@@ -120,6 +127,7 @@ fn open_named(host: &cpal::Host, device_name: &str) -> Result<AudioRecorder, Str
         device_name: device_name.to_string(),
         opened_ms: now_ms(),
         last_callback_ms: parts.last_callback_ms,
+        paused: AtomicBool::new(false),
         _stream: stream,
     })
 }
@@ -129,9 +137,32 @@ impl AudioRecorder {
         &self.device_name
     }
 
+    /// Park the input stream while idle so the microphone (and its Windows
+    /// privacy indicator) is only hot around actual recordings.
+    pub fn pause_input(&self) {
+        if self.paused.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let _ = self._stream.pause();
+    }
+
+    /// Resume a parked stream. Refreshes the callback clock so a long idle
+    /// does not look like a dead device.
+    pub fn resume_input(&self) {
+        if !self.paused.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        let _ = self._stream.play();
+        note_callback(&self.last_callback_ms);
+    }
+
     /// True when the capture callback has stopped. The next recording should
     /// open the microphone again instead of writing into a dead stream.
+    /// A deliberately parked stream is healthy, not stale.
     pub fn needs_reopen(&self) -> bool {
+        if self.paused.load(Ordering::SeqCst) {
+            return false;
+        }
         stream_is_stale(
             self.opened_ms,
             nonzero(self.last_callback_ms.load(Ordering::Relaxed)),
@@ -152,6 +183,9 @@ impl AudioRecorder {
         }
 
         // Calculate RMS audio level (0.0 to 1.0)
+        if mono.is_empty() {
+            return;
+        }
         let sum_squares: f32 = mono.iter().map(|&s| s * s).sum();
         let level = (sum_squares / mono.len() as f32).sqrt().min(1.0);
         *parts.rms.lock() = level;
@@ -230,6 +264,7 @@ impl AudioRecorder {
             samples_ready: Arc::clone(&self.samples_ready),
             current_rms: Arc::clone(&self.current_rms),
             envelope: Arc::clone(&self.envelope),
+            captured: Arc::clone(&self.captured),
         }
     }
 
@@ -253,7 +288,7 @@ impl AudioRecorder {
 #[allow(dead_code)]
 impl CaptureHandle {
     pub fn drain(&self) -> Vec<f32> {
-        drain_samples(&self.is_recording, &self.buffer)
+        drain_samples(&self.is_recording, &self.buffer, &self.captured)
     }
 
     /// Same end state as AudioRecorder::stop: is_recording false, rms 0,
@@ -264,6 +299,7 @@ impl CaptureHandle {
             &self.current_rms,
             &self.envelope,
             &self.buffer,
+            &self.captured,
         )
     }
 
@@ -275,17 +311,27 @@ impl CaptureHandle {
     /// the condvar waits on the same mutex as the sample buffer.
     pub fn wait_for_audio(&self, timeout: std::time::Duration) {
         let mut guard = self.buffer.lock();
-        if guard.is_empty() {
-            let _ = self.samples_ready.wait_for(&mut guard, timeout);
+        let start = std::time::Instant::now();
+        while guard.is_empty() {
+            let remaining = timeout.saturating_sub(start.elapsed());
+            if remaining.is_zero() {
+                break;
+            }
+            self.samples_ready.wait_for(&mut guard, remaining);
         }
     }
 }
 
-fn drain_samples(is_recording: &AtomicBool, buffer: &Mutex<Vec<f32>>) -> Vec<f32> {
+fn drain_samples(
+    is_recording: &AtomicBool,
+    buffer: &Mutex<Vec<f32>>,
+    captured: &AtomicUsize,
+) -> Vec<f32> {
     let mut recorded = buffer.lock();
     if !is_recording.load(Ordering::SeqCst) {
         return Vec::new();
     }
+    captured.store(0, Ordering::SeqCst);
     std::mem::take(&mut *recorded)
 }
 
@@ -294,10 +340,12 @@ fn stop_samples(
     current_rms: &Mutex<f32>,
     envelope: &Mutex<SpeechEnvelope>,
     buffer: &Mutex<Vec<f32>>,
+    captured: &AtomicUsize,
 ) -> Vec<f32> {
     is_recording.store(false, Ordering::SeqCst);
     *current_rms.lock() = 0.0;
     *envelope.lock() = SpeechEnvelope::default();
+    captured.store(0, Ordering::SeqCst);
     std::mem::take(&mut *buffer.lock())
 }
 
@@ -334,10 +382,14 @@ fn clear_session_signals(last_error: &Mutex<Option<String>>, at_limit: &AtomicBo
 fn stream_error_callback(
     last_error: Arc<Mutex<Option<String>>>,
     is_recording: Arc<AtomicBool>,
+    rms: Arc<Mutex<f32>>,
+    envelope: Arc<Mutex<SpeechEnvelope>>,
 ) -> impl FnMut(cpal::StreamError) + Send + 'static {
     move |err| {
         eprintln!("Audio stream error: {}", err);
         apply_stream_error(&last_error, &is_recording, err);
+        *rms.lock() = 0.0;
+        *envelope.lock() = SpeechEnvelope::default();
     }
 }
 
@@ -434,6 +486,7 @@ fn ingest(samples: &[f32], channels: usize, sample_rate: u32, parts: &CapturePar
         AudioRecorder::process_samples_f32(samples, channels, sample_rate, parts);
     } else {
         *parts.rms.lock() = 0.0;
+        *parts.envelope.lock() = SpeechEnvelope::default();
     }
 }
 

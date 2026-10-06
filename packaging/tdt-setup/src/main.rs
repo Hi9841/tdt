@@ -44,6 +44,7 @@ fn run(args: &Args) -> Result<(), String> {
     let _ = fs::remove_file(&zip_path);
 
     let stage = find_stage(&extract_dir)?;
+    verify_manifest(&stage)?;
     let script = stage.join("Install-TDT.ps1");
     if !script.is_file() {
         return Err("Installer payload is missing Install-TDT.ps1".to_string());
@@ -73,6 +74,8 @@ fn run(args: &Args) -> Result<(), String> {
         ));
     }
     log_line("TDT Setup finished");
+    // The payload served its purpose; do not leave a copy in temp.
+    let _ = fs::remove_dir_all(&extract_dir);
     Ok(())
 }
 
@@ -102,6 +105,42 @@ fn uninstall() -> Result<(), String> {
 fn install_dir() -> PathBuf {
     let base = std::env::var_os("LOCALAPPDATA").unwrap_or_else(|| ".".into());
     PathBuf::from(base).join(APP_NAME)
+}
+
+fn verify_manifest(stage: &Path) -> Result<(), String> {
+    use sha2::Digest;
+    let manifest = stage.join("payload-sha256.txt");
+    let body = fs::read_to_string(&manifest)
+        .map_err(|_| "Installer payload is missing its integrity manifest".to_string())?;
+    let mut checked = 0;
+    for line in body.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let (Some(expected), Some(name)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        if name == "payload-sha256.txt" {
+            continue;
+        }
+        let bytes = fs::read(stage.join(name))
+            .map_err(|_| format!("Installer payload is missing {name}"))?;
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(&bytes);
+        let actual = format!("{:x}", hasher.finalize());
+        if !actual.eq_ignore_ascii_case(expected) {
+            return Err(format!(
+                "Installer payload failed its integrity check ({name}). Re-download TDT-Setup.exe."
+            ));
+        }
+        checked += 1;
+    }
+    if checked == 0 {
+        return Err("Installer payload integrity manifest is empty".to_string());
+    }
+    Ok(())
 }
 
 fn find_stage(extract_dir: &Path) -> Result<PathBuf, String> {
@@ -252,5 +291,22 @@ mod tests {
     #[test]
     fn split_sfx_rejects_bare_stub() {
         assert!(split_sfx(b"no-payload-here").is_err());
+    }
+
+    #[test]
+    fn manifest_verifies_staged_files() {
+        use sha2::Digest;
+        let dir = std::env::temp_dir().join(format!("tdt-manifest-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("TDT.exe"), b"fake-exe").unwrap();
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(b"fake-exe");
+        let hash = format!("{:x}", hasher.finalize());
+        fs::write(dir.join("payload-sha256.txt"), format!("{hash}  TDT.exe\n")).unwrap();
+        assert!(verify_manifest(&dir).is_ok());
+        fs::write(dir.join("TDT.exe"), b"tampered").unwrap();
+        assert!(verify_manifest(&dir).is_err());
+        let _ = fs::remove_dir_all(&dir);
     }
 }

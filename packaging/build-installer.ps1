@@ -53,6 +53,13 @@ Set-Content -LiteralPath (Join-Path $Stage "VERSION") -Value $Version -NoNewline
 
 # Never bundle speech models. First run downloads Parakeet Redux from Settings. Updates
 # must not reinstall a 200 MB model the user already has.
+$manifest = Join-Path $Stage "payload-sha256.txt"
+$manifestLines = @()
+Get-ChildItem -LiteralPath $Stage -File | Where-Object { $_.Name -ne "payload-sha256.txt" } | ForEach-Object {
+    $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant()
+    $manifestLines += "$hash  $($_.Name)"
+}
+Set-Content -LiteralPath $manifest -Value $manifestLines
 $portable = Join-Path $Dist "TDT-$Version-windows-x64.zip"
 if (Test-Path $portable) { Remove-Item $portable -Force }
 Compress-Archive -Path (Join-Path $Stage "*") -DestinationPath $portable -Force

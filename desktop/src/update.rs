@@ -38,8 +38,11 @@ pub fn current_version() -> &'static str {
 
 pub fn updates_disabled() -> bool {
     matches!(
-        std::env::var("TDT_DISABLE_UPDATES").as_deref(),
-        Ok("1") | Ok("true") | Ok("TRUE")
+        std::env::var("TDT_DISABLE_UPDATES")
+            .as_deref()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref(),
+        Ok("1") | Ok("true") | Ok("yes") | Ok("on")
     )
 }
 
@@ -90,6 +93,10 @@ pub fn check_latest() -> Result<UpdatePhase, String> {
     };
 
     let latest = tag.trim().trim_start_matches('v').to_string();
+    if parse_semver(&latest).is_none() {
+        eprintln!("TDT: ignoring unparseable release tag {tag}");
+        return Ok(UpdatePhase::UpToDate);
+    }
     if !version_newer(&latest, current_version()) {
         return Ok(UpdatePhase::UpToDate);
     }
@@ -99,7 +106,15 @@ pub fn check_latest() -> Result<UpdatePhase, String> {
     let sums_body = match http_get_string(&sums_url) {
         Ok(body) => body,
         Err(err) if is_no_release(&err) => {
-            return Ok(UpdatePhase::UpToDate);
+            let asset_name = "TDT.exe".to_string();
+            let asset_url =
+                format!("https://github.com/{repo}/releases/download/{tag}/{asset_name}");
+            return Ok(UpdatePhase::Available {
+                version: latest,
+                asset_url,
+                asset_name,
+                sums_url: None,
+            });
         }
         Err(err) => return Err(clean_error_message(&err)),
     };
@@ -143,7 +158,7 @@ pub fn download_installer(
     } else {
         "TDT-Setup.exe"
     };
-    let path = std::env::temp_dir().join(format!("{file_name}.download"));
+    let path = std::env::temp_dir().join(format!("{file_name}.{}.download", std::process::id()));
     let mut file = File::create(&path).map_err(|e| format!("Could not write update: {e}"))?;
     let mut hasher = sha2::Sha256::new();
 
@@ -173,6 +188,7 @@ pub fn download_installer(
         total += read as u64;
         on_progress(total, content_len.max(total).max(1));
     }
+    let _ = file.sync_all();
     drop(file);
 
     if total < 64 {
@@ -236,9 +252,10 @@ fn download_file_name(url: &str) -> String {
 fn expected_hash_for(sums: &str, file_name: &str) -> Option<String> {
     for line in sums.lines() {
         let mut parts = line.split_whitespace();
-        let (Some(hash), Some(name)) = (parts.next(), parts.next()) else {
+        let (Some(hash), Some(raw_name)) = (parts.next(), parts.next()) else {
             continue;
         };
+        let name = raw_name.strip_prefix('*').unwrap_or(raw_name);
         if name.eq_ignore_ascii_case(file_name) {
             return Some(hash.to_ascii_lowercase());
         }
@@ -247,8 +264,11 @@ fn expected_hash_for(sums: &str, file_name: &str) -> Option<String> {
 }
 
 pub fn launch_installer(path: &Path) -> Result<(), String> {
-    Command::new(path)
-        .args(["/SILENT", "/CLOSEAPPLICATIONS", "/NORESTART"])
+    let mut command = Command::new(path);
+    if !is_app_binary(&path.to_string_lossy()) {
+        command.args(["/SILENT", "/CLOSEAPPLICATIONS", "/NORESTART"]);
+    }
+    command
         .spawn()
         .map_err(|e| format!("Could not start installer: {e}"))?;
     Ok(())
@@ -276,10 +296,16 @@ pub fn replace_running_exe(new_exe: &Path, version: &str) -> Result<(), String> 
     let _ = std::fs::write(dir.join("VERSION"), version.trim().trim_start_matches('v'));
 
     let script = dir.join("tdt-apply-update.cmd");
-    let staged_s = staged.display().to_string().replace('"', "");
-    let current_s = current.display().to_string().replace('"', "");
+    let esc = |s: &str| {
+        s.replace('"', "")
+            .replace('%', "%%")
+            .replace('&', "^&")
+            .replace('^', "^^")
+    };
+    let staged_s = esc(&staged.display().to_string());
+    let current_s = esc(&current.display().to_string());
     let body = format!(
-        "@echo off\r\n:retry\r\nping -n 2 127.0.0.1 >nul\r\nmove /Y \"{staged_s}\" \"{current_s}\"\r\nif exist \"{staged_s}\" goto retry\r\nstart \"\" \"{current_s}\"\r\ndel \"%~f0\"\r\n"
+        "@echo off\r\nset /a tries=0\r\n:retry\r\nping -n 2 127.0.0.1 >nul\r\nmove /Y \"{staged_s}\" \"{current_s}\"\r\nif not exist \"{staged_s}\" goto done\r\nset /a tries+=1\r\nif %tries% LSS 60 goto retry\r\nexit /b 1\r\n:done\r\nstart \"\" \"{current_s}\"\r\ndel \"%~f0\"\r\n"
     );
     std::fs::write(&script, body)
         .map_err(|error| format!("Could not write the update script: {error}"))?;
@@ -414,6 +440,11 @@ mod tests {
             Some("abc123".to_string())
         );
         assert_eq!(expected_hash_for(sums, "missing.zip"), None);
+        // Binary-mode marker (`*name`) from GNU coreutils.
+        assert_eq!(
+            expected_hash_for("abc123 *TDT.exe\n", "TDT.exe"),
+            Some("abc123".to_string())
+        );
     }
 
     #[test]
