@@ -20,9 +20,13 @@ import os
 import sys
 import time
 
-# Disable third-party network warnings and unnecessary cloud prompts
+# TDT is offline. No key means no cloud finetunes; the hub flags keep model
+# loading on local files and stop Hugging Face telemetry.
 os.environ["MOONDREAM_API_KEY"] = ""
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+os.environ["DO_NOT_TRACK"] = "1"
 
 # Safe fallback for ternary quantization resident form on CPU platforms:
 # When CPU does not have avx512vnni or the native kernel is unbuilt/scalar,
@@ -32,21 +36,55 @@ try:
 
     orig_resident_form = getattr(kt, "resident_form", None)
     if orig_resident_form:
+        warned_dense = False
+
         def safe_resident_form(device):
+            global warned_dense
             try:
                 return orig_resident_form(device)
             except NotImplementedError:
-                # stderr, never stdout: stdout is the JSON protocol.
-                print(
-                    "native ternary kernel unavailable; falling back to dense",
-                    file=sys.stderr,
-                    flush=True,
-                )
+                # Every layer asks; say it once. stderr, never stdout: stdout
+                # is the JSON protocol.
+                if not warned_dense:
+                    warned_dense = True
+                    print(
+                        "native ternary kernel unavailable; falling back to dense",
+                        file=sys.stderr,
+                        flush=True,
+                    )
                 return "dense"
 
         kt.resident_form = safe_resident_form
 except Exception as exc:  # import failure is fine; only patching is conditional
     print(f"kestrel_kernels patch skipped: {exc}", file=sys.stderr, flush=True)
+
+
+def keep_engine_local() -> None:
+    """Stop the Photon runtime from talking to the network.
+
+    Kestrel posts usage reports (hostname, request counts, GPU) to
+    api.moondream.ai at startup and every 60 s, and probes Hugging Face for
+    model configs. Startup also waits on that first report. Both are cut here,
+    so speech never leaves the machine and init does not wait on a socket.
+    """
+    try:
+        from kestrel import photon as kestrel_photon
+
+        async def no_report(self, *, rotate: bool = True):
+            if rotate:
+                self._rotate_window()
+            self._pending_reports.clear()
+            return None
+
+        kestrel_photon.PhotonReporter._flush_window = no_report
+    except Exception as exc:
+        print(f"photon telemetry patch skipped: {exc}", file=sys.stderr, flush=True)
+    try:
+        import kestrel.model_download as kestrel_download
+
+        kestrel_download.probe_supported_model_configs = lambda *_, **__: None
+    except Exception as exc:
+        print(f"model probe patch skipped: {exc}", file=sys.stderr, flush=True)
 
 
 def main() -> None:
@@ -79,6 +117,7 @@ def main() -> None:
                         f"Model directory is missing or not a directory: {model_dir!r}"
                     )
 
+                keep_engine_local()
                 client = md.photon("moondream/parakeet-redux", **kwargs)
 
                 # Warm-up inference on a tiny silence PCM WAV buffer to pay

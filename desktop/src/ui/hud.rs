@@ -24,6 +24,7 @@ use ely_gpui_component::theme::{ActiveTheme, ControlSize};
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use parking_lot::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use voice_stt_desktop::stt::{models, DownloadPhase, EngineSlot, SttEngine, CATALOG};
@@ -89,6 +90,8 @@ struct PreparedModel {
 pub struct HudView {
     pub status: HudStatus,
     pub auto_paste_enabled: bool,
+    remove_fillers_enabled: bool,
+    remove_fillers_state: Arc<AtomicBool>,
     autostart_enabled: bool,
     autostart_error: Option<String>,
     pub hotkey_label: String,
@@ -132,10 +135,10 @@ pub struct HudView {
 
 impl HudView {
     pub fn new(
-        auto_paste_enabled: bool,
         hotkey_label: String,
         stt_engine: EngineSlot,
         auto_paste_state: Arc<Mutex<bool>>,
+        remove_fillers_state: Arc<AtomicBool>,
         update: Arc<Mutex<UpdatePhase>>,
         update_ping: crossbeam_channel::Sender<()>,
         cx: &mut Context<Self>,
@@ -162,9 +165,12 @@ impl HudView {
             .map(|model| model.id.to_string())
             .collect();
         let (model_ready_tx, model_ready_rx) = crossbeam_channel::unbounded();
+        let auto_paste_enabled = *auto_paste_state.lock();
         let mut view = Self {
             status: HudStatus::Idle,
             auto_paste_enabled,
+            remove_fillers_enabled: remove_fillers_state.load(Ordering::Relaxed),
+            remove_fillers_state,
             autostart_enabled: crate::autostart::is_enabled(),
             autostart_error: None,
             hotkey_label,
@@ -226,6 +232,7 @@ impl HudView {
         }
 
         self.auto_paste_enabled = true;
+        self.remove_fillers_enabled = true;
         self.autostart_enabled = false;
         self.autostart_error = None;
 
@@ -773,6 +780,17 @@ impl HudView {
         cfg.auto_paste = self.auto_paste_enabled;
         let _ = cfg.save();
         *self.auto_paste_state.lock() = self.auto_paste_enabled;
+    }
+
+    fn set_remove_fillers(&mut self, on: bool) {
+        self.remove_fillers_enabled = on;
+        if preview::is_active() {
+            return;
+        }
+        let mut cfg = AppConfig::load();
+        cfg.remove_fillers = on;
+        let _ = cfg.save();
+        self.remove_fillers_state.store(on, Ordering::Relaxed);
     }
 
     fn toggle_autostart(&mut self) {
@@ -1561,6 +1579,29 @@ impl HudView {
             auto_paste_switch.into_any_element(),
         );
 
+        let fillers_switch =
+            Switch::new("remove_fillers", self.remove_fillers_enabled).on_change({
+                let hud = hud.clone();
+                move |on, _, cx| {
+                    hud.update(cx, |this, cx| {
+                        if this.remove_fillers_enabled != on {
+                            this.set_remove_fillers(on);
+                        }
+                        cx.notify();
+                    });
+                }
+            });
+        let fillers_row = settings_row(
+            "Remove filler words",
+            if self.remove_fillers_enabled {
+                "Drops um, uh, and similar sounds."
+            } else {
+                "Keeps every word as spoken."
+            }
+            .to_string(),
+            fillers_switch.into_any_element(),
+        );
+
         let startup_switch = Switch::new("start_with_windows", self.autostart_enabled).on_change({
             let hud = hud.clone();
             move |on, _, cx| {
@@ -1829,7 +1870,8 @@ impl HudView {
                     .gap(px(GAP_TIGHT))
                     .child(controls::group_label("Dictation"))
                     .child(hotkey_row)
-                    .child(auto_paste_row),
+                    .child(auto_paste_row)
+                    .child(fillers_row),
             )
             .child(
                 div()

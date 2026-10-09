@@ -62,6 +62,8 @@ fn write_json_atomic<T: Serialize>(
 #[serde(default)]
 pub struct AppConfig {
     pub auto_paste: bool,
+    /// Drop "um", "uh", and similar sounds from transcripts.
+    pub remove_fillers: bool,
     pub hotkey: String,
     pub model_dir: Option<PathBuf>,
     pub model_id: String,
@@ -71,6 +73,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             auto_paste: true,
+            remove_fillers: true,
             hotkey: "Ctrl+;".to_string(),
             model_dir: None,
             model_id: voice_stt_desktop::stt::DEFAULT_MODEL_ID.to_string(),
@@ -277,6 +280,10 @@ mod tests {
     fn partial_config_json_keeps_defaults_for_missing_fields() {
         let config: AppConfig = serde_json::from_str(r#"{"auto_paste": false}"#).unwrap();
         assert!(!config.auto_paste);
+        assert!(
+            config.remove_fillers,
+            "configs from older versions get the new default"
+        );
         assert_eq!(config.hotkey, AppConfig::default().hotkey);
         assert_eq!(config.model_id, voice_stt_desktop::stt::DEFAULT_MODEL_ID);
     }

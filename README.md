@@ -25,7 +25,7 @@ That writes:
 
 - `dist/TDT.exe` slim app binary used by in-app updates
 - `dist/TDT-Setup.exe` per-user installer (app only, no speech model)
-- `dist/TDT-0.2.19-windows-x64.zip` portable copy (app only, no speech model)
+- `dist/TDT-0.2.21-windows-x64.zip` portable copy (app only, no speech model)
 - `dist/SHA256SUMS.txt`
 
 The installer copies TDT and the license files into `%LOCALAPPDATA%\TDT`,
@@ -50,6 +50,11 @@ the hotkey records until release. Default shortcut is `Ctrl+;`. Change it in
 Settings by clicking the shortcut chip, then press the new combo. The tray
 menu controls auto-paste. Auto-paste writes the result to the clipboard and
 injects Unicode text directly into the previously focused application.
+
+TDT removes filler sounds such as "um", "uh", "erm", and "hmm" before it
+delivers the text, together with the commas around them. Words that can carry
+meaning, such as "like" or "you know", stay. Turn this off in Settings with
+**Remove filler words**.
 
 The floating bubble stays on screen while TDT runs and shows recording state
 directly. The tray icon mirrors that state, so hovering it gives status or the
@@ -102,8 +107,11 @@ portable zip on tag `v*`.
 
 ## Privacy and limits
 
-Recording and transcription stay on-device. The optional updater talks to
-GitHub only. Text is copied to the clipboard by design. Recordings are
+Recording and transcription stay on-device. The speech worker blocks the
+Photon runtime's usage reports and Hugging Face lookups, and it starts from
+the cached runtime without a package index request. The network is used only
+for the first runtime install, the model download you start in Settings, and
+the optional updater, which talks to GitHub only. Text is copied to the clipboard by design. Recordings are
 capped at 120 seconds to prevent unbounded memory growth.
 
 ## License
