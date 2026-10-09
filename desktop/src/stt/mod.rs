@@ -1,8 +1,10 @@
 pub mod engine;
+pub mod fillers;
 pub mod models;
 pub mod photon;
 
 pub use engine::{LiveAudio, LiveTranscript, SttEngine};
+pub use fillers::remove_fillers;
 pub use models::{DownloadPhase, CATALOG, DEFAULT_MODEL_ID};
 // Used by the bench-asr bin through the library target; the app binary
 // declares its own module tree and does not touch it.

@@ -80,7 +80,9 @@ enum PythonLauncher {
 }
 
 impl PythonLauncher {
-    fn build_command(&self, script_path: &Path) -> Command {
+    /// `offline` keeps uv on its cache: no index request, so a start needs no
+    /// network. Only the first install of the runtime goes online.
+    fn build_command(&self, script_path: &Path, offline: bool) -> Command {
         #[allow(unused_mut)]
         let mut cmd = match self {
             Self::Direct(exe) => {
@@ -90,8 +92,11 @@ impl PythonLauncher {
             }
             Self::Uv(uv_exe) => {
                 let mut c = Command::new(uv_exe);
-                c.arg("run")
-                    .arg("--with")
+                c.arg("run");
+                if offline {
+                    c.arg("--offline");
+                }
+                c.arg("--with")
                     .arg("moondream>=2.4.0")
                     .arg("python")
                     .arg("-u")
@@ -262,28 +267,55 @@ struct PhotonWorkerClient {
     reader: BufReader<ChildStdout>,
 }
 
+enum SpawnError {
+    /// The process ended before it answered, such as uv offline with no cached runtime.
+    Exited(String),
+    /// The worker ran and reported an error; a retry would fail the same way.
+    Failed(String),
+}
+
+impl SpawnError {
+    fn into_message(self) -> String {
+        match self {
+            Self::Exited(message) | Self::Failed(message) => message,
+        }
+    }
+}
+
 impl PhotonWorkerClient {
     fn spawn(model_dir: &Path) -> Result<Self, String> {
         let launcher = find_python_launcher()?;
         let script_file = locate_script_file()?;
 
-        let mut cmd = launcher.build_command(&script_file);
+        if matches!(launcher, PythonLauncher::Uv(_)) {
+            match Self::start(launcher.build_command(&script_file, true), model_dir) {
+                Ok(client) => return Ok(client),
+                Err(SpawnError::Failed(message)) => return Err(message),
+                Err(SpawnError::Exited(message)) => {
+                    eprintln!("No cached Photon runtime ({message}); installing it once.");
+                }
+            }
+        }
+        Self::start(launcher.build_command(&script_file, false), model_dir)
+            .map_err(SpawnError::into_message)
+    }
+
+    fn start(mut cmd: Command, model_dir: &Path) -> Result<Self, SpawnError> {
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
 
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| format!("Failed to spawn Photon worker process: {e}"))?;
+        let mut child = cmd.spawn().map_err(|e| {
+            SpawnError::Failed(format!("Failed to spawn Photon worker process: {e}"))
+        })?;
 
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| "Failed to open stdin for Photon worker".to_string())?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| "Failed to open stdout for Photon worker".to_string())?;
+        let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(SpawnError::Failed(
+                "Failed to open pipes for Photon worker".to_string(),
+            ));
+        };
 
         let reader = BufReader::new(stdout);
         let mut client = Self {
@@ -298,13 +330,16 @@ impl PhotonWorkerClient {
             "model_dir": model_dir.to_string_lossy().to_string(),
         });
 
-        let resp = client.send_request(&init_req)?;
+        // Dropping `client` on an error path kills the child process.
+        let resp = client.send_request(&init_req).map_err(SpawnError::Exited)?;
         if resp.get("status").and_then(|s| s.as_str()) != Some("ready") {
             let msg = resp
                 .get("message")
                 .and_then(|m| m.as_str())
                 .unwrap_or("Unknown initialization error");
-            return Err(format!("Photon worker initialization failed: {msg}"));
+            return Err(SpawnError::Failed(format!(
+                "Photon worker initialization failed: {msg}"
+            )));
         }
 
         Ok(client)

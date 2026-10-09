@@ -39,7 +39,9 @@ use ui::window_util::{
 };
 use ui::{HudStatus, HudView, SystemTray};
 use update::UpdatePhase;
-use voice_stt_desktop::stt::{models, EngineSlot, LiveAudio, LiveTranscript, SttEngine};
+use voice_stt_desktop::stt::{
+    models, remove_fillers, EngineSlot, LiveAudio, LiveTranscript, SttEngine,
+};
 
 enum InternalEvent {
     TranscribeSuccess {
@@ -53,23 +55,25 @@ enum InternalEvent {
 }
 
 fn deliver_transcript(
-    result: LiveTranscript,
+    mut result: LiveTranscript,
     injector: Arc<PasteInjector>,
     tx: crossbeam_channel::Sender<InternalEvent>,
     should_paste: bool,
+    clean_fillers: bool,
     target: Option<isize>,
     user_typed: bool,
 ) {
+    if clean_fillers {
+        result.text = remove_fillers(&result.text);
+    }
+    let delivered = injector.apply_final(&result.text, should_paste, target, user_typed);
+    // Text reaches the user first; the history write is not on the latency path.
+    // A failed copy still lands in History so the transcript is not lost.
     if !result.text.trim().is_empty() {
         let mut stats = AppStats::load();
         stats.record_and_save(&result.text, result.duration_secs, result.latency_ms);
     }
-    let (auto_pasted, notice) = match injector.apply_final(
-        &result.text,
-        should_paste,
-        target,
-        user_typed,
-    ) {
+    let (auto_pasted, notice) = match delivered {
         Ok(DeliveryOutcome::NoSpeech) => {
             let _ = tx.send(InternalEvent::NoSpeech);
             return;
@@ -143,6 +147,7 @@ fn main() {
         config.model_id = resolved_id;
     }
     let auto_paste = config.auto_paste;
+    let remove_fillers_state = Arc::new(AtomicBool::new(config.remove_fillers));
     let hotkey_binding = match HotkeyBinding::parse(&config.hotkey) {
         Some(binding) => binding,
         None => {
@@ -283,6 +288,8 @@ fn main() {
         let auto_paste_state = Arc::new(Mutex::new(auto_paste));
         let auto_paste_bg = Arc::clone(&auto_paste_state);
         let auto_paste_view = Arc::clone(&auto_paste_state);
+        let fillers_bg = Arc::clone(&remove_fillers_state);
+        let fillers_view = Arc::clone(&remove_fillers_state);
         let update_state = Arc::new(Mutex::new(UpdatePhase::Idle));
         let update_for_view = Arc::clone(&update_state);
         let update_for_boot = Arc::clone(&update_state);
@@ -333,6 +340,7 @@ fn main() {
                 let inj = Arc::clone(&injector_clone);
                 let stt = stt_clone.clone();
                 let auto_paste_flag = Arc::clone(&auto_paste_bg);
+                let fillers_flag = Arc::clone(&fillers_bg);
                 let target_hwnd = Arc::clone(&target_hwnd_loop);
 
                 // Spawn UI coordination loop running on GPUI executor
@@ -591,6 +599,7 @@ fn main() {
                                             let events = internal_tx.clone();
                                             let inj_worker = Arc::clone(&inj);
                                             let paste_flag = Arc::clone(&auto_paste_flag);
+                                            let fillers_worker = Arc::clone(&fillers_flag);
                                             let target_flag = Arc::clone(&target_hwnd);
                                             let discard_worker = Arc::clone(&discard);
                                             std::thread::spawn(move || {
@@ -600,8 +609,9 @@ fn main() {
                                                             return;
                                                         }
                                                         let should_paste = *paste_flag.lock();
+                                                        let clean = fillers_worker.load(Ordering::Relaxed);
                                                         let target = *target_flag.lock();
-                                                        deliver_transcript(result, inj_worker, events, should_paste, target, user_typed());
+                                                        deliver_transcript(result, inj_worker, events, should_paste, clean, target, user_typed());
                                                     }
                                                     Err(error) => {
                                                         if discard_worker.load(Ordering::SeqCst) {
@@ -912,10 +922,10 @@ fn main() {
                 });
 
                 let mut view = HudView::new(
-                    auto_paste,
                     hotkey_label,
                     stt_for_view,
                     auto_paste_view,
+                    fillers_view,
                     update_for_view,
                     update_ping_view,
                     cx,
