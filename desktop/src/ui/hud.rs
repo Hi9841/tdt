@@ -878,12 +878,33 @@ impl HudView {
             let bar_color = accent();
             for peak in self.wave_peaks {
                 let height = wave_height(peak);
+                let glow = (height * 1.55).min(28.0);
                 bars.push(
                     div()
+                        .relative()
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .justify_center()
                         .w(px(WAVE_BAR_W))
-                        .h(px(height))
-                        .rounded_full()
-                        .bg(bar_color),
+                        .h(px(28.0))
+                        .child(
+                            div()
+                                .absolute()
+                                .w(px(WAVE_BAR_W + 2.0))
+                                .h(px(glow))
+                                .rounded_full()
+                                .bg(bar_color)
+                                .opacity(0.22),
+                        )
+                        .child(
+                            div()
+                                .w(px(WAVE_BAR_W))
+                                .h(px(height))
+                                .rounded_full()
+                                .bg(bar_color)
+                                .opacity(0.5 + 0.5 * peak),
+                        ),
                 );
             }
             let waveform = div()

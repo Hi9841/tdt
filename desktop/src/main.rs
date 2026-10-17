@@ -11,7 +11,7 @@ mod paste;
 mod ui;
 mod update;
 
-use audio::{play_sound, AudioRecorder, SoundEffect, SpeechTail, MAX_TAIL, VIS_BARS};
+use audio::{play_sound, prewarm, AudioRecorder, SoundEffect, SpeechTail, MAX_TAIL, VIS_BARS};
 use config::{AppConfig, AppStats};
 use ely_gpui_component::Assets;
 use gpui::*;
@@ -166,16 +166,9 @@ fn main() {
     set_binding(hotkey_binding);
     let hotkey_label = hotkey_binding.display();
 
-    // 1. Initialize audio recorder
-    let (recorder, microphone_error) = if preview::is_active() {
-        (None, None)
-    } else {
-        match AudioRecorder::new() {
-            Ok(recorder) => (Some(recorder), None),
-            Err(error) => (None, Some(format!("Could not start the microphone. Connect a microphone and choose Retry microphone. {error}"))),
-        }
-    };
-    let recorder = Rc::new(RefCell::new(recorder));
+    // The microphone opens after the window exists. WASAPI enumeration stays
+    // on this thread because the capture stream cannot move between threads.
+    let recorder: Rc<RefCell<Option<AudioRecorder>>> = Rc::new(RefCell::new(None));
 
     // 2. Initialize STT Engine
     let model_spec = models::resolve(&config.model_id);
@@ -362,6 +355,37 @@ fn main() {
                     let mut limit_notice = false;
                     let mut no_speech_at: Option<Instant> = None;
                     let mut session: Option<LiveTake> = None;
+
+                    if !preview::is_active() {
+                        // Yield once so the bubble can paint before WASAPI enumeration.
+                        cx.background_executor()
+                            .timer(Duration::from_millis(1))
+                            .await;
+                        prewarm();
+                        match AudioRecorder::new() {
+                            Ok(opened) => {
+                                append_log(&format!("Microphone: {}", opened.device_name()));
+                                *rec.borrow_mut() = Some(opened);
+                            }
+                            Err(error) => {
+                                let message = format!("Could not start the microphone. Connect a microphone and choose Retry microphone. {error}");
+                                let _ = this.update(cx, |view, cx| {
+                                    // Keep a hotkey failure that was stored before this
+                                    // deferred open. One status string, both facts.
+                                    let message = match &view.status {
+                                        HudStatus::Error { message: existing, .. }
+                                            if !existing.is_empty() && existing != &message =>
+                                        {
+                                            format!("{existing} {message}")
+                                        }
+                                        _ => message,
+                                    };
+                                    view.set_error(message);
+                                    cx.notify();
+                                });
+                            }
+                        }
+                    }
 
                     loop {
                         let poll_interval = if is_recording_state || is_processing_state {
@@ -930,7 +954,6 @@ fn main() {
                     update_ping_view,
                     cx,
                 );
-                if let Some(error) = microphone_error { view.set_error(error); }
                 if let Some(error) = hotkey_error { view.set_error(error); }
                 view
             })

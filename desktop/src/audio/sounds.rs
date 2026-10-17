@@ -14,25 +14,26 @@ static STOP_WAV: OnceLock<Vec<u8>> = OnceLock::new();
 static SUCCESS_WAV: OnceLock<Vec<u8>> = OnceLock::new();
 static ERROR_WAV: OnceLock<Vec<u8>> = OnceLock::new();
 
+impl SoundEffect {
+    /// Every cue. The prewarm test matches each one, so a new cue fails the build
+    /// until it is listed here and synthesized in `wav_for`.
+    const ALL: [SoundEffect; 4] = [
+        SoundEffect::StartListening,
+        SoundEffect::StopListening,
+        SoundEffect::Success,
+        SoundEffect::Error,
+    ];
+}
+
+/// Build every cue once so the first hotkey does not synthesize on the UI path.
+pub fn prewarm() {
+    for effect in SoundEffect::ALL {
+        let _ = wav_for(effect);
+    }
+}
+
 pub fn play_sound(effect: SoundEffect) {
-    let wav_bytes: &'static [u8] = match effect {
-        SoundEffect::StartListening => START_WAV.get_or_init(|| {
-            // Soft rise: A4 -> E5
-            two_note_wav(440.0, 659.25, 0.055, 0.075, 0.20)
-        }),
-        SoundEffect::StopListening => STOP_WAV.get_or_init(|| {
-            // Soft fall: E5 -> C5
-            two_note_wav(659.25, 523.25, 0.045, 0.070, 0.17)
-        }),
-        SoundEffect::Success => SUCCESS_WAV.get_or_init(|| {
-            // Quiet major third: E5 -> G5
-            two_note_wav(659.25, 783.99, 0.050, 0.085, 0.19)
-        }),
-        SoundEffect::Error => ERROR_WAV.get_or_init(|| {
-            // Low muted fall: G3 -> D3
-            two_note_wav(196.00, 146.83, 0.070, 0.095, 0.14)
-        }),
-    };
+    let wav_bytes: &'static [u8] = wav_for(effect);
 
     #[cfg(target_os = "windows")]
     {
@@ -53,35 +54,59 @@ pub fn play_sound(effect: SoundEffect) {
     }
 }
 
-fn two_note_wav(f1: f32, f2: f32, d1: f32, d2: f32, amp: f32) -> Vec<u8> {
-    let sr = 44100;
-    let a = synth_note(f1, d1, amp, sr);
-    let b = synth_note(f2, d2, amp * 1.05, sr);
-    pcm_to_wav(&crossfade(&a, &b, (0.006 * sr as f32) as usize), sr)
+fn wav_for(effect: SoundEffect) -> &'static [u8] {
+    match effect {
+        SoundEffect::StartListening => START_WAV.get_or_init(|| {
+            // Short rising tick. Quiet enough to sit under speech.
+            chirp_wav(520.0, 880.0, 0.055, 0.11)
+        }),
+        SoundEffect::StopListening => STOP_WAV.get_or_init(|| chirp_wav(760.0, 420.0, 0.048, 0.09)),
+        SoundEffect::Success => SUCCESS_WAV.get_or_init(|| {
+            let sr = 22_050;
+            let a = tone(659.25, 0.042, 0.10, sr);
+            let b = tone(987.77, 0.070, 0.09, sr);
+            pcm_to_wav(&crossfade(&a, &b, (0.008 * sr as f32) as usize), sr)
+        }),
+        SoundEffect::Error => ERROR_WAV.get_or_init(|| chirp_wav(220.0, 146.0, 0.090, 0.10)),
+    }
 }
 
-fn synth_note(freq: f32, dur: f32, amp: f32, sample_rate: u32) -> Vec<f32> {
+fn chirp_wav(f0: f32, f1: f32, dur: f32, amp: f32) -> Vec<u8> {
+    let sr = 22_050u32;
+    pcm_to_wav(&chirp(f0, f1, dur, amp, sr), sr)
+}
+
+fn chirp(f0: f32, f1: f32, dur: f32, amp: f32, sample_rate: u32) -> Vec<f32> {
     let n = ((dur * sample_rate as f32).round() as usize).max(8);
-    let attack = ((0.006 * sample_rate as f32) as usize).clamp(2, n / 3);
-    let release = ((0.40 * n as f32) as usize).clamp(attack, n - 1);
     let mut out = vec![0.0f32; n];
+    let mut phase = 0.0f32;
+    let mut noise = 0.17f32;
     for (i, sample) in out.iter_mut().enumerate() {
-        let t = i as f32 / sample_rate as f32;
-        let phase = 2.0 * PI * freq * t;
-        let harmonic = phase.sin() + 0.14 * (2.0 * phase).sin() + 0.04 * (3.0 * phase).sin();
-        let a = if i < attack {
-            i as f32 / attack as f32
+        let t = i as f32 / (n as f32 - 1.0);
+        let freq = f0 + (f1 - f0) * t;
+        phase += 2.0 * PI * freq / sample_rate as f32;
+        noise = noise.mul_add(1.37, 0.31).fract();
+        let tick = if i < sample_rate as usize / 400 {
+            (noise - 0.5) * 0.35
         } else {
-            1.0
+            0.0
         };
-        let r = if i + release >= n {
-            (n - 1 - i) as f32 / release as f32
-        } else {
-            1.0
-        };
-        *sample = harmonic * amp * a * r.clamp(0.0, 1.0);
+        let body = phase.sin() + 0.08 * (2.0 * phase).sin();
+        let env = soft_env(i, n);
+        *sample = (body + tick) * amp * env;
     }
     out
+}
+
+fn tone(freq: f32, dur: f32, amp: f32, sample_rate: u32) -> Vec<f32> {
+    chirp(freq, freq, dur, amp, sample_rate)
+}
+
+fn soft_env(i: usize, n: usize) -> f32 {
+    let t = i as f32 / n as f32;
+    let attack = (t / 0.08).clamp(0.0, 1.0);
+    let release = (-6.5 * t).exp();
+    attack * release
 }
 
 fn crossfade(a: &[f32], b: &[f32], fade: usize) -> Vec<f32> {
@@ -131,8 +156,31 @@ mod tests {
 
     #[test]
     fn wav_has_riff_header_and_body() {
-        let wav = two_note_wav(440.0, 550.0, 0.04, 0.04, 0.1);
+        let wav = chirp_wav(440.0, 550.0, 0.04, 0.1);
         assert!(wav.starts_with(b"RIFF"));
         assert!(wav.len() > 44);
+        assert!(wav.len() < 8_000);
+        let peak = wav[44..]
+            .chunks_exact(2)
+            .map(|pair| i16::from_le_bytes([pair[0], pair[1]]).unsigned_abs())
+            .max()
+            .unwrap_or(0);
+        assert!(peak > 200 && peak < 12_000);
+    }
+
+    #[test]
+    fn prewarm_covers_every_effect() {
+        let mut mask = 0u8;
+        for effect in SoundEffect::ALL {
+            mask |= match effect {
+                SoundEffect::StartListening => 1,
+                SoundEffect::StopListening => 2,
+                SoundEffect::Success => 4,
+                SoundEffect::Error => 8,
+            };
+            assert!(wav_for(effect).starts_with(b"RIFF"));
+        }
+        assert_eq!(mask, 0b1111);
+        assert_eq!(SoundEffect::ALL.len(), 4);
     }
 }
