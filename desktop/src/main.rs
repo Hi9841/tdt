@@ -166,9 +166,26 @@ fn main() {
     set_binding(hotkey_binding);
     let hotkey_label = hotkey_binding.display();
 
-    // The microphone opens after the window exists. WASAPI enumeration stays
-    // on this thread because the capture stream cannot move between threads.
-    let recorder: Rc<RefCell<Option<AudioRecorder>>> = Rc::new(RefCell::new(None));
+    // Open the microphone before the window. Doing it on the GPUI executor
+    // blocks the first frame, and the popup then stays without WS_VISIBLE.
+    let (recorder, microphone_error) = if preview::is_active() {
+        (None, None)
+    } else {
+        std::thread::spawn(prewarm);
+        match AudioRecorder::new() {
+            Ok(recorder) => {
+                append_log(&format!("Microphone: {}", recorder.device_name()));
+                (Some(recorder), None)
+            }
+            Err(error) => (
+                None,
+                Some(format!(
+                    "Could not start the microphone. Connect a microphone and choose Retry microphone. {error}"
+                )),
+            ),
+        }
+    };
+    let recorder = Rc::new(RefCell::new(recorder));
 
     // 2. Initialize STT Engine
     let model_spec = models::resolve(&config.model_id);
@@ -320,6 +337,7 @@ fn main() {
             };
 
             ui::window_util::apply_overlay_window_style(hwnd);
+            ui::window_util::show_overlay_window(hwnd);
 
             position_bubble_on_preferred_monitor(hwnd);
             follow_current_virtual_desktop();
@@ -355,37 +373,6 @@ fn main() {
                     let mut limit_notice = false;
                     let mut no_speech_at: Option<Instant> = None;
                     let mut session: Option<LiveTake> = None;
-
-                    if !preview::is_active() {
-                        // Yield once so the bubble can paint before WASAPI enumeration.
-                        cx.background_executor()
-                            .timer(Duration::from_millis(1))
-                            .await;
-                        prewarm();
-                        match AudioRecorder::new() {
-                            Ok(opened) => {
-                                append_log(&format!("Microphone: {}", opened.device_name()));
-                                *rec.borrow_mut() = Some(opened);
-                            }
-                            Err(error) => {
-                                let message = format!("Could not start the microphone. Connect a microphone and choose Retry microphone. {error}");
-                                let _ = this.update(cx, |view, cx| {
-                                    // Keep a hotkey failure that was stored before this
-                                    // deferred open. One status string, both facts.
-                                    let message = match &view.status {
-                                        HudStatus::Error { message: existing, .. }
-                                            if !existing.is_empty() && existing != &message =>
-                                        {
-                                            format!("{existing} {message}")
-                                        }
-                                        _ => message,
-                                    };
-                                    view.set_error(message);
-                                    cx.notify();
-                                });
-                            }
-                        }
-                    }
 
                     loop {
                         let poll_interval = if is_recording_state || is_processing_state {
@@ -954,7 +941,20 @@ fn main() {
                     update_ping_view,
                     cx,
                 );
-                if let Some(error) = hotkey_error { view.set_error(error); }
+                if let Some(error) = microphone_error {
+                    view.set_error(error);
+                }
+                if let Some(error) = hotkey_error {
+                    let message = match &view.status {
+                        HudStatus::Error { message: existing, .. }
+                            if !existing.is_empty() && existing != &error =>
+                        {
+                            format!("{existing} {error}")
+                        }
+                        _ => error,
+                    };
+                    view.set_error(message);
+                }
                 view
             })
         }) {
@@ -1036,6 +1036,18 @@ fn claim_instance() -> InstanceClaim {
         use windows::Win32::System::Threading::{CreateEventW, CreateMutexW};
 
         unsafe {
+            // CreateMutexW's wrapper does not surface ERROR_ALREADY_EXISTS.
+            // Open the existing object first so a second launch cannot start
+            // another speech worker.
+            if let Ok(existing) = windows::Win32::System::Threading::OpenMutexW(
+                windows::Win32::System::Threading::SYNCHRONIZATION_ACCESS_RIGHTS(0x00100000),
+                false,
+                w!("Local\\TDT-TalkDontType"),
+            ) {
+                let _ = windows::Win32::Foundation::CloseHandle(existing);
+                signal_running_instance();
+                return InstanceClaim::AlreadyRunning;
+            }
             match CreateMutexW(None, true, w!("Local\\TDT-TalkDontType")) {
                 Ok(mutex) => {
                     if GetLastError() == ERROR_ALREADY_EXISTS {

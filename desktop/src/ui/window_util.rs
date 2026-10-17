@@ -442,6 +442,18 @@ pub fn is_overlay_hidden() -> bool {
     overlay_hidden().load(std::sync::atomic::Ordering::SeqCst)
 }
 
+/// GPUI's popup can finish creation without WS_VISIBLE when the first frame
+/// was delayed. Show it without activating, unless the user hid the overlay.
+#[cfg(target_os = "windows")]
+pub fn show_overlay_window(hwnd: HWND) {
+    if hwnd.is_invalid() || is_overlay_hidden() {
+        return;
+    }
+    unsafe {
+        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    }
+}
+
 pub fn set_overlay_hidden(hidden: bool) {
     overlay_hidden().store(hidden, std::sync::atomic::Ordering::SeqCst);
     #[cfg(target_os = "windows")]
