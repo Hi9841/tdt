@@ -79,10 +79,19 @@ enum PythonLauncher {
     Command(String, Vec<String>),
 }
 
+/// How `uv run` may use its package cache.
+#[derive(Clone, Copy)]
+enum CacheUse {
+    /// No index request. A start works from the cache alone.
+    Offline,
+    /// Download the runtime when the cache has nothing, or after a repair.
+    Install,
+}
+
 impl PythonLauncher {
-    /// `offline` keeps uv on its cache: no index request, so a start needs no
-    /// network. Only the first install of the runtime goes online.
-    fn build_command(&self, script_path: &Path, offline: bool) -> Command {
+    /// `Offline` keeps uv on its cache: no index request, so a start needs no
+    /// network. Only the first install, or a repair of a broken cache, goes online.
+    fn build_command(&self, script_path: &Path, cache: CacheUse) -> Command {
         #[allow(unused_mut)]
         let mut cmd = match self {
             Self::Direct(exe) => {
@@ -93,7 +102,7 @@ impl PythonLauncher {
             Self::Uv(uv_exe) => {
                 let mut c = Command::new(uv_exe);
                 c.arg("run");
-                if offline {
+                if matches!(cache, CacheUse::Offline) {
                     c.arg("--offline");
                 }
                 c.arg("--with")
@@ -117,6 +126,19 @@ impl PythonLauncher {
         cmd.creation_flags(CREATE_NO_WINDOW);
 
         cmd
+    }
+
+    /// Drop Pillow's cached wheel. A later `uv run` downloads it again.
+    /// `--reinstall-package` is not enough: uv keeps the broken environment.
+    fn cache_clean_pillow(&self) -> Option<Command> {
+        let Self::Uv(uv_exe) = self else {
+            return None;
+        };
+        let mut cmd = Command::new(uv_exe);
+        cmd.arg("cache").arg("clean").arg("pillow");
+        #[cfg(target_os = "windows")]
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        Some(cmd)
     }
 }
 
@@ -282,22 +304,89 @@ impl SpawnError {
     }
 }
 
+/// An import failure is a broken cached runtime, not a missing speech model.
+/// uv will keep serving that cache until the environment is removed.
+fn cached_runtime_is_broken(message: &str) -> bool {
+    message.contains("cannot import name")
+        || message.contains("No module named")
+        || message.contains("DLL load failed")
+}
+
+/// Directory of the uv archive named in an import error.
+/// Only an absolute path under `uv/cache/archive-v0/<id>` is accepted.
+fn broken_archive_dir(message: &str) -> Option<PathBuf> {
+    let (needle, pos) = ["uv\\cache\\archive-v0\\", "uv/cache/archive-v0/"]
+        .into_iter()
+        .find_map(|needle| message.find(needle).map(|pos| (needle, pos)))?;
+    let path_start = message[..pos]
+        .rfind(['(', ' ', '"', '\n', '\t'])
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    let head = &message[path_start..pos];
+    if !(head.contains(':') || head.starts_with('/') || head.starts_with('\\')) {
+        return None;
+    }
+    let rest = &message[pos + needle.len()..];
+    let id_end = rest.find(['\\', '/', ')', ' ', '"']).unwrap_or(rest.len());
+    let id = &rest[..id_end];
+    if id.is_empty()
+        || id == "."
+        || id == ".."
+        || !id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return None;
+    }
+    let mut dir = PathBuf::from(head);
+    dir.push("uv");
+    dir.push("cache");
+    dir.push("archive-v0");
+    dir.push(id);
+    Some(dir)
+}
+
 impl PhotonWorkerClient {
     fn spawn(model_dir: &Path) -> Result<Self, String> {
         let launcher = find_python_launcher()?;
         let script_file = locate_script_file()?;
 
         if matches!(launcher, PythonLauncher::Uv(_)) {
-            match Self::start(launcher.build_command(&script_file, true), model_dir) {
+            match Self::start(
+                launcher.build_command(&script_file, CacheUse::Offline),
+                model_dir,
+            ) {
                 Ok(client) => return Ok(client),
+                Err(SpawnError::Failed(message)) if cached_runtime_is_broken(&message) => {
+                    eprintln!(
+                        "Cached speech runtime cannot import ({message}); reinstalling it once."
+                    );
+                    // uv reuses the environment named in the error, and
+                    // `--reinstall-package` links that environment back to the
+                    // same incomplete Pillow extract. Remove both, then install.
+                    if let Some(dir) = broken_archive_dir(&message) {
+                        let _ = fs::remove_dir_all(&dir);
+                    }
+                    if let Some(mut clean) = launcher.cache_clean_pillow() {
+                        let _ = clean.stdout(Stdio::null()).stderr(Stdio::null()).status();
+                    }
+                    return Self::start(
+                        launcher.build_command(&script_file, CacheUse::Install),
+                        model_dir,
+                    )
+                    .map_err(SpawnError::into_message);
+                }
                 Err(SpawnError::Failed(message)) => return Err(message),
                 Err(SpawnError::Exited(message)) => {
                     eprintln!("No cached Photon runtime ({message}); installing it once.");
                 }
             }
         }
-        Self::start(launcher.build_command(&script_file, false), model_dir)
-            .map_err(SpawnError::into_message)
+        Self::start(
+            launcher.build_command(&script_file, CacheUse::Install),
+            model_dir,
+        )
+        .map_err(SpawnError::into_message)
     }
 
     fn start(mut cmd: Command, model_dir: &Path) -> Result<Self, SpawnError> {
@@ -576,7 +665,14 @@ mod tests {
     use super::*;
     use crate::stt::models::{by_id, DEFAULT_MODEL_ID};
     use std::fs;
+    use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn command_args(cmd: &Command) -> Vec<String> {
+        cmd.get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
 
     fn unique_dir(tag: &str) -> std::path::PathBuf {
         let unique = SystemTime::now()
@@ -636,5 +732,73 @@ mod tests {
         );
 
         fs::remove_dir_all(model_dir).expect("cleanup");
+    }
+
+    #[test]
+    fn broken_pillow_cache_is_reinstalled_once() {
+        // The message the worker returns when the cached Pillow wheel has no Image.py.
+        assert!(cached_runtime_is_broken(
+            "cannot import name 'Image' from 'PIL' (C:\\Users\\hi\\AppData\\Local\\uv\\cache\\archive-v0\\dJP2kpEhvs5M73D9\\Lib\\site-packages\\PIL\\__init__.py)"
+        ));
+        assert!(!cached_runtime_is_broken(
+            "Model directory is missing or not a directory: \"C:\\missing\""
+        ));
+    }
+
+    #[test]
+    fn repair_removes_only_the_named_uv_archive_and_installs_online() {
+        let message = "cannot import name 'Image' from 'PIL' (C:\\Users\\hi\\AppData\\Local\\uv\\cache\\archive-v0\\dJP2kpEhvs5M73D9\\Lib\\site-packages\\PIL\\__init__.py)";
+        assert_eq!(
+            broken_archive_dir(message),
+            Some(PathBuf::from(
+                "C:\\Users\\hi\\AppData\\Local\\uv\\cache\\archive-v0\\dJP2kpEhvs5M73D9"
+            ))
+        );
+        assert_eq!(
+            broken_archive_dir(
+                "cannot import name 'Image' from 'PIL' (C:\\Users\\hi\\AppData\\Local\\uv\\cache\\archive-v0\\f-Vd1EQPV2KNTyWi\\Lib\\site-packages\\PIL\\__init__.py)"
+            ),
+            Some(PathBuf::from(
+                "C:\\Users\\hi\\AppData\\Local\\uv\\cache\\archive-v0\\f-Vd1EQPV2KNTyWi"
+            ))
+        );
+        assert!(broken_archive_dir(
+            "cannot import name 'Image' from 'PIL' (C:\\Windows\\System32\\archive-v0\\dJP2kpEhvs5M73D9\\PIL\\__init__.py)"
+        )
+        .is_none());
+        assert!(broken_archive_dir(
+            "Model directory is missing or not a directory: \"C:\\missing\""
+        )
+        .is_none());
+
+        let launcher = PythonLauncher::Uv("uv".into());
+        let script = PathBuf::from("photon_worker.py");
+        assert_eq!(
+            command_args(&launcher.cache_clean_pillow().expect("uv clean command")),
+            vec!["cache", "clean", "pillow"]
+        );
+        assert_eq!(
+            command_args(&launcher.build_command(&script, CacheUse::Install)),
+            vec![
+                "run",
+                "--with",
+                "moondream>=2.4.0",
+                "python",
+                "-u",
+                "photon_worker.py",
+            ]
+        );
+        assert_eq!(
+            command_args(&launcher.build_command(&script, CacheUse::Offline)),
+            vec![
+                "run",
+                "--offline",
+                "--with",
+                "moondream>=2.4.0",
+                "python",
+                "-u",
+                "photon_worker.py",
+            ]
+        );
     }
 }
