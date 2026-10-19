@@ -109,12 +109,16 @@ portable zip on tag `v*`.
 
 Recording and transcription stay on-device. The speech worker blocks the
 Photon runtime's usage reports and Hugging Face lookups, and it starts from
-the cached runtime without a package index request. The network is used only
-for the first runtime install, the model download you start in Settings, and
-the optional updater, which talks to GitHub only. Text is copied to the clipboard by design. Recordings are
-capped at 120 seconds to prevent unbounded memory growth.
+the cached runtime without a package index request. TDT uses the network only for these operations:
+
+- The first runtime installation.
+- The model download that you start in Settings.
+- The optional updater. The updater connects only to GitHub.
+
+TDT copies the text to the clipboard by design. The maximum recording length
+is 120 seconds. This limit stops unbounded memory growth.
 
 ## License
 
 The application source is Apache-2.0. Model weights and bundled dependencies
-have their own terms; read `THIRD_PARTY_NOTICES.md` before redistributing them.
+have their own terms. Read `THIRD_PARTY_NOTICES.md` before you redistribute them.
