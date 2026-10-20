@@ -11,6 +11,11 @@ mod paste;
 mod ui;
 mod update;
 
+// The speech engine frees and allocates large buffers on every take; this
+// allocator keeps them mapped instead of returning them to Windows.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use audio::{play_sound, prewarm, AudioRecorder, SoundEffect, SpeechTail, MAX_TAIL, VIS_BARS};
 use config::{AppConfig, AppStats};
 use ely_gpui_component::Assets;

@@ -1,8 +1,17 @@
 use super::models::ModelSpec;
+use super::native::NativeParakeet;
 use super::photon::PhotonParakeetEngine;
-use crossbeam_channel::Receiver;
-use std::path::Path;
-use std::time::Instant;
+use super::segment;
+use crossbeam_channel::{Receiver, RecvTimeoutError};
+use parking_lot::Mutex;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+const MAX_CAPTURED_SAMPLES: usize = 120 * 16_000;
+/// After a cut, a remainder shorter than 200 ms is the pause itself, not speech.
+const MIN_REMAINDER_SAMPLES: usize = 3_200;
 
 /// Audio captured while the user is still holding the hotkey.
 pub enum LiveAudio {
@@ -17,34 +26,148 @@ pub struct LiveTranscript {
     pub duration_secs: f32,
 }
 
+/// Speech to text for one installed model. TDT's own Rust engine runs it;
+/// the Python Photon worker remains for `TDT_ENGINE=photon` and for a model
+/// the Rust engine cannot load.
 pub struct SttEngine {
-    inner: PhotonParakeetEngine,
+    model_dir: PathBuf,
+    native: Mutex<Option<Arc<NativeParakeet>>>,
+    photon: PhotonParakeetEngine,
+    use_photon: AtomicBool,
 }
 
 impl SttEngine {
     pub fn new(spec: &ModelSpec, model_dir: &Path) -> Result<Self, String> {
-        let inner = PhotonParakeetEngine::new(spec, model_dir)?;
-        Ok(Self { inner })
+        let photon = PhotonParakeetEngine::new(spec, model_dir)?;
+        let forced = std::env::var("TDT_ENGINE").is_ok_and(|v| v.eq_ignore_ascii_case("photon"));
+        Ok(Self {
+            model_dir: model_dir.to_path_buf(),
+            native: Mutex::new(None),
+            photon,
+            use_photon: AtomicBool::new(forced),
+        })
     }
 
     pub fn prepare(&self) -> Result<(), String> {
-        self.inner.prepare()
+        if !self.use_photon.load(Ordering::SeqCst) {
+            let mut native = self.native.lock();
+            if native.is_some() {
+                return Ok(());
+            }
+            match NativeParakeet::load(&self.model_dir) {
+                Ok(engine) => {
+                    *native = Some(Arc::new(engine));
+                    return Ok(());
+                }
+                Err(error) => {
+                    eprintln!(
+                        "TDT speech engine could not load this model ({error}); using Photon."
+                    );
+                    self.use_photon.store(true, Ordering::SeqCst);
+                }
+            }
+        }
+        self.photon.prepare()
+    }
+
+    fn transcribe_samples(&self, samples: &[f32]) -> Result<String, String> {
+        if !self.use_photon.load(Ordering::SeqCst) {
+            let native = self.native.lock().clone();
+            if let Some(engine) = native {
+                return Ok(engine.transcribe(samples));
+            }
+        }
+        self.photon.transcribe_samples(samples)
     }
 
     pub fn transcribe_live_reporting(
         &self,
         rx: &Receiver<LiveAudio>,
     ) -> Result<LiveTranscript, String> {
-        self.inner.transcribe_live_reporting(rx)
+        self.prepare()?;
+        let mut stopped_at = None;
+        let mut captured: Vec<f32> = Vec::new();
+        // Speech before `committed` is already text in `parts`.
+        let mut committed = 0;
+        let mut parts: Vec<String> = Vec::new();
+        let mut last_any = Instant::now();
+
+        loop {
+            match rx.recv_timeout(Duration::from_millis(20)) {
+                Ok(LiveAudio::Chunk(samples)) => {
+                    last_any = Instant::now();
+                    if captured.len() < MAX_CAPTURED_SAMPLES {
+                        captured.extend_from_slice(&samples);
+                        // Transcribe finished sentences while the user still
+                        // talks. New chunks wait in the channel meanwhile.
+                        if let Some(cut) = segment::pause_cut(&captured, committed) {
+                            let text = self.transcribe_samples(&captured[committed..cut])?;
+                            if !text.is_empty() {
+                                parts.push(text);
+                            }
+                            committed = cut;
+                        }
+                    }
+                }
+                Ok(LiveAudio::Finish(at)) => {
+                    stopped_at = Some(at);
+                    break;
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    // A stalled producer must not hang transcription forever.
+                    if last_any.elapsed() > Duration::from_secs(120) {
+                        return Err("Audio capture stalled; transcription aborted.".to_string());
+                    }
+                }
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        }
+
+        let stopped_at = stopped_at.unwrap_or_else(Instant::now);
+        // Duration actually fed to the model, not the full take when the
+        // capture cap truncated it.
+        let duration_secs = captured.len() as f32 / 16000.0;
+
+        if captured.is_empty() {
+            return Ok(LiveTranscript {
+                text: String::new(),
+                latency_ms: stopped_at.elapsed().as_millis() as u64,
+                duration_secs,
+            });
+        }
+
+        let remainder = &captured[committed..];
+        if parts.is_empty() || remainder.len() >= MIN_REMAINDER_SAMPLES {
+            let text = self.transcribe_samples(remainder)?;
+            if !text.is_empty() {
+                parts.push(text);
+            }
+        }
+        let mut text = segment::join_parts(&parts);
+
+        if text.is_empty() {
+            if let Some(boosted) = boost_quiet_speech(&captured) {
+                if let Ok(boosted_text) = self.transcribe_samples(&boosted) {
+                    text = boosted_text;
+                }
+            }
+        }
+
+        Ok(LiveTranscript {
+            text,
+            latency_ms: stopped_at.elapsed().as_millis() as u64,
+            duration_secs,
+        })
     }
 
     pub fn release(&self) {
-        self.inner.release();
+        *self.native.lock() = None;
+        self.photon.release();
     }
 
     #[cfg(test)]
     pub fn is_loaded(&self) -> bool {
-        self.inner.is_loaded()
+        self.native.lock().is_some() || self.photon.is_loaded()
     }
 }
 

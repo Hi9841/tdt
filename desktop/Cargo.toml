@@ -2,7 +2,7 @@
 name = "voice-stt-desktop"
 version = "0.2.24"
 edition = "2021"
-description = "TDT (Talk Don't Type), native offline speech-to-text built with Rust, GPUI, and Moondream Photon"
+description = "TDT (Talk Don't Type), native offline speech-to-text built with Rust and GPUI, with its own Parakeet speech engine"
 license = "Apache-2.0"
 readme = "../README.md"
 homepage = "https://github.com/Hi9841/tdt"

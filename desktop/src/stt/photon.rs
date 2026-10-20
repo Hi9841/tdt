@@ -1,7 +1,4 @@
 use super::models::ModelSpec;
-use super::segment;
-use super::{LiveAudio, LiveTranscript};
-use crossbeam_channel::{Receiver, RecvTimeoutError};
 use parking_lot::Mutex;
 use serde_json::json;
 use std::fs;
@@ -9,7 +6,6 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
@@ -17,9 +13,6 @@ use std::os::windows::process::CommandExt;
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-const MAX_CAPTURED_SAMPLES: usize = 120 * 16_000;
-/// After a cut, a remainder shorter than 200 ms is the pause itself, not speech.
-const MIN_REMAINDER_SAMPLES: usize = 3_200;
 const WORKER_SCRIPT: &str = include_str!("photon_worker.py");
 
 const B64_CHARS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -564,88 +557,8 @@ impl PhotonParakeetEngine {
         Ok(())
     }
 
-    pub fn transcribe_live_reporting(
-        &self,
-        rx: &Receiver<LiveAudio>,
-    ) -> Result<LiveTranscript, String> {
-        self.prepare()?;
-        let mut stopped_at = None;
-        let mut captured: Vec<f32> = Vec::new();
-        // Speech before `committed` is already text in `parts`.
-        let mut committed = 0;
-        let mut parts: Vec<String> = Vec::new();
-        let mut last_any = std::time::Instant::now();
-
-        loop {
-            match rx.recv_timeout(Duration::from_millis(20)) {
-                Ok(LiveAudio::Chunk(samples)) => {
-                    last_any = std::time::Instant::now();
-                    if captured.len() < MAX_CAPTURED_SAMPLES {
-                        captured.extend_from_slice(&samples);
-                        // Transcribe finished sentences while the user still
-                        // talks. New chunks wait in the channel meanwhile.
-                        if let Some(cut) = segment::pause_cut(&captured, committed) {
-                            let text = self.transcribe_samples(&captured[committed..cut])?;
-                            if !text.is_empty() {
-                                parts.push(text);
-                            }
-                            committed = cut;
-                        }
-                    }
-                }
-                Ok(LiveAudio::Finish(at)) => {
-                    stopped_at = Some(at);
-                    break;
-                }
-                Err(RecvTimeoutError::Timeout) => {
-                    // A stalled producer must not hang transcription forever.
-                    if last_any.elapsed() > Duration::from_secs(120) {
-                        return Err("Audio capture stalled; transcription aborted.".to_string());
-                    }
-                }
-                Err(RecvTimeoutError::Disconnected) => break,
-            }
-        }
-
-        let stopped_at = stopped_at.unwrap_or_else(Instant::now);
-        // Duration actually fed to the model, not the full take when the
-        // capture cap truncated it.
-        let duration_secs = captured.len() as f32 / 16000.0;
-
-        if captured.is_empty() {
-            return Ok(LiveTranscript {
-                text: String::new(),
-                latency_ms: stopped_at.elapsed().as_millis() as u64,
-                duration_secs,
-            });
-        }
-
-        let remainder = &captured[committed..];
-        if parts.is_empty() || remainder.len() >= MIN_REMAINDER_SAMPLES {
-            let text = self.transcribe_samples(remainder)?;
-            if !text.is_empty() {
-                parts.push(text);
-            }
-        }
-        let mut text = segment::join_parts(&parts);
-
-        if text.is_empty() {
-            if let Some(boosted) = super::engine::boost_quiet_speech(&captured) {
-                if let Ok(boosted_text) = self.transcribe_samples(&boosted) {
-                    text = boosted_text;
-                }
-            }
-        }
-
-        Ok(LiveTranscript {
-            text,
-            latency_ms: stopped_at.elapsed().as_millis() as u64,
-            duration_secs,
-        })
-    }
-
     /// One request to the worker. A dead worker is dropped so the next take respawns it.
-    fn transcribe_samples(&self, samples: &[f32]) -> Result<String, String> {
+    pub(crate) fn transcribe_samples(&self, samples: &[f32]) -> Result<String, String> {
         let req = json!({
             "cmd": "transcribe",
             "audio": b64_encode(&encode_wav_pcm16(samples, 16000)),
