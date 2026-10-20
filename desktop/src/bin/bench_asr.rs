@@ -13,6 +13,11 @@ use voice_stt_desktop::stt::{pcm16_wav, LiveAudio, SttEngine};
 
 /// 100 ms at 16 kHz, the size of one capture chunk.
 const CHUNK_SAMPLES: usize = 1600;
+/// The app stops recording after 150 ms of quiet, so a take never ends in
+/// more silence than this. Speech synthesis leaves about 800 ms.
+const KEPT_TRAILING_QUIET: usize = 150 * 16;
+/// Frames under this level count as the quiet after the last word.
+const TRAILING_QUIET_DB: f32 = -45.0;
 
 struct Clip {
     name: String,
@@ -80,7 +85,8 @@ fn load_clips_into(dir: &Path, clips: &mut Vec<Clip>) {
             .unwrap_or_default()
             .to_string_lossy()
             .to_string();
-        if let Some(samples) = pcm16_wav(&path) {
+        if let Some(mut samples) = pcm16_wav(&path) {
+            trim_trailing_quiet(&mut samples);
             let duration_secs = samples.len() as f32 / 16000.0;
             let reference = std::fs::read_to_string(path.with_extension("txt")).ok();
             clips.push(Clip {
@@ -91,6 +97,21 @@ fn load_clips_into(dir: &Path, clips: &mut Vec<Clip>) {
             });
         }
     }
+}
+
+/// Cut the silence after the last word down to what the app's tail keeps.
+fn trim_trailing_quiet(samples: &mut Vec<f32>) {
+    let frame = 160;
+    let mut end = samples.len();
+    while end >= frame {
+        let window = &samples[end - frame..end];
+        let power = window.iter().map(|s| s * s).sum::<f32>() / frame as f32;
+        if 10.0 * (power + 1e-12).log10() >= TRAILING_QUIET_DB {
+            break;
+        }
+        end -= frame;
+    }
+    samples.truncate((end + KEPT_TRAILING_QUIET).min(samples.len()));
 }
 
 /// Lowercase words with punctuation removed, so WER counts words, not style.
@@ -229,7 +250,15 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_words, word_errors};
+    use super::{normalize_words, trim_trailing_quiet, word_errors, KEPT_TRAILING_QUIET};
+
+    #[test]
+    fn trailing_silence_is_cut_to_the_tail_length() {
+        let mut take = vec![0.3_f32; 16_000];
+        take.extend(vec![0.0; 12_800]);
+        trim_trailing_quiet(&mut take);
+        assert_eq!(take.len(), 16_000 + KEPT_TRAILING_QUIET);
+    }
 
     #[test]
     fn punctuation_and_case_are_not_errors() {
