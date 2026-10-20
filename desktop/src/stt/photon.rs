@@ -1,4 +1,5 @@
 use super::models::ModelSpec;
+use super::segment;
 use super::{LiveAudio, LiveTranscript};
 use crossbeam_channel::{Receiver, RecvTimeoutError};
 use parking_lot::Mutex;
@@ -17,6 +18,8 @@ use std::os::windows::process::CommandExt;
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 const MAX_CAPTURED_SAMPLES: usize = 120 * 16_000;
+/// After a cut, a remainder shorter than 200 ms is the pause itself, not speech.
+const MIN_REMAINDER_SAMPLES: usize = 3_200;
 const WORKER_SCRIPT: &str = include_str!("photon_worker.py");
 
 const B64_CHARS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -501,6 +504,9 @@ impl PhotonParakeetEngine {
         self.prepare()?;
         let mut stopped_at = None;
         let mut captured: Vec<f32> = Vec::new();
+        // Speech before `committed` is already text in `parts`.
+        let mut committed = 0;
+        let mut parts: Vec<String> = Vec::new();
         let mut last_any = std::time::Instant::now();
 
         loop {
@@ -509,6 +515,15 @@ impl PhotonParakeetEngine {
                     last_any = std::time::Instant::now();
                     if captured.len() < MAX_CAPTURED_SAMPLES {
                         captured.extend_from_slice(&samples);
+                        // Transcribe finished sentences while the user still
+                        // talks. New chunks wait in the channel meanwhile.
+                        if let Some(cut) = segment::pause_cut(&captured, committed) {
+                            let text = self.transcribe_samples(&captured[committed..cut])?;
+                            if !text.is_empty() {
+                                parts.push(text);
+                            }
+                            committed = cut;
+                        }
                     }
                 }
                 Ok(LiveAudio::Finish(at)) => {
@@ -538,12 +553,35 @@ impl PhotonParakeetEngine {
             });
         }
 
-        let wav_bytes = encode_wav_pcm16(&captured, 16000);
-        let audio_b64 = b64_encode(&wav_bytes);
+        let remainder = &captured[committed..];
+        if parts.is_empty() || remainder.len() >= MIN_REMAINDER_SAMPLES {
+            let text = self.transcribe_samples(remainder)?;
+            if !text.is_empty() {
+                parts.push(text);
+            }
+        }
+        let mut text = segment::join_parts(&parts);
 
+        if text.is_empty() {
+            if let Some(boosted) = super::engine::boost_quiet_speech(&captured) {
+                if let Ok(boosted_text) = self.transcribe_samples(&boosted) {
+                    text = boosted_text;
+                }
+            }
+        }
+
+        Ok(LiveTranscript {
+            text,
+            latency_ms: stopped_at.elapsed().as_millis() as u64,
+            duration_secs,
+        })
+    }
+
+    /// One request to the worker. A dead worker is dropped so the next take respawns it.
+    fn transcribe_samples(&self, samples: &[f32]) -> Result<String, String> {
         let req = json!({
             "cmd": "transcribe",
-            "audio": audio_b64,
+            "audio": b64_encode(&encode_wav_pcm16(samples, 16000)),
         });
 
         let mut guard = self.worker.lock();
@@ -554,7 +592,6 @@ impl PhotonParakeetEngine {
         let resp = match client.send_request(&req) {
             Ok(r) => r,
             Err(e) => {
-                // If worker connection severed, clear dead client
                 eprintln!("Photon worker died mid-transcription: {e}");
                 *guard = None;
                 return Err(format!("Photon transcription failed: {e}"));
@@ -569,42 +606,12 @@ impl PhotonParakeetEngine {
             return Err(format!("Photon worker error: {msg}"));
         }
 
-        let mut text = resp
+        Ok(resp
             .get("text")
             .and_then(|t| t.as_str())
             .unwrap_or("")
             .trim()
-            .to_string();
-
-        if text.is_empty() {
-            if let Some(boosted) = super::engine::boost_quiet_speech(&captured) {
-                let boosted_wav = encode_wav_pcm16(&boosted, 16000);
-                let boosted_b64 = b64_encode(&boosted_wav);
-                let boosted_req = json!({
-                    "cmd": "transcribe",
-                    "audio": boosted_b64,
-                });
-                if let Ok(boosted_resp) = client.send_request(&boosted_req) {
-                    if boosted_resp.get("status").and_then(|s| s.as_str()) == Some("ok") {
-                        let boosted_text = boosted_resp
-                            .get("text")
-                            .and_then(|t| t.as_str())
-                            .unwrap_or("")
-                            .trim()
-                            .to_string();
-                        if !boosted_text.is_empty() {
-                            text = boosted_text;
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(LiveTranscript {
-            text,
-            latency_ms: stopped_at.elapsed().as_millis() as u64,
-            duration_secs,
-        })
+            .to_string())
     }
 
     pub fn release(&self) {

@@ -2,6 +2,7 @@ pub mod engine;
 pub mod fillers;
 pub mod models;
 pub mod photon;
+pub mod segment;
 
 pub use engine::{LiveAudio, LiveTranscript, SttEngine};
 pub use fillers::remove_fillers;
