@@ -11,7 +11,7 @@ use crate::ui::theme::{
     TYPE_META, TYPE_TITLE,
 };
 use crate::ui::window_util::{
-    client_animations_enabled, set_pill_hit_rect, set_window_mode, BUBBLE_HEIGHT, BUBBLE_WIDTH, PANEL_CLOSE_MS, PANEL_OPEN_MS,
+    client_animations_enabled, set_pill_hit_rect, set_window_mode, BUBBLE_HEIGHT, BUBBLE_WIDTH,
 };
 use crate::update::{self, UpdatePhase};
 use ely_gpui_component::buttons::{ButtonVariant, IconButton, SegmentedControl};
@@ -62,6 +62,9 @@ const HIT_PAD: f32 = 6.0;
 const TIP_H: f32 = 30.0;
 const TIP_GAP: f32 = 6.0;
 const PILL_MOTION_MS: u64 = 320;
+/// The pill grows into the panel, and shrinks back faster than it grew.
+const PANEL_IN_MS: u64 = 260;
+const PANEL_OUT_MS: u64 = 180;
 
 /// The pill's size moves from `from` to `to` with a small overshoot.
 #[derive(Debug, Clone, Copy)]
@@ -269,6 +272,48 @@ fn live_peaks(peaks: &[f32; WAVE_BARS]) -> [f32; LIVE_BARS] {
     out
 }
 
+/// The pill grows into the panel. A black shell widens first and then rises
+/// (height trails width), staying a pill until it is tall, and the content
+/// fades in at the end. Closing runs the same path back: the content goes
+/// first, then the shell flattens into the pill.
+fn morph(panel: AnyElement, open: f32, viewport: Size<Pixels>) -> AnyElement {
+    let lerp = |from: f32, to: f32, at: f32| from + (to - from) * at;
+    let (width, height) = (viewport.width / px(1.0), viewport.height / px(1.0));
+    let shell_h = lerp(REST.1, height, open * open);
+    let content = ((open - 0.8) / 0.2).clamp(0.0, 1.0);
+    div()
+        .size_full()
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_end()
+        .pb(px(lerp(HIT_PAD, 0.0, open)))
+        .child(
+            div()
+                .flex_none()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_end()
+                .w(px(lerp(REST.0, width, open)))
+                .h(px(shell_h))
+                .rounded(px((shell_h / 2.0).min(theme::R_WINDOW)))
+                .bg(bg())
+                .border_1()
+                .border_color(edge())
+                .overflow_hidden()
+                .child(
+                    div()
+                        .flex_none()
+                        .w(px(width))
+                        .h(px(height))
+                        .opacity(content)
+                        .child(panel),
+                ),
+        )
+        .into_any_element()
+}
+
 /// Three dots that pulse in turn while the words are worked out.
 fn finishing_dots() -> AnyElement {
     let dots = (0..3usize).map(|index| {
@@ -334,6 +379,20 @@ pub enum SettingsTab {
 enum PanelMotion {
     Opening { started_at: Instant },
     Closing { started_at: Instant },
+}
+
+impl PanelMotion {
+    /// How open the panel is now (0 is the resting pill, 1 the full panel),
+    /// and whether it still moves.
+    fn openness(&self) -> (f32, bool) {
+        let (started_at, ms, opening) = match *self {
+            Self::Opening { started_at } => (started_at, PANEL_IN_MS, true),
+            Self::Closing { started_at } => (started_at, PANEL_OUT_MS, false),
+        };
+        let t = (started_at.elapsed().as_secs_f32() * 1000.0 / ms as f32).min(1.0);
+        let eased = ease_out_quint()(t);
+        (if opening { eased } else { 1.0 - eased }, t < 1.0)
+    }
 }
 
 struct PreparedModel {
@@ -766,15 +825,17 @@ impl HudView {
             self.hotkey_capturing = false;
             hotkey::end_capture();
         }
-        set_window_mode(false);
+        // The panel fades out first; then the window jumps back to the pill.
+        let fade = if client_animations_enabled() { PANEL_OUT_MS } else { 0 };
         cx.spawn(async move |this, cx| {
             cx.background_executor()
-                .timer(Duration::from_millis(PANEL_CLOSE_MS))
+                .timer(Duration::from_millis(fade))
                 .await;
             let _ = this.update(cx, |view, cx| {
                 if view.panel_motion == Some(PanelMotion::Closing { started_at }) {
                     view.mode = WindowViewMode::Bubble;
                     view.panel_motion = None;
+                    set_window_mode(false);
                     cx.notify();
                 }
             });
@@ -795,7 +856,7 @@ impl HudView {
         set_window_mode(true);
         cx.spawn(async move |this, cx| {
             cx.background_executor()
-                .timer(Duration::from_millis(PANEL_OPEN_MS))
+                .timer(Duration::from_millis(PANEL_IN_MS))
                 .await;
             let _ = this.update(cx, |view, cx| {
                 if view.panel_motion == Some(PanelMotion::Opening { started_at }) {
@@ -1100,7 +1161,17 @@ impl Render for HudView {
             self.panel_needs_focus = false;
         }
         let body = if self.mode == WindowViewMode::StatsAndSettings {
-            self.render_stats_settings(cx)
+            let panel = self.render_stats_settings(cx);
+            match self.panel_motion.filter(|_| client_animations_enabled()) {
+                Some(motion) => {
+                    let (open, moving) = motion.openness();
+                    if moving {
+                        window.request_animation_frame();
+                    }
+                    morph(panel, open, window.viewport_size())
+                }
+                None => panel,
+            }
         } else {
             self.render_bubble(window, cx)
         };
@@ -1254,8 +1325,7 @@ impl HudView {
             .flex_col()
             .items_center()
             .justify_end()
-            .w(px(BUBBLE_WIDTH))
-            .h(px(BUBBLE_HEIGHT))
+            .size_full()
             .child(zone)
             .into_any_element()
     }
@@ -1613,18 +1683,7 @@ impl HudView {
                         panel.child(div().flex_none().pb(px(GAP_SECTION)).child(alert))
                     })
                     .child(faded_content);
-                if client_animations_enabled() {
-                    panel
-                        .with_animation(
-                            "panel_presence",
-                            Animation::new(Duration::from_millis(PANEL_OPEN_MS))
-                                .with_easing(ease_out_quint()),
-                            |this, delta| this.opacity(delta),
-                        )
-                        .into_any_element()
-                } else {
-                    panel.into_any_element()
-                }
+                panel.into_any_element()
             })
             .into_any_element()
     }

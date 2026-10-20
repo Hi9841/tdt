@@ -41,8 +41,6 @@ pub const PANEL_WIDTH: i32 = 400;
 pub const PANEL_HEIGHT: i32 = 540;
 pub const PANEL_MIN_HEIGHT: i32 = 480;
 pub const PANEL_MAX_HEIGHT: i32 = 620;
-pub const PANEL_OPEN_MS: u64 = 240;
-pub const PANEL_CLOSE_MS: u64 = 180;
 /// Inset from the monitor work area when choosing a panel size. 48 keeps the
 /// existing 480-620 height range on typical displays while still fitting a
 /// 400px-wide panel (400 + 48). These values are GPUI logical pixels and are
@@ -722,52 +720,6 @@ fn panel_origin_at_scale(
     (left, top)
 }
 
-fn cubic_bezier_point(t: f32, a: f32, b: f32) -> f32 {
-    let u = 1.0 - t;
-    3.0 * u * u * t * a + 3.0 * u * t * t * b + t * t * t
-}
-
-fn cubic_bezier_deriv(t: f32, a: f32, b: f32) -> f32 {
-    let u = 1.0 - t;
-    3.0 * u * u * a + 6.0 * u * t * (b - a) + 3.0 * t * t * (1.0 - b)
-}
-
-/// iOS-like drawer curve: cubic-bezier(0.32, 0.72, 0, 1)
-pub fn ease_drawer(t: f32) -> f32 {
-    let t = t.clamp(0.0, 1.0);
-    let x1 = 0.32;
-    let y1 = 0.72;
-    let x2 = 0.0;
-    let y2 = 1.0;
-    let mut u = t;
-    for _ in 0..8 {
-        let x = cubic_bezier_point(u, x1, x2);
-        let dx = cubic_bezier_deriv(u, x1, x2);
-        if dx.abs() < 1e-6 {
-            break;
-        }
-        u = (u - (x - t) / dx).clamp(0.0, 1.0);
-    }
-    cubic_bezier_point(u, y1, y2)
-}
-
-pub fn lerp_i32(a: i32, b: i32, t: f32) -> i32 {
-    (a as f32 + (b - a) as f32 * t).round() as i32
-}
-
-/// Keep the bottom edge where it is while height changes. `to_y` is ignored so
-/// a clamped panel origin cannot drag the pill off the taskbar.
-pub fn lerp_pinned_bottom(from_y: i32, from_h: i32, _to_y: i32, to_h: i32, t: f32) -> (i32, i32) {
-    let bottom = from_y + from_h;
-    let h = lerp_i32(from_h, to_h, t).max(1);
-    (bottom - h, h)
-}
-
-fn anim_generation() -> &'static std::sync::atomic::AtomicU64 {
-    static GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    &GEN
-}
-
 #[cfg(target_os = "windows")]
 pub fn client_animations_enabled() -> bool {
     // Cached; the Win32 call is cheap but this runs on every render and the
@@ -947,8 +899,6 @@ pub fn set_window_mode(is_expanded: bool) {
             }
         }
 
-        let gen = anim_generation().fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-
         std::thread::spawn(move || {
             let Some(hwnd) = find_app_hwnd() else {
                 overlay_animating().store(false, std::sync::atomic::Ordering::SeqCst);
@@ -973,7 +923,6 @@ pub fn set_window_mode(is_expanded: bool) {
 
                 let from_x = rect.left;
                 let from_y = rect.top;
-                let from_w = (rect.right - rect.left).max(1);
                 let from_h = rect.bottom - rect.top;
                 let bottom = from_y + from_h;
                 let (bubble_w, bubble_h) = bubble_outer_size(hwnd);
@@ -1018,42 +967,8 @@ pub fn set_window_mode(is_expanded: bool) {
                     apply_overlay_region(hwnd);
                 };
 
-                if !client_animations_enabled()
-                    || (from_x == to_x && from_y == to_y && from_w == to_w && from_h == to_h)
-                {
-                    apply(to_x, to_y, to_w, to_h);
-                    finish_window_mode(hwnd, is_expanded);
-                    return;
-                }
-
-                let duration = std::time::Duration::from_millis(if is_expanded {
-                    PANEL_OPEN_MS
-                } else {
-                    PANEL_CLOSE_MS
-                });
-                let started = std::time::Instant::now();
-                loop {
-                    if anim_generation().load(std::sync::atomic::Ordering::SeqCst) != gen {
-                        return;
-                    }
-                    let t = (started.elapsed().as_secs_f32() / duration.as_secs_f32()).min(1.0);
-                    let e = ease_drawer(t);
-                    let (y, h) = if bottom == to_y + to_h {
-                        lerp_pinned_bottom(from_y, from_h, to_y, to_h, e)
-                    } else {
-                        (lerp_i32(from_y, to_y, e), lerp_i32(from_h, to_h, e))
-                    };
-                    apply(
-                        lerp_i32(from_x, to_x, e),
-                        y,
-                        lerp_i32(from_w, to_w, e).max(1),
-                        h,
-                    );
-                    if t >= 1.0 {
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
+                // One jump. The panel animates inside the window instead, so
+                // Windows never shows it cropped mid-resize.
                 apply(to_x, to_y, to_w, to_h);
                 finish_window_mode(hwnd, is_expanded);
             }
@@ -1248,18 +1163,6 @@ mod tests {
             (300 - PANEL_WORK_MARGIN, 400 - PANEL_WORK_MARGIN)
         );
         assert_eq!(panel_size_for_work(0, 0), (PANEL_WIDTH, PANEL_HEIGHT));
-    }
-
-    #[test]
-    fn pinned_bottom_stays_put_when_growing_up() {
-        let from_y = 918;
-        let from_h = BUBBLE_HEIGHT as i32;
-        let to_h = PANEL_HEIGHT;
-        let to_y = from_y + from_h - to_h;
-        let bottom = from_y + from_h;
-        assert_eq!(to_y + to_h, bottom);
-        let (y, h) = lerp_pinned_bottom(from_y, from_h, to_y, to_h, 0.5);
-        assert_eq!(y + h, bottom);
     }
 
     #[test]
