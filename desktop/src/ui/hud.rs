@@ -11,7 +11,7 @@ use crate::ui::theme::{
     TYPE_META, TYPE_TITLE,
 };
 use crate::ui::window_util::{
-    client_animations_enabled, set_pill_hit_rect, set_window_mode, BUBBLE_HEIGHT, BUBBLE_WIDTH,
+    client_animations_enabled, set_pill_hit_rect, set_window_mode,
 };
 use crate::update::{self, UpdatePhase};
 use ely_gpui_component::buttons::{ButtonVariant, IconButton, SegmentedControl};
@@ -113,11 +113,9 @@ impl PillMotion {
         if self.progress() >= 1.0 {
             return self.to;
         }
-        let w = self.from.0.max(self.to.0) * 1.08 + 2.0;
-        let h = self.from.1.max(self.to.1) * 1.08 + 2.0;
         (
-            w.min(BUBBLE_WIDTH - 2.0 * HIT_PAD),
-            h.min(BUBBLE_HEIGHT - 2.0 * HIT_PAD),
+            self.from.0.max(self.to.0) * 1.08 + 2.0,
+            self.from.1.max(self.to.1) * 1.08 + 2.0,
         )
     }
 }
@@ -257,6 +255,19 @@ impl PillPart {
     }
 }
 
+/// The app's orb logo, shown in the live pill. Decoded once and shared, so
+/// GPUI keeps one texture for it.
+fn orb_image() -> Arc<Image> {
+    static ORB: std::sync::OnceLock<Arc<Image>> = std::sync::OnceLock::new();
+    ORB.get_or_init(|| {
+        Arc::new(Image::from_bytes(
+            ImageFormat::Png,
+            include_bytes!("../../assets/orb.png").to_vec(),
+        ))
+    })
+    .clone()
+}
+
 /// Fold the recorder's bars into the few the live pill shows.
 fn live_peaks(peaks: &[f32; WAVE_BARS]) -> [f32; LIVE_BARS] {
     let mut out = [0.0; LIVE_BARS];
@@ -390,7 +401,9 @@ impl PanelMotion {
             Self::Closing { started_at } => (started_at, PANEL_OUT_MS, false),
         };
         let t = (started_at.elapsed().as_secs_f32() * 1000.0 / ms as f32).min(1.0);
-        let eased = ease_out_quint()(t);
+        // Cubic, not quint: a gentler start spreads the motion over more
+        // frames, so a 143 Hz display shows small even steps, not jumps.
+        let eased = 1.0 - (1.0 - t).powi(3);
         (if opening { eased } else { 1.0 - eased }, t < 1.0)
     }
 }
@@ -825,25 +838,31 @@ impl HudView {
             self.hotkey_capturing = false;
             hotkey::end_capture();
         }
-        // The panel fades out first; then the window jumps back to the pill.
-        let fade = if client_animations_enabled() { PANEL_OUT_MS } else { 0 };
-        cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(Duration::from_millis(fade))
-                .await;
-            let _ = this.update(cx, |view, cx| {
-                if view.panel_motion == Some(PanelMotion::Closing { started_at }) {
-                    view.mode = WindowViewMode::Bubble;
-                    view.panel_motion = None;
-                    set_window_mode(false);
-                    cx.notify();
-                }
-            });
-        })
-        .detach();
+        // The morph shrinks the panel back into the pill; when it ends,
+        // finish_panel_motion leaves panel mode.
+        if !client_animations_enabled() {
+            self.finish_panel_motion();
+        }
+        cx.notify();
+    }
+
+    /// The morph reached its end: settle into the panel or back into the pill.
+    fn finish_panel_motion(&mut self) {
+        if let Some(PanelMotion::Closing { .. }) = self.panel_motion {
+            self.mode = WindowViewMode::Bubble;
+            set_window_mode(false);
+        }
+        self.panel_motion = None;
     }
 
     pub fn open_settings(&mut self, cx: &mut Context<Self>) {
+        // Already open or opening: a second click (or a double click on the
+        // tray icon) must not restart the morph.
+        if self.mode == WindowViewMode::StatsAndSettings
+            && !matches!(self.panel_motion, Some(PanelMotion::Closing { .. }))
+        {
+            return;
+        }
         self.mode = WindowViewMode::StatsAndSettings;
         self.pill_hovered = false;
         if !preview::is_active() {
@@ -854,18 +873,10 @@ impl HudView {
         let started_at = Instant::now();
         self.panel_motion = Some(PanelMotion::Opening { started_at });
         set_window_mode(true);
-        cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(Duration::from_millis(PANEL_IN_MS))
-                .await;
-            let _ = this.update(cx, |view, cx| {
-                if view.panel_motion == Some(PanelMotion::Opening { started_at }) {
-                    view.panel_motion = None;
-                    cx.notify();
-                }
-            });
-        })
-        .detach();
+        if !client_animations_enabled() {
+            self.finish_panel_motion();
+        }
+        cx.notify();
     }
 
     fn copy_history(&mut self, key: &str, text: &str) {
@@ -1167,6 +1178,8 @@ impl Render for HudView {
                     let (open, moving) = motion.openness();
                     if moving {
                         window.request_animation_frame();
+                    } else {
+                        self.finish_panel_motion();
                     }
                     morph(panel, open, window.viewport_size())
                 }
@@ -1229,11 +1242,10 @@ impl HudView {
         let hit = (!hover_tip).then(|| {
             let w = span.0 + 2.0 * HIT_PAD;
             let h = span.1 + 2.0 * HIT_PAD;
-            ((BUBBLE_WIDTH - w) / 2.0, BUBBLE_HEIGHT - h, w, h)
+            let canvas = window.viewport_size();
+            ((canvas.width / px(1.0) - w) / 2.0, canvas.height / px(1.0) - h, w, h)
         });
-        if !preview::is_active() {
-            set_pill_hit_rect(hit);
-        }
+        set_pill_hit_rect(hit);
 
         let at_rest = matches!(self.status, HudStatus::Idle) && ready && !hover_tip;
         let content: AnyElement = match (&self.status, message) {
@@ -1403,17 +1415,7 @@ impl HudView {
             .flex()
             .items_center()
             .gap(px(6.0))
-            .child(
-                div()
-                    .flex_none()
-                    .size(px(LIVE_ORB))
-                    .rounded_full()
-                    .bg(linear_gradient(
-                        160.0,
-                        linear_color_stop(rgb(0x8ab8f5), 0.0),
-                        linear_color_stop(rgb(0x2f66c0), 1.0),
-                    )),
-            )
+            .child(img(orb_image()).flex_none().size(px(LIVE_ORB)))
             .child(
                 div()
                     .flex()
@@ -2336,8 +2338,6 @@ fn history_text_overflows(text: &str, latest: bool) -> bool {
 // Compile-time invariant: the painted settings surface must stay inset within
 // the pill so its highlight never collides with the border and 14px corners.
 const _: () = assert!(SETTINGS_SURFACE_HEIGHT >= 24.0);
-const _: () = assert!(SETTINGS_SURFACE_HEIGHT <= BUBBLE_HEIGHT - 12.0);
-const _: () = assert!(SETTINGS_SURFACE_HEIGHT <= BUBBLE_HEIGHT - 14.0);
 
 #[cfg(test)]
 mod motion_tests {

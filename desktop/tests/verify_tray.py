@@ -1,15 +1,21 @@
-"""Isolated Windows tray workflow check. Run with uv run."""
+"""Isolated Windows tray workflow check. Run with uv run.
+
+Drives the real tray icon and its native menu through window messages, in
+preview mode, so it runs beside an installed TDT without touching it.
+"""
 
 import ctypes as c
 from ctypes import wintypes as w
 import os
 from pathlib import Path
 import subprocess
+import sys
 import time
 
 ROOT = Path(__file__).resolve().parents[2]
-EXE = ROOT / "desktop/target/debug/TDT.exe"
+EXE = Path(sys.argv[1]) if len(sys.argv) > 1 else ROOT / "desktop/target/debug/TDT.exe"
 u = c.WinDLL("user32", use_last_error=True)
+g = c.WinDLL("gdi32", use_last_error=True)
 u.SetProcessDPIAware()
 CALLBACK = c.WINFUNCTYPE(w.BOOL, w.HWND, w.LPARAM)
 u.EnumWindows.argtypes = [CALLBACK, w.LPARAM]
@@ -24,6 +30,12 @@ u.GetMenuItemCount.argtypes = [w.HMENU]
 u.GetMenuState.argtypes = [w.HMENU, w.UINT, w.UINT]
 u.GetWindowRect.argtypes = [w.HWND, c.POINTER(w.RECT)]
 u.GetWindowLongW.argtypes = [w.HWND, c.c_int]
+u.GetDC.restype = w.HDC
+g.GetPixel.argtypes = [w.HDC, c.c_int, c.c_int]
+
+TRAY_MESSAGE = 6002
+WM_LBUTTONUP, WM_LBUTTONDBLCLK, WM_RBUTTONUP = 0x202, 0x203, 0x205
+WS_EX_NOACTIVATE = 0x08000000
 
 
 def find(pid, name):
@@ -49,7 +61,7 @@ def wait_for(fn, timeout=10):
         result = fn()
         if result:
             return result
-        time.sleep(0.05)
+        time.sleep(0.02)
     raise AssertionError("Timed out waiting for " + str(fn))
 
 
@@ -65,8 +77,25 @@ def rect(hwnd):
     return value.left, value.top, value.right, value.bottom
 
 
+def panel_open(hwnd):
+    """The open panel takes focus, so the overlay drops WS_EX_NOACTIVATE."""
+    return not u.GetWindowLongW(hwnd, -20) & WS_EX_NOACTIVATE
+
+
+def panel_fully_drawn(hwnd):
+    """Near the top of the window, the full panel is opaque black; the
+    resting pill or a panel still growing leaves the desktop showing."""
+    left, top, right, _ = rect(hwnd)
+    screen = u.GetDC(None)
+    try:
+        samples = [g.GetPixel(screen, x, top + 12) for x in range(left + 40, right - 40, 40)]
+    finally:
+        u.ReleaseDC(None, screen)
+    return all(color == 0 for color in samples)
+
+
 def menu_action(proc, tray, label):
-    u.PostMessageW(tray, 6002, 0, 0x204)
+    u.PostMessageW(tray, TRAY_MESSAGE, 0, WM_RBUTTONUP)
     menu_window = wait_for(lambda: find(proc.pid, "#32768"))
     menu = u.SendMessageW(menu_window, 0x1E1, 0, 0)
     labels = []
@@ -85,7 +114,6 @@ def menu_action(proc, tray, label):
     u.GetMenuStringW(menu, selected[0], selected_label, 256, 0x400)
     assert selected_label.value == label, selected_label.value
     key(tray, 0x0D)
-    time.sleep(0.4)
 
 
 def launch(state):
@@ -94,51 +122,49 @@ def launch(state):
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     hwnd = wait_for(lambda: find(proc.pid, "Zed::Window"))
     tray = wait_for(lambda: find(proc.pid, "tray_icon_app"))
-    time.sleep(0.7)
+    time.sleep(1.0)
     return proc, hwnd, tray
+
+
+def close_with_escape(hwnd):
+    key(hwnd, 0x1B)
+    wait_for(lambda: not panel_open(hwnd), timeout=3)
 
 
 def main():
     proc, hwnd, tray = launch("bubble.idle")
     try:
-        assert not u.IsWindowVisible(hwnd), "Idle should live only in tray"
-        u.PostMessageW(tray, 6002, 0, 0x202)
-        wait_for(lambda: u.IsWindowVisible(hwnd))
-        time.sleep(0.4)
-        assert rect(hwnd)[3] - rect(hwnd)[1] > 300, "Tray click opens settings, not a status bubble"
-        menu_action(proc, tray, "Hide overlay")
-        assert not u.IsWindowVisible(hwnd)
-        menu_action(proc, tray, "Keep bubble in tray")
-        assert u.IsWindowVisible(hwnd), "Disabling tray mode restores floating bubble"
-        menu_action(proc, tray, "Keep bubble in tray")
-        assert not u.IsWindowVisible(hwnd), "Enabling tray mode hides idle bubble"
+        size = rect(hwnd)
+        assert u.IsWindowVisible(hwnd), "The resting pill is always on screen"
+        assert not panel_open(hwnd)
+
+        u.PostMessageW(tray, TRAY_MESSAGE, 0, WM_LBUTTONUP)
+        wait_for(lambda: panel_open(hwnd), timeout=3)
+        wait_for(lambda: panel_fully_drawn(hwnd), timeout=3)
+        print("PASS: a tray click opens Settings")
+
+        # A double click arrives as click, double click, click. The open panel
+        # must stay fully drawn: a restarted morph would shrink it first.
+        for message in (WM_LBUTTONUP, WM_LBUTTONDBLCLK, WM_LBUTTONUP):
+            u.PostMessageW(tray, TRAY_MESSAGE, 0, message)
+        for _ in range(15):
+            time.sleep(0.02)
+            assert panel_fully_drawn(hwnd), "A double click must not restart the morph"
+        print("PASS: a tray double click keeps Settings still")
+
+        close_with_escape(hwnd)
+        print("PASS: Escape closes Settings back to the pill")
+
         menu_action(proc, tray, "Open settings")
-        assert u.IsWindowVisible(hwnd)
-        assert rect(hwnd)[3] - rect(hwnd)[1] > 300
-        assert not u.GetWindowLongW(hwnd, -20) & 0x08000000
-        key(hwnd, 0x1B)
-        wait_for(lambda: not u.IsWindowVisible(hwnd), timeout=7)
-        print("PASS: idle hiding, click opens settings, native keyboard menu hide/toggle/settings, Escape return")
+        wait_for(lambda: panel_open(hwnd), timeout=3)
+        close_with_escape(hwnd)
+        print("PASS: the tray menu opens Settings")
+
+        assert rect(hwnd) == size, "The overlay window never resizes"
+        print("PASS: the window kept one size the whole time")
     finally:
         proc.terminate()
         proc.wait(timeout=5)
-
-    for state in ["bubble.listening.loud", "bubble.transcribing", "bubble.success.copied", "bubble.error", "bubble.no-speech"]:
-        proc, hwnd, tray = launch(state)
-        try:
-            assert not u.IsWindowVisible(hwnd), state + " must stay entirely in the tray"
-            assert u.GetWindowLongW(hwnd, -20) & 0x08000000
-            menu_action(proc, tray, "Open settings")
-            assert u.IsWindowVisible(hwnd), "Recovery/settings remain explicitly accessible"
-            time.sleep(0.3)
-            key(hwnd, 0x1B)
-            wait_for(lambda: not u.IsWindowVisible(hwnd))
-            time.sleep(0.4)
-            assert not u.IsWindowVisible(hwnd), "Closing settings must never reveal the status bubble"
-            print("PASS:", state, "icon only; explicit settings open and Escape returns to tray")
-        finally:
-            proc.terminate()
-            proc.wait(timeout=5)
 
 
 if __name__ == "__main__":

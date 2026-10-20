@@ -40,7 +40,7 @@ use ui::preview;
 use ui::tray::tooltip_text;
 use ui::window_util::{
     ensure_overlay_topmost, find_app_hwnd, follow_current_virtual_desktop, lock_overlay_chrome,
-    position_bubble_on_preferred_monitor, BUBBLE_HEIGHT, BUBBLE_WIDTH,
+    position_bubble_on_preferred_monitor, PANEL_HEIGHT, PANEL_WIDTH,
 };
 use ui::{HudStatus, HudView, SystemTray};
 use update::UpdatePhase;
@@ -135,6 +135,7 @@ fn main() {
     };
     if !preview::is_active() {
         autostart::refresh_if_enabled();
+        update::sync_install_record();
     }
 
     let mut config = if preview::is_active() {
@@ -287,7 +288,7 @@ fn main() {
         let window_options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(Bounds {
                 origin: Point::new(px(700.0), px(860.0)),
-                size: Size::new(px(BUBBLE_WIDTH), px(BUBBLE_HEIGHT)),
+                size: Size::new(px(PANEL_WIDTH as f32), px(PANEL_HEIGHT as f32)),
             })),
             titlebar: None,
             focus: false,

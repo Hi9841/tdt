@@ -33,10 +33,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_THICKFRAME,
 };
 
-/// The overlay canvas. The pill is drawn inside it, bottom-centered, and the
-/// window region limits input to the pill so the rest never blocks clicks.
-pub const BUBBLE_WIDTH: f32 = 400.0;
-pub const BUBBLE_HEIGHT: f32 = 64.0;
+/// The overlay window always has the panel's size. The pill is drawn at its
+/// bottom center, and the window region limits input to the pill while the
+/// panel is closed, so the rest never blocks clicks. The window never resizes
+/// on screen, so Windows never shows a stretched frame.
 pub const PANEL_WIDTH: i32 = 400;
 pub const PANEL_HEIGHT: i32 = 540;
 pub const PANEL_MIN_HEIGHT: i32 = 480;
@@ -46,14 +46,8 @@ pub const PANEL_MAX_HEIGHT: i32 = 620;
 /// 400px-wide panel (400 + 48). These values are GPUI logical pixels and are
 /// converted to device pixels before Win32 sizing calls.
 const PANEL_WORK_MARGIN: i32 = 48;
-const PANEL_EDGE_PAD: i32 = 20;
 
 fn overlay_expanded() -> &'static std::sync::atomic::AtomicBool {
-    static FLAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    &FLAG
-}
-
-fn overlay_animating() -> &'static std::sync::atomic::AtomicBool {
     static FLAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     &FLAG
 }
@@ -379,7 +373,7 @@ unsafe fn apply_overlay_region(hwnd: HWND) {
     // A GDI round region is not antialiased and produces a second, jagged
     // curve over GPUI's GPU-painted corner. So the region is a plain
     // rectangle around the pill; the transparent surface draws the round shape.
-    // No region (the whole window) while the panel is open or moving.
+    // No region (the whole window) while the panel is open.
     let region = pill_region(hwnd).unwrap_or_default();
     // On success the system owns the region.
     let _ = SetWindowRgn(hwnd, region, true);
@@ -387,8 +381,7 @@ unsafe fn apply_overlay_region(hwnd: HWND) {
 
 #[cfg(target_os = "windows")]
 unsafe fn pill_region(hwnd: HWND) -> Option<HRGN> {
-    let collapsed = !overlay_expanded().load(std::sync::atomic::Ordering::SeqCst)
-        && !overlay_animating().load(std::sync::atomic::Ordering::SeqCst);
+    let collapsed = !overlay_expanded().load(std::sync::atomic::Ordering::SeqCst);
     let (x, y, w, h) = (*pill_hit_rect().lock()).filter(|_| collapsed)?;
     let mut outer = RECT::default();
     let mut origin = POINT::default();
@@ -484,10 +477,8 @@ fn restore_previous_foreground(overlay: HWND) {
 }
 
 #[cfg(target_os = "windows")]
-fn finish_window_mode(hwnd: HWND, is_expanded: bool) {
+fn apply_window_mode(hwnd: HWND, is_expanded: bool) {
     if !is_expanded {
-        bubble_anchor().lock().take();
-        overlay_expanded().store(false, std::sync::atomic::Ordering::SeqCst);
         apply_overlay_window_style(hwnd);
         restore_previous_foreground(hwnd);
     } else {
@@ -498,7 +489,6 @@ fn finish_window_mode(hwnd: HWND, is_expanded: bool) {
             activate_overlay_window(hwnd);
         }
     }
-    overlay_animating().store(false, std::sync::atomic::Ordering::SeqCst);
     // Input follows the new mode: the whole panel, or only the pill.
     unsafe { apply_overlay_region(hwnd) };
 }
@@ -574,19 +564,16 @@ fn chrome_inset(hwnd: HWND) -> (i32, i32) {
     (0, 0)
 }
 
-/// Outer window size that yields the intended logical bubble client area.
+/// Outer window size for the panel on the work area `work`.
 #[cfg(target_os = "windows")]
-fn bubble_outer_size(hwnd: HWND) -> (i32, i32) {
+fn canvas_outer_size(hwnd: HWND, work: (i32, i32, i32, i32)) -> (i32, i32) {
     let (dw, dh) = chrome_inset(hwnd);
-    let scale = window_scale(hwnd);
-    (
-        logical_to_device(BUBBLE_WIDTH, scale) + dw,
-        logical_to_device(BUBBLE_HEIGHT, scale) + dh,
-    )
+    let (w, h) = panel_size_for_work_at_scale(work.2 - work.0, work.3 - work.1, window_scale(hwnd));
+    (w + dw, h + dh)
 }
 
-/// Make the overlay a true popup, strip resize handles, and snap the collapsed
-/// surface to exactly 400x42 logical pixels without an overlapped-window frame.
+/// Make the overlay a true popup, strip resize handles, and keep it at the
+/// panel's size for its monitor without an overlapped-window frame.
 pub fn lock_overlay_chrome() {
     #[cfg(target_os = "windows")]
     {
@@ -616,14 +603,12 @@ pub fn lock_overlay_chrome() {
                 );
                 apply_overlay_dwm(hwnd);
             }
-            if overlay_expanded().load(std::sync::atomic::Ordering::SeqCst)
-                || overlay_animating().load(std::sync::atomic::Ordering::SeqCst)
-            {
+            let Some(work) = monitor_work_area(hwnd) else {
                 return;
-            }
+            };
             let mut rect = RECT::default();
             let _ = GetWindowRect(hwnd, &mut rect);
-            let (want_w, want_h) = bubble_outer_size(hwnd);
+            let (want_w, want_h) = canvas_outer_size(hwnd, work);
             let w = rect.right - rect.left;
             let h = rect.bottom - rect.top;
             if w != want_w || h != want_h {
@@ -640,18 +625,6 @@ pub fn lock_overlay_chrome() {
                 apply_overlay_region(hwnd);
             }
         }
-    }
-}
-
-fn bubble_anchor() -> &'static parking_lot::Mutex<Option<(i32, i32, i32)>> {
-    static POS: parking_lot::Mutex<Option<(i32, i32, i32)>> = parking_lot::Mutex::new(None);
-    &POS
-}
-
-fn save_bubble_rect(left: i32, top: i32, width: i32) {
-    let mut saved = bubble_anchor().lock();
-    if saved.is_none() {
-        *saved = Some((left, top, width.max(1)));
     }
 }
 
@@ -691,33 +664,6 @@ fn clamp_panel_extent(
     } else {
         available.min(max_preferred).max(min_preferred)
     }
-}
-
-/// Clamp the expanded panel to a monitor work area. Origins may be negative
-/// or beyond the primary width when the overlay lives on a second display.
-#[cfg(test)]
-fn panel_origin(bubble: (i32, i32), work: (i32, i32, i32, i32), panel: (i32, i32)) -> (i32, i32) {
-    panel_origin_at_scale(bubble, work, panel, 1.0)
-}
-
-fn panel_origin_at_scale(
-    bubble: (i32, i32),
-    work: (i32, i32, i32, i32),
-    panel: (i32, i32),
-    scale: f32,
-) -> (i32, i32) {
-    let pad = logical_to_device(PANEL_EDGE_PAD as f32, scale);
-    let (bubble_left, bubble_top) = bubble;
-    let (work_left, work_top, work_right, work_bottom) = work;
-    let (panel_w, panel_h) = panel;
-    let bubble_bottom = bubble_top + logical_to_device(BUBBLE_HEIGHT, scale);
-    let min_left = work_left + pad;
-    let max_left = (work_right - panel_w - pad).max(min_left);
-    let min_top = work_top + pad;
-    let max_top = (work_bottom - panel_h - pad).max(min_top);
-    let left = bubble_left.clamp(min_left, max_left);
-    let top = (bubble_bottom - panel_h).clamp(min_top, max_top);
-    (left, top)
 }
 
 #[cfg(target_os = "windows")]
@@ -882,97 +828,22 @@ fn preferred_startup_work_area() -> Option<(i32, i32, i32, i32)> {
     found.secondary.or(found.primary)
 }
 
+/// Switch between the pill and the open panel. The window keeps its size;
+/// only focus behavior and the input region change.
 pub fn set_window_mode(is_expanded: bool) {
     #[cfg(target_os = "windows")]
     {
-        overlay_animating().store(true, std::sync::atomic::Ordering::SeqCst);
+        overlay_expanded().store(is_expanded, std::sync::atomic::Ordering::SeqCst);
+        let Some(hwnd) = find_app_hwnd() else {
+            return;
+        };
         if is_expanded {
-            overlay_expanded().store(true, std::sync::atomic::Ordering::SeqCst);
-            if let Some(hwnd) = find_app_hwnd() {
-                capture_previous_foreground(hwnd);
-                let mut rect = RECT::default();
-                unsafe {
-                    let _ = GetWindowRect(hwnd, &mut rect);
-                }
-                save_bubble_rect(rect.left, rect.top, (rect.right - rect.left).max(1));
-                apply_overlay_window_style(hwnd);
-            }
+            capture_previous_foreground(hwnd);
         }
-
-        std::thread::spawn(move || {
-            let Some(hwnd) = find_app_hwnd() else {
-                overlay_animating().store(false, std::sync::atomic::Ordering::SeqCst);
-                if !is_expanded {
-                    overlay_expanded().store(false, std::sync::atomic::Ordering::SeqCst);
-                }
-                return;
-            };
-            unsafe {
-                let mut rect = RECT::default();
-                let _ = GetWindowRect(hwnd, &mut rect);
-                let work =
-                    monitor_work_area(hwnd).unwrap_or((i32::MIN, i32::MIN, i32::MAX, i32::MAX));
-                let empty = work.2 <= work.0 || work.3 <= work.1;
-                if empty {
-                    overlay_animating().store(false, std::sync::atomic::Ordering::SeqCst);
-                    if !is_expanded {
-                        overlay_expanded().store(false, std::sync::atomic::Ordering::SeqCst);
-                    }
-                    return;
-                }
-
-                let from_x = rect.left;
-                let from_y = rect.top;
-                let from_h = rect.bottom - rect.top;
-                let bottom = from_y + from_h;
-                let (bubble_w, bubble_h) = bubble_outer_size(hwnd);
-                let (inset_w, inset_h) = chrome_inset(hwnd);
-                let work_w = work.2 - work.0;
-                let work_h = work.3 - work.1;
-                let scale = window_scale(hwnd);
-                let edge_pad = logical_to_device(PANEL_EDGE_PAD as f32, scale);
-
-                let (to_x, to_y, to_w, to_h) = if is_expanded {
-                    save_bubble_rect(rect.left, rect.top, bubble_w);
-                    let (panel_w, panel_h) = panel_size_for_work_at_scale(work_w, work_h, scale);
-                    // A tray at the top/side must still open a full settings panel.
-                    let max_h = (work_h - 2 * edge_pad).max(bubble_h);
-                    let to_h = (panel_h + inset_h).min(max_h).max(1);
-                    let max_w = work_w.max(1);
-                    let to_w = (panel_w + inset_w).min(max_w).max(1);
-                    let (clamped_x, clamped_y) = panel_origin_at_scale(
-                        (from_x, from_y),
-                        work,
-                        (
-                            to_w.saturating_sub(inset_w).max(1),
-                            to_h.saturating_sub(inset_h).max(1),
-                        ),
-                        scale,
-                    );
-                    (clamped_x, clamped_y.min(work.3 - to_h), to_w, to_h)
-                } else {
-                    (from_x, bottom - bubble_h, bubble_w, bubble_h)
-                };
-
-                let apply = |x, y, w, h| {
-                    let _ = SetWindowPos(
-                        hwnd,
-                        HWND::default(),
-                        x,
-                        y,
-                        w,
-                        h,
-                        SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOCOPYBITS,
-                    );
-                    apply_overlay_region(hwnd);
-                };
-
-                // One jump. The panel animates inside the window instead, so
-                // Windows never shows it cropped mid-resize.
-                apply(to_x, to_y, to_w, to_h);
-                finish_window_mode(hwnd, is_expanded);
-            }
-        });
+        let raw = hwnd.0 as isize;
+        // Focus changes send window messages back into GPUI; make them off
+        // the UI thread so they never arrive in the middle of an update.
+        std::thread::spawn(move || apply_window_mode(HWND(raw as _), is_expanded));
     }
 }
 
@@ -1031,7 +902,7 @@ pub fn follow_current_virtual_desktop() {
 #[cfg(target_os = "windows")]
 pub fn position_bubble_on_preferred_monitor(hwnd: HWND) {
     if let Some((left, top, right, bottom)) = preferred_startup_work_area() {
-        let (w, h) = bubble_outer_size(hwnd);
+        let (w, h) = canvas_outer_size(hwnd, (left, top, right, bottom));
         let scale = window_scale(hwnd);
         let x = left + ((right - left - w) / 2).max(0);
         let y =
@@ -1121,31 +992,8 @@ mod tests {
     }
 
     #[test]
-    fn panel_grows_up_from_the_bubble() {
-        let bubble_left = 700;
-        let bubble_top = 600;
-        let (left, top) = panel_origin(
-            (bubble_left, bubble_top),
-            (0, 0, 1920, 1080),
-            (PANEL_WIDTH, PANEL_HEIGHT),
-        );
-        assert_eq!(left, bubble_left);
-        assert_eq!(top, bubble_top + BUBBLE_HEIGHT as i32 - PANEL_HEIGHT);
-    }
-
-    #[test]
-    fn panel_origin_stays_on_primary_work_area() {
-        let (left, top) =
-            panel_origin((-40, 2000), (0, 0, 1920, 1080), (PANEL_WIDTH, PANEL_HEIGHT));
-        assert!(left >= 20);
-        assert!(top >= 20);
-        assert!(left + PANEL_WIDTH <= 1900);
-        assert!(top + PANEL_HEIGHT <= 1060);
-    }
-
-    #[test]
     fn panel_size_fits_small_and_large_work_areas() {
-        assert_eq!(panel_size_for_work(1920, 1080).0, BUBBLE_WIDTH as i32);
+        assert_eq!(panel_size_for_work(1920, 1080).0, PANEL_WIDTH);
         assert_eq!(
             panel_size_for_work(1920, 1080),
             (PANEL_WIDTH, PANEL_MAX_HEIGHT)
@@ -1163,34 +1011,6 @@ mod tests {
             (300 - PANEL_WORK_MARGIN, 400 - PANEL_WORK_MARGIN)
         );
         assert_eq!(panel_size_for_work(0, 0), (PANEL_WIDTH, PANEL_HEIGHT));
-    }
-
-    #[test]
-    fn panel_stays_on_second_monitor() {
-        let bubble_left = 2500;
-        let bubble_top = 900;
-        let (left, top) = panel_origin(
-            (bubble_left, bubble_top),
-            (1920, 0, 3840, 1080),
-            (PANEL_WIDTH, PANEL_HEIGHT),
-        );
-        assert_eq!(left, 2500);
-        assert!(left >= 1920);
-        assert!(left + PANEL_WIDTH <= 3840);
-        assert!(top >= 0);
-        assert!(top + PANEL_HEIGHT <= 1080);
-        assert!(top < bubble_top);
-    }
-
-    #[test]
-    fn panel_origin_fits_clamped_size_on_tiny_work_area() {
-        let work = (0, 0, 300, 400);
-        let size = panel_size_for_work(300, 400);
-        let (left, top) = panel_origin((20, 350), work, size);
-        assert!(left >= PANEL_EDGE_PAD);
-        assert!(top >= PANEL_EDGE_PAD);
-        assert!(left + size.0 <= 300 - PANEL_EDGE_PAD);
-        assert!(top + size.1 <= 400 - PANEL_EDGE_PAD);
     }
 
     #[test]
