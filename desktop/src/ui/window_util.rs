@@ -75,6 +75,33 @@ fn previous_foreground() -> &'static parking_lot::Mutex<Option<isize>> {
 
 /// Shell popups the pill must not cover. The taskbar is absent on purpose:
 /// a topmost taskbar was painting over the pill and leaving it there.
+/// Opens a file with its default program, for example a text file in the user's editor.
+pub fn open_file(path: &std::path::Path) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let verb: Vec<u16> = "open\0".encode_utf16().collect();
+    // SAFETY: both strings are null-terminated and live until the call returns.
+    let result = unsafe {
+        ShellExecuteW(
+            None,
+            PCWSTR(verb.as_ptr()),
+            PCWSTR(wide.as_ptr()),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    // ShellExecute reports success with a value above 32.
+    if result.0 as isize > 32 {
+        Ok(())
+    } else {
+        Err(format!("Windows could not open {}", path.display()))
+    }
+}
+
 pub fn overlay_should_yield_to(class_name: &str) -> bool {
     matches!(
         class_name,

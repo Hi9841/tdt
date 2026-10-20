@@ -1,5 +1,6 @@
+use super::dictionary;
 use super::models::ModelSpec;
-use super::native::NativeParakeet;
+use super::native::{BiasWeights, NativeParakeet};
 use super::photon::PhotonParakeetEngine;
 use super::segment;
 use crossbeam_channel::{Receiver, RecvTimeoutError};
@@ -34,6 +35,8 @@ pub struct SttEngine {
     native: Mutex<Option<Arc<NativeParakeet>>>,
     photon: PhotonParakeetEngine,
     use_photon: AtomicBool,
+    /// The dictionary file as last applied to the Rust engine.
+    dictionary: Mutex<dictionary::Watch>,
 }
 
 impl SttEngine {
@@ -45,6 +48,7 @@ impl SttEngine {
             native: Mutex::new(None),
             photon,
             use_photon: AtomicBool::new(forced),
+            dictionary: Mutex::new(dictionary::Watch::default()),
         })
     }
 
@@ -57,6 +61,8 @@ impl SttEngine {
             match NativeParakeet::load(&self.model_dir) {
                 Ok(engine) => {
                     *native = Some(Arc::new(engine));
+                    // A fresh engine has no dictionary yet.
+                    *self.dictionary.lock() = dictionary::Watch::default();
                     return Ok(());
                 }
                 Err(error) => {
@@ -68,6 +74,21 @@ impl SttEngine {
             }
         }
         self.photon.prepare()
+    }
+
+    /// Applies the built-in terms and the user's dictionary file when it changed.
+    fn refresh_dictionary(&self) {
+        let native = self.native.lock().clone();
+        let Some(engine) = native else {
+            return;
+        };
+        let path = dictionary::user_file();
+        if let Some(terms) = self.dictionary.lock().changed_terms(path.as_deref()) {
+            let skipped = engine.set_dictionary(&terms, BiasWeights::default());
+            if !skipped.is_empty() {
+                eprintln!("Dictionary terms the model cannot spell: {skipped:?}");
+            }
+        }
     }
 
     fn transcribe_samples(&self, samples: &[f32]) -> Result<String, String> {
@@ -85,6 +106,7 @@ impl SttEngine {
         rx: &Receiver<LiveAudio>,
     ) -> Result<LiveTranscript, String> {
         self.prepare()?;
+        self.refresh_dictionary();
         let mut stopped_at = None;
         let mut captured: Vec<f32> = Vec::new();
         // Speech before `committed` is already text in `parts`.

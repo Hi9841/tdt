@@ -118,6 +118,8 @@ pub struct HudView {
     update_ping: crossbeam_channel::Sender<()>,
     model_phase: Arc<Mutex<DownloadPhase>>,
     model_error: Option<String>,
+    /// Why the dictionary file could not be opened, shown under the Dictionary row.
+    dictionary_error: Option<String>,
     pub hotkey_capturing: bool,
     pub stop_requested: bool,
     pub retry_microphone: bool,
@@ -202,6 +204,7 @@ impl HudView {
             update_ping,
             model_phase: Arc::new(Mutex::new(DownloadPhase::Idle)),
             model_error: None,
+            dictionary_error: None,
             hotkey_capturing: false,
             stop_requested: false,
             retry_microphone: false,
@@ -1644,6 +1647,18 @@ impl HudView {
                 });
             }
         });
+        let dictionary_row = settings_row(
+            "Dictionary",
+            "Names and terms TDT should spell your way.".to_string(),
+            controls::secondary_button("dictionary_btn", "Edit")
+                .on_click(cx.listener(|this, _, _, cx| {
+                    let opened = voice_stt_desktop::stt::dictionary::ensure_user_file()
+                        .and_then(|path| crate::ui::window_util::open_file(&path));
+                    this.dictionary_error = opened.err();
+                    cx.notify();
+                }))
+                .into_any_element(),
+        );
         let startup_row = settings_row(
             "Start with Windows",
             "Opens TDT when you sign in.".to_string(),
@@ -1919,6 +1934,10 @@ impl HudView {
                     .when_some(model_meter, |column, meter| column.child(meter))
                     .when(show_activate || show_download, |column| {
                         column.child(model_actions)
+                    })
+                    .child(dictionary_row)
+                    .when_some(self.dictionary_error.clone(), |column, error| {
+                        column.child(InlineMessage::new(Severity::Danger, error))
                     }),
             )
             .when_some(self.model_error.clone(), |column, error| {
