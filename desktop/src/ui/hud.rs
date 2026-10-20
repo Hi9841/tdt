@@ -13,7 +13,7 @@ use crate::ui::theme::{
     TYPE_META, TYPE_TITLE,
 };
 use crate::ui::window_util::{
-    client_animations_enabled, set_overlay_hidden, set_window_mode, start_window_drag,
+    client_animations_enabled, is_overlay_hidden, set_overlay_hidden, set_window_mode, start_window_drag,
     BUBBLE_HEIGHT, BUBBLE_WIDTH, PANEL_CLOSE_MS, PANEL_OPEN_MS,
 };
 use crate::update::{self, UpdatePhase};
@@ -121,6 +121,8 @@ pub struct HudView {
     /// Why the dictionary file could not be opened, shown under the Dictionary row.
     dictionary_error: Option<String>,
     pub hotkey_capturing: bool,
+    /// A take revealed the hidden overlay; hide it again once the result has shown.
+    rehide_after_take: bool,
     pub stop_requested: bool,
     pub retry_microphone: bool,
     pub recovery_message: Option<String>,
@@ -195,6 +197,7 @@ impl HudView {
             copied_key: None,
             expanded_history_key: None,
             copied_at: None,
+            rehide_after_take: false,
             injector: PasteInjector::new(),
             selected_model,
             stt_engine,
@@ -530,6 +533,7 @@ impl HudView {
             self.hotkey_capturing = false;
             hotkey::end_capture();
         }
+        self.rehide_after_take = false;
         self.mode = WindowViewMode::Bubble;
         self.panel_motion = None;
         set_window_mode(false);
@@ -541,12 +545,30 @@ impl HudView {
         set_overlay_hidden(false);
     }
 
+    /// Show the overlay for a take. If the user had hidden it, it hides
+    /// again after the result has shown.
+    pub fn reveal_for_take(&mut self) {
+        if is_overlay_hidden() {
+            self.rehide_after_take = true;
+        }
+        self.reveal_overlay();
+    }
+
+    /// The take's result has finished showing; put back a hidden overlay.
+    pub fn finish_take(&mut self, cx: &mut Context<Self>) {
+        if self.rehide_after_take {
+            self.hide_overlay(cx);
+        }
+    }
+
     pub fn show_from_tray(&mut self, cx: &mut Context<Self>) {
+        self.rehide_after_take = false;
         self.reveal_overlay();
         cx.notify();
     }
 
     pub fn open_settings(&mut self, cx: &mut Context<Self>) {
+        self.rehide_after_take = false;
         self.mode = WindowViewMode::StatsAndSettings;
         self.reveal_overlay();
         if !preview::is_active() {
@@ -843,6 +865,8 @@ impl HudView {
     }
 
     pub fn set_error(&mut self, message: String) {
+        // Keep the overlay up so the user can read the error.
+        self.rehide_after_take = false;
         self.recovery_is_microphone = message.to_lowercase().contains("microphone");
         self.recovery_message = Some(message.clone());
         self.status = HudStatus::Error {

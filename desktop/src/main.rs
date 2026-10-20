@@ -564,7 +564,7 @@ fn main() {
                                         .as_ref()
                                         .is_some_and(|live| !live.done.load(Ordering::SeqCst));
                                     if !is_recording_state && !is_processing_state && !pump_busy {
-                                        let _ = this.update(cx, |view, _| view.reveal_overlay());
+                                        let _ = this.update(cx, |view, _| view.reveal_for_take());
                                         if stt.get().is_none() {
                                             let _ = this.update(cx, |view, cx| {
                                                 view.set_error("Download a speech model in Settings before recording.".into());
@@ -890,12 +890,14 @@ fn main() {
                                     {
                                         view.status = HudStatus::Idle;
                                         view.recovery_message = None;
+                                        view.finish_take(cx);
                                         cx.notify();
                                     }
                                 }
                                 HudStatus::NoSpeech if clear_no_speech => {
                                     view.status = HudStatus::Idle;
                                     view.recovery_message = None;
+                                    view.finish_take(cx);
                                     cx.notify();
                                 }
                                 HudStatus::NoSpeech | HudStatus::Error { .. } | HudStatus::Idle => {}
