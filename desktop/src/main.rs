@@ -136,6 +136,7 @@ fn main() {
     if !preview::is_active() {
         autostart::refresh_if_enabled();
         update::sync_install_record();
+        update::remove_replaced_binaries();
     }
 
     let mut config = if preview::is_active() {
@@ -254,7 +255,12 @@ fn main() {
             Ok((guard, rx)) => {
                 _hotkey_guard = Some(guard);
                 hotkey_rx = rx;
-                hotkey_error = None;
+                // The hook installs fine at low integrity but never sees keys
+                // typed into normal apps, so say why instead of failing silently.
+                hotkey_error = low_rights_message();
+                if let Some(message) = &hotkey_error {
+                    append_log(message);
+                }
             }
             Err(error) => {
                 append_log(&format!("Hotkey hook failed: {error}"));
@@ -1039,6 +1045,53 @@ fn signal_running_instance() {
             }
         }
     }
+}
+
+/// Windows starts an exe at low integrity when the file carries a low-rights
+/// label (files saved into a folder with that label inherit it). A low process
+/// cannot read keys from, or paste into, normal apps.
+#[cfg(windows)]
+fn low_rights_message() -> Option<String> {
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::Security::{
+        GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TokenIntegrityLevel,
+        TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
+    };
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    const MEDIUM_RID: u32 = 0x2000;
+
+    let rid = unsafe {
+        let mut token = HANDLE::default();
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).ok()?;
+        let mut buf = [0u64; 16];
+        let mut len = 0u32;
+        let read = GetTokenInformation(
+            token,
+            TokenIntegrityLevel,
+            Some(buf.as_mut_ptr().cast()),
+            std::mem::size_of_val(&buf) as u32,
+            &mut len,
+        );
+        let _ = CloseHandle(token);
+        read.ok()?;
+        let sid = (*(buf.as_ptr() as *const TOKEN_MANDATORY_LABEL)).Label.Sid;
+        *GetSidSubAuthority(sid, u32::from(*GetSidSubAuthorityCount(sid)) - 1)
+    };
+    if rid >= MEDIUM_RID {
+        return None;
+    }
+    let exe = std::env::current_exe().ok()?;
+    Some(format!(
+        "Windows started TDT with low rights, so the shortcut and auto-paste cannot reach \
+         other apps. The TDT.exe file has a low-rights label. Run this in PowerShell, then \
+         start TDT again: icacls \"{}\" /setintegritylevel M",
+        exe.display()
+    ))
+}
+
+#[cfg(not(windows))]
+fn low_rights_message() -> Option<String> {
+    None
 }
 
 fn claim_instance() -> InstanceClaim {

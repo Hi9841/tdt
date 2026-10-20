@@ -291,8 +291,15 @@ pub fn replace_running_exe(new_exe: &Path, version: &str) -> Result<(), String> 
         .parent()
         .ok_or_else(|| "Could not locate the TDT folder".to_string())?;
     let staged = dir.join("TDT.exe.new");
-    std::fs::copy(new_exe, &staged)
+    // A fresh file takes the install folder's permissions. A copy can carry
+    // the download's low-rights label, and Windows would then start TDT with
+    // low rights, where the shortcut cannot work.
+    std::fs::read(new_exe)
+        .and_then(|bytes| std::fs::write(&staged, bytes))
         .map_err(|error| format!("Could not stage the update: {error}"))?;
+    // Windows lets an exe in use be renamed but not replaced, so the old one
+    // moves aside first. That works even while a stuck process still holds it.
+    let old = dir.join(format!("TDT.exe.old-{}", std::process::id()));
     let _ = std::fs::write(dir.join("VERSION"), version.trim().trim_start_matches('v'));
 
     let script = dir.join("tdt-apply-update.cmd");
@@ -304,9 +311,26 @@ pub fn replace_running_exe(new_exe: &Path, version: &str) -> Result<(), String> 
     };
     let staged_s = esc(&staged.display().to_string());
     let current_s = esc(&current.display().to_string());
-    let body = format!(
-        "@echo off\r\nset /a tries=0\r\n:retry\r\nping -n 2 127.0.0.1 >nul\r\nmove /Y \"{staged_s}\" \"{current_s}\"\r\nif not exist \"{staged_s}\" goto done\r\nset /a tries+=1\r\nif %tries% LSS 60 goto retry\r\nexit /b 1\r\n:done\r\nstart \"\" \"{current_s}\"\r\ndel \"%~f0\"\r\n"
-    );
+    let old_s = esc(&old.display().to_string());
+    let body = [
+        "@echo off".to_string(),
+        "set /a tries=0".to_string(),
+        ":retry".to_string(),
+        "ping -n 2 127.0.0.1 >nul".to_string(),
+        format!("if exist \"{current_s}\" move /Y \"{current_s}\" \"{old_s}\" >nul 2>&1"),
+        format!("if not exist \"{current_s}\" move /Y \"{staged_s}\" \"{current_s}\" >nul 2>&1"),
+        format!("if not exist \"{staged_s}\" goto done"),
+        "set /a tries+=1".to_string(),
+        "if %tries% LSS 60 goto retry".to_string(),
+        // Never leave the folder without TDT.exe: put the old one back.
+        format!("if not exist \"{current_s}\" move /Y \"{old_s}\" \"{current_s}\" >nul 2>&1"),
+        "exit /b 1".to_string(),
+        ":done".to_string(),
+        format!("start \"\" \"{current_s}\""),
+        "del \"%~f0\"".to_string(),
+    ]
+    .join("\r\n")
+        + "\r\n";
     std::fs::write(&script, body)
         .map_err(|error| format!("Could not write the update script: {error}"))?;
 
@@ -322,6 +346,25 @@ pub fn replace_running_exe(new_exe: &Path, version: &str) -> Result<(), String> 
     cmd.spawn()
         .map_err(|error| format!("Could not start the update script: {error}"))?;
     Ok(())
+}
+
+/// Delete exes that updates moved aside. One a stuck process still holds
+/// stays until that process is gone, so a later start removes it.
+pub fn remove_replaced_binaries() {
+    let Some(dir) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf))
+    else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.file_name().to_string_lossy().starts_with("TDT.exe.old") {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// The Windows app list shows what the installer wrote. An in-app update

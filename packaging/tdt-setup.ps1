@@ -87,6 +87,14 @@ if (-not (Test-Path (Join-Path $StageDir "TDT.exe"))) {
 Stop-TdtProcesses
 
 New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
+# Windows lets an exe in use be renamed but not replaced. A TDT process that
+# is stuck while it exits can still hold TDT.exe, so move it aside first; TDT
+# deletes the leftover on a later start.
+$installedExe = Join-Path $InstallDir "TDT.exe"
+if (Test-Path -LiteralPath $installedExe) {
+    $aside = "TDT.exe.old-" + [guid]::NewGuid().ToString("N").Substring(0, 8)
+    Rename-Item -LiteralPath $installedExe -NewName $aside -ErrorAction SilentlyContinue
+}
 # Never copy models/. Updates and reinstalls must leave a downloaded
 # Parakeet tree on disk.
 Get-ChildItem -LiteralPath $StageDir -Force | Where-Object { $_.Name -ne "models" } | ForEach-Object {
