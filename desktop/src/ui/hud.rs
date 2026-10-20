@@ -1323,7 +1323,7 @@ impl HudView {
                                     }),
                             );
                         }
-                        panel.child(alert)
+                        panel.child(div().flex_none().pb(px(GAP_SECTION)).child(alert))
                     })
                     .child(faded_content);
                 if client_animations_enabled() {
