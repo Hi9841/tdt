@@ -1,12 +1,56 @@
+//! Speech benchmark: latency after release and word error rate.
+//!
+//! `cargo run --release --bin bench-asr -- [--dir PATH] [--realtime] [--repeat N]`
+//!
+//! Each `clip.wav` may have a `clip.txt` reference transcript next to it.
+//! `--realtime` feeds audio at speaking pace, so latency is the wait a user
+//! has after the key is released. Without it, all audio arrives at once.
+
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use voice_stt_desktop::stt::models::{find_dir, ModelSpec, CATALOG};
 use voice_stt_desktop::stt::{pcm16_wav, LiveAudio, SttEngine};
+
+/// 100 ms at 16 kHz, the size of one capture chunk.
+const CHUNK_SAMPLES: usize = 1600;
 
 struct Clip {
     name: String,
     samples: Vec<f32>,
     duration_secs: f32,
+    reference: Option<String>,
+}
+
+struct Options {
+    dir: PathBuf,
+    realtime: bool,
+    repeat: usize,
+}
+
+fn parse_options() -> Options {
+    let mut options = Options {
+        dir: std::env::var_os("LOCALAPPDATA")
+            .map(|l| PathBuf::from(l).join("Temp").join("tdt-bench-audio"))
+            .unwrap_or_else(|| std::env::temp_dir().join("tdt-bench-audio")),
+        realtime: false,
+        repeat: 1,
+    };
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--dir" => options.dir = args.next().map(PathBuf::from).unwrap_or(options.dir),
+            "--realtime" => options.realtime = true,
+            "--repeat" => {
+                options.repeat = args
+                    .next()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(1)
+                    .max(1)
+            }
+            other => eprintln!("ignored argument {other}"),
+        }
+    }
+    options
 }
 
 fn load_clips(dir: &Path) -> Vec<Clip> {
@@ -38,16 +82,67 @@ fn load_clips_into(dir: &Path, clips: &mut Vec<Clip>) {
             .to_string();
         if let Some(samples) = pcm16_wav(&path) {
             let duration_secs = samples.len() as f32 / 16000.0;
+            let reference = std::fs::read_to_string(path.with_extension("txt")).ok();
             clips.push(Clip {
                 name,
                 samples,
                 duration_secs,
+                reference,
             });
         }
     }
 }
 
-fn bench_model(spec: &ModelSpec, clips: &[Clip]) {
+/// Lowercase words with punctuation removed, so WER counts words, not style.
+fn normalize_words(text: &str) -> Vec<String> {
+    text.split_whitespace()
+        .map(|word| {
+            word.chars()
+                .filter(|c| c.is_alphanumeric() || *c == '\'')
+                .flat_map(char::to_lowercase)
+                .collect::<String>()
+        })
+        .filter(|word| !word.is_empty())
+        .collect()
+}
+
+/// Words as written, with case and punctuation, to catch formatting damage.
+fn raw_words(text: &str) -> Vec<String> {
+    text.split_whitespace().map(str::to_string).collect()
+}
+
+/// Word-level edit distance: substitutions, insertions, and deletions.
+fn word_errors(reference: &[String], hypothesis: &[String]) -> usize {
+    let mut previous: Vec<usize> = (0..=hypothesis.len()).collect();
+    for (i, ref_word) in reference.iter().enumerate() {
+        let mut current = vec![i + 1; hypothesis.len() + 1];
+        for (j, hyp_word) in hypothesis.iter().enumerate() {
+            let substitution = previous[j] + usize::from(ref_word != hyp_word);
+            current[j + 1] = substitution.min(previous[j + 1] + 1).min(current[j] + 1);
+        }
+        previous = current;
+    }
+    previous[hypothesis.len()]
+}
+
+fn feed(clip: &Clip, realtime: bool) -> crossbeam_channel::Receiver<LiveAudio> {
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let samples = clip.samples.clone();
+    std::thread::spawn(move || {
+        let started = Instant::now();
+        for (index, chunk) in samples.chunks(CHUNK_SAMPLES).enumerate() {
+            if realtime {
+                let due = started + Duration::from_millis(100 * (index as u64 + 1));
+                std::thread::sleep(due.saturating_duration_since(Instant::now()));
+            }
+            let _ = tx.send(LiveAudio::Chunk(chunk.to_vec()));
+        }
+        let _ = tx.send(LiveAudio::Finish(Instant::now()));
+    });
+    rx
+}
+
+fn bench_model(spec: &ModelSpec, clips: &[Clip], options: &Options) {
     println!("\nModel: {} ({})", spec.label, spec.id);
     let Some(model_dir) = find_dir(spec, None) else {
         println!("Skipped: model directory not found.");
@@ -65,48 +160,101 @@ fn bench_model(spec: &ModelSpec, clips: &[Clip]) {
     }
     println!("Init: {} ms", t0.elapsed().as_millis());
 
-    for clip in clips {
-        let (tx, rx) = crossbeam_channel::unbounded();
-        for chunk in clip.samples.chunks(1600) {
-            let _ = tx.send(LiveAudio::Chunk(chunk.to_vec()));
-        }
-        let _ = tx.send(LiveAudio::Finish(Instant::now()));
-        drop(tx);
-
-        let t_infer = Instant::now();
-        match engine.transcribe_live_reporting(&rx) {
-            Ok(res) => {
-                let ms = t_infer.elapsed().as_millis().max(1);
-                let speedup_x = (clip.duration_secs * 1000.0) / ms as f32;
-                println!(
-                    "[{:.2}s] {} -> {} ms ({:.1}x): {:?}",
-                    clip.duration_secs,
-                    clip.name,
-                    ms,
-                    speedup_x,
-                    res.text.trim()
-                );
+    for run in 1..=options.repeat {
+        let mut latencies = Vec::new();
+        let mut errors = 0;
+        let mut format_errors = 0;
+        let mut reference_words = 0;
+        for clip in clips {
+            let rx = feed(clip, options.realtime);
+            match engine.transcribe_live_reporting(&rx) {
+                Ok(res) => {
+                    latencies.push(res.latency_ms);
+                    let mut wer_note = String::new();
+                    if let Some(reference) = &clip.reference {
+                        format_errors += word_errors(&raw_words(reference), &raw_words(&res.text));
+                        let reference = normalize_words(reference);
+                        let clip_errors = word_errors(&reference, &normalize_words(&res.text));
+                        errors += clip_errors;
+                        reference_words += reference.len();
+                        wer_note = format!(" {clip_errors}/{} errors", reference.len());
+                    }
+                    println!(
+                        "[{:.2}s] {} -> {} ms{}: {:?}",
+                        clip.duration_secs,
+                        clip.name,
+                        res.latency_ms,
+                        wer_note,
+                        res.text.trim()
+                    );
+                }
+                Err(e) => println!("[{:.2}s] {} -> Error: {e}", clip.duration_secs, clip.name),
             }
-            Err(e) => println!("[{:.2}s] {} -> Error: {e}", clip.duration_secs, clip.name),
         }
+        latencies.sort_unstable();
+        let p50 = latencies.get(latencies.len() / 2).copied().unwrap_or(0);
+        let total: u64 = latencies.iter().sum();
+        let wer = if reference_words == 0 {
+            f64::NAN
+        } else {
+            100.0 * errors as f64 / reference_words as f64
+        };
+        println!(
+            "SUMMARY run={run} realtime={} clips={} latency_p50_ms={p50} latency_total_ms={total} wer_pct={wer:.2} errors={errors} format_errors={format_errors} words={reference_words}",
+            options.realtime,
+            latencies.len()
+        );
     }
 
     engine.release();
 }
 
 fn main() {
-    let dir = std::env::var_os("LOCALAPPDATA")
-        .map(|l| PathBuf::from(l).join("Temp").join("tdt-bench-audio"))
-        .unwrap_or_else(|| std::env::temp_dir().join("tdt-bench-audio"));
-
-    let clips = load_clips(&dir);
+    let options = parse_options();
+    let clips = load_clips(&options.dir);
     if clips.is_empty() {
-        println!("No wav clips found in {}", dir.display());
+        println!("No wav clips found in {}", options.dir.display());
         return;
     }
 
-    println!("Benchmarking {} clips from {}", clips.len(), dir.display());
+    println!(
+        "Benchmarking {} clips from {}",
+        clips.len(),
+        options.dir.display()
+    );
     for spec in CATALOG {
-        bench_model(spec, &clips);
+        bench_model(spec, &clips, &options);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{normalize_words, word_errors};
+
+    #[test]
+    fn punctuation_and_case_are_not_errors() {
+        let reference = normalize_words("Thanks, that works for me.");
+        assert_eq!(
+            word_errors(&reference, &normalize_words("thanks that Works for me")),
+            0
+        );
+    }
+
+    #[test]
+    fn substitutions_insertions_and_deletions_each_count_once() {
+        let reference = normalize_words("open a new issue");
+        assert_eq!(
+            word_errors(&reference, &normalize_words("open the new issue")),
+            1
+        );
+        assert_eq!(
+            word_errors(&reference, &normalize_words("open a new big issue")),
+            1
+        );
+        assert_eq!(
+            word_errors(&reference, &normalize_words("open new issue")),
+            1
+        );
+        assert_eq!(word_errors(&reference, &[]), 4);
     }
 }
