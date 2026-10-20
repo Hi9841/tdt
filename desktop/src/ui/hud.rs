@@ -4,7 +4,9 @@ use crate::hotkey;
 use crate::paste::PasteInjector;
 use crate::ui::controls;
 use crate::ui::preview::{self, Spec as PreviewSpec};
-use crate::ui::text::{clip_text, format_latency_ms, format_mmss, format_time_saved};
+use crate::ui::text::{
+    clip_text, first_sentence, format_latency_ms, format_mmss, format_time_saved,
+};
 use crate::ui::theme::{
     self, accent, gold, love, muted, pad, r_chip, r_section, r_window, shell_surface, success,
     text, well, GAP_SECTION, GAP_TIGHT, MOTION_MS, MUTED, TAB_FADE_MS, TEXT, TYPE_DESC, TYPE_LABEL,
@@ -934,7 +936,7 @@ impl HudView {
                 .into_any_element(),
             HudStatus::Idle => overlay_snippet("Download a model", muted()),
             HudStatus::Success { text, .. } => overlay_snippet(text, theme::text()),
-            HudStatus::Error { message, .. } => overlay_snippet(message, text()),
+            HudStatus::Error { message, .. } => overlay_snippet(first_sentence(message), text()),
             HudStatus::NoSpeech => overlay_snippet("No speech detected", text()),
             HudStatus::Transcribing { .. } => div()
                 .w(px(72.0))
