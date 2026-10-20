@@ -24,7 +24,7 @@ That writes:
 
 - `dist/TDT.exe` slim app binary used by in-app updates
 - `dist/TDT-Setup.exe` per-user installer (app only, no speech model)
-- `dist/TDT-0.2.25-windows-x64.zip` portable copy (app only, no speech model)
+- `dist/TDT-0.2.26-windows-x64.zip` portable copy (app only, no speech model)
 - `dist/SHA256SUMS.txt`
 
 The installer copies TDT and the license files into `%LOCALAPPDATA%\TDT`,
@@ -104,13 +104,13 @@ Measured on 2026-10-20 with the Parakeet Redux model on an AMD Ryzen 9
 
 - **Photon**: the Python worker. TDT now uses it only as a fallback.
 - **v0.2.25**: the first release with TDT's own Rust engine.
-- **Current**: the Rust engine in this source.
-- **Current + dictionary**: the same engine with the built-in developer terms.
+- **v0.2.26**: the Rust engine in this release.
+- **v0.2.26 + dictionary**: the same engine with the built-in developer terms.
   This is what the app does by default.
 
 **Word error rate.** Lower is better. The error count is in brackets.
 
-| Set | Clips | Photon | v0.2.25 | Current | Current + dictionary |
+| Set | Clips | Photon | v0.2.25 | v0.2.26 | v0.2.26 + dictionary |
 |---|---:|---:|---:|---:|---:|
 | LibriSpeech test-clean | 200 | 2.07 % (83) | 2.02 % (81) | 2.02 % (81) | 2.02 % (81) |
 | LibriSpeech test-other | 200 | 4.64 % (177) | 4.59 % (175) | 4.59 % (175) | 4.59 % (175) |
@@ -121,7 +121,7 @@ Measured on 2026-10-20 with the Parakeet Redux model on an AMD Ryzen 9
 means that 1 minute of speech takes less than 1 second. Higher is better. The
 median time per clip is in brackets.
 
-| Set | Photon | v0.2.25 | Current | Current + dictionary |
+| Set | Photon | v0.2.25 | v0.2.26 | v0.2.26 + dictionary |
 |---|---:|---:|---:|---:|
 | LibriSpeech test-clean | 36× (168 ms) | 86× (68 ms) | 84× (69 ms) | 78× (74 ms) |
 | LibriSpeech test-other | 36× (159 ms) | 89× (62 ms) | 96× (56 ms) | 99× (54 ms) |

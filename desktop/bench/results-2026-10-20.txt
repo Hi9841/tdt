@@ -5,8 +5,8 @@ Scorer: bench/accuracy.py (Whisper English normalizer). One run per configuratio
 
 photon  = Python Photon worker, whole clips (--engine photon)
 v0.2.25 = TDT's Rust engine at tag v0.2.25 (--engine native)
-current = TDT's Rust engine at commit fb0058b (--engine native)
-current + dictionary = the same, with TDT_DICTIONARY=assets/dictionary/developer-terms.txt
+v0.2.26 = TDT's Rust engine at commit fb0058b (engine code as released) (--engine native)
+v0.2.26 + dictionary = the same, with TDT_DICTIONARY=assets/dictionary/developer-terms.txt
 
 == photon
 clean: WER 2.07 % (83 errors / 4009 words, 200 clips, median 168 ms, 36x realtime)
@@ -18,12 +18,12 @@ clean: WER 2.02 % (81 errors / 4009 words, 200 clips, median 68 ms, 86x realtime
 other: WER 4.59 % (175 errors / 3815 words, 200 clips, median 62 ms, 89x realtime)
 tech: WER 7.19 % (34 errors / 473 words, 40 clips, median 52 ms, 80x realtime)
 tts16: WER 1.55 % (6 errors / 386 words, 16 clips, median 59 ms, 88x realtime)
-== current
+== v0.2.26
 clean: WER 2.02 % (81 errors / 4009 words, 200 clips, median 69 ms, 84x realtime)
 other: WER 4.59 % (175 errors / 3815 words, 200 clips, median 56 ms, 96x realtime)
 tech: WER 7.19 % (34 errors / 473 words, 40 clips, median 43 ms, 93x realtime)
 tts16: WER 1.55 % (6 errors / 386 words, 16 clips, median 64 ms, 86x realtime)
-== current + dictionary
+== v0.2.26 + dictionary
 clean: WER 2.02 % (81 errors / 4009 words, 200 clips, median 74 ms, 78x realtime)
 other: WER 4.59 % (175 errors / 3815 words, 200 clips, median 54 ms, 99x realtime)
 tech: WER 4.65 % (22 errors / 473 words, 40 clips, median 44 ms, 91x realtime)
@@ -35,7 +35,7 @@ other: WER 4.64 % (177 errors / 3815 words, 200 clips, median 161 ms, 35x realti
 tech: WER 7.19 % (34 errors / 473 words, 40 clips, median 146 ms, 28x realtime)
 tts16: WER 1.55 % (6 errors / 386 words, 16 clips, median 156 ms, 33x realtime)
 
-App path (--engine app, current, built-in dictionary): pause cuts give
+App path (--engine app, v0.2.26, built-in dictionary): pause cuts give
 9 more errors on other and 2 on tts16 ("auto paste" -> "autopaste").
 clean: WER 2.02 % (81 errors / 4009 words, 200 clips, median 70 ms, 80x realtime)
 other: WER 4.82 % (184 errors / 3815 words, 200 clips, median 64 ms, 85x realtime)
