@@ -558,7 +558,7 @@ impl PhotonParakeetEngine {
     }
 
     /// One request to the worker. A dead worker is dropped so the next take respawns it.
-    pub(crate) fn transcribe_samples(&self, samples: &[f32]) -> Result<String, String> {
+    pub fn transcribe_samples(&self, samples: &[f32]) -> Result<String, String> {
         let req = json!({
             "cmd": "transcribe",
             "audio": b64_encode(&encode_wav_pcm16(samples, 16000)),

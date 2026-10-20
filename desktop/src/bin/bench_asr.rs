@@ -1,17 +1,19 @@
 //! Speech benchmark: latency after release and word error rate.
 //!
-//! `cargo run --release --bin bench-asr -- [--dir PATH] [--realtime] [--repeat N] [--native] [--exact]`
+//! `cargo run --release --bin bench-asr -- [--dir PATH] [--realtime] [--repeat N] [--native] [--exact] [--photon]`
 //!
 //! Each `clip.wav` may have a `clip.txt` reference transcript next to it.
 //! `--realtime` feeds audio at speaking pace, so latency is the wait a user
 //! has after the key is released. Without it, all audio arrives at once.
 //! `--native` runs TDT's Rust engine on each whole clip instead of the app path.
 //! `--exact` does the same with f32 activations, as the reference does.
+//! `--photon` runs the Python Photon worker on each whole clip.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use voice_stt_desktop::stt::models::{find_dir, ModelSpec, CATALOG};
 use voice_stt_desktop::stt::native::{BiasWeights, NativeParakeet, Precision};
+use voice_stt_desktop::stt::photon::PhotonParakeetEngine;
 use voice_stt_desktop::stt::{pcm16_wav, LiveAudio, SttEngine};
 
 #[global_allocator]
@@ -37,6 +39,7 @@ struct Options {
     realtime: bool,
     native: bool,
     exact: bool,
+    photon: bool,
     repeat: usize,
 }
 
@@ -48,6 +51,7 @@ fn parse_options() -> Options {
         realtime: false,
         native: false,
         exact: false,
+        photon: false,
         repeat: 1,
     };
     let mut args = std::env::args().skip(1);
@@ -56,6 +60,7 @@ fn parse_options() -> Options {
             "--dir" => options.dir = args.next().map(PathBuf::from).unwrap_or(options.dir),
             "--realtime" => options.realtime = true,
             "--native" => options.native = true,
+            "--photon" => options.photon = true,
             "--exact" => {
                 options.native = true;
                 options.exact = true;
@@ -307,12 +312,56 @@ fn bench_native(clips: &[Clip], options: &Options) {
             terms.len() - skipped.len()
         );
     }
+    whole_clips(clips, options, "native", |samples| {
+        engine.transcribe(samples)
+    });
+}
+
+fn bench_photon(clips: &[Clip], options: &Options) {
+    let spec = &CATALOG[0];
+    let Some(model_dir) = find_dir(spec, None) else {
+        println!("Skipped: model directory not found.");
+        return;
+    };
+    let started = Instant::now();
+    let engine = match PhotonParakeetEngine::new(spec, &model_dir) {
+        Ok(engine) => engine,
+        Err(e) => {
+            println!("Failed to create the Photon engine: {e}");
+            return;
+        }
+    };
+    if let Err(e) = engine.prepare() {
+        println!("Failed to start the Photon worker: {e}");
+        return;
+    }
+    println!(
+        "
+Photon worker. Init: {} ms",
+        started.elapsed().as_millis()
+    );
+    whole_clips(clips, options, "photon", |samples| {
+        engine.transcribe_samples(samples).unwrap_or_else(|e| {
+            eprintln!("{e}");
+            String::new()
+        })
+    });
+    engine.release();
+}
+
+/// Transcribes each whole clip in one call and reports latency and WER.
+fn whole_clips(
+    clips: &[Clip],
+    options: &Options,
+    label: &str,
+    mut transcribe: impl FnMut(&[f32]) -> String,
+) {
     for run in 1..=options.repeat {
         let (mut errors, mut format_errors, mut words) = (0, 0, 0);
         let mut latencies = Vec::new();
         for clip in clips {
             let started = Instant::now();
-            let text = engine.transcribe(&clip.samples);
+            let text = transcribe(&clip.samples);
             let ms = started.elapsed().as_millis() as u64;
             latencies.push(ms);
             let mut note = String::new();
@@ -331,7 +380,7 @@ fn bench_native(clips: &[Clip], options: &Options) {
         latencies.sort_unstable();
         let total: u64 = latencies.iter().sum();
         println!(
-            "SUMMARY run={run} native=true clips={} latency_p50_ms={} latency_total_ms={total} wer_pct={:.2} errors={errors} format_errors={format_errors} words={words}",
+            "SUMMARY run={run} engine={label} clips={} latency_p50_ms={} latency_total_ms={total} wer_pct={:.2} errors={errors} format_errors={format_errors} words={words}",
             latencies.len(),
             latencies[latencies.len() / 2],
             100.0 * errors as f64 / words.max(1) as f64
@@ -354,6 +403,10 @@ fn main() {
     );
     if options.native {
         bench_native(&clips, &options);
+        return;
+    }
+    if options.photon {
+        bench_photon(&clips, &options);
         return;
     }
     for spec in CATALOG {

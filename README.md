@@ -72,7 +72,7 @@ To fetch the model directly via PowerShell:
 powershell -ExecutionPolicy Bypass -File .\models\download-models.ps1
 ```
 
-To run the comparative ASR benchmark across all installed engines:
+To run the speech benchmark (WER and speed tables: see [Benchmarks](#benchmarks)):
 
 ```powershell
 cargo run --release --bin bench-asr --manifest-path .\desktop\Cargo.toml
@@ -96,6 +96,49 @@ file. The next dictation uses it.
 TDT changes a word only when the speech supports it. On the test sentences
 with developer terms, the dictionary removes about a third of the errors. On
 400 recordings of ordinary speech (LibriSpeech), it changes no transcript.
+
+## Benchmarks
+
+Measured on 2026-10-20 with the Parakeet Redux model on an AMD Ryzen 9
+7950X3D (32 GB RAM, Windows 11). The four engines got the same 456 clips:
+
+- **Photon**: the Python worker. TDT now uses it only as a fallback.
+- **v0.2.25**: the first release with TDT's own Rust engine.
+- **Current**: the Rust engine in this source.
+- **Current + dictionary**: the same engine with the built-in developer terms.
+  This is what the app does by default.
+
+**Word error rate.** Lower is better. The error count is in brackets.
+
+| Set | Clips | Photon | v0.2.25 | Current | Current + dictionary |
+|---|---:|---:|---:|---:|---:|
+| LibriSpeech test-clean | 200 | 2.07 % (83) | 2.02 % (81) | 2.02 % (81) | 2.02 % (81) |
+| LibriSpeech test-other | 200 | 4.64 % (177) | 4.59 % (175) | 4.59 % (175) | 4.59 % (175) |
+| Developer terms | 40 | 7.19 % (34) | 7.19 % (34) | 7.19 % (34) | **4.65 % (22)** |
+| Everyday dictation | 16 | 1.55 % (6) | 1.55 % (6) | 1.55 % (6) | **1.04 % (4)** |
+
+**Speed.** The number is audio time divided by transcription time, so 90×
+means that 1 minute of speech takes less than 1 second. Higher is better. The
+median time per clip is in brackets.
+
+| Set | Photon | v0.2.25 | Current | Current + dictionary |
+|---|---:|---:|---:|---:|
+| LibriSpeech test-clean | 36× (168 ms) | 86× (68 ms) | 84× (69 ms) | 78× (74 ms) |
+| LibriSpeech test-other | 36× (159 ms) | 89× (62 ms) | 96× (56 ms) | 99× (54 ms) |
+| Developer terms | 32× (127 ms) | 80× (52 ms) | 93× (43 ms) | 91× (44 ms) |
+| Everyday dictation | 38× (142 ms) | 88× (59 ms) | 86× (64 ms) | 98× (54 ms) |
+
+- Each value comes from one run. The speed changes by about 10 % from one run
+  to the next, so the three Rust columns have the same speed. The Rust engine
+  is about 2.5 times as fast as Photon.
+- The developer-term and everyday sets are synthetic speech from the Windows
+  voices. LibriSpeech is recorded human speech.
+- The bench gives each whole clip to the engine. The app cuts long
+  recordings at pauses, so text comes sooner. On LibriSpeech test-other this
+  gives 184 errors instead of 175.
+
+The method, the raw output, and the commands that reproduce these tables are
+in [desktop/bench](desktop/bench/README.md).
 
 ## Updates
 
