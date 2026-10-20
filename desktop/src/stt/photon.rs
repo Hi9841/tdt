@@ -290,6 +290,30 @@ struct PhotonWorkerClient {
     child: Child,
     stdin: ChildStdin,
     reader: BufReader<ChildStdout>,
+    /// The interpreter the worker runs in, as the worker reports it.
+    python: Option<PathBuf>,
+}
+
+/// uv resolves its environment on every start, which costs about 0.4 s warm
+/// and several seconds after sign-in. The interpreter it chose last time is
+/// kept here and started directly.
+const REMEMBERED_PYTHON_FILE: &str = "photon-python.txt";
+
+fn remembered_python_in(app_dir: &Path) -> Option<PathBuf> {
+    let text = fs::read_to_string(app_dir.join(REMEMBERED_PYTHON_FILE)).ok()?;
+    let python = PathBuf::from(text.trim());
+    python.is_file().then_some(python)
+}
+
+fn remember_python_in(app_dir: &Path, python: &Path) {
+    let _ = fs::write(
+        app_dir.join(REMEMBERED_PYTHON_FILE),
+        python.to_string_lossy().as_bytes(),
+    );
+}
+
+fn forget_python_in(app_dir: &Path) {
+    let _ = fs::remove_file(app_dir.join(REMEMBERED_PYTHON_FILE));
 }
 
 enum SpawnError {
@@ -353,7 +377,45 @@ impl PhotonWorkerClient {
     fn spawn(model_dir: &Path) -> Result<Self, String> {
         let launcher = find_python_launcher()?;
         let script_file = locate_script_file()?;
+        let app_dir = match script_file.parent() {
+            Some(dir) if matches!(launcher, PythonLauncher::Uv(_)) => dir.to_path_buf(),
+            _ => return Self::spawn_with(&launcher, &script_file, model_dir),
+        };
 
+        if let Some(python) = remembered_python_in(&app_dir) {
+            let direct = PythonLauncher::Direct(python);
+            match Self::start(
+                direct.build_command(&script_file, CacheUse::Offline),
+                model_dir,
+            ) {
+                Ok(client) => return Ok(client),
+                // uv would start the same environment and fail the same way.
+                Err(SpawnError::Failed(message)) if !cached_runtime_is_broken(&message) => {
+                    return Err(message)
+                }
+                Err(error) => {
+                    eprintln!(
+                        "Remembered speech runtime did not start ({}); resolving it with uv.",
+                        error.into_message()
+                    );
+                    forget_python_in(&app_dir);
+                }
+            }
+        }
+
+        let client = Self::spawn_with(&launcher, &script_file, model_dir)?;
+        if let Some(python) = &client.python {
+            remember_python_in(&app_dir, python);
+        }
+        Ok(client)
+    }
+
+    fn spawn_with(
+        launcher: &PythonLauncher,
+        script_file: &Path,
+        model_dir: &Path,
+    ) -> Result<Self, String> {
+        let script_file = script_file.to_path_buf();
         if matches!(launcher, PythonLauncher::Uv(_)) {
             match Self::start(
                 launcher.build_command(&script_file, CacheUse::Offline),
@@ -414,6 +476,7 @@ impl PhotonWorkerClient {
             child,
             stdin,
             reader,
+            python: None,
         };
 
         // Initialize model in worker
@@ -433,6 +496,10 @@ impl PhotonWorkerClient {
                 "Photon worker initialization failed: {msg}"
             )));
         }
+        client.python = resp
+            .get("python")
+            .and_then(|path| path.as_str())
+            .map(PathBuf::from);
 
         Ok(client)
     }
@@ -711,6 +778,27 @@ mod tests {
         let data_len = u32::from_le_bytes(wav[40..44].try_into().unwrap());
         assert_eq!(data_len, 3200);
         assert_eq!(wav.len(), 44 + 3200);
+    }
+
+    #[test]
+    fn the_resolved_python_is_remembered_until_it_is_gone() {
+        let dir = unique_dir("remembered-python");
+        fs::create_dir_all(&dir).expect("temp dir");
+        assert_eq!(remembered_python_in(&dir), None);
+
+        let python = dir.join("python.exe");
+        fs::write(&python, b"stub").expect("stub python");
+        remember_python_in(&dir, &python);
+        assert_eq!(remembered_python_in(&dir), Some(python.clone()));
+
+        fs::remove_file(&python).expect("remove stub");
+        assert_eq!(remembered_python_in(&dir), None);
+
+        fs::write(&python, b"stub").expect("stub python");
+        remember_python_in(&dir, &python);
+        forget_python_in(&dir);
+        assert_eq!(remembered_python_in(&dir), None);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

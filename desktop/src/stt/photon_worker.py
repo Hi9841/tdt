@@ -3,7 +3,7 @@
 
 Communicates over standard I/O with JSON-lines:
   -> {"cmd": "init", "model_dir": "..."}
-  <- {"status": "ready"}
+  <- {"status": "ready", "python": "<sys.executable>"}
   -> {"cmd": "transcribe", "audio": "<base64_wav>"}
   <- {"status": "ok", "text": "...", "duration": 1.23, "inference_ms": 45.6}
   -> {"cmd": "ping"}
@@ -132,7 +132,10 @@ def main() -> None:
                 except Exception:
                     pass
 
-                print(json.dumps({"status": "ready"}), flush=True)
+                print(
+                    json.dumps({"status": "ready", "python": sys.executable}),
+                    flush=True,
+                )
 
             elif cmd == "transcribe":
                 if client is None:
