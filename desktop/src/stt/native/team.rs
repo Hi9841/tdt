@@ -169,6 +169,11 @@ fn team() -> &'static Team {
     })
 }
 
+/// Threads that work on each step, the caller included.
+pub fn threads() -> usize {
+    team().workers + 1
+}
+
 /// `run(task)` for every task in `0..tasks`, spread over the team.
 pub fn for_each(tasks: usize, run: impl Fn(usize) + Sync) {
     team().for_each(tasks, &run);

@@ -229,9 +229,9 @@ impl Subsampling {
                     bias,
                 )
             },
-            dw1: conv(2)?,
+            dw1: tap_major(conv(2)?, ch),
             pw1: dense(t, "encoder.subsampling.layers.3", ch, ch, true)?,
-            dw2: conv(5)?,
+            dw2: tap_major(conv(5)?, ch),
             pw2: dense(t, "encoder.subsampling.layers.6", ch, ch, true)?,
             linear: dense(
                 t,
@@ -246,27 +246,7 @@ impl Subsampling {
     /// `features` is `frames x mels`; returns `(out_frames x hidden, out_frames)`.
     fn forward(&self, features: &[f32], frames: usize, mels: usize) -> (Buf, usize) {
         let ch = self.channels;
-        // First conv: one input channel, output channels-last [h][w][c].
-        let (h1, w1) = (half(frames), half(mels));
-        let mut x = Buf::zeroed(h1 * w1 * ch);
-        let (weight, bias) = &self.conv0;
-        team::chunks_mut(&mut x, w1 * ch, |h, row| {
-            for w in 0..w1 {
-                let cell = &mut row[w * ch..(w + 1) * ch];
-                cell.copy_from_slice(bias);
-                for tap in 0..9 {
-                    let Some(v) = sample(features, frames, mels, 2 * h + tap / 3, 2 * w + tap % 3)
-                    else {
-                        continue;
-                    };
-                    for (o, wt) in cell.iter_mut().zip(&weight[tap * ch..(tap + 1) * ch]) {
-                        *o += wt * v;
-                    }
-                }
-                cell.iter_mut().for_each(|o| *o = o.max(0.0));
-            }
-        });
-        let (x, h2, w2) = depthwise(&x, h1, w1, ch, &self.dw1);
+        let (x, h2, w2) = self.first_two_convs(features, frames, mels);
         let mut x = self.pw1.forward(&x, h2 * w2);
         x.iter_mut().for_each(|v| *v = v.max(0.0));
         let (x, h3, w3) = depthwise(&x, h2, w2, ch, &self.dw2);
@@ -283,6 +263,83 @@ impl Subsampling {
         }
         (self.linear.forward(&flat, h3), h3)
     }
+}
+
+impl Subsampling {
+    /// conv0 (one input channel) and the first depthwise conv, in strips of
+    /// output rows. The full conv0 output is 73 MB for a 22 s take; a strip
+    /// only computes the conv0 rows it needs, so that buffer never exists.
+    fn first_two_convs(&self, features: &[f32], frames: usize, mels: usize) -> (Buf, usize, usize) {
+        let ch = self.channels;
+        let (h1, w1) = (half(frames), half(mels));
+        let (h2, w2) = (half(h1), half(w1));
+        let mut out = Buf::zeroed(h2 * w2 * ch);
+        // At least four strips per thread, so a short take still spreads out.
+        let strip_rows = h2.div_ceil(4 * team::threads()).clamp(1, MAX_STRIP_ROWS);
+        team::chunks_mut(&mut out, strip_rows * w2 * ch, |strip, rows| {
+            let first_out = strip * strip_rows;
+            let out_rows = rows.len() / (w2 * ch);
+            // Output row oh reads conv0 rows 2oh-1 ..= 2oh+1.
+            let first_in = (2 * first_out).saturating_sub(1);
+            let last_in = (2 * (first_out + out_rows - 1) + 1).min(h1 - 1);
+            let mut conv0 = vec![0.0f32; (last_in - first_in + 1) * w1 * ch];
+            for (offset, row) in conv0.chunks_exact_mut(w1 * ch).enumerate() {
+                self.conv0_row(features, frames, mels, first_in + offset, row);
+            }
+            let (weight, bias) = &self.dw1;
+            for local in 0..out_rows {
+                let oh = first_out + local;
+                for ow in 0..w2 {
+                    let cell = &mut rows[(local * w2 + ow) * ch..][..ch];
+                    cell.copy_from_slice(bias);
+                    for i in 0..3 {
+                        for j in 0..3 {
+                            let (ih, iw) = (2 * oh + i, 2 * ow + j);
+                            if ih == 0 || iw == 0 || ih > h1 || iw > w1 {
+                                continue;
+                            }
+                            let input = &conv0[((ih - 1 - first_in) * w1 + (iw - 1)) * ch..][..ch];
+                            let taps = &weight[(i * 3 + j) * ch..][..ch];
+                            for ((o, wt), v) in cell.iter_mut().zip(taps).zip(input) {
+                                *o += wt * v;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        (out, h2, w2)
+    }
+
+    /// One output row of conv0, channels-last, after ReLU.
+    fn conv0_row(&self, features: &[f32], frames: usize, mels: usize, h: usize, row: &mut [f32]) {
+        let ch = self.channels;
+        let (weight, bias) = &self.conv0;
+        for (w, cell) in row.chunks_exact_mut(ch).enumerate() {
+            cell.copy_from_slice(bias);
+            for tap in 0..9 {
+                let Some(v) = sample(features, frames, mels, 2 * h + tap / 3, 2 * w + tap % 3)
+                else {
+                    continue;
+                };
+                for (o, wt) in cell.iter_mut().zip(&weight[tap * ch..(tap + 1) * ch]) {
+                    *o += wt * v;
+                }
+            }
+            cell.iter_mut().for_each(|o| *o = o.max(0.0));
+        }
+    }
+}
+
+/// Most output rows of the first depthwise conv in one parallel task.
+const MAX_STRIP_ROWS: usize = 8;
+
+/// `[channel][tap]` depthwise weights as `[tap][channel]`, so a tap is one contiguous row.
+fn tap_major((weight, bias): (Vec<f32>, Vec<f32>), ch: usize) -> (Vec<f32>, Vec<f32>) {
+    (
+        (0..9 * ch).map(|i| weight[(i % ch) * 9 + i / ch]).collect(),
+        bias,
+    )
 }
 
 /// Output length of a kernel-3, stride-2, padding-1 convolution.
@@ -317,8 +374,9 @@ fn depthwise(
                         continue;
                     }
                     let input = &x[((ih - 1) * w + (iw - 1)) * ch..][..ch];
-                    for c in 0..ch {
-                        cell[c] += weight[c * 9 + i * 3 + j] * input[c];
+                    let taps = &weight[(i * 3 + j) * ch..][..ch];
+                    for ((o, wt), v) in cell.iter_mut().zip(taps).zip(input) {
+                        *o += wt * v;
                     }
                 }
             }
@@ -786,6 +844,51 @@ mod tests {
             &text.replace("\"subsampling_factor\":8", "\"subsampling_factor\":4")
         )
         .is_err());
+    }
+
+    #[test]
+    fn strips_equal_the_whole_first_conv_then_the_depthwise_conv() {
+        use super::{depthwise, half, Subsampling};
+        use crate::stt::native::gemm::Dense;
+        let ch = 4;
+        let weight = |seed: usize| -> Vec<f32> {
+            (0..ch * 9)
+                .map(|i| (((i * 7 + seed) % 11) as f32 - 5.0) * 0.1)
+                .collect()
+        };
+        let bias: Vec<f32> = (0..ch).map(|c| c as f32 * 0.05 - 0.1).collect();
+        let identity = || Dense::new(vec![0.0; ch * ch], None, ch, ch).expect("dense");
+        let conv0_weight = weight(1);
+        let sub = Subsampling {
+            channels: ch,
+            // [tap][channel], as load arranges it.
+            conv0: (
+                (0..9 * ch)
+                    .map(|i| conv0_weight[(i % ch) * 9 + i / ch])
+                    .collect(),
+                bias.clone(),
+            ),
+            dw1: (weight(3), bias.clone()),
+            pw1: identity(),
+            dw2: (weight(5), bias.clone()),
+            pw2: identity(),
+            linear: Dense::new(vec![0.0; 4 * ch], None, 4, ch).expect("dense"),
+        };
+        for frames in [8usize, 9, 37, 70] {
+            let mels = 16;
+            let features: Vec<f32> = (0..frames * mels)
+                .map(|i| ((i * 13 % 17) as f32 - 8.0) * 0.1)
+                .collect();
+            let (h1, w1) = (half(frames), half(mels));
+            let mut whole = vec![0.0f32; h1 * w1 * ch];
+            for (h, row) in whole.chunks_exact_mut(w1 * ch).enumerate() {
+                sub.conv0_row(&features, frames, mels, h, row);
+            }
+            let (expected, eh, ew) = depthwise(&whole, h1, w1, ch, &sub.dw1);
+            let (strips, sh, sw) = sub.first_two_convs(&features, frames, mels);
+            assert_eq!((sh, sw), (eh, ew));
+            assert_eq!(&strips[..], &expected[..], "frames {frames}");
+        }
     }
 
     #[test]
