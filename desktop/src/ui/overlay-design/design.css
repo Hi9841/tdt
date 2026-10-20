@@ -1,0 +1,69 @@
+:root {
+  --text: oklch(0.96 0.004 270);
+  --muted: oklch(0.74 0.012 270);
+  --faint: oklch(0.62 0.012 270);
+  --iris: oklch(0.74 0.11 295);
+  --foam: oklch(0.84 0.06 235);
+  --success: oklch(0.84 0.07 165);
+  --ink: oklch(0.18 0.012 270);
+  --well: oklch(1 0 0 / 0.08);
+  --line: oklch(1 0 0 / 0.1);
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  color: var(--text);
+  font-family: "Segoe UI", sans-serif;
+  background:
+    radial-gradient(900px 420px at 15% -10%, oklch(0.36 0.03 275), transparent 55%),
+    oklch(0.24 0.015 265);
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+}
+
+.shell {
+  background: linear-gradient(180deg, oklch(0.22 0.014 270 / 0.96), oklch(0.15 0.012 270 / 0.98));
+  border: 1px solid var(--line);
+  box-shadow: 0 16px 40px oklch(0 0 0 / 0.28);
+}
+
+.mono {
+  font-family: Consolas, "Segoe UI", sans-serif;
+  font-variant-numeric: tabular-nums;
+}
+
+.wave {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  height: 22px;
+}
+
+.wave i {
+  display: block;
+  width: 2px;
+  border-radius: 99px;
+  background: currentColor;
+}
+
+.keys {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text);
+  font-size: 13px;
+}
+
+.keys span.plus {
+  color: var(--faint);
+}

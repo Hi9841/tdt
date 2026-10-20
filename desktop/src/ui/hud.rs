@@ -40,6 +40,8 @@ const WAVE_FLAT: f32 = 2.0;
 const WAVE_MAX: f32 = 22.0;
 /// Two clamped lines at 12px in this panel hold about this many characters.
 const HISTORY_EXPAND_CHARS: usize = 88;
+/// The latest row clamps four lines at 14px, so it holds about twice as much.
+const LATEST_EXPAND_CHARS: usize = 170;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum HudStatus {
@@ -1380,7 +1382,7 @@ impl HudView {
                 let btn_key = click_key.clone();
                 let expanded =
                     self.expanded_history_key.as_deref() == Some(item.timestamp.as_str());
-                let can_expand = history_text_overflows(&text_val);
+                let can_expand = history_text_overflows(&text_val, latest);
 
                 let copy_icon = if is_copied {
                     IconName::Check
@@ -1412,9 +1414,15 @@ impl HudView {
                         .px(px(10.0))
                         .py(px(10.0))
                         .rounded(r_chip())
-                        .when(can_expand, |row| row.tab_index(0).cursor_pointer())
-                        .focus(|style| style.opacity(0.85))
-                        .active(|style| style.opacity(0.7))
+                        .border_1()
+                        .border_color(theme::transparent())
+                        .when(can_expand, |row| {
+                            row.tab_index(0)
+                                .cursor_pointer()
+                                .hover(|style| style.bg(theme::hover()))
+                                .active(|style| style.bg(theme::pressed()))
+                        })
+                        .focus(|style| style.border_color(theme::focus_ring()))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             if can_expand {
                                 this.toggle_history_preview(&click_key);
@@ -1450,7 +1458,7 @@ impl HudView {
                                 .line_height(px(if latest { 18.0 } else { 16.0 }))
                                 .text_color(rgb(TEXT))
                                 .when(!expanded, |text| {
-                                    text.line_clamp(if latest { 4 } else { 2 })
+                                    text.line_clamp(if latest { 4 } else { 2 }).text_ellipsis()
                                 })
                                 .child(text_val),
                         )
@@ -1994,8 +2002,13 @@ fn overlay_snippet(text: &str, color: impl Into<Hsla>) -> AnyElement {
         .into_any_element()
 }
 
-fn history_text_overflows(text: &str) -> bool {
-    text.chars().count() > HISTORY_EXPAND_CHARS
+fn history_text_overflows(text: &str, latest: bool) -> bool {
+    let limit = if latest {
+        LATEST_EXPAND_CHARS
+    } else {
+        HISTORY_EXPAND_CHARS
+    };
+    text.chars().count() > limit
 }
 
 // Compile-time invariant: the painted settings surface must stay inset within
@@ -2006,7 +2019,7 @@ const _: () = assert!(SETTINGS_SURFACE_HEIGHT <= BUBBLE_HEIGHT - 14.0);
 
 #[cfg(test)]
 mod motion_tests {
-    use super::{history_text_overflows, HISTORY_EXPAND_CHARS};
+    use super::{history_text_overflows, HISTORY_EXPAND_CHARS, LATEST_EXPAND_CHARS};
 
     #[test]
     fn a_notice_does_not_keep_the_pill_on_the_result() {
@@ -2032,9 +2045,19 @@ mod motion_tests {
     #[test]
     fn short_history_text_does_not_offer_expand() {
         assert!(!history_text_overflows(
-            "Short transcript 1: ready when you are"
+            "Short transcript 1: ready when you are",
+            false
         ));
         let long = "word ".repeat(HISTORY_EXPAND_CHARS);
-        assert!(history_text_overflows(&long));
+        assert!(history_text_overflows(&long, false));
+    }
+
+    #[test]
+    fn the_latest_row_offers_expand_only_past_four_lines() {
+        let three_lines = "This is a longer transcript that wraps onto a second and third line so expand versus collapse is visible in the stats list.";
+        assert!(!history_text_overflows(three_lines, true));
+        assert!(history_text_overflows(three_lines, false));
+        let long = "word ".repeat(LATEST_EXPAND_CHARS);
+        assert!(history_text_overflows(&long, true));
     }
 }

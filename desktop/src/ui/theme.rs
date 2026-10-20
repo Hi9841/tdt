@@ -63,6 +63,12 @@ pub fn selected() -> Hsla {
 pub fn well() -> Hsla {
     rgba(WELL).into()
 }
+pub fn hover() -> Hsla {
+    rgba(HOVER).into()
+}
+pub fn pressed() -> Hsla {
+    rgba(PRESSED).into()
+}
 pub fn shell_surface() -> Background {
     linear_gradient(
         180.0,

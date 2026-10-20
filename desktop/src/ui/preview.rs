@@ -138,7 +138,7 @@ pub fn parse_name(name: &str) -> Option<Spec> {
 }
 
 pub fn fixture_stats(count: usize) -> AppStats {
-    let long = "This is a longer transcript that wraps onto a second and third line so expand versus collapse is visible in the stats list.";
+    let long = "This is a longer transcript that runs past the four lines the latest row shows. It keeps going so the preview needs the expand control, and the expanded state shows every line of the saved text instead of a clipped summary.";
     let history = (0..count)
         .map(|index| HistoryItem {
             text: if index == 0 {
