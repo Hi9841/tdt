@@ -324,6 +324,71 @@ pub fn replace_running_exe(new_exe: &Path, version: &str) -> Result<(), String> 
     Ok(())
 }
 
+/// The Windows app list shows what the installer wrote. An in-app update
+/// replaces only TDT.exe, so on the first start of a new version, write the
+/// version and ask Windows to reload app icons. Copies outside the install
+/// folder (dev builds, portable zips) leave the record alone.
+#[cfg(windows)]
+pub fn sync_install_record() {
+    use windows::core::HSTRING;
+    use windows::Win32::System::Registry::{
+        RegGetValueW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_SZ,
+    };
+    use windows::Win32::UI::Shell::{SHChangeNotify, SHCNE_ASSOCCHANGED, SHCNF_IDLIST};
+
+    let key = HSTRING::from(r"Software\Microsoft\Windows\CurrentVersion\Uninstall\TDT");
+    let read = |name: &str| -> Option<String> {
+        let name = HSTRING::from(name);
+        let mut buf = [0u16; 512];
+        let mut len = std::mem::size_of_val(&buf) as u32;
+        let status = unsafe {
+            RegGetValueW(
+                HKEY_CURRENT_USER,
+                &key,
+                &name,
+                RRF_RT_REG_SZ,
+                None,
+                Some(buf.as_mut_ptr().cast()),
+                Some(&mut len),
+            )
+        };
+        status.is_ok().then(|| {
+            let chars = (len as usize / 2).saturating_sub(1);
+            String::from_utf16_lossy(&buf[..chars.min(buf.len())])
+        })
+    };
+
+    let Some(dir) = std::env::current_exe().ok().and_then(|exe| exe.parent().map(Path::to_path_buf))
+    else {
+        return;
+    };
+    let same_dir = |location: &str| {
+        location.trim_end_matches('\\').eq_ignore_ascii_case(
+            dir.to_string_lossy()
+                .trim_start_matches(r"\\?\")
+                .trim_end_matches('\\'),
+        )
+    };
+    if !read("InstallLocation").is_some_and(|location| same_dir(&location)) {
+        return;
+    }
+    if read("DisplayVersion").as_deref() == Some(current_version()) {
+        return;
+    }
+    let version: Vec<u16> = current_version().encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        let _ = RegSetKeyValueW(
+            HKEY_CURRENT_USER,
+            &key,
+            &HSTRING::from("DisplayVersion"),
+            REG_SZ.0,
+            Some(version.as_ptr().cast()),
+            (version.len() * 2) as u32,
+        );
+        SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, None, None);
+    }
+}
+
 fn parse_semver(raw: &str) -> Option<(u64, u64, u64)> {
     let trimmed = raw.trim().trim_start_matches('v');
     let mut parts = trimmed.split('.');
