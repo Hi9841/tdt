@@ -161,8 +161,10 @@ mod tests {
         assert!(wav.len() > 44);
         assert!(wav.len() < 8_000);
         let peak = wav[44..]
-            .chunks_exact(2)
-            .map(|pair| i16::from_le_bytes([pair[0], pair[1]]).unsigned_abs())
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| i16::from_le_bytes(*pair).unsigned_abs())
             .max()
             .unwrap_or(0);
         assert!(peak > 200 && peak < 12_000);
