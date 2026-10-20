@@ -1,7 +1,10 @@
 //! Parakeet TDT: a FastConformer encoder and a token-and-duration transducer.
 //! The structure follows the Apache-2.0 Hugging Face `ParakeetForTDT`.
 
-use super::gemm::{dot, Dense, Ternary};
+use super::buf::Buf;
+use super::fgemm;
+use super::gemm::{Dense, Precision, Ternary};
+use super::half::HalfDense;
 use super::tensors::Tensors;
 use rayon::prelude::*;
 
@@ -67,7 +70,9 @@ impl Config {
             max_symbols: num(&json, "max_symbols_per_step")?,
             group: num(&json, "ternary_group_size")?,
         };
-        if config.hidden % config.heads != 0 || config.mels % 8 != 0 || config.durations.is_empty()
+        if !config.hidden.is_multiple_of(config.heads)
+            || !config.mels.is_multiple_of(8)
+            || config.durations.is_empty()
         {
             return Err("config.json has inconsistent sizes".into());
         }
@@ -88,12 +93,33 @@ impl Norm {
         })
     }
 
-    fn apply(&self, x: &[f32]) -> Vec<f32> {
+    fn apply(&self, x: &[f32]) -> Buf {
         let size = self.weight.len();
-        let mut out = vec![0.0f32; x.len()];
+        let mut out = Buf::zeroed(x.len());
         out.par_chunks_mut(size)
             .zip(x.par_chunks(size))
             .for_each(|(o, row)| {
+                let mean = row.iter().sum::<f32>() / size as f32;
+                let var = row.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / size as f32;
+                let inv = 1.0 / (var + LAYER_NORM_EPS).sqrt();
+                for i in 0..size {
+                    o[i] = (row[i] - mean) * inv * self.weight[i] + self.bias[i];
+                }
+            });
+        out
+    }
+
+    /// `x += scale * y`, then the normalized `x`, in one pass per row.
+    fn residual(&self, x: &mut [f32], y: &[f32], scale: f32) -> Buf {
+        let size = self.weight.len();
+        let mut out = Buf::zeroed(x.len());
+        out.par_chunks_mut(size)
+            .zip(x.par_chunks_mut(size))
+            .zip(y.par_chunks(size))
+            .for_each(|((o, row), add)| {
+                for (v, a) in row.iter_mut().zip(add) {
+                    *v += scale * a;
+                }
                 let mean = row.iter().sum::<f32>() / size as f32;
                 let var = row.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / size as f32;
                 let inv = 1.0 / (var + LAYER_NORM_EPS).sqrt();
@@ -111,9 +137,43 @@ fn ternary(
     out: usize,
     inp: usize,
     group: usize,
+    precision: Precision,
 ) -> Result<Ternary, String> {
     let scales = t.f32_len(&format!("{name}.scales"), out * (inp / group))?;
-    Ternary::from_packed(t.u8(&format!("{name}.qweight"))?, scales, out, inp, group)
+    Ternary::from_packed(
+        t.u8(&format!("{name}.qweight"))?,
+        scales,
+        out,
+        inp,
+        group,
+        precision,
+    )
+}
+
+/// Several attention layers with the same input, stacked by output rows.
+fn stacked(
+    t: &Tensors,
+    prefix: &str,
+    names: &[&str],
+    (out, inp): (usize, usize),
+    group: usize,
+    precision: Precision,
+) -> Result<Ternary, String> {
+    let mut packed = Vec::new();
+    let mut scales = Vec::new();
+    for name in names {
+        let name = format!("{prefix}.self_attn.{name}");
+        packed.extend_from_slice(t.u8(&format!("{name}.qweight"))?);
+        scales.extend(t.f32_len(&format!("{name}.scales"), out * (inp / group))?);
+    }
+    Ternary::from_packed(&packed, scales, names.len() * out, inp, group, precision)
+}
+
+/// Decoder layer with f16 weights as stored and an f32 bias.
+fn half_dense(t: &Tensors, name: &str, out: usize, inp: usize) -> Result<HalfDense, String> {
+    let weight = t.f16_bits(&format!("{name}.weight"), out * inp)?;
+    let bias = t.f32_len(&format!("{name}.bias"), out)?;
+    HalfDense::new(weight, Some(bias), out, inp)
 }
 
 fn dense(t: &Tensors, name: &str, out: usize, inp: usize, bias: bool) -> Result<Dense, String> {
@@ -134,15 +194,10 @@ fn sigmoid(v: f32) -> f32 {
     1.0 / (1.0 + (-v).exp())
 }
 
-fn add_scaled(x: &mut [f32], y: &[f32], scale: f32) {
-    for (a, b) in x.iter_mut().zip(y) {
-        *a += scale * b;
-    }
-}
-
 /// Stride-2 convolution stack that turns 10 ms mel frames into 80 ms frames.
 struct Subsampling {
     channels: usize,
+    /// First conv as `[tap][channel]` weights and bias.
     conv0: (Vec<f32>, Vec<f32>),
     dw1: (Vec<f32>, Vec<f32>),
     pw1: Dense,
@@ -165,7 +220,13 @@ impl Subsampling {
         };
         Ok(Self {
             channels: ch,
-            conv0: conv(0)?,
+            conv0: {
+                let (weight, bias) = conv(0)?;
+                (
+                    (0..9 * ch).map(|i| weight[(i % ch) * 9 + i / ch]).collect(),
+                    bias,
+                )
+            },
             dw1: conv(2)?,
             pw1: dense(t, "encoder.subsampling.layers.3", ch, ch, true)?,
             dw2: conv(5)?,
@@ -181,25 +242,26 @@ impl Subsampling {
     }
 
     /// `features` is `frames x mels`; returns `(out_frames x hidden, out_frames)`.
-    fn forward(&self, features: &[f32], frames: usize, mels: usize) -> (Vec<f32>, usize) {
+    fn forward(&self, features: &[f32], frames: usize, mels: usize) -> (Buf, usize) {
         let ch = self.channels;
         // First conv: one input channel, output channels-last [h][w][c].
         let (h1, w1) = (half(frames), half(mels));
-        let mut x = vec![0.0f32; h1 * w1 * ch];
+        let mut x = Buf::zeroed(h1 * w1 * ch);
         let (weight, bias) = &self.conv0;
         x.par_chunks_mut(w1 * ch).enumerate().for_each(|(h, row)| {
             for w in 0..w1 {
-                for c in 0..ch {
-                    let mut sum = bias[c];
-                    for i in 0..3 {
-                        for j in 0..3 {
-                            if let Some(v) = sample(features, frames, mels, 2 * h + i, 2 * w + j) {
-                                sum += weight[c * 9 + i * 3 + j] * v;
-                            }
-                        }
+                let cell = &mut row[w * ch..(w + 1) * ch];
+                cell.copy_from_slice(bias);
+                for tap in 0..9 {
+                    let Some(v) = sample(features, frames, mels, 2 * h + tap / 3, 2 * w + tap % 3)
+                    else {
+                        continue;
+                    };
+                    for (o, wt) in cell.iter_mut().zip(&weight[tap * ch..(tap + 1) * ch]) {
+                        *o += wt * v;
                     }
-                    row[w * ch + c] = sum.max(0.0);
                 }
+                cell.iter_mut().for_each(|o| *o = o.max(0.0));
             }
         });
         let (x, h2, w2) = depthwise(&x, h1, w1, ch, &self.dw1);
@@ -209,7 +271,7 @@ impl Subsampling {
         let mut x = self.pw2.forward(&x, h3 * w3);
         x.iter_mut().for_each(|v| *v = v.max(0.0));
         // Flatten per frame as channel-major: index = c * w3 + w.
-        let mut flat = vec![0.0f32; h3 * ch * w3];
+        let mut flat = Buf::zeroed(h3 * ch * w3);
         for h in 0..h3 {
             for w in 0..w3 {
                 for c in 0..ch {
@@ -239,9 +301,9 @@ fn depthwise(
     w: usize,
     ch: usize,
     (weight, bias): &(Vec<f32>, Vec<f32>),
-) -> (Vec<f32>, usize, usize) {
+) -> (Buf, usize, usize) {
     let (ho, wo) = (half(h), half(w));
-    let mut out = vec![0.0f32; ho * wo * ch];
+    let mut out = Buf::zeroed(ho * wo * ch);
     out.par_chunks_mut(wo * ch)
         .enumerate()
         .for_each(|(oh, row)| {
@@ -269,16 +331,16 @@ struct Block {
     norm_ff1: Norm,
     ff1: (Ternary, Ternary),
     norm_att: Norm,
-    q: Ternary,
-    k: Ternary,
-    v: Ternary,
+    /// q, k, and v stacked into one `3d x d` layer: one quantization, one product.
+    qkv: Ternary,
     o: Ternary,
     rel_k: Ternary,
     bias_u: Vec<f32>,
     bias_v: Vec<f32>,
     norm_conv: Norm,
     pw1: Ternary,
-    dw: Vec<f32>,
+    /// Depthwise conv weights as `[tap][channel]`, so a tap is one contiguous row.
+    dw_by_tap: Vec<f32>,
     bn_scale: Vec<f32>,
     bn_shift: Vec<f32>,
     pw2: Ternary,
@@ -288,11 +350,12 @@ struct Block {
 }
 
 impl Block {
-    fn load(t: &Tensors, c: &Config, index: usize) -> Result<Self, String> {
+    fn load(t: &Tensors, c: &Config, index: usize, precision: Precision) -> Result<Self, String> {
         let p = format!("encoder.layers.{index}");
         let (d, g) = (c.hidden, c.group);
-        let tern =
-            |name: &str, out: usize, inp: usize| ternary(t, &format!("{p}.{name}"), out, inp, g);
+        let tern = |name: &str, out: usize, inp: usize| {
+            ternary(t, &format!("{p}.{name}"), out, inp, g, precision)
+        };
         let mean = t.f32_len(&format!("{p}.conv.norm.running_mean"), d)?;
         let var = t.f32_len(&format!("{p}.conv.norm.running_var"), d)?;
         let weight = t.f32_len(&format!("{p}.conv.norm.weight"), d)?;
@@ -308,19 +371,20 @@ impl Block {
                 tern("feed_forward1.linear2", d, c.ff)?,
             ),
             norm_att: Norm::load(t, &format!("{p}.norm_self_att"), d)?,
-            q: tern("self_attn.q_proj", d, d)?,
-            k: tern("self_attn.k_proj", d, d)?,
-            v: tern("self_attn.v_proj", d, d)?,
+            qkv: stacked(t, &p, &["q_proj", "k_proj", "v_proj"], (d, d), g, precision)?,
             o: tern("self_attn.o_proj", d, d)?,
             rel_k: tern("self_attn.relative_k_proj", d, d)?,
             bias_u: t.f32_len(&format!("{p}.self_attn.bias_u"), d)?,
             bias_v: t.f32_len(&format!("{p}.self_attn.bias_v"), d)?,
             norm_conv: Norm::load(t, &format!("{p}.norm_conv"), d)?,
             pw1: tern("conv.pointwise_conv1", 2 * d, d)?,
-            dw: t.f32_len(
-                &format!("{p}.conv.depthwise_conv.weight"),
-                d * c.conv_kernel,
-            )?,
+            dw_by_tap: {
+                let kernel = c.conv_kernel;
+                let dw = t.f32_len(&format!("{p}.conv.depthwise_conv.weight"), d * kernel)?;
+                (0..kernel * d)
+                    .map(|i| dw[(i % d) * kernel + i / d])
+                    .collect()
+            },
             bn_scale,
             bn_shift,
             pw2: tern("conv.pointwise_conv2", d, d)?,
@@ -333,70 +397,80 @@ impl Block {
         })
     }
 
-    fn feed_forward((up, down): &(Ternary, Ternary), x: &[f32], frames: usize) -> Vec<f32> {
+    fn feed_forward((up, down): &(Ternary, Ternary), x: &[f32], frames: usize) -> Buf {
         let mut hidden = up.forward(x, frames);
         hidden.par_iter_mut().for_each(|v| *v = silu(*v));
         down.forward(&hidden, frames)
     }
 
-    fn forward(&self, x: &mut Vec<f32>, frames: usize, positions: &[f32], c: &Config) {
+    fn forward(&self, x: &mut Buf, frames: usize, positions: &[f32], c: &Config) {
         let ff = Self::feed_forward(&self.ff1, &self.norm_ff1.apply(x), frames);
-        add_scaled(x, &ff, 0.5);
-        let att = self.attention(&self.norm_att.apply(x), frames, positions, c);
-        add_scaled(x, &att, 1.0);
-        let conv = self.convolution(&self.norm_conv.apply(x), frames, c);
-        add_scaled(x, &conv, 1.0);
-        let ff = Self::feed_forward(&self.ff2, &self.norm_ff2.apply(x), frames);
-        add_scaled(x, &ff, 0.5);
-        *x = self.norm_out.apply(x);
+        let normed = self.norm_att.residual(x, &ff, 0.5);
+        let att = self.attention(&normed, frames, positions, c);
+        let normed = self.norm_conv.residual(x, &att, 1.0);
+        let conv = self.convolution(&normed, frames, c);
+        let normed = self.norm_ff2.residual(x, &conv, 1.0);
+        let ff = Self::feed_forward(&self.ff2, &normed, frames);
+        *x = self.norm_out.residual(x, &ff, 0.5);
     }
 
     /// Multi-head attention with Transformer-XL relative positions.
-    fn attention(&self, x: &[f32], t: usize, positions: &[f32], c: &Config) -> Vec<f32> {
+    fn attention(&self, x: &[f32], t: usize, positions: &[f32], c: &Config) -> Buf {
         let (d, heads) = (c.hidden, c.heads);
         let hd = d / heads;
-        let q = self.q.forward(x, t);
-        let k = self.k.forward(x, t);
-        let v = self.v.forward(x, t);
+        let qkv = self.qkv.forward(x, t);
         let r = self.rel_k.forward(positions, 2 * t - 1);
         let scale = 1.0 / (hd as f32).sqrt();
-        let mut context = vec![0.0f32; t * d];
-        let per_head: Vec<Vec<f32>> = (0..heads)
+        let p = 2 * t - 1;
+        let mut context = Buf::zeroed(t * d);
+        let per_head: Vec<Buf> = (0..heads)
             .into_par_iter()
             .map(|h| {
                 let cols = h * hd..(h + 1) * hd;
-                let mut out = vec![0.0f32; t * hd];
-                let mut scores = vec![0.0f32; t];
-                let mut qu = vec![0.0f32; hd];
-                let mut qv = vec![0.0f32; hd];
-                for i in 0..t {
-                    let qi = &q[i * d..][cols.clone()];
-                    for e in 0..hd {
-                        qu[e] = qi[e] + self.bias_u[h * hd + e];
-                        qv[e] = qi[e] + self.bias_v[h * hd + e];
-                    }
-                    let mut max = f32::NEG_INFINITY;
-                    for (j, score) in scores.iter_mut().enumerate() {
-                        let ac = dot(&qu, &k[j * d..][cols.clone()]);
-                        // Row t-1-i+j of the position table is relative position i - j.
-                        let bd = dot(&qv, &r[(t - 1 - i + j) * d..][cols.clone()]);
-                        *score = (ac + bd) * scale;
-                        max = max.max(*score);
-                    }
-                    let mut total = 0.0f32;
-                    for score in scores.iter_mut() {
-                        *score = (*score - max).exp();
-                        total += *score;
-                    }
-                    let row = &mut out[i * hd..(i + 1) * hd];
-                    for (j, score) in scores.iter().enumerate() {
-                        let weight = score / total;
-                        for (o, value) in row.iter_mut().zip(&v[j * d..][cols.clone()]) {
-                            *o += weight * value;
+                // Columns of head h from a matrix with `stride` values per row.
+                let head = |src: &[f32],
+                            stride: usize,
+                            offset: usize,
+                            rows: usize,
+                            bias: Option<&[f32]>| {
+                    let mut out = Vec::with_capacity(rows * hd);
+                    for i in 0..rows {
+                        let row = &src[i * stride + offset..][cols.clone()];
+                        match bias {
+                            Some(b) => out.extend(row.iter().zip(b).map(|(v, b)| v + b)),
+                            None => out.extend_from_slice(row),
                         }
                     }
+                    out
+                };
+                let qu = head(&qkv, 3 * d, 0, t, Some(&self.bias_u[cols.clone()]));
+                let qv = head(&qkv, 3 * d, 0, t, Some(&self.bias_v[cols.clone()]));
+                let ac = fgemm::matmul(&qu, t, hd, &head(&qkv, 3 * d, d, t, None), t);
+                let bd = fgemm::matmul(&qv, t, hd, &head(&r, d, 0, p, None), p);
+                let mut probs = Buf::zeroed(t * t);
+                for (i, row) in probs.chunks_exact_mut(t).enumerate() {
+                    // Column t-1-i+j of the position product is relative position i - j.
+                    let shifted = &bd[i * p + (t - 1 - i)..][..t];
+                    let mut max = f32::NEG_INFINITY;
+                    for j in 0..t {
+                        row[j] = (ac[i * t + j] + shifted[j]) * scale;
+                        max = max.max(row[j]);
+                    }
+                    let mut total = 0.0f32;
+                    for value in row.iter_mut() {
+                        *value = (*value - max).exp();
+                        total += *value;
+                    }
+                    let inv = 1.0 / total;
+                    row.iter_mut().for_each(|value| *value *= inv);
                 }
-                out
+                let mut v_t = Buf::zeroed(hd * t);
+                for j in 0..t {
+                    for (e, value) in qkv[j * 3 * d + 2 * d..][cols.clone()].iter().enumerate() {
+                        v_t[e * t + j] = *value;
+                    }
+                }
+                fgemm::matmul(&probs, t, t, &v_t, hd)
             })
             .collect();
         for (h, out) in per_head.iter().enumerate() {
@@ -409,29 +483,34 @@ impl Block {
     }
 
     /// Pointwise conv with GLU, depthwise conv over time, batch norm, SiLU, pointwise conv.
-    fn convolution(&self, x: &[f32], t: usize, c: &Config) -> Vec<f32> {
+    fn convolution(&self, x: &[f32], t: usize, c: &Config) -> Buf {
         let d = c.hidden;
         let kernel = c.conv_kernel;
         let pad = (kernel - 1) / 2;
         let wide = self.pw1.forward(x, t);
-        let mut gated = vec![0.0f32; t * d];
-        for i in 0..t {
-            let row = &wide[i * 2 * d..(i + 1) * 2 * d];
-            for ch in 0..d {
-                gated[i * d + ch] = row[ch] * sigmoid(row[d + ch]);
-            }
-        }
-        let mut mixed = vec![0.0f32; t * d];
-        mixed.par_chunks_mut(d).enumerate().for_each(|(i, out)| {
-            for ch in 0..d {
-                let mut sum = 0.0f32;
-                for k in 0..kernel {
-                    let src = i + k;
-                    if src >= pad && src - pad < t {
-                        sum += self.dw[ch * kernel + k] * gated[(src - pad) * d + ch];
-                    }
+        let mut gated = Buf::zeroed(t * d);
+        gated
+            .par_chunks_mut(d)
+            .zip(wide.par_chunks(2 * d))
+            .for_each(|(out, row)| {
+                for ch in 0..d {
+                    out[ch] = row[ch] * sigmoid(row[d + ch]);
                 }
-                out[ch] = silu(sum * self.bn_scale[ch] + self.bn_shift[ch]);
+            });
+        let mut mixed = Buf::zeroed(t * d);
+        mixed.par_chunks_mut(d).enumerate().for_each(|(i, out)| {
+            for k in 0..kernel {
+                let src = i + k;
+                if src < pad || src - pad >= t {
+                    continue;
+                }
+                let taps = &self.dw_by_tap[k * d..(k + 1) * d];
+                for ((o, w), g) in out.iter_mut().zip(taps).zip(&gated[(src - pad) * d..][..d]) {
+                    *o += w * g;
+                }
+            }
+            for ((o, scale), shift) in out.iter_mut().zip(&self.bn_scale).zip(&self.bn_shift) {
+                *o = silu(*o * scale + shift);
             }
         });
         self.pw2.forward(&mixed, t)
@@ -441,22 +520,24 @@ impl Block {
 /// Sinusoidal table for relative positions t-1 down to -(t-1), sin and cos interleaved.
 fn relative_positions(t: usize, d: usize) -> Vec<f32> {
     let rows = 2 * t - 1;
+    let inv_freq: Vec<f32> = (0..d / 2)
+        .map(|i| 1.0 / 10000f32.powf((2 * i) as f32 / d as f32))
+        .collect();
     let mut table = vec![0.0f32; rows * d];
-    for p in 0..rows {
+    table.par_chunks_mut(d).enumerate().for_each(|(p, row)| {
         let position = (t - 1) as f32 - p as f32;
-        for i in 0..d / 2 {
-            let inv_freq = 1.0 / 10000f32.powf((2 * i) as f32 / d as f32);
-            let angle = position * inv_freq;
-            table[p * d + 2 * i] = angle.sin();
-            table[p * d + 2 * i + 1] = angle.cos();
+        for (i, freq) in inv_freq.iter().enumerate() {
+            let angle = position * freq;
+            row[2 * i] = angle.sin();
+            row[2 * i + 1] = angle.cos();
         }
-    }
+    });
     table
 }
 
 struct Lstm {
-    w_ih: Dense,
-    w_hh: Dense,
+    /// `[W_ih | W_hh]`, applied to `[input | hidden]`.
+    gates: HalfDense,
     bias: Vec<f32>,
 }
 
@@ -472,29 +553,28 @@ pub struct Parakeet {
     encoder_projector: Dense,
     embedding: Vec<f32>,
     lstm: Vec<Lstm>,
-    decoder_projector: Dense,
-    joint: Dense,
+    decoder_projector: HalfDense,
+    joint: HalfDense,
 }
 
 impl Parakeet {
-    pub fn load(t: &Tensors, config: Config) -> Result<Self, String> {
+    pub fn load(t: &Tensors, config: Config, precision: Precision) -> Result<Self, String> {
         let c = &config;
         let dh = c.decoder_hidden;
         let blocks = (0..c.layers)
             .into_par_iter()
-            .map(|index| Block::load(t, c, index))
+            .map(|index| Block::load(t, c, index, precision))
             .collect::<Result<Vec<_>, _>>()?;
         let lstm = (0..c.decoder_layers)
             .map(|l| -> Result<Lstm, String> {
                 let b_ih = t.f32_len(&format!("decoder.lstm.bias_ih_l{l}"), 4 * dh)?;
                 let b_hh = t.f32_len(&format!("decoder.lstm.bias_hh_l{l}"), 4 * dh)?;
                 // LSTM weights carry no `.weight` suffix.
-                let matrix = |name: String| -> Result<Dense, String> {
-                    Dense::new(t.f32_len(&name, 4 * dh * dh)?, None, 4 * dh, dh)
-                };
+                let w_ih = t.f16_bits(&format!("decoder.lstm.weight_ih_l{l}"), 4 * dh * dh)?;
+                let w_hh = t.f16_bits(&format!("decoder.lstm.weight_hh_l{l}"), 4 * dh * dh)?;
+                let joined = HalfDense::side_by_side(&w_ih, &w_hh, 4 * dh, dh, dh);
                 Ok(Lstm {
-                    w_ih: matrix(format!("decoder.lstm.weight_ih_l{l}"))?,
-                    w_hh: matrix(format!("decoder.lstm.weight_hh_l{l}"))?,
+                    gates: HalfDense::new(joined, None, 4 * dh, 2 * dh)?,
                     bias: b_ih.iter().zip(&b_hh).map(|(a, b)| a + b).collect(),
                 })
             })
@@ -505,14 +585,14 @@ impl Parakeet {
             encoder_projector: dense(t, "encoder_projector", dh, c.hidden, true)?,
             embedding: t.f32_len("decoder.embedding.weight", c.vocab * dh)?,
             lstm,
-            decoder_projector: dense(t, "decoder.decoder_projector", dh, dh, true)?,
-            joint: dense(t, "joint.head", c.vocab + c.durations.len(), dh, true)?,
+            decoder_projector: half_dense(t, "decoder.decoder_projector", dh, dh)?,
+            joint: half_dense(t, "joint.head", c.vocab + c.durations.len(), dh)?,
             config,
         })
     }
 
     /// Encoder output after the 24 blocks: `frames x hidden`.
-    pub fn encode(&self, features: &[f32], frames: usize) -> (Vec<f32>, usize) {
+    pub fn encode(&self, features: &[f32], frames: usize) -> (Buf, usize) {
         self.encode_inspect(features, frames, |_, _| {})
     }
 
@@ -522,7 +602,7 @@ impl Parakeet {
         features: &[f32],
         frames: usize,
         mut inspect: impl FnMut(usize, &[f32]),
-    ) -> (Vec<f32>, usize) {
+    ) -> (Buf, usize) {
         let c = &self.config;
         let (mut x, t) = self.subsampling.forward(features, frames, c.mels);
         inspect(0, &x);
@@ -534,18 +614,20 @@ impl Parakeet {
         (x, t)
     }
 
-    pub fn project(&self, encoded: &[f32], t: usize) -> Vec<f32> {
+    pub fn project(&self, encoded: &[f32], t: usize) -> Buf {
         self.encoder_projector.forward(encoded, t)
     }
 
-    fn decoder_step(&self, token: usize, state: &mut DecoderState) -> Vec<f32> {
+    fn decoder_step(&self, token: usize, state: &mut DecoderState) -> Buf {
         let dh = self.config.decoder_hidden;
         let mut input = self.embedding[token * dh..(token + 1) * dh].to_vec();
+        let mut joined = vec![0.0f32; 2 * dh];
         for (layer, lstm) in self.lstm.iter().enumerate() {
-            let mut gates = lstm.w_ih.forward(&input, 1);
-            let recurrent = lstm.w_hh.forward(&state.hidden[layer], 1);
-            for i in 0..4 * dh {
-                gates[i] += recurrent[i] + lstm.bias[i];
+            joined[..dh].copy_from_slice(&input);
+            joined[dh..].copy_from_slice(&state.hidden[layer]);
+            let mut gates = lstm.gates.matvec(&joined);
+            for (g, b) in gates.iter_mut().zip(&lstm.bias) {
+                *g += b;
             }
             // PyTorch gate order: input, forget, cell, output.
             let (h, c) = (&mut state.hidden[layer], &mut state.cell[layer]);
@@ -559,7 +641,7 @@ impl Parakeet {
             }
             input = h.clone();
         }
-        self.decoder_projector.forward(&input, 1)
+        self.decoder_projector.matvec(&input)
     }
 
     /// Greedy TDT decoding over projected encoder frames (`t x decoder_hidden`).
@@ -579,7 +661,7 @@ impl Parakeet {
             for i in 0..dh {
                 joint_in[i] = (enc[i] + dec[i]).max(0.0);
             }
-            let logits = self.joint.forward(&joint_in, 1);
+            let logits = self.joint.matvec(&joint_in);
             let token = argmax(&logits[..c.vocab]);
             let mut duration = c.durations[argmax(&logits[c.vocab..])];
             if token == c.blank {

@@ -81,16 +81,22 @@ impl Tensors {
         let raw = self.raw(entry);
         let values = match entry.dtype.as_str() {
             "F32" => raw
-                .chunks_exact(4)
-                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| f32::from_le_bytes(*b))
                 .collect(),
             "F16" => raw
-                .chunks_exact(2)
-                .map(|b| f16_to_f32(u16::from_le_bytes([b[0], b[1]])))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| f16_to_f32(u16::from_le_bytes(*b)))
                 .collect(),
             "BF16" => raw
-                .chunks_exact(2)
-                .map(|b| f32::from_bits(u32::from(u16::from_le_bytes([b[0], b[1]])) << 16))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| f32::from_bits(u32::from(u16::from_le_bytes(*b)) << 16))
                 .collect(),
             other => return Err(format!("tensor {name} has dtype {other}, not a float")),
         };
@@ -107,6 +113,28 @@ impl Tensors {
             ));
         }
         Ok(values)
+    }
+
+    /// The raw bits of an F16 tensor with `len` values.
+    pub fn f16_bits(&self, name: &str, len: usize) -> Result<Vec<u16>, String> {
+        let entry = self.entry(name)?;
+        if entry.dtype != "F16" {
+            return Err(format!("tensor {name} has dtype {}, not F16", entry.dtype));
+        }
+        let bits: Vec<u16> = self
+            .raw(entry)
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| u16::from_le_bytes(*b))
+            .collect();
+        if bits.len() != len {
+            return Err(format!(
+                "tensor {name} has {} values, expected {len}",
+                bits.len()
+            ));
+        }
+        Ok(bits)
     }
 
     pub fn u8(&self, name: &str) -> Result<&[u8], String> {

@@ -2,6 +2,9 @@
 //! as the model file stores them, so every output is a dot product of two
 //! contiguous rows.
 
+use super::buf::Buf;
+use super::fgemm;
+use super::kernels::{Isa, PackedTernary, GROUP};
 use rayon::prelude::*;
 
 /// Output columns per parallel task.
@@ -39,8 +42,8 @@ impl Dense {
     }
 
     /// `x` is `rows x in_features`; the result is `rows x out_features`.
-    pub fn forward(&self, x: &[f32], rows: usize) -> Vec<f32> {
-        let mut out = matmul(x, rows, self.in_features, &self.weight, self.out_features);
+    pub fn forward(&self, x: &[f32], rows: usize) -> Buf {
+        let mut out = fgemm::matmul(x, rows, self.in_features, &self.weight, self.out_features);
         if let Some(bias) = &self.bias {
             for row in out.chunks_exact_mut(self.out_features) {
                 for (value, b) in row.iter_mut().zip(bias) {
@@ -52,15 +55,25 @@ impl Dense {
     }
 }
 
+/// How ternary layers multiply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Precision {
+    /// f32 activations, as the reference does. Slow; used to check the model.
+    Exact,
+    /// i8 activations per 128-value group, with the fastest kernel for this CPU.
+    Int8,
+}
+
 /// Ternary layer: `w = scale[row][col / group] * (code - 1)`, code in {0, 1, 2}.
 pub struct Ternary {
     pub out_features: usize,
     pub in_features: usize,
     group: usize,
-    /// `out x in`, one code per byte.
+    /// Exact mode: `out x in`, one code per byte.
     codes: Vec<u8>,
-    /// `out x (in / group)`.
+    /// Exact mode: `out x (in / group)`.
     scales: Vec<f32>,
+    packed: Option<PackedTernary>,
 }
 
 impl Ternary {
@@ -72,11 +85,12 @@ impl Ternary {
         out_features: usize,
         in_features: usize,
         group: usize,
+        precision: Precision,
     ) -> Result<Self, String> {
         let row_bytes = in_features.div_ceil(5);
         if packed.len() != out_features * row_bytes
             || group == 0
-            || in_features % group != 0
+            || !in_features.is_multiple_of(group)
             || scales.len() != out_features * (in_features / group)
         {
             return Err(format!(
@@ -96,20 +110,36 @@ impl Ternary {
                 *code = (packed_row[col / 5] / POW3[col % 5]) % 3;
             }
         }
+        if precision == Precision::Int8 && group == GROUP {
+            let packed =
+                PackedTernary::new(Isa::detect(), &codes, &scales, out_features, in_features);
+            return Ok(Self {
+                out_features,
+                in_features,
+                group,
+                codes: Vec::new(),
+                scales: Vec::new(),
+                packed: Some(packed),
+            });
+        }
         Ok(Self {
             out_features,
             in_features,
             group,
             codes,
             scales,
+            packed: None,
         })
     }
 
     /// `x` is `rows x in_features`; the result is `rows x out_features`.
-    pub fn forward(&self, x: &[f32], rows: usize) -> Vec<f32> {
+    pub fn forward(&self, x: &[f32], rows: usize) -> Buf {
+        if let Some(packed) = &self.packed {
+            return packed.forward(x, rows);
+        }
         let (k, n, group) = (self.in_features, self.out_features, self.group);
         let groups = k / group;
-        let mut out = vec![0.0f32; rows * n];
+        let mut out = Buf::zeroed(rows * n);
         let out_ptr = SendPtr(out.as_mut_ptr());
         (0..n.div_ceil(COLUMN_BLOCK))
             .into_par_iter()
@@ -121,13 +151,13 @@ impl Ternary {
                     for row in 0..rows {
                         let xr = &x[row * k..(row + 1) * k];
                         let mut total = 0.0f32;
-                        for g in 0..groups {
+                        for (g, scale) in scales.iter().enumerate() {
                             let span = g * group..(g + 1) * group;
                             let mut sum = 0.0f32;
                             for (xv, code) in xr[span.clone()].iter().zip(&codes[span]) {
                                 sum += xv * (f32::from(*code) - 1.0);
                             }
-                            total += sum * scales[g];
+                            total += sum * scale;
                         }
                         // SAFETY: each (row, col) is written by exactly one task.
                         unsafe { *out_ptr.get().add(row * n + col) = total };
@@ -151,58 +181,22 @@ impl SendPtr {
     }
 }
 
-/// `out[m][n] = sum_k x[m][k] * w[n][k]`.
-pub fn matmul(x: &[f32], rows: usize, k: usize, w: &[f32], n: usize) -> Vec<f32> {
-    debug_assert_eq!(x.len(), rows * k);
-    debug_assert_eq!(w.len(), n * k);
-    let mut out = vec![0.0f32; rows * n];
-    let out_ptr = SendPtr(out.as_mut_ptr());
-    (0..n.div_ceil(COLUMN_BLOCK))
-        .into_par_iter()
-        .for_each(|block| {
-            let columns = block * COLUMN_BLOCK..((block + 1) * COLUMN_BLOCK).min(n);
-            for col in columns {
-                let wr = &w[col * k..(col + 1) * k];
-                for row in 0..rows {
-                    let value = dot(&x[row * k..(row + 1) * k], wr);
-                    // SAFETY: each (row, col) is written by exactly one task.
-                    unsafe { *out_ptr.get().add(row * n + col) = value };
-                }
-            }
-        });
-    out
-}
-
-pub fn dot(a: &[f32], b: &[f32]) -> f32 {
-    let mut lanes = [0.0f32; 16];
-    let chunks = a.len() / 16;
-    for (ca, cb) in a.chunks_exact(16).zip(b.chunks_exact(16)) {
-        for i in 0..16 {
-            lanes[i] += ca[i] * cb[i];
-        }
-    }
-    let mut total: f32 = lanes.iter().sum();
-    for i in chunks * 16..a.len() {
-        total += a[i] * b[i];
-    }
-    total
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{matmul, Dense, Ternary};
+    use super::{Dense, Precision, Ternary};
 
     #[test]
     fn packed_ternary_rows_decode_and_multiply() {
         // Codes 2,0,1,2,1 | 0,2 are weights +1,-1,0,+1,0 | -1,+1.
         // Byte 0 = 2 + 0*3 + 1*9 + 2*27 + 1*81 = 146, byte 1 = 0 + 2*3 = 6.
-        let layer = Ternary::from_packed(&[146, 6], vec![2.0], 1, 7, 7).expect("layer");
+        let layer =
+            Ternary::from_packed(&[146, 6], vec![2.0], 1, 7, 7, Precision::Exact).expect("layer");
         let x = [1.0, 10.0, 100.0, 1000.0, 5.0, 3.0, 7.0];
         assert_eq!(
-            layer.forward(&x, 1),
+            layer.forward(&x, 1).to_vec(),
             vec![2.0 * (1.0 - 10.0 + 1000.0 - 3.0 + 7.0)]
         );
-        assert!(Ternary::from_packed(&[243, 6], vec![2.0], 1, 7, 7).is_err());
+        assert!(Ternary::from_packed(&[243, 6], vec![2.0], 1, 7, 7, Precision::Exact).is_err());
     }
 
     #[test]
@@ -215,11 +209,6 @@ mod tests {
         )
         .expect("layer");
         let y = layer.forward(&[1.0, 0.0, 2.0, 0.0, 1.0, 0.0], 2);
-        assert_eq!(y, vec![7.5, 15.0, 2.5, 4.0]);
-        let big: Vec<f32> = (0..70 * 33).map(|i| (i % 7) as f32).collect();
-        let x: Vec<f32> = (0..2 * 33).map(|i| (i % 3) as f32).collect();
-        let out = matmul(&x, 2, 33, &big, 70);
-        let expected: f32 = (0..33).map(|k| x[33 + k] * big[69 * 33 + k]).sum();
-        assert_eq!(out[70 + 69], expected);
+        assert_eq!(y.to_vec(), vec![7.5, 15.0, 2.5, 4.0]);
     }
 }

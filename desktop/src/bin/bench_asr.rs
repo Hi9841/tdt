@@ -1,15 +1,20 @@
 //! Speech benchmark: latency after release and word error rate.
 //!
-//! `cargo run --release --bin bench-asr -- [--dir PATH] [--realtime] [--repeat N]`
+//! `cargo run --release --bin bench-asr -- [--dir PATH] [--realtime] [--repeat N] [--native]`
 //!
 //! Each `clip.wav` may have a `clip.txt` reference transcript next to it.
 //! `--realtime` feeds audio at speaking pace, so latency is the wait a user
 //! has after the key is released. Without it, all audio arrives at once.
+//! `--native` runs TDT's Rust engine on each whole clip instead of the app path.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use voice_stt_desktop::stt::models::{find_dir, ModelSpec, CATALOG};
+use voice_stt_desktop::stt::native::NativeParakeet;
 use voice_stt_desktop::stt::{pcm16_wav, LiveAudio, SttEngine};
+
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 /// 100 ms at 16 kHz, the size of one capture chunk.
 const CHUNK_SAMPLES: usize = 1600;
@@ -29,6 +34,7 @@ struct Clip {
 struct Options {
     dir: PathBuf,
     realtime: bool,
+    native: bool,
     repeat: usize,
 }
 
@@ -38,6 +44,7 @@ fn parse_options() -> Options {
             .map(|l| PathBuf::from(l).join("Temp").join("tdt-bench-audio"))
             .unwrap_or_else(|| std::env::temp_dir().join("tdt-bench-audio")),
         realtime: false,
+        native: false,
         repeat: 1,
     };
     let mut args = std::env::args().skip(1);
@@ -45,6 +52,7 @@ fn parse_options() -> Options {
         match arg.as_str() {
             "--dir" => options.dir = args.next().map(PathBuf::from).unwrap_or(options.dir),
             "--realtime" => options.realtime = true,
+            "--native" => options.native = true,
             "--repeat" => {
                 options.repeat = args
                     .next()
@@ -230,6 +238,67 @@ fn bench_model(spec: &ModelSpec, clips: &[Clip], options: &Options) {
     engine.release();
 }
 
+/// Scores one transcript; returns (word errors, format errors, reference words).
+fn score(reference: &str, text: &str) -> (usize, usize, usize) {
+    let format = word_errors(&raw_words(reference), &raw_words(text));
+    let reference = normalize_words(reference);
+    (
+        word_errors(&reference, &normalize_words(text)),
+        format,
+        reference.len(),
+    )
+}
+
+fn bench_native(clips: &[Clip], options: &Options) {
+    let Some(model_dir) = find_dir(&CATALOG[0], None) else {
+        println!("Skipped: model directory not found.");
+        return;
+    };
+    let started = Instant::now();
+    let engine = match NativeParakeet::load(&model_dir) {
+        Ok(engine) => engine,
+        Err(e) => {
+            println!("Failed to load the native engine: {e}");
+            return;
+        }
+    };
+    println!(
+        "
+Native engine. Init: {} ms",
+        started.elapsed().as_millis()
+    );
+    for run in 1..=options.repeat {
+        let (mut errors, mut format_errors, mut words) = (0, 0, 0);
+        let mut latencies = Vec::new();
+        for clip in clips {
+            let started = Instant::now();
+            let text = engine.transcribe(&clip.samples);
+            let ms = started.elapsed().as_millis() as u64;
+            latencies.push(ms);
+            let mut note = String::new();
+            if let Some(reference) = &clip.reference {
+                let (e, f, w) = score(reference, &text);
+                errors += e;
+                format_errors += f;
+                words += w;
+                note = format!(" {e}/{w} errors");
+            }
+            println!(
+                "[{:.2}s] {} -> {ms} ms{note}: {text:?}",
+                clip.duration_secs, clip.name
+            );
+        }
+        latencies.sort_unstable();
+        let total: u64 = latencies.iter().sum();
+        println!(
+            "SUMMARY run={run} native=true clips={} latency_p50_ms={} latency_total_ms={total} wer_pct={:.2} errors={errors} format_errors={format_errors} words={words}",
+            latencies.len(),
+            latencies[latencies.len() / 2],
+            100.0 * errors as f64 / words.max(1) as f64
+        );
+    }
+}
+
 fn main() {
     let options = parse_options();
     let clips = load_clips(&options.dir);
@@ -243,6 +312,10 @@ fn main() {
         clips.len(),
         options.dir.display()
     );
+    if options.native {
+        bench_native(&clips, &options);
+        return;
+    }
     for spec in CATALOG {
         bench_model(spec, &clips, &options);
     }

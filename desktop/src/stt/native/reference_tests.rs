@@ -2,7 +2,7 @@
 //! (`ref_tdt.py --dump desktop/target/native-ref`). Needs the installed model:
 //! `cargo test --release --lib native -- --ignored --nocapture`.
 
-use super::NativeParakeet;
+use super::{NativeParakeet, Precision};
 use crate::stt::models::{find_dir, DEFAULT};
 use std::path::PathBuf;
 
@@ -16,8 +16,10 @@ fn reference_dir() -> Option<PathBuf> {
 fn load(dir: &std::path::Path, name: &str) -> Vec<f32> {
     std::fs::read(dir.join(format!("{name}.f32")))
         .expect("reference tensor")
-        .chunks_exact(4)
-        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| f32::from_le_bytes(*b))
         .collect()
 }
 
@@ -44,7 +46,7 @@ fn the_engine_matches_the_open_reference() {
         return;
     };
     let started = std::time::Instant::now();
-    let engine = NativeParakeet::load(&model_dir).expect("load");
+    let engine = NativeParakeet::load_with(&model_dir, Precision::Exact).expect("load");
     println!("load {} ms", started.elapsed().as_millis());
 
     let audio = load(&dir, "audio");
@@ -75,4 +77,29 @@ fn the_engine_matches_the_open_reference() {
     let expected: Vec<usize> = load(&dir, "tokens").iter().map(|v| *v as usize).collect();
     println!("text {:?}", engine.tokenizer.decode(&tokens));
     assert_eq!(tokens, expected);
+}
+
+#[test]
+#[ignore = "needs the installed model and a reference dump"]
+fn the_int8_engine_stays_close_to_the_open_reference() {
+    let (Some(dir), Some(model_dir)) = (reference_dir(), find_dir(DEFAULT, None)) else {
+        println!("skipped: no reference dump or model");
+        return;
+    };
+    let engine = NativeParakeet::load_with(&model_dir, Precision::Int8).expect("load");
+    let audio = load(&dir, "audio");
+    let (features, frames) = engine.frontend.compute(&audio);
+    for _ in 0..2 {
+        let started = std::time::Instant::now();
+        let (encoded, t) = engine
+            .pool
+            .install(|| engine.model.encode(&features, frames));
+        println!("encode {} ms for {t} frames", started.elapsed().as_millis());
+        compare("encoder", &encoded, &load(&dir, "encoder"));
+        let projected = engine.model.project(&encoded, t);
+        let started = std::time::Instant::now();
+        let tokens = engine.pool.install(|| engine.model.decode(&projected, t));
+        println!("decode {} ms", started.elapsed().as_millis());
+        println!("text {:?}", engine.tokenizer.decode(&tokens));
+    }
 }
