@@ -394,7 +394,7 @@ fn main() {
                         poll_capture_timeout();
                         if take_show_request() {
                             let _ = this.update(cx, |view, cx| {
-                                view.show_from_tray(cx);
+                                view.open_settings(cx);
                             });
                         }
                         while update_ping_rx.try_recv().is_ok() {}
@@ -447,7 +447,7 @@ fn main() {
                                     let _ = this.update(cx, |view, _| view.stop_requested = true);
                                 } else if event.id == tray.show_item.id() {
                                     let _ = this.update(cx, |view, cx| {
-                                        view.show_from_tray(cx);
+                                        view.open_settings(cx);
                                     });
                                 } else if event.id == tray.updates_item.id() {
                                     let _ = this.update(cx, |view, cx| {
@@ -469,7 +469,7 @@ fn main() {
                                     ..
                                 } => {
                                     let _ = this.update(cx, |view, cx| {
-                                        view.show_from_tray(cx);
+                                        view.open_settings(cx);
                                     });
                                 }
                                 _ => {}
@@ -496,7 +496,15 @@ fn main() {
                         if preview::is_active() {
                             while hotkey_rx.try_recv().is_ok() {}
                         }
-                        let actions: Vec<_> = hotkey_rx.try_iter().collect();
+                        let mut actions: Vec<_> = hotkey_rx.try_iter().collect();
+                        // A click on the resting pill is a tap of the shortcut.
+                        let clicked = this
+                            .update(cx, |view, _| std::mem::take(&mut view.click_dictation))
+                            .unwrap_or(false);
+                        if clicked && !is_recording_state && !is_processing_state {
+                            actions.push(HotkeyAction::PressStarted);
+                            actions.push(HotkeyAction::Toggled);
+                        }
                         let stream_error = rec.borrow().as_ref().and_then(AudioRecorder::take_error);
                         if let Some(error) = stream_error {
                             if let Some(live) = session.take() {
@@ -564,7 +572,6 @@ fn main() {
                                         .as_ref()
                                         .is_some_and(|live| !live.done.load(Ordering::SeqCst));
                                     if !is_recording_state && !is_processing_state && !pump_busy {
-                                        let _ = this.update(cx, |view, _| view.reveal_for_take());
                                         if stt.get().is_none() {
                                             let _ = this.update(cx, |view, cx| {
                                                 view.set_error("Download a speech model in Settings before recording.".into());
@@ -890,14 +897,12 @@ fn main() {
                                     {
                                         view.status = HudStatus::Idle;
                                         view.recovery_message = None;
-                                        view.finish_take(cx);
                                         cx.notify();
                                     }
                                 }
                                 HudStatus::NoSpeech if clear_no_speech => {
                                     view.status = HudStatus::Idle;
                                     view.recovery_message = None;
-                                    view.finish_take(cx);
                                     cx.notify();
                                 }
                                 HudStatus::NoSpeech | HudStatus::Error { .. } | HudStatus::Idle => {}

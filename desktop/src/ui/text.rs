@@ -1,7 +1,3 @@
-pub fn format_mmss(secs: u64) -> String {
-    format!("{:02}:{:02}", secs / 60, secs % 60)
-}
-
 pub fn format_latency_ms(latency_ms: u64) -> String {
     format!("{latency_ms}ms")
 }

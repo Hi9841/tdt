@@ -4,25 +4,22 @@ use crate::hotkey;
 use crate::paste::PasteInjector;
 use crate::ui::controls;
 use crate::ui::preview::{self, Spec as PreviewSpec};
-use crate::ui::text::{
-    clip_text, first_sentence, format_latency_ms, format_mmss, format_time_saved,
-};
+use crate::ui::text::{clip_text, first_sentence, format_latency_ms, format_time_saved};
 use crate::ui::theme::{
-    self, accent, gold, love, muted, pad, r_chip, r_section, r_window, shell_surface, success,
-    text, well, GAP_SECTION, GAP_TIGHT, MOTION_MS, MUTED, TAB_FADE_MS, TEXT, TYPE_DESC, TYPE_LABEL,
+    self, bg, chip, danger, edge, muted, pad, r_chip, r_section, r_window, rest_bg, rest_edge,
+    soft, text, well, GAP_SECTION, GAP_TIGHT, MUTED, TAB_FADE_MS, TEXT, TYPE_DESC, TYPE_LABEL,
     TYPE_META, TYPE_TITLE,
 };
 use crate::ui::window_util::{
-    client_animations_enabled, is_overlay_hidden, set_overlay_hidden, set_window_mode, start_window_drag,
-    BUBBLE_HEIGHT, BUBBLE_WIDTH, PANEL_CLOSE_MS, PANEL_OPEN_MS,
+    client_animations_enabled, set_pill_hit_rect, set_window_mode, BUBBLE_HEIGHT, BUBBLE_WIDTH, PANEL_CLOSE_MS, PANEL_OPEN_MS,
 };
 use crate::update::{self, UpdatePhase};
 use ely_gpui_component::buttons::{ButtonVariant, IconButton, SegmentedControl};
 use ely_gpui_component::feedback::{Alert, InlineMessage};
 use ely_gpui_component::forms::{Choice, ChoiceChips, Switch};
 use ely_gpui_component::layout::ScrollArea;
-use ely_gpui_component::primitives::{FocusScope, IconName, Severity};
-use ely_gpui_component::theme::{ActiveTheme, ControlSize};
+use ely_gpui_component::primitives::{FocusScope, Icon, IconName, Severity};
+use ely_gpui_component::theme::{ActiveTheme, ControlSize, IconSize};
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use parking_lot::Mutex;
@@ -33,17 +30,270 @@ use voice_stt_desktop::stt::{models, DownloadPhase, EngineSlot, SttEngine, CATAL
 
 /// Compact actions leave seven pixels above and below inside the overlay.
 const SETTINGS_SURFACE_HEIGHT: f32 = 28.0;
-const BUBBLE_CONTENT_HEIGHT: f32 = 28.0;
-const BUBBLE_TEXT_LINE_HEIGHT: f32 = 16.0;
 const WAVE_BARS: usize = VIS_BARS;
-const WAVE_BAR_W: f32 = 3.0;
-const WAVE_GAP: f32 = 2.0;
-const WAVE_FLAT: f32 = 2.0;
-const WAVE_MAX: f32 = 22.0;
 /// Two clamped lines at 12px in this panel hold about this many characters.
 const HISTORY_EXPAND_CHARS: usize = 88;
 /// The latest row clamps four lines at 14px, so it holds about twice as much.
 const LATEST_EXPAND_CHARS: usize = 170;
+
+// The overlay pill follows Aqua Voice: a small black capsule at rest that
+// grows for live audio and for a short message, then settles back.
+const REST: (f32, f32) = (28.0, 11.0);
+const REST_HOVER: (f32, f32) = (36.0, 14.0);
+const FINISHING: (f32, f32) = (34.0, 14.0);
+const LIVE_W: f32 = 76.0;
+const LIVE_H: f32 = 25.0;
+const LIVE_ORB: f32 = 9.0;
+const LIVE_BARS: usize = 11;
+const LIVE_BAR_W: f32 = 2.0;
+const LIVE_BAR_GAP: f32 = 2.0;
+const LIVE_BAR_MIN: f32 = 3.0;
+const LIVE_BAR_MAX: f32 = 13.0;
+const MESSAGE_H: f32 = 41.0;
+const MESSAGE_PAD: f32 = 18.0;
+const MESSAGE_TEXT: f32 = 13.5;
+const MESSAGE_MAX_W: f32 = 360.0;
+const SNIPPET_MAX_W: f32 = 170.0;
+const ERROR_MAX_W: f32 = 230.0;
+const SNIPPET_CHARS: usize = 80;
+const PILL_GAP: f32 = 10.0;
+const CHIP_PAD: f32 = 9.0;
+const HIT_PAD: f32 = 6.0;
+const TIP_H: f32 = 30.0;
+const TIP_GAP: f32 = 6.0;
+const PILL_MOTION_MS: u64 = 320;
+
+/// The pill's size moves from `from` to `to` with a small overshoot.
+#[derive(Debug, Clone, Copy)]
+struct PillMotion {
+    from: (f32, f32),
+    to: (f32, f32),
+    started: Instant,
+}
+
+impl PillMotion {
+    fn new() -> Self {
+        Self {
+            from: REST,
+            to: REST,
+            started: Instant::now(),
+        }
+    }
+
+    fn progress(&self) -> f32 {
+        if !client_animations_enabled() {
+            return 1.0;
+        }
+        (self.started.elapsed().as_secs_f32() * 1000.0 / PILL_MOTION_MS as f32).min(1.0)
+    }
+
+    fn current(&self) -> (f32, f32) {
+        let eased = ease_pop(self.progress());
+        (
+            self.from.0 + (self.to.0 - self.from.0) * eased,
+            self.from.1 + (self.to.1 - self.from.1) * eased,
+        )
+    }
+
+    /// Size for this frame, and whether the motion still runs.
+    fn sample(&mut self, target: (f32, f32)) -> ((f32, f32), bool) {
+        if target != self.to {
+            self.from = self.current();
+            self.to = target;
+            self.started = Instant::now();
+        }
+        (self.current(), self.progress() < 1.0)
+    }
+
+    /// Room the pill can take while it moves, overshoot included.
+    fn span(&self) -> (f32, f32) {
+        if self.progress() >= 1.0 {
+            return self.to;
+        }
+        let w = self.from.0.max(self.to.0) * 1.08 + 2.0;
+        let h = self.from.1.max(self.to.1) * 1.08 + 2.0;
+        (
+            w.min(BUBBLE_WIDTH - 2.0 * HIT_PAD),
+            h.min(BUBBLE_HEIGHT - 2.0 * HIT_PAD),
+        )
+    }
+}
+
+/// Ease out with a small overshoot, so the pill pops open.
+fn ease_pop(t: f32) -> f32 {
+    let c1 = 1.1;
+    let c3 = c1 + 1.0;
+    let u = t.clamp(0.0, 1.0) - 1.0;
+    1.0 + c3 * u * u * u + c1 * u * u
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum PillAction {
+    Start,
+    Stop,
+    Settings,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum PillKind {
+    Label,
+    Snippet(f32),
+    Meta,
+    Chip,
+}
+
+/// One run of words in the message pill.
+struct PillPart {
+    text: SharedString,
+    color: Hsla,
+    kind: PillKind,
+}
+
+impl PillPart {
+    fn label(text: impl Into<SharedString>, color: Hsla) -> Self {
+        Self {
+            text: text.into(),
+            color,
+            kind: PillKind::Label,
+        }
+    }
+
+    fn snippet(text: &str, color: Hsla, max_width: f32) -> Self {
+        let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        Self {
+            text: clip_text(&line, SNIPPET_CHARS).into(),
+            color,
+            kind: PillKind::Snippet(max_width),
+        }
+    }
+
+    fn meta(text: String) -> Self {
+        Self {
+            text: text.into(),
+            color: soft(),
+            kind: PillKind::Meta,
+        }
+    }
+
+    fn chip(words: &'static str) -> Self {
+        Self {
+            text: words.into(),
+            color: text(),
+            kind: PillKind::Chip,
+        }
+    }
+
+    fn font(&self, family: &SharedString) -> (Font, f32) {
+        match self.kind {
+            PillKind::Meta => (font("Consolas"), 12.0),
+            PillKind::Chip => (
+                Font {
+                    weight: FontWeight::MEDIUM,
+                    ..font(family.clone())
+                },
+                12.0,
+            ),
+            PillKind::Label => (
+                Font {
+                    weight: FontWeight::MEDIUM,
+                    ..font(family.clone())
+                },
+                MESSAGE_TEXT,
+            ),
+            PillKind::Snippet(_) => (font(family.clone()), MESSAGE_TEXT),
+        }
+    }
+
+    fn width(&self, window: &Window, family: &SharedString) -> f32 {
+        let (font, size) = self.font(family);
+        let run = TextRun {
+            len: self.text.len(),
+            font,
+            color: self.color,
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let shaped = window
+            .text_system()
+            .shape_line(self.text.clone(), px(size), &[run], None);
+        let width = (shaped.width / px(1.0)).ceil();
+        match self.kind {
+            PillKind::Snippet(max) => width.min(max),
+            PillKind::Chip => width + 2.0 * CHIP_PAD,
+            _ => width,
+        }
+    }
+
+    fn render(self, window: &Window, family: &SharedString) -> AnyElement {
+        let width = self.width(window, family);
+        let (font, size) = self.font(family);
+        let part = div()
+            .flex_none()
+            .w(px(width))
+            .text_size(px(size))
+            .line_height(px(20.0))
+            .font_family(font.family)
+            .font_weight(font.weight)
+            .text_color(self.color)
+            .whitespace_nowrap()
+            .overflow_hidden()
+            .text_ellipsis();
+        match self.kind {
+            PillKind::Chip => part
+                .flex()
+                .items_center()
+                .justify_center()
+                .h(px(22.0))
+                .rounded_full()
+                .bg(chip())
+                .child(self.text)
+                .into_any_element(),
+            _ => part.child(self.text).into_any_element(),
+        }
+    }
+}
+
+/// Fold the recorder's bars into the few the live pill shows.
+fn live_peaks(peaks: &[f32; WAVE_BARS]) -> [f32; LIVE_BARS] {
+    let mut out = [0.0; LIVE_BARS];
+    for (index, slot) in out.iter_mut().enumerate() {
+        let start = index * WAVE_BARS / LIVE_BARS;
+        let end = ((index + 1) * WAVE_BARS / LIVE_BARS).max(start + 1);
+        *slot = peaks[start..end]
+            .iter()
+            .copied()
+            .fold(0.0, f32::max)
+            .clamp(0.0, 1.0);
+    }
+    out
+}
+
+/// Three dots that pulse in turn while the words are worked out.
+fn finishing_dots() -> AnyElement {
+    let dots = (0..3usize).map(|index| {
+        let dot = div().flex_none().size(px(3.0)).rounded_full().bg(text());
+        if client_animations_enabled() {
+            dot.with_animation(
+                ("finishing_dot", index),
+                Animation::new(Duration::from_millis(900)).repeat(),
+                move |dot, progress| {
+                    let phase = (progress - index as f32 * 0.18).rem_euclid(1.0);
+                    dot.opacity(0.3 + 0.7 * (phase * std::f32::consts::PI).sin())
+                },
+            )
+            .into_any_element()
+        } else {
+            dot.opacity(0.7).into_any_element()
+        }
+    });
+    div()
+        .flex()
+        .items_center()
+        .gap(px(3.0))
+        .children(dots)
+        .into_any_element()
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum HudStatus {
@@ -121,8 +371,10 @@ pub struct HudView {
     /// Why the dictionary file could not be opened, shown under the Dictionary row.
     dictionary_error: Option<String>,
     pub hotkey_capturing: bool,
-    /// A take revealed the hidden overlay; hide it again once the result has shown.
-    rehide_after_take: bool,
+    pill_hovered: bool,
+    pill_motion: PillMotion,
+    /// A click on the resting pill asks the main loop to start a take.
+    pub click_dictation: bool,
     pub stop_requested: bool,
     pub retry_microphone: bool,
     pub recovery_message: Option<String>,
@@ -197,7 +449,9 @@ impl HudView {
             copied_key: None,
             expanded_history_key: None,
             copied_at: None,
-            rehide_after_take: false,
+            pill_hovered: false,
+            pill_motion: PillMotion::new(),
+            click_dictation: false,
             injector: PasteInjector::new(),
             selected_model,
             stt_engine,
@@ -267,6 +521,7 @@ impl HudView {
 
         match spec {
             PreviewSpec::BubbleIdle => {}
+            PreviewSpec::BubbleHover => self.pill_hovered = true,
             PreviewSpec::BubbleListening { loud } => {
                 self.status = HudStatus::Listening {
                     audio_level: if loud { 0.8 } else { 0.12 },
@@ -520,7 +775,6 @@ impl HudView {
                 if view.panel_motion == Some(PanelMotion::Closing { started_at }) {
                     view.mode = WindowViewMode::Bubble;
                     view.panel_motion = None;
-                    view.reveal_overlay();
                     cx.notify();
                 }
             });
@@ -528,49 +782,9 @@ impl HudView {
         .detach();
     }
 
-    pub fn hide_overlay(&mut self, cx: &mut Context<Self>) {
-        if self.hotkey_capturing {
-            self.hotkey_capturing = false;
-            hotkey::end_capture();
-        }
-        self.rehide_after_take = false;
-        self.mode = WindowViewMode::Bubble;
-        self.panel_motion = None;
-        set_window_mode(false);
-        set_overlay_hidden(true);
-        cx.notify();
-    }
-
-    pub fn reveal_overlay(&mut self) {
-        set_overlay_hidden(false);
-    }
-
-    /// Show the overlay for a take. If the user had hidden it, it hides
-    /// again after the result has shown.
-    pub fn reveal_for_take(&mut self) {
-        if is_overlay_hidden() {
-            self.rehide_after_take = true;
-        }
-        self.reveal_overlay();
-    }
-
-    /// The take's result has finished showing; put back a hidden overlay.
-    pub fn finish_take(&mut self, cx: &mut Context<Self>) {
-        if self.rehide_after_take {
-            self.hide_overlay(cx);
-        }
-    }
-
-    pub fn show_from_tray(&mut self, cx: &mut Context<Self>) {
-        self.rehide_after_take = false;
-        self.reveal_overlay();
-        cx.notify();
-    }
-
     pub fn open_settings(&mut self, cx: &mut Context<Self>) {
-        self.rehide_after_take = false;
         self.mode = WindowViewMode::StatsAndSettings;
-        self.reveal_overlay();
+        self.pill_hovered = false;
         if !preview::is_active() {
             self.stats = AppStats::load();
         }
@@ -865,8 +1079,6 @@ impl HudView {
     }
 
     pub fn set_error(&mut self, message: String) {
-        // Keep the overlay up so the user can read the error.
-        self.rehide_after_take = false;
         self.recovery_is_microphone = message.to_lowercase().contains("microphone");
         self.recovery_message = Some(message.clone());
         self.status = HudStatus::Error {
@@ -890,7 +1102,7 @@ impl Render for HudView {
         let body = if self.mode == WindowViewMode::StatsAndSettings {
             self.render_stats_settings(cx)
         } else {
-            self.render_bubble(cx)
+            self.render_bubble(window, cx)
         };
         FocusScope::new(&self.root_focus)
             .root()
@@ -900,254 +1112,305 @@ impl Render for HudView {
 }
 
 impl HudView {
-    fn render_bubble(&mut self, cx: &mut Context<'_, Self>) -> AnyElement {
-        let holding = matches!(&self.status, HudStatus::Listening { .. });
-        let font = cx.theme().font_family.clone();
-
-        let waveform = if holding {
-            let mut bars = Vec::with_capacity(WAVE_BARS);
-            let bar_color = accent();
-            for peak in self.wave_peaks {
-                let height = wave_height(peak);
-                let glow = (height * 1.55).min(28.0);
-                bars.push(
-                    div()
-                        .relative()
-                        .flex()
-                        .flex_none()
-                        .items_center()
-                        .justify_center()
-                        .w(px(WAVE_BAR_W))
-                        .h(px(28.0))
-                        .child(
-                            div()
-                                .absolute()
-                                .w(px(WAVE_BAR_W + 2.0))
-                                .h(px(glow))
-                                .rounded_full()
-                                .bg(bar_color)
-                                .opacity(0.22),
-                        )
-                        .child(
-                            div()
-                                .w(px(WAVE_BAR_W))
-                                .h(px(height))
-                                .rounded_full()
-                                .bg(bar_color)
-                                .opacity(0.5 + 0.5 * peak),
-                        ),
-                );
-            }
-            let waveform = div()
-                .flex()
-                .flex_none()
-                .items_center()
-                .justify_center()
-                .gap(px(WAVE_GAP))
-                .h(px(28.0))
-                .overflow_hidden()
-                .children(bars);
-            waveform.into_any_element()
-        } else {
-            div().into_any_element()
-        };
-
-        let center_child = match &self.status {
-            HudStatus::Idle if self.model_ready() => div()
-                .flex()
-                .flex_none()
-                .items_center()
-                .justify_center()
-                .overflow_hidden()
-                .child(controls::shortcut_keys(&self.hotkey_label))
-                .into_any_element(),
-            HudStatus::Idle => overlay_snippet("Download a model", muted()),
-            HudStatus::Success { text, .. } => overlay_snippet(text, theme::text()),
-            HudStatus::Error { message, .. } => overlay_snippet(first_sentence(message), text()),
-            HudStatus::NoSpeech => overlay_snippet("No speech detected", text()),
-            HudStatus::Transcribing { .. } => div()
-                .w(px(72.0))
-                .child(controls::indeterminate_bar("bubble_transcribe"))
-                .into_any_element(),
-            _ => waveform,
-        };
-
-        let state_key = match &self.status {
-            HudStatus::Idle => "bubble_ready",
-            HudStatus::Listening { .. } => "bubble_listening",
-            HudStatus::Transcribing { .. } => "bubble_transcribing",
-            HudStatus::Success { .. } => "bubble_success",
-            HudStatus::Error { .. } => "bubble_error",
-            HudStatus::NoSpeech => "bubble_no_speech",
-        };
-        let center_child = div()
-            .flex()
-            .flex_1()
-            .items_center()
-            .justify_center()
-            .h_full()
-            .min_w(px(0.0))
-            .overflow_hidden()
-            .child(center_child);
-        let center_child = if client_animations_enabled() {
-            center_child
-                .with_animation(
-                    state_key,
-                    Animation::new(Duration::from_millis(MOTION_MS)).with_easing(ease_out_quint()),
-                    |element, progress| element.opacity(0.7 + 0.3 * progress),
-                )
-                .into_any_element()
-        } else {
-            center_child.into_any_element()
-        };
-
-        let (status_label, status_color) = match &self.status {
-            HudStatus::Idle if !self.model_ready() => ("Set up", gold()),
-            HudStatus::Idle => ("Ready", text()),
-            HudStatus::NoSpeech => ("No speech", gold()),
-            HudStatus::Listening { .. } => ("Listening", accent()),
-            HudStatus::Transcribing { .. } => ("Transcribing", accent()),
-            HudStatus::Success { auto_pasted, .. } => {
-                (if *auto_pasted { "Pasted" } else { "Copied" }, success())
-            }
-            HudStatus::Error { .. } => ("Action needed", love()),
-        };
-
-        let left_section = div()
-            .flex()
-            .flex_none()
-            .items_center()
-            .h_full()
-            .gap(px(GAP_TIGHT))
-            .child(
-                div()
-                    .flex_none()
-                    .w(px(6.0))
-                    .h(px(6.0))
-                    .rounded_full()
-                    .bg(status_color),
-            )
-            .child(
-                div()
-                    .text_size(px(TYPE_LABEL))
-                    .line_height(px(BUBBLE_TEXT_LINE_HEIGHT))
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(status_color)
-                    .whitespace_nowrap()
-                    .child(status_label),
-            );
-
-        let timer_str = match &self.status {
+    fn render_bubble(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> AnyElement {
+        let font_family = cx.theme().font_family.clone();
+        let ready = self.model_ready();
+        // A mouse that leaves through the window edge sends no hover-out to
+        // the zone, but the window does know it lost the mouse.
+        if !preview::is_active() && !window.is_window_hovered() {
+            self.pill_hovered = false;
+        }
+        let hover_tip = self.pill_hovered && ready && matches!(self.status, HudStatus::Idle);
+        let limit_left = match &self.status {
             HudStatus::Listening { started_at, .. } => {
                 let elapsed = started_at.elapsed().as_secs();
                 let limit = crate::audio::MAX_RECORDING_SECONDS as u64;
-                if elapsed >= limit.saturating_sub(10) {
-                    format!("{}s left", limit.saturating_sub(elapsed))
-                } else {
-                    format_mmss(elapsed)
-                }
+                (elapsed >= limit.saturating_sub(10)).then(|| limit.saturating_sub(elapsed))
             }
-            HudStatus::Transcribing { recorded_for } => format_mmss(recorded_for.as_secs()),
-            _ => String::new(),
-        };
-        let latency_label = match &self.status {
-            HudStatus::Success { latency_ms, .. } => Some(format_latency_ms(*latency_ms)),
             _ => None,
         };
 
-        let right_section = div()
+        // The message is laid out first: its measured width sizes the pill.
+        let message = self.pill_message(ready);
+        let message_width = message.as_ref().map(|parts| {
+            let widths: f32 = parts
+                .iter()
+                .map(|part| part.width(window, &font_family))
+                .sum();
+            let gaps = PILL_GAP * parts.len().saturating_sub(1) as f32;
+            (widths + gaps + 2.0 * MESSAGE_PAD).min(MESSAGE_MAX_W)
+        });
+        let target = match (&self.status, message_width) {
+            (_, Some(width)) => (width, MESSAGE_H),
+            (HudStatus::Listening { .. }, _) if limit_left.is_some() => (LIVE_W + 30.0, LIVE_H),
+            (HudStatus::Listening { .. }, _) => (LIVE_W, LIVE_H),
+            (HudStatus::Transcribing { .. }, _) => FINISHING,
+            _ if hover_tip => REST_HOVER,
+            _ => REST,
+        };
+        let (size, moving) = self.pill_motion.sample(target);
+        if moving {
+            window.request_animation_frame();
+        }
+
+        // Input reaches only the pill, plus the tip while it shows.
+        let span = self.pill_motion.span();
+        let hit = (!hover_tip).then(|| {
+            let w = span.0 + 2.0 * HIT_PAD;
+            let h = span.1 + 2.0 * HIT_PAD;
+            ((BUBBLE_WIDTH - w) / 2.0, BUBBLE_HEIGHT - h, w, h)
+        });
+        if !preview::is_active() {
+            set_pill_hit_rect(hit);
+        }
+
+        let at_rest = matches!(self.status, HudStatus::Idle) && ready && !hover_tip;
+        let content: AnyElement = match (&self.status, message) {
+            (_, Some(parts)) => div()
+                .flex()
+                .items_center()
+                .gap(px(PILL_GAP))
+                .px(px(MESSAGE_PAD))
+                .children(
+                    parts
+                        .into_iter()
+                        .map(|part| part.render(window, &font_family)),
+                )
+                .into_any_element(),
+            (HudStatus::Listening { .. }, _) => self.live_wave(limit_left),
+            (HudStatus::Transcribing { .. }, _) => finishing_dots(),
+            _ => div().into_any_element(),
+        };
+        let state_key = match &self.status {
+            HudStatus::Idle => "pill_rest",
+            HudStatus::Listening { .. } => "pill_live",
+            HudStatus::Transcribing { .. } => "pill_finishing",
+            HudStatus::Success { .. } => "pill_success",
+            HudStatus::Error { .. } => "danger",
+            HudStatus::NoSpeech => "pill_no_speech",
+        };
+        let content = div()
             .flex()
             .flex_none()
             .items_center()
-            .justify_end()
+            .justify_center()
             .h_full()
-            .gap(px(GAP_TIGHT));
-
-        let right_section = if matches!(&self.status, HudStatus::Idle) {
-            right_section
-                .child(controls::hold_click(
-                    "hold_hide",
-                    controls::icon_button("hide_overlay_btn", IconName::EyeOff, "Hide").on_click(
-                        cx.listener(|this, _, _, cx| {
-                            cx.stop_propagation();
-                            this.hide_overlay(cx);
-                            cx.notify();
-                        }),
-                    ),
-                ))
-                .child(controls::hold_click(
-                    "hold_settings",
-                    controls::icon_button("open_settings_btn", IconName::Settings, "Settings")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            cx.stop_propagation();
-                            this.open_settings(cx);
-                            cx.notify();
-                        })),
-                ))
-        } else if matches!(self.status, HudStatus::Error { .. } | HudStatus::NoSpeech)
-            || (self.recovery_message.is_some() && matches!(self.status, HudStatus::Success { .. }))
-        {
-            right_section.child(controls::hold_click(
-                "hold_details",
-                controls::secondary_button("recovery_details", "Details").on_click(cx.listener(
-                    |this, _, _, cx| {
-                        this.open_settings(cx);
-                        cx.notify();
-                    },
-                )),
-            ))
-        } else if !timer_str.is_empty() {
-            right_section
-                .when(holding, |row| {
-                    row.child(controls::hold_click(
-                        "hold_stop",
-                        controls::icon_button("stop_recording", IconName::CircleStop, "Stop")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.stop_requested = true;
-                                cx.notify();
-                            })),
-                    ))
-                })
-                .child(meta_label(timer_str))
+            .child(content);
+        let content = if client_animations_enabled() {
+            content
+                .with_animation(
+                    state_key,
+                    Animation::new(Duration::from_millis(PILL_MOTION_MS)),
+                    |element, progress| element.opacity(((progress - 0.35) / 0.65).clamp(0.0, 1.0)),
+                )
+                .into_any_element()
         } else {
-            right_section
-        };
-        let right_section = if let Some(label) = latency_label {
-            right_section.child(meta_label(label))
-        } else {
-            right_section
+            content.into_any_element()
         };
 
-        div()
+        let pill = div()
             .id("recording_overlay_pill")
-            .font_family(font)
             .flex()
+            .flex_none()
             .items_center()
-            .w(px(BUBBLE_WIDTH))
-            .h(px(BUBBLE_HEIGHT))
-            .relative()
-            .rounded(r_window())
-            .bg(shell_surface())
+            .justify_center()
+            .w(px(size.0))
+            .h(px(size.1))
+            .rounded_full()
             .overflow_hidden()
-            .cursor_move()
+            .border_1()
+            .when(at_rest, |pill| {
+                pill.bg(rest_bg()).border_color(rest_edge())
+            })
+            .when(!at_rest, |pill| {
+                pill.bg(bg()).border_color(edge())
+            })
+            .when(self.pill_action().is_some(), |pill| pill.cursor_pointer())
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|_this, _, _, _| {
-                    start_window_drag();
-                }),
+                cx.listener(|this, _, _, cx| this.pill_clicked(cx)),
+            )
+            .child(content);
+
+        let zone = div()
+            .id("pill_zone")
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap(px(TIP_GAP))
+            .p(px(HIT_PAD))
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                if this.pill_hovered != *hovered {
+                    this.pill_hovered = *hovered;
+                    cx.notify();
+                }
+            }))
+            .when(hover_tip, |zone| zone.child(self.rest_tip(cx)))
+            .child(pill);
+
+        div()
+            .font_family(font_family)
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_end()
+            .w(px(BUBBLE_WIDTH))
+            .h(px(BUBBLE_HEIGHT))
+            .child(zone)
+            .into_any_element()
+    }
+
+    /// What the pill says in states that carry words. `None` keeps it wordless.
+    fn pill_message(&self, ready: bool) -> Option<Vec<PillPart>> {
+        let details = || PillPart::chip("Details");
+        Some(match &self.status {
+            HudStatus::Idle if !ready => vec![
+                PillPart::label("Download a speech model", text()),
+                PillPart::chip("Set up"),
+            ],
+            HudStatus::Success {
+                text: said,
+                auto_pasted,
+                latency_ms,
+                ..
+            } => {
+                let mut parts = vec![
+                    PillPart::label(if *auto_pasted { "Pasted" } else { "Copied" }, text()),
+                    PillPart::snippet(said, soft(), SNIPPET_MAX_W),
+                    PillPart::meta(format_latency_ms(*latency_ms)),
+                ];
+                if self.recovery_message.is_some() {
+                    parts.push(details());
+                }
+                parts
+            }
+            HudStatus::Error { message, .. } => vec![
+                PillPart::snippet(first_sentence(message), danger(), ERROR_MAX_W),
+                details(),
+            ],
+            HudStatus::NoSpeech => vec![PillPart::label("No speech detected", text()), details()],
+            _ => return None,
+        })
+    }
+
+    /// What a click on the pill does now. `None` while it only reports.
+    fn pill_action(&self) -> Option<PillAction> {
+        match &self.status {
+            HudStatus::Idle if self.model_ready() => Some(PillAction::Start),
+            HudStatus::Listening { .. } => Some(PillAction::Stop),
+            HudStatus::Idle | HudStatus::Error { .. } | HudStatus::NoSpeech => {
+                Some(PillAction::Settings)
+            }
+            HudStatus::Success { .. } if self.recovery_message.is_some() => {
+                Some(PillAction::Settings)
+            }
+            _ => None,
+        }
+    }
+
+    fn pill_clicked(&mut self, cx: &mut Context<Self>) {
+        match self.pill_action() {
+            Some(PillAction::Start) => self.click_dictation = true,
+            Some(PillAction::Stop) => self.stop_requested = true,
+            Some(PillAction::Settings) => self.open_settings(cx),
+            None => {}
+        }
+        cx.notify();
+    }
+
+    /// The live pill: a blue orb and a short white wave, as in Aqua Voice.
+    fn live_wave(&self, limit_left: Option<u64>) -> AnyElement {
+        let bars = live_peaks(&self.wave_peaks).into_iter().map(|peak| {
+            div()
+                .flex_none()
+                .w(px(LIVE_BAR_W))
+                .h(px(LIVE_BAR_MIN + (LIVE_BAR_MAX - LIVE_BAR_MIN) * peak))
+                .rounded_full()
+                .bg(text())
+                .opacity(0.7 + 0.3 * peak)
+        });
+        div()
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .child(
+                div()
+                    .flex_none()
+                    .size(px(LIVE_ORB))
+                    .rounded_full()
+                    .bg(linear_gradient(
+                        160.0,
+                        linear_color_stop(rgb(0x8ab8f5), 0.0),
+                        linear_color_stop(rgb(0x2f66c0), 1.0),
+                    )),
             )
             .child(
                 div()
                     .flex()
                     .items_center()
-                    .w_full()
-                    .h(px(BUBBLE_CONTENT_HEIGHT))
-                    .px(pad())
-                    .gap(px(GAP_TIGHT))
-                    .overflow_hidden()
-                    .child(left_section)
-                    .child(center_child)
-                    .child(right_section),
+                    .gap(px(LIVE_BAR_GAP))
+                    .h(px(LIVE_BAR_MAX))
+                    .children(bars),
+            )
+            .when_some(limit_left, |row, left| {
+                row.child(
+                    div()
+                        .text_size(px(11.0))
+                        .font_family("Consolas")
+                        .text_color(danger())
+                        .whitespace_nowrap()
+                        .child(format!("{left}s")),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// The tip over the resting pill: how to start, and a way into Settings.
+    fn rest_tip(&self, cx: &mut Context<'_, Self>) -> AnyElement {
+        div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(4.0))
+            .h(px(TIP_H))
+            .pl(px(12.0))
+            .pr(px(4.0))
+            .rounded_full()
+            .bg(bg())
+            .border_1()
+            .border_color(edge())
+            .child(
+                div()
+                    .mr(px(4.0))
+                    .text_size(px(12.0))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(text())
+                    .whitespace_nowrap()
+                    .child("Click to start dictation"),
+            )
+            .child(controls::shortcut_keys(&self.hotkey_label))
+            .child(
+                div()
+                    .id("open_settings_btn")
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .justify_center()
+                    .ml(px(2.0))
+                    .size(px(22.0))
+                    .rounded_full()
+                    .cursor_pointer()
+                    .text_color(soft())
+                    .hover(|button| button.bg(chip()).text_color(text()))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.open_settings(cx);
+                            cx.notify();
+                        }),
+                    )
+                    .child(Icon::new(IconName::Settings).size(IconSize::Xs)),
             )
             .into_any_element()
     }
@@ -1189,15 +1452,6 @@ impl HudView {
                     .min_w(px(0.0))
                     .items_center()
                     .gap(px(8.0))
-                    .cursor_move()
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|_, event: &MouseDownEvent, _window, _| {
-                            if event.click_count == 1 {
-                                start_window_drag();
-                            }
-                        }),
-                    )
                     .child(
                         div()
                             .text_size(px(TYPE_TITLE))
@@ -1283,7 +1537,9 @@ impl HudView {
             .pt(pad())
             .pb(pad())
             .rounded(r_window())
-            .bg(shell_surface())
+            .bg(bg())
+            .border_1()
+            .border_color(edge())
             .overflow_hidden()
             .child(header);
 
@@ -1709,7 +1965,7 @@ impl HudView {
                 controls::shortcut_keys(&hotkey_str)
             })
             .child(
-                controls::ghost_button(
+                controls::secondary_button(
                     "hotkey_bind_btn",
                     if capturing { "Cancel" } else { "Change" },
                 )
@@ -1995,18 +2251,6 @@ pub fn success_returns_to_idle(elapsed: Duration, has_notice: bool) -> bool {
     elapsed > hold
 }
 
-fn meta_label(text: String) -> Div {
-    div()
-        .text_size(px(TYPE_META))
-        .line_height(px(14.0))
-        .font_family("Consolas")
-        .font_weight(FontWeight::MEDIUM)
-        .text_color(muted())
-        .text_right()
-        .whitespace_nowrap()
-        .child(text)
-}
-
 fn preview_wave(loud: bool) -> [f32; WAVE_BARS] {
     let mut peaks = [0.0; WAVE_BARS];
     for (index, slot) in peaks.iter_mut().enumerate() {
@@ -2019,32 +2263,6 @@ fn preview_wave(loud: bool) -> [f32; WAVE_BARS] {
         };
     }
     peaks
-}
-
-fn wave_height(peak: f32) -> f32 {
-    let driven = peak.clamp(0.0, 1.0);
-    WAVE_FLAT + (WAVE_MAX - WAVE_FLAT) * driven
-}
-
-fn overlay_snippet(text: &str, color: impl Into<Hsla>) -> AnyElement {
-    let color = color.into();
-    div()
-        .flex()
-        .w_full()
-        .min_w(px(0.0))
-        .items_center()
-        .justify_center()
-        .h(px(28.0))
-        .overflow_hidden()
-        .child(
-            div()
-                .text_size(px(TYPE_META))
-                .line_height(px(14.0))
-                .text_color(color)
-                .truncate()
-                .child(clip_text(text, 40)),
-        )
-        .into_any_element()
 }
 
 fn history_text_overflows(text: &str, latest: bool) -> bool {

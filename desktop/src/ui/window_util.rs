@@ -1,5 +1,5 @@
 #[cfg(target_os = "windows")]
-use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT, WPARAM};
+use windows::Win32::Foundation::{BOOL, HWND, LPARAM, POINT, RECT, WPARAM};
 #[cfg(target_os = "windows")]
 use windows::Win32::Graphics::Dwm::{
     DwmGetWindowAttribute, DwmSetWindowAttribute, DWMNCRP_DISABLED, DWMWA_BORDER_COLOR,
@@ -8,8 +8,8 @@ use windows::Win32::Graphics::Dwm::{
 };
 #[cfg(target_os = "windows")]
 use windows::Win32::Graphics::Gdi::{
-    EnumDisplayMonitors, GetMonitorInfoW, MonitorFromWindow, SetWindowRgn, HDC, HMONITOR, HRGN,
-    MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    ClientToScreen, CreateRectRgn, EnumDisplayMonitors, GetMonitorInfoW, MonitorFromWindow,
+    SetWindowRgn, HDC, HMONITOR, HRGN, MONITORINFO, MONITOR_DEFAULTTONEAREST,
 };
 #[cfg(target_os = "windows")]
 use windows::Win32::System::Com::{
@@ -18,23 +18,25 @@ use windows::Win32::System::Com::{
 #[cfg(target_os = "windows")]
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 #[cfg(target_os = "windows")]
-use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetFocus};
+use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::Shell::{IVirtualDesktopManager, VirtualDesktopManager};
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetClassNameW, GetClientRect, GetForegroundWindow, GetSystemMetrics, GetWindow,
     GetWindowLongW, GetWindowRect, GetWindowThreadProcessId, IsWindow, IsWindowVisible, LoadImageW,
-    PostMessageW, SendMessageW, SetForegroundWindow, SetWindowLongW, SetWindowPos, ShowWindow,
-    SystemParametersInfoW, GWL_EXSTYLE, GWL_STYLE, GW_HWNDPREV, HTCAPTION, HWND_TOPMOST, ICON_BIG,
+    SendMessageW, SetForegroundWindow, SetWindowLongW, SetWindowPos, ShowWindow,
+    SystemParametersInfoW, GWL_EXSTYLE, GWL_STYLE, GW_HWNDPREV, HWND_TOPMOST, ICON_BIG,
     ICON_SMALL, IMAGE_ICON, LR_DEFAULTSIZE, LR_SHARED, SM_CXICON, SM_CXSMICON,
     SPI_GETCLIENTAREAANIMATION, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOMOVE,
-    SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, SW_SHOWNOACTIVATE,
-    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WM_NCLBUTTONDOWN, WM_SETICON, WS_CAPTION,
+    SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_SHOWNOACTIVATE,
+    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WM_SETICON, WS_CAPTION,
     WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP,
     WS_THICKFRAME,
 };
 
+/// The overlay canvas. The pill is drawn inside it, bottom-centered, and the
+/// window region limits input to the pill so the rest never blocks clicks.
 pub const BUBBLE_WIDTH: f32 = 400.0;
-pub const BUBBLE_HEIGHT: f32 = 42.0;
+pub const BUBBLE_HEIGHT: f32 = 64.0;
 pub const PANEL_WIDTH: i32 = 400;
 pub const PANEL_HEIGHT: i32 = 540;
 pub const PANEL_MIN_HEIGHT: i32 = 480;
@@ -58,9 +60,25 @@ fn overlay_animating() -> &'static std::sync::atomic::AtomicBool {
     &FLAG
 }
 
-fn overlay_hidden() -> &'static std::sync::atomic::AtomicBool {
-    static FLAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    &FLAG
+/// Logical (x, y, w, h) inside the canvas that takes input. `None` is the whole canvas.
+fn pill_hit_rect() -> &'static parking_lot::Mutex<Option<(f32, f32, f32, f32)>> {
+    static RECT: parking_lot::Mutex<Option<(f32, f32, f32, f32)>> = parking_lot::Mutex::new(None);
+    &RECT
+}
+
+/// Limit input on the collapsed overlay to `rect`. Only a change reaches Win32.
+pub fn set_pill_hit_rect(rect: Option<(f32, f32, f32, f32)>) {
+    {
+        let mut current = pill_hit_rect().lock();
+        if *current == rect {
+            return;
+        }
+        *current = rect;
+    }
+    #[cfg(target_os = "windows")]
+    if let Some(hwnd) = find_app_hwnd() {
+        unsafe { apply_overlay_region(hwnd) };
+    }
 }
 
 fn remembered_hwnd() -> &'static parking_lot::Mutex<Option<isize>> {
@@ -259,9 +277,6 @@ pub fn set_window_icon(hwnd: HWND) {
 /// already has WS_EX_TOPMOST. Call this from the existing overlay poll.
 #[cfg(target_os = "windows")]
 pub fn ensure_overlay_topmost() {
-    if is_overlay_hidden() {
-        return;
-    }
     let Some(hwnd) = find_app_hwnd() else {
         return;
     };
@@ -364,9 +379,32 @@ unsafe fn apply_overlay_dwm(hwnd: HWND) {
 #[cfg(target_os = "windows")]
 unsafe fn apply_overlay_region(hwnd: HWND) {
     // A GDI round region is not antialiased and produces a second, jagged
-    // curve over GPUI's GPU-painted corner. Clear it and let the transparent
-    // client surface provide the single visible rounded shape.
-    let _ = SetWindowRgn(hwnd, HRGN::default(), true);
+    // curve over GPUI's GPU-painted corner. So the region is a plain
+    // rectangle around the pill; the transparent surface draws the round shape.
+    // No region (the whole window) while the panel is open or moving.
+    let region = pill_region(hwnd).unwrap_or_default();
+    // On success the system owns the region.
+    let _ = SetWindowRgn(hwnd, region, true);
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn pill_region(hwnd: HWND) -> Option<HRGN> {
+    let collapsed = !overlay_expanded().load(std::sync::atomic::Ordering::SeqCst)
+        && !overlay_animating().load(std::sync::atomic::Ordering::SeqCst);
+    let (x, y, w, h) = (*pill_hit_rect().lock()).filter(|_| collapsed)?;
+    let mut outer = RECT::default();
+    let mut origin = POINT::default();
+    GetWindowRect(hwnd, &mut outer).ok()?;
+    ClientToScreen(hwnd, &mut origin).as_bool().then_some(())?;
+    let scale = window_scale(hwnd);
+    let (dx, dy) = (origin.x - outer.left, origin.y - outer.top);
+    let region = CreateRectRgn(
+        dx + (x * scale).floor() as i32,
+        dy + (y * scale).floor() as i32,
+        dx + ((x + w) * scale).ceil() as i32,
+        dy + ((y + h) * scale).ceil() as i32,
+    );
+    (!region.is_invalid()).then_some(region)
 }
 
 /// HWND of the app that should receive inserted text. Never the TDT overlay.
@@ -463,37 +501,19 @@ fn finish_window_mode(hwnd: HWND, is_expanded: bool) {
         }
     }
     overlay_animating().store(false, std::sync::atomic::Ordering::SeqCst);
-}
-
-pub fn is_overlay_hidden() -> bool {
-    overlay_hidden().load(std::sync::atomic::Ordering::SeqCst)
+    // Input follows the new mode: the whole panel, or only the pill.
+    unsafe { apply_overlay_region(hwnd) };
 }
 
 /// GPUI's popup can finish creation without WS_VISIBLE when the first frame
-/// was delayed. Show it without activating, unless the user hid the overlay.
+/// was delayed. Show it without activating.
 #[cfg(target_os = "windows")]
 pub fn show_overlay_window(hwnd: HWND) {
-    if hwnd.is_invalid() || is_overlay_hidden() {
+    if hwnd.is_invalid() {
         return;
     }
     unsafe {
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-    }
-}
-
-pub fn set_overlay_hidden(hidden: bool) {
-    overlay_hidden().store(hidden, std::sync::atomic::Ordering::SeqCst);
-    #[cfg(target_os = "windows")]
-    {
-        let Some(hwnd) = find_app_hwnd() else {
-            return;
-        };
-        unsafe {
-            let _ = ShowWindow(hwnd, if hidden { SW_HIDE } else { SW_SHOWNOACTIVATE });
-            if !hidden {
-                apply_overlay_window_style(hwnd);
-            }
-        }
     }
 }
 
@@ -572,9 +592,6 @@ fn bubble_outer_size(hwnd: HWND) -> (i32, i32) {
 pub fn lock_overlay_chrome() {
     #[cfg(target_os = "windows")]
     {
-        if is_overlay_hidden() {
-            return;
-        }
         let Some(hwnd) = find_app_hwnd() else {
             return;
         };
@@ -848,26 +865,6 @@ fn stored_overlay_hwnd() -> Option<HWND> {
     })
 }
 
-pub fn start_window_drag() {
-    #[cfg(target_os = "windows")]
-    {
-        // Release GPUI's client-area capture on the UI thread, then ask Windows
-        // to treat the same press as a title-bar drag. This keeps the whole
-        // borderless surface draggable without adding a visible handle.
-        if let Some(hwnd) = find_app_hwnd() {
-            unsafe {
-                let _ = ReleaseCapture();
-                let _ = PostMessageW(
-                    hwnd,
-                    WM_NCLBUTTONDOWN,
-                    WPARAM(HTCAPTION as usize),
-                    LPARAM(0),
-                );
-            }
-        }
-    }
-}
-
 #[cfg(target_os = "windows")]
 fn monitor_work_area(hwnd: HWND) -> Option<(i32, i32, i32, i32)> {
     unsafe {
@@ -1067,9 +1064,6 @@ pub fn set_window_mode(is_expanded: bool) {
 pub fn follow_current_virtual_desktop() {
     #[cfg(target_os = "windows")]
     {
-        if is_overlay_hidden() {
-            return;
-        }
         use std::time::{Duration, Instant};
         static LAST: parking_lot::Mutex<Option<Instant>> = parking_lot::Mutex::new(None);
         {

@@ -27,6 +27,7 @@ pub fn wants_panel() -> bool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Spec {
     BubbleIdle,
+    BubbleHover,
     BubbleListening { loud: bool },
     BubbleTranscribing,
     BubbleSuccess { pasted: bool },
@@ -62,6 +63,7 @@ pub enum Spec {
 #[allow(dead_code)]
 pub const CATALOG: &[&str] = &[
     "bubble.idle",
+    "bubble.hover",
     "bubble.listening.quiet",
     "bubble.listening.loud",
     "bubble.transcribing",
@@ -102,6 +104,7 @@ pub fn parse() -> Option<Spec> {
 pub fn parse_name(name: &str) -> Option<Spec> {
     Some(match name {
         "bubble.idle" => Spec::BubbleIdle,
+        "bubble.hover" => Spec::BubbleHover,
         "bubble.listening.quiet" => Spec::BubbleListening { loud: false },
         "bubble.listening.loud" => Spec::BubbleListening { loud: true },
         "bubble.transcribing" => Spec::BubbleTranscribing,

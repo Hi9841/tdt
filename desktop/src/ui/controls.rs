@@ -1,11 +1,11 @@
 //! Ely controls used by the overlay and the panel.
 //! Layout helpers stay here so the HUD does not rebuild rows by hand.
 
+use crate::ui::theme;
 use ely_gpui_component::buttons::{Button, ButtonVariant, IconButton};
 use ely_gpui_component::motion::ProgressBar;
 use ely_gpui_component::primitives::{Icon, IconName};
 use ely_gpui_component::theme::{ActiveTheme, ControlSize, IconSize, TextSize};
-use ely_gpui_component::typography::Kbd;
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 
@@ -38,15 +38,6 @@ pub fn icon_button(id: &'static str, icon: IconName, tip: &'static str) -> IconB
         .variant(ButtonVariant::Ghost)
         .size(ControlSize::Sm)
         .tooltip(tip)
-}
-
-pub fn hold_click(id: &'static str, child: impl IntoElement) -> Stateful<Div> {
-    div()
-        .id(id)
-        .on_mouse_down(MouseButton::Left, |_, _, cx| {
-            cx.stop_propagation();
-        })
-        .child(child)
 }
 
 /// One setting on a single line. The control stays on the right in a narrow panel.
@@ -212,82 +203,58 @@ pub fn progress_bar(id: &'static str, done: u64, total: u64) -> ProgressBar {
     ProgressBar::new(id, fraction)
 }
 
-pub fn indeterminate_bar(id: &'static str) -> ProgressBar {
-    ProgressBar::indeterminate(id)
-}
-
-/// Ely keycaps. `hotkey` is TDT's display form, such as `Ctrl+;`.
+/// Flat keycaps. `hotkey` is TDT's display form, such as `Ctrl+;`.
 pub fn shortcut_keys(hotkey: &str) -> AnyElement {
-    Kbd::new(&display_to_gpui(hotkey)).into_any_element()
+    let keys = hotkey_parts(hotkey).into_iter().map(|key| {
+        div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .h(px(18.0))
+            .px(px(5.0))
+            .rounded(px(4.5))
+            .bg(theme::chip())
+            .text_size(px(11.0))
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(theme::text())
+            .child(key.to_string())
+    });
+    div()
+        .flex()
+        .flex_none()
+        .items_center()
+        .gap(px(4.0))
+        .children(keys)
+        .into_any_element()
 }
 
-fn display_to_gpui(hotkey: &str) -> String {
-    // `+` can itself be the shortcut's key ("Ctrl++"), so split off the key
-    // from the right and only treat the rest as modifiers.
-    let (mods_part, key_part) = if let Some(stripped) = hotkey.strip_suffix("++") {
-        (stripped, "+")
+/// The keys of a shortcut label. `+` can itself be the key ("Ctrl++").
+fn hotkey_parts(hotkey: &str) -> Vec<&str> {
+    let (mods, key) = if let Some(mods) = hotkey.strip_suffix("++") {
+        (mods, "+")
     } else if hotkey == "+" {
         ("", "+")
     } else {
-        match hotkey.rsplit_once('+') {
-            Some((left, right)) if !right.trim().is_empty() => (left, right),
-            // A trailing "+" ("Ctrl+") names no key; treat the whole thing
-            // as modifiers like the old parser did.
-            _ => (hotkey, ""),
-        }
+        hotkey.rsplit_once('+').unwrap_or(("", hotkey))
     };
-    let parts: Vec<&str> = std::iter::once(mods_part)
-        .flat_map(|part| part.split('+'))
+    mods.split('+')
+        .chain(std::iter::once(key))
         .map(str::trim)
         .filter(|part| !part.is_empty())
-        .collect();
-    let mut mods: Vec<String> = parts
-        .iter()
-        .map(|part| match part.to_ascii_lowercase().as_str() {
-            "control" => "ctrl".to_string(),
-            "windows" => "win".to_string(),
-            other => other.to_string(),
-        })
-        .collect();
-    let key = match key_part {
-        "Backspace" => "backspace",
-        "Tab" => "tab",
-        "Enter" => "enter",
-        "Space" => "space",
-        ";" => ";",
-        "-" => "-",
-        "+" => "+",
-        other => {
-            if other.is_empty() {
-                return mods.join("-");
-            }
-            mods.push(other.to_ascii_lowercase());
-            return mods.join("-");
-        }
-    };
-    if key == "-" {
-        let mut source = mods.join("-");
-        if !source.is_empty() {
-            source.push('-');
-        }
-        source.push('-');
-        return source;
-    }
-    mods.push(key.to_string());
-    mods.join("-")
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::display_to_gpui;
+    use super::hotkey_parts;
 
     #[test]
-    fn display_shortcuts_become_gpui_keystrokes() {
-        assert_eq!(display_to_gpui("Ctrl+;"), "ctrl-;");
-        assert_eq!(display_to_gpui("Ctrl+Shift+Space"), "ctrl-shift-space");
-        assert_eq!(display_to_gpui("Ctrl+-"), "ctrl--");
-        assert_eq!(display_to_gpui("F5"), "f5");
-        assert_eq!(display_to_gpui("Ctrl+Win+A"), "ctrl-win-a");
-        assert_eq!(display_to_gpui("Ctrl++"), "ctrl-+");
+    fn shortcut_labels_split_into_keys() {
+        assert_eq!(hotkey_parts("Ctrl+;"), ["Ctrl", ";"]);
+        assert_eq!(hotkey_parts("Ctrl+Shift+Space"), ["Ctrl", "Shift", "Space"]);
+        assert_eq!(hotkey_parts("Ctrl+-"), ["Ctrl", "-"]);
+        assert_eq!(hotkey_parts("F5"), ["F5"]);
+        assert_eq!(hotkey_parts("Ctrl++"), ["Ctrl", "+"]);
+        assert_eq!(hotkey_parts("+"), ["+"]);
     }
 }
