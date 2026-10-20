@@ -6652,7 +6652,6 @@ dependencies = [
  "gpui_platform",
  "mimalloc",
  "parking_lot",
- "rayon",
  "serde",
  "serde_json",
  "sha2 0.10.9",

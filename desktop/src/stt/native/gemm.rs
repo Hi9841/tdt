@@ -5,7 +5,7 @@
 use super::buf::Buf;
 use super::fgemm;
 use super::kernels::{Isa, PackedTernary, GROUP};
-use rayon::prelude::*;
+use super::team;
 
 /// Output columns per parallel task.
 const COLUMN_BLOCK: usize = 64;
@@ -141,29 +141,27 @@ impl Ternary {
         let groups = k / group;
         let mut out = Buf::zeroed(rows * n);
         let out_ptr = SendPtr(out.as_mut_ptr());
-        (0..n.div_ceil(COLUMN_BLOCK))
-            .into_par_iter()
-            .for_each(|block| {
-                let columns = block * COLUMN_BLOCK..((block + 1) * COLUMN_BLOCK).min(n);
-                for col in columns {
-                    let codes = &self.codes[col * k..(col + 1) * k];
-                    let scales = &self.scales[col * groups..(col + 1) * groups];
-                    for row in 0..rows {
-                        let xr = &x[row * k..(row + 1) * k];
-                        let mut total = 0.0f32;
-                        for (g, scale) in scales.iter().enumerate() {
-                            let span = g * group..(g + 1) * group;
-                            let mut sum = 0.0f32;
-                            for (xv, code) in xr[span.clone()].iter().zip(&codes[span]) {
-                                sum += xv * (f32::from(*code) - 1.0);
-                            }
-                            total += sum * scale;
+        team::for_each(n.div_ceil(COLUMN_BLOCK), |block| {
+            let columns = block * COLUMN_BLOCK..((block + 1) * COLUMN_BLOCK).min(n);
+            for col in columns {
+                let codes = &self.codes[col * k..(col + 1) * k];
+                let scales = &self.scales[col * groups..(col + 1) * groups];
+                for row in 0..rows {
+                    let xr = &x[row * k..(row + 1) * k];
+                    let mut total = 0.0f32;
+                    for (g, scale) in scales.iter().enumerate() {
+                        let span = g * group..(g + 1) * group;
+                        let mut sum = 0.0f32;
+                        for (xv, code) in xr[span.clone()].iter().zip(&codes[span]) {
+                            sum += xv * (f32::from(*code) - 1.0);
                         }
-                        // SAFETY: each (row, col) is written by exactly one task.
-                        unsafe { *out_ptr.get().add(row * n + col) = total };
+                        total += sum * scale;
                     }
+                    // SAFETY: each (row, col) is written by exactly one task.
+                    unsafe { *out_ptr.get().add(row * n + col) = total };
                 }
-            });
+            }
+        });
         out
     }
 }

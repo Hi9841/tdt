@@ -4,7 +4,7 @@
 //! products in flight and reduce each one once at the end.
 
 use super::buf::Buf;
-use rayon::prelude::*;
+use super::team;
 use std::sync::OnceLock;
 
 /// Rows and columns per parallel task.
@@ -61,15 +61,13 @@ pub fn matmul_into(x: &[f32], m: usize, k: usize, w: &[f32], n: usize, out: &mut
     let (row_blocks, col_blocks) = (m.div_ceil(BLOCK), n.div_ceil(BLOCK));
     let ptr = OutPtr(out.as_mut_ptr());
     let level = level();
-    (0..row_blocks * col_blocks)
-        .into_par_iter()
-        .for_each(|task| {
-            let rows = (task / col_blocks) * BLOCK..((task / col_blocks + 1) * BLOCK).min(m);
-            let cols = (task % col_blocks) * BLOCK..((task % col_blocks + 1) * BLOCK).min(n);
-            // SAFETY: the block is inside all three buffers and belongs to this task only;
-            // the level was detected from the CPU.
-            unsafe { block(level, x, k, w, n, rows, cols, ptr) };
-        });
+    team::for_each(row_blocks * col_blocks, |task| {
+        let rows = (task / col_blocks) * BLOCK..((task / col_blocks + 1) * BLOCK).min(m);
+        let cols = (task % col_blocks) * BLOCK..((task % col_blocks + 1) * BLOCK).min(n);
+        // SAFETY: the block is inside all three buffers and belongs to this task only;
+        // the level was detected from the CPU.
+        unsafe { block(level, x, k, w, n, rows, cols, ptr) };
+    });
 }
 
 /// One block, on the calling thread.

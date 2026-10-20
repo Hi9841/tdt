@@ -7,7 +7,7 @@
 //! the weight scale and the activation scale of that group.
 
 use super::buf::Buf;
-use rayon::prelude::*;
+use super::team;
 use std::cell::RefCell;
 
 pub const GROUP: usize = 128;
@@ -127,7 +127,7 @@ impl PackedTernary {
         } else {
             tasks
         };
-        (0..tasks).into_par_iter().for_each(|task| match self.isa {
+        team::for_each(tasks, |task| match self.isa {
             Isa::Scalar => self.scalar_rows(&q, task, ptr),
             #[cfg(target_arch = "x86_64")]
             // SAFETY: Isa::detect confirmed the CPU features.
@@ -302,13 +302,21 @@ impl Quantized {
         values.resize(m * k, 0);
         let mut scales = vec![0.0f32; m * groups];
         let mut sums = vec![0i32; m * groups];
-        values
-            .par_chunks_mut(k)
-            .zip(scales.par_chunks_mut(groups))
-            .zip(sums.par_chunks_mut(groups))
-            .enumerate()
-            .with_min_len(16)
-            .for_each(|(row, ((values, scales), sums))| {
+        let (all_values, all_scales, all_sums) = (
+            team::SendPtr::new(&mut values),
+            team::SendPtr::new(&mut scales),
+            team::SendPtr::new(&mut sums),
+        );
+        team::for_each(m.div_ceil(QUANTIZE_ROWS), |block| {
+            for row in block * QUANTIZE_ROWS..((block + 1) * QUANTIZE_ROWS).min(m) {
+                // SAFETY: each row belongs to one task; the buffers outlive the step.
+                let (values, scales, sums) = unsafe {
+                    (
+                        all_values.slice_mut(row * k, k),
+                        all_scales.slice_mut(row * groups, groups),
+                        all_sums.slice_mut(row * groups, groups),
+                    )
+                };
                 let src = &x[row * k..(row + 1) * k];
                 for g in 0..groups {
                     let span = g * GROUP..(g + 1) * GROUP;
@@ -328,7 +336,8 @@ impl Quantized {
                     scales[g] = scale;
                     sums[g] = sum;
                 }
-            });
+            }
+        });
         Self {
             m,
             values,
@@ -337,6 +346,9 @@ impl Quantized {
         }
     }
 }
+
+/// Rows per quantization task: a short take still splits, a row is never shared.
+const QUANTIZE_ROWS: usize = 8;
 
 thread_local! {
     static QUANTIZED: RefCell<Vec<i8>> = const { RefCell::new(Vec::new()) };
@@ -556,15 +568,6 @@ mod bench {
                 std::hint::black_box(layer.forward(&x, m));
             }
             let secs = started.elapsed().as_secs_f64() / runs as f64;
-            let one = rayon::ThreadPoolBuilder::new()
-                .num_threads(1)
-                .build()
-                .unwrap();
-            let single = one.install(|| {
-                let started = std::time::Instant::now();
-                std::hint::black_box(layer.forward(&x, m));
-                started.elapsed().as_secs_f64()
-            });
             let quant = {
                 let started = std::time::Instant::now();
                 for _ in 0..runs {
@@ -573,28 +576,12 @@ mod bench {
                 started.elapsed().as_secs_f64() / runs as f64
             };
             let macs = (m * n * k) as f64;
-            for threads in [1usize, 4, 8, 16] {
-                let pool = rayon::ThreadPoolBuilder::new()
-                    .num_threads(threads)
-                    .build()
-                    .unwrap();
-                let t = pool.install(|| {
-                    let _ = layer.forward(&x, m);
-                    let started = std::time::Instant::now();
-                    for _ in 0..runs {
-                        std::hint::black_box(layer.forward(&x, m));
-                    }
-                    started.elapsed().as_secs_f64() / runs as f64
-                });
-                println!(
-                    "  {threads:2} threads: {:.3} ms ({:.0} GMAC/s)",
-                    t * 1e3,
-                    macs / t / 1e9
-                );
-            }
             println!(
-                "{:?} m{m} n{n} k{k}: {:.2} ms all threads ({:.0} GMAC/s), {:.2} ms one thread ({:.0} GMAC/s), quantize {:.3} ms",
-                layer.isa, secs * 1e3, macs / secs / 1e9, single * 1e3, macs / single / 1e9, quant * 1e3
+                "{:?} m{m} n{n} k{k}: {:.3} ms ({:.0} GMAC/s), quantize {:.3} ms",
+                layer.isa,
+                secs * 1e3,
+                macs / secs / 1e9,
+                quant * 1e3
             );
         }
     }

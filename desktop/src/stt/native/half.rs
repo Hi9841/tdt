@@ -3,8 +3,8 @@
 //! keeping the weights as stored (f16) halves it at no loss of precision.
 
 use super::buf::Buf;
+use super::team;
 use super::tensors::f16_to_f32;
-use rayon::prelude::*;
 use std::sync::OnceLock;
 
 /// Output rows per parallel task.
@@ -96,26 +96,24 @@ impl HalfDense {
         let (n, k) = (self.out_features, self.in_features);
         let mut out = Buf::zeroed(n);
         let level = level();
-        out.par_chunks_mut(ROWS_PER_TASK)
-            .enumerate()
-            .for_each(|(task, rows)| {
-                let first = task * ROWS_PER_TASK;
-                let weights = &self.weight[first * k..(first + rows.len()) * k];
-                match level {
-                    #[cfg(target_arch = "x86_64")]
-                    // SAFETY: the level was detected from the CPU.
-                    Level::Avx512 => unsafe { avx512_rows(weights, k, x, rows) },
-                    #[cfg(target_arch = "x86_64")]
-                    // SAFETY: the level was detected from the CPU.
-                    Level::Avx2 => unsafe { avx2_rows(weights, k, x, rows) },
-                    Level::Scalar => scalar_rows(weights, k, x, rows),
+        team::chunks_mut(&mut out, ROWS_PER_TASK, |task, rows| {
+            let first = task * ROWS_PER_TASK;
+            let weights = &self.weight[first * k..(first + rows.len()) * k];
+            match level {
+                #[cfg(target_arch = "x86_64")]
+                // SAFETY: the level was detected from the CPU.
+                Level::Avx512 => unsafe { avx512_rows(weights, k, x, rows) },
+                #[cfg(target_arch = "x86_64")]
+                // SAFETY: the level was detected from the CPU.
+                Level::Avx2 => unsafe { avx2_rows(weights, k, x, rows) },
+                Level::Scalar => scalar_rows(weights, k, x, rows),
+            }
+            if let Some(bias) = &self.bias {
+                for (o, b) in rows.iter_mut().zip(&bias[first..]) {
+                    *o += b;
                 }
-                if let Some(bias) = &self.bias {
-                    for (o, b) in rows.iter_mut().zip(&bias[first..]) {
-                        *o += b;
-                    }
-                }
-            });
+            }
+        });
         out
     }
 }

@@ -91,14 +91,12 @@ fn the_int8_engine_stays_close_to_the_open_reference() {
     let (features, frames) = engine.frontend.compute(&audio);
     for _ in 0..2 {
         let started = std::time::Instant::now();
-        let (encoded, t) = engine
-            .pool
-            .install(|| engine.model.encode(&features, frames));
+        let (encoded, t) = engine.model.encode(&features, frames);
         println!("encode {} ms for {t} frames", started.elapsed().as_millis());
         compare("encoder", &encoded, &load(&dir, "encoder"));
         let projected = engine.model.project(&encoded, t);
         let started = std::time::Instant::now();
-        let tokens = engine.pool.install(|| engine.model.decode(&projected, t));
+        let tokens = engine.model.decode(&projected, t);
         println!("decode {} ms", started.elapsed().as_millis());
         println!("text {:?}", engine.tokenizer.decode(&tokens));
     }

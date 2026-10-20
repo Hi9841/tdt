@@ -9,6 +9,7 @@ mod gemm;
 mod half;
 mod kernels;
 mod model;
+mod team;
 mod tensors;
 mod tokenizer;
 
@@ -18,9 +19,6 @@ pub use gemm::Precision;
 pub use model::Config;
 
 pub struct NativeParakeet {
-    /// One thread per physical core. A second thread on a core shares its
-    /// vector units and only adds contention.
-    pool: rayon::ThreadPool,
     model: model::Parakeet,
     frontend: features::MelFrontend,
     tokenizer: tokenizer::Tokenizer,
@@ -35,16 +33,13 @@ impl NativeParakeet {
         let config_text = std::fs::read_to_string(model_dir.join("config.json"))
             .map_err(|e| format!("Could not read config.json: {e}"))?;
         let config = Config::parse(&config_text)?;
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(engine_threads())
-            .thread_name(|i| format!("tdt-speech-{i}"))
-            .build()
-            .map_err(|e| format!("Could not start speech threads: {e}"))?;
+        // One thread per physical core of one L3 domain. A second thread on a
+        // core shares its vector units and only adds contention.
+        team::init(engine_threads());
         let tensors = tensors::Tensors::open(&model_dir.join("model.safetensors"))?;
         let frontend = features::MelFrontend::new(config.mels);
-        let model = pool.install(|| model::Parakeet::load(&tensors, config, precision))?;
+        let model = model::Parakeet::load(&tensors, config, precision)?;
         Ok(Self {
-            pool,
             model,
             frontend,
             tokenizer: tokenizer::Tokenizer::open(&model_dir.join("tokenizer.json"))?,
@@ -58,10 +53,6 @@ impl NativeParakeet {
     }
 
     pub fn tokens(&self, samples: &[f32]) -> Vec<usize> {
-        self.pool.install(|| self.tokens_in_pool(samples))
-    }
-
-    fn tokens_in_pool(&self, samples: &[f32]) -> Vec<usize> {
         let (features, frames) = self.frontend.compute(samples);
         // The subsampling needs at least one output frame per stage.
         if frames < 8 {

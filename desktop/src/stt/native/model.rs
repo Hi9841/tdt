@@ -5,8 +5,8 @@ use super::buf::Buf;
 use super::fgemm;
 use super::gemm::{Dense, Precision, Ternary};
 use super::half::HalfDense;
+use super::team;
 use super::tensors::Tensors;
-use rayon::prelude::*;
 
 const LAYER_NORM_EPS: f32 = 1e-5;
 const BATCH_NORM_EPS: f32 = 1e-5;
@@ -96,16 +96,15 @@ impl Norm {
     fn apply(&self, x: &[f32]) -> Buf {
         let size = self.weight.len();
         let mut out = Buf::zeroed(x.len());
-        out.par_chunks_mut(size)
-            .zip(x.par_chunks(size))
-            .for_each(|(o, row)| {
-                let mean = row.iter().sum::<f32>() / size as f32;
-                let var = row.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / size as f32;
-                let inv = 1.0 / (var + LAYER_NORM_EPS).sqrt();
-                for i in 0..size {
-                    o[i] = (row[i] - mean) * inv * self.weight[i] + self.bias[i];
-                }
-            });
+        team::chunks_mut(&mut out, size, |index, o| {
+            let row = &x[index * size..(index + 1) * size];
+            let mean = row.iter().sum::<f32>() / size as f32;
+            let var = row.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / size as f32;
+            let inv = 1.0 / (var + LAYER_NORM_EPS).sqrt();
+            for i in 0..size {
+                o[i] = (row[i] - mean) * inv * self.weight[i] + self.bias[i];
+            }
+        });
         out
     }
 
@@ -113,20 +112,21 @@ impl Norm {
     fn residual(&self, x: &mut [f32], y: &[f32], scale: f32) -> Buf {
         let size = self.weight.len();
         let mut out = Buf::zeroed(x.len());
-        out.par_chunks_mut(size)
-            .zip(x.par_chunks_mut(size))
-            .zip(y.par_chunks(size))
-            .for_each(|((o, row), add)| {
-                for (v, a) in row.iter_mut().zip(add) {
-                    *v += scale * a;
-                }
-                let mean = row.iter().sum::<f32>() / size as f32;
-                let var = row.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / size as f32;
-                let inv = 1.0 / (var + LAYER_NORM_EPS).sqrt();
-                for i in 0..size {
-                    o[i] = (row[i] - mean) * inv * self.weight[i] + self.bias[i];
-                }
-            });
+        let rows = team::SendPtr::new(x);
+        team::chunks_mut(&mut out, size, |index, o| {
+            // SAFETY: each row of `x` belongs to the task of the same output row.
+            let row = unsafe { rows.slice_mut(index * size, size) };
+            let add = &y[index * size..(index + 1) * size];
+            for (v, a) in row.iter_mut().zip(add) {
+                *v += scale * a;
+            }
+            let mean = row.iter().sum::<f32>() / size as f32;
+            let var = row.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / size as f32;
+            let inv = 1.0 / (var + LAYER_NORM_EPS).sqrt();
+            for i in 0..size {
+                o[i] = (row[i] - mean) * inv * self.weight[i] + self.bias[i];
+            }
+        });
         out
     }
 }
@@ -248,7 +248,7 @@ impl Subsampling {
         let (h1, w1) = (half(frames), half(mels));
         let mut x = Buf::zeroed(h1 * w1 * ch);
         let (weight, bias) = &self.conv0;
-        x.par_chunks_mut(w1 * ch).enumerate().for_each(|(h, row)| {
+        team::chunks_mut(&mut x, w1 * ch, |h, row| {
             for w in 0..w1 {
                 let cell = &mut row[w * ch..(w + 1) * ch];
                 cell.copy_from_slice(bias);
@@ -304,26 +304,24 @@ fn depthwise(
 ) -> (Buf, usize, usize) {
     let (ho, wo) = (half(h), half(w));
     let mut out = Buf::zeroed(ho * wo * ch);
-    out.par_chunks_mut(wo * ch)
-        .enumerate()
-        .for_each(|(oh, row)| {
-            for ow in 0..wo {
-                let cell = &mut row[ow * ch..(ow + 1) * ch];
-                cell.copy_from_slice(bias);
-                for i in 0..3 {
-                    for j in 0..3 {
-                        let (ih, iw) = (2 * oh + i, 2 * ow + j);
-                        if ih == 0 || iw == 0 || ih > h || iw > w {
-                            continue;
-                        }
-                        let input = &x[((ih - 1) * w + (iw - 1)) * ch..][..ch];
-                        for c in 0..ch {
-                            cell[c] += weight[c * 9 + i * 3 + j] * input[c];
-                        }
+    team::chunks_mut(&mut out, wo * ch, |oh, row| {
+        for ow in 0..wo {
+            let cell = &mut row[ow * ch..(ow + 1) * ch];
+            cell.copy_from_slice(bias);
+            for i in 0..3 {
+                for j in 0..3 {
+                    let (ih, iw) = (2 * oh + i, 2 * ow + j);
+                    if ih == 0 || iw == 0 || ih > h || iw > w {
+                        continue;
+                    }
+                    let input = &x[((ih - 1) * w + (iw - 1)) * ch..][..ch];
+                    for c in 0..ch {
+                        cell[c] += weight[c * 9 + i * 3 + j] * input[c];
                     }
                 }
             }
-        });
+        }
+    });
     (out, ho, wo)
 }
 
@@ -399,7 +397,9 @@ impl Block {
 
     fn feed_forward((up, down): &(Ternary, Ternary), x: &[f32], frames: usize) -> Buf {
         let mut hidden = up.forward(x, frames);
-        hidden.par_iter_mut().for_each(|v| *v = silu(*v));
+        team::chunks_mut(&mut hidden, 4096, |_, values| {
+            values.iter_mut().for_each(|v| *v = silu(*v));
+        });
         down.forward(&hidden, frames)
     }
 
@@ -423,16 +423,11 @@ impl Block {
         let scale = 1.0 / (hd as f32).sqrt();
         let p = 2 * t - 1;
         let mut context = Buf::zeroed(t * d);
-        let per_head: Vec<Buf> = (0..heads)
-            .into_par_iter()
-            .map(|h| {
-                let cols = h * hd..(h + 1) * hd;
-                // Columns of head h from a matrix with `stride` values per row.
-                let head = |src: &[f32],
-                            stride: usize,
-                            offset: usize,
-                            rows: usize,
-                            bias: Option<&[f32]>| {
+        let per_head: Vec<Buf> = team::map(heads, |h| {
+            let cols = h * hd..(h + 1) * hd;
+            // Columns of head h from a matrix with `stride` values per row.
+            let head =
+                |src: &[f32], stride: usize, offset: usize, rows: usize, bias: Option<&[f32]>| {
                     let mut out = Vec::with_capacity(rows * hd);
                     for i in 0..rows {
                         let row = &src[i * stride + offset..][cols.clone()];
@@ -443,36 +438,35 @@ impl Block {
                     }
                     out
                 };
-                let qu = head(&qkv, 3 * d, 0, t, Some(&self.bias_u[cols.clone()]));
-                let qv = head(&qkv, 3 * d, 0, t, Some(&self.bias_v[cols.clone()]));
-                let ac = fgemm::matmul(&qu, t, hd, &head(&qkv, 3 * d, d, t, None), t);
-                let bd = fgemm::matmul(&qv, t, hd, &head(&r, d, 0, p, None), p);
-                let mut probs = Buf::zeroed(t * t);
-                for (i, row) in probs.chunks_exact_mut(t).enumerate() {
-                    // Column t-1-i+j of the position product is relative position i - j.
-                    let shifted = &bd[i * p + (t - 1 - i)..][..t];
-                    let mut max = f32::NEG_INFINITY;
-                    for j in 0..t {
-                        row[j] = (ac[i * t + j] + shifted[j]) * scale;
-                        max = max.max(row[j]);
-                    }
-                    let mut total = 0.0f32;
-                    for value in row.iter_mut() {
-                        *value = (*value - max).exp();
-                        total += *value;
-                    }
-                    let inv = 1.0 / total;
-                    row.iter_mut().for_each(|value| *value *= inv);
-                }
-                let mut v_t = Buf::zeroed(hd * t);
+            let qu = head(&qkv, 3 * d, 0, t, Some(&self.bias_u[cols.clone()]));
+            let qv = head(&qkv, 3 * d, 0, t, Some(&self.bias_v[cols.clone()]));
+            let ac = fgemm::matmul(&qu, t, hd, &head(&qkv, 3 * d, d, t, None), t);
+            let bd = fgemm::matmul(&qv, t, hd, &head(&r, d, 0, p, None), p);
+            let mut probs = Buf::zeroed(t * t);
+            for (i, row) in probs.chunks_exact_mut(t).enumerate() {
+                // Column t-1-i+j of the position product is relative position i - j.
+                let shifted = &bd[i * p + (t - 1 - i)..][..t];
+                let mut max = f32::NEG_INFINITY;
                 for j in 0..t {
-                    for (e, value) in qkv[j * 3 * d + 2 * d..][cols.clone()].iter().enumerate() {
-                        v_t[e * t + j] = *value;
-                    }
+                    row[j] = (ac[i * t + j] + shifted[j]) * scale;
+                    max = max.max(row[j]);
                 }
-                fgemm::matmul(&probs, t, t, &v_t, hd)
-            })
-            .collect();
+                let mut total = 0.0f32;
+                for value in row.iter_mut() {
+                    *value = (*value - max).exp();
+                    total += *value;
+                }
+                let inv = 1.0 / total;
+                row.iter_mut().for_each(|value| *value *= inv);
+            }
+            let mut v_t = Buf::zeroed(hd * t);
+            for j in 0..t {
+                for (e, value) in qkv[j * 3 * d + 2 * d..][cols.clone()].iter().enumerate() {
+                    v_t[e * t + j] = *value;
+                }
+            }
+            fgemm::matmul(&probs, t, t, &v_t, hd)
+        });
         for (h, out) in per_head.iter().enumerate() {
             for i in 0..t {
                 context[i * d + h * hd..i * d + (h + 1) * hd]
@@ -489,16 +483,14 @@ impl Block {
         let pad = (kernel - 1) / 2;
         let wide = self.pw1.forward(x, t);
         let mut gated = Buf::zeroed(t * d);
-        gated
-            .par_chunks_mut(d)
-            .zip(wide.par_chunks(2 * d))
-            .for_each(|(out, row)| {
-                for ch in 0..d {
-                    out[ch] = row[ch] * sigmoid(row[d + ch]);
-                }
-            });
+        team::chunks_mut(&mut gated, d, |index, out| {
+            let row = &wide[index * 2 * d..(index + 1) * 2 * d];
+            for ch in 0..d {
+                out[ch] = row[ch] * sigmoid(row[d + ch]);
+            }
+        });
         let mut mixed = Buf::zeroed(t * d);
-        mixed.par_chunks_mut(d).enumerate().for_each(|(i, out)| {
+        team::chunks_mut(&mut mixed, d, |i, out| {
             for k in 0..kernel {
                 let src = i + k;
                 if src < pad || src - pad >= t {
@@ -524,7 +516,7 @@ fn relative_positions(t: usize, d: usize) -> Vec<f32> {
         .map(|i| 1.0 / 10000f32.powf((2 * i) as f32 / d as f32))
         .collect();
     let mut table = vec![0.0f32; rows * d];
-    table.par_chunks_mut(d).enumerate().for_each(|(p, row)| {
+    team::chunks_mut(&mut table, d, |p, row| {
         let position = (t - 1) as f32 - p as f32;
         for (i, freq) in inv_freq.iter().enumerate() {
             let angle = position * freq;
@@ -561,9 +553,8 @@ impl Parakeet {
     pub fn load(t: &Tensors, config: Config, precision: Precision) -> Result<Self, String> {
         let c = &config;
         let dh = c.decoder_hidden;
-        let blocks = (0..c.layers)
-            .into_par_iter()
-            .map(|index| Block::load(t, c, index, precision))
+        let blocks = team::map(c.layers, |index| Block::load(t, c, index, precision))
+            .into_iter()
             .collect::<Result<Vec<_>, _>>()?;
         let lstm = (0..c.decoder_layers)
             .map(|l| -> Result<Lstm, String> {
