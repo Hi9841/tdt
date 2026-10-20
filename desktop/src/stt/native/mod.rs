@@ -2,6 +2,7 @@
 //! The model files are read as published (CC-BY-4.0); the network follows
 //! the Apache-2.0 Hugging Face Parakeet implementation.
 
+mod bias;
 mod buf;
 mod features;
 mod fgemm;
@@ -13,13 +14,18 @@ mod team;
 mod tensors;
 mod tokenizer;
 
+use parking_lot::RwLock;
 use std::path::Path;
+
+pub use bias::BiasWeights;
 
 pub use gemm::Precision;
 pub use model::Config;
 
 pub struct NativeParakeet {
     model: model::Parakeet,
+    /// The user's dictionary as token paths; empty means plain greedy decoding.
+    dictionary: RwLock<Option<bias::Bias>>,
     frontend: features::MelFrontend,
     tokenizer: tokenizer::Tokenizer,
 }
@@ -46,10 +52,43 @@ impl NativeParakeet {
             model.warm_positions();
         }
         Ok(Self {
+            dictionary: RwLock::new(None),
             model,
             frontend,
             tokenizer: tokenizer::Tokenizer::open(&model_dir.join("tokenizer.json"))?,
         })
+    }
+
+    /// Terms to favor while decoding, as written ("Kubernetes", "PostgreSQL").
+    /// Returns the terms the vocabulary cannot spell; they are skipped.
+    pub fn set_dictionary(&self, terms: &[String], weights: BiasWeights) -> Vec<String> {
+        let mut paths = Vec::new();
+        let mut skipped = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for term in terms.iter().map(|t| t.trim()).filter(|t| !t.is_empty()) {
+            let Some(written) = self.tokenizer.encode(term) else {
+                skipped.push(term.to_string());
+                continue;
+            };
+            for (variant, rewrite) in bias::variants(term) {
+                let Some(path) = self.tokenizer.encode(&variant) else {
+                    continue;
+                };
+                if seen.insert(path.clone()) {
+                    paths.push(bias::Term {
+                        written: (path != written).then(|| written.clone()),
+                        always: rewrite,
+                        path,
+                    });
+                }
+            }
+        }
+        let letters: Vec<usize> = (0..self.tokenizer.len())
+            .map(|id| self.tokenizer.letters(id))
+            .collect();
+        let bias = bias::Bias::new(paths, &letters, self.tokenizer.word_starts(), weights);
+        *self.dictionary.write() = (!bias.is_empty()).then_some(bias);
+        skipped
     }
 
     /// 16 kHz mono samples to text.
@@ -66,7 +105,8 @@ impl NativeParakeet {
         }
         let (encoded, t) = self.model.encode(&features, frames);
         let projected = self.model.project(&encoded, t);
-        self.model.decode(&projected, t)
+        let dictionary = self.dictionary.read();
+        self.model.decode(&projected, t, dictionary.as_ref())
     }
 }
 

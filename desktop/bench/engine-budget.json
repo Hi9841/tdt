@@ -1,4 +1,16 @@
 {
+  "accuracy/librispeech-clean-200-errors": {
+    "updated": "2026-10-20",
+    "value": 81
+  },
+  "accuracy/librispeech-other-200-errors": {
+    "updated": "2026-10-20",
+    "value": 175
+  },
+  "accuracy/tech-errors-with-dev-terms": {
+    "updated": "2026-10-20",
+    "value": 22
+  },
   "engine/word-errors": {
     "updated": "2026-10-20",
     "value": 8

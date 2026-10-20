@@ -1,6 +1,7 @@
 //! Parakeet TDT: a FastConformer encoder and a token-and-duration transducer.
 //! The structure follows the Apache-2.0 Hugging Face `ParakeetForTDT`.
 
+use super::bias::{Bias, BiasState};
 use super::buf::Buf;
 use super::fgemm;
 use super::gemm::{Dense, Precision, Ternary};
@@ -758,7 +759,8 @@ impl Parakeet {
     }
 
     /// Greedy TDT decoding over projected encoder frames (`t x decoder_hidden`).
-    pub fn decode(&self, projected: &[f32], t: usize) -> Vec<usize> {
+    /// `bias` boosts dictionary terms; see `bias.rs`.
+    pub fn decode(&self, projected: &[f32], t: usize, bias: Option<&Bias>) -> Vec<usize> {
         let c = &self.config;
         let dh = c.decoder_hidden;
         let mut state = DecoderState {
@@ -769,18 +771,48 @@ impl Parakeet {
         let mut tokens = Vec::new();
         let (mut frame, mut symbols) = (0usize, 0usize);
         let mut joint_in = vec![0.0f32; dh];
+        let mut matched = BiasState::default();
+        // Whether a bonus changed a choice in the current match, and a
+        // completed term waiting for the next word to start before it is rewritten.
+        let mut decisive = false;
+        let mut pending: Option<(std::ops::Range<usize>, Vec<usize>)> = None;
         while frame < t {
             let enc = &projected[frame * dh..(frame + 1) * dh];
             for i in 0..dh {
                 joint_in[i] = (enc[i] + dec[i]).max(0.0);
             }
-            let logits = self.joint.matvec(&joint_in);
+            let mut logits = self.joint.matvec(&joint_in);
+            let own = argmax(&logits[..c.vocab]);
+            if let Some(bias) = bias {
+                bias.apply(matched, &mut logits[..c.vocab]);
+            }
             let token = argmax(&logits[..c.vocab]);
             let mut duration = c.durations[argmax(&logits[c.vocab..])];
             if token == c.blank {
                 duration = duration.max(1);
             } else {
-                tokens.push(token);
+                if let Some(bias) = bias {
+                    // "rest" must not become "REST" inside "restart": a term is
+                    // rewritten only when the next word starts.
+                    if let Some((span, written)) = pending.take() {
+                        if bias.starts_word(token) {
+                            tokens.splice(span, written);
+                        }
+                    }
+                    let fresh = matched == BiasState::default();
+                    decisive = (decisive && !fresh) || token != own;
+                    tokens.push(token);
+                    let (next, completion) = bias.advance(matched, token);
+                    matched = next;
+                    if let Some(done) = completion {
+                        if let Some(written) = bias.replacement(done, decisive) {
+                            let end = tokens.len();
+                            pending = Some((end - done.len..end, written.to_vec()));
+                        }
+                    }
+                } else {
+                    tokens.push(token);
+                }
                 dec = self.decoder_step(token, &mut state);
                 symbols += 1;
                 if duration == 0 && symbols >= c.max_symbols {
@@ -791,6 +823,9 @@ impl Parakeet {
                 symbols = 0;
             }
             frame += duration;
+        }
+        if let Some((span, written)) = pending {
+            tokens.splice(span, written);
         }
         tokens
     }

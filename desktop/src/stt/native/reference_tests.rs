@@ -73,7 +73,7 @@ fn the_engine_matches_the_open_reference() {
     let projected = engine.model.project(&encoded, t);
     compare("projected", &projected, &load(&dir, "projected"));
 
-    let tokens = engine.model.decode(&projected, t);
+    let tokens = engine.model.decode(&projected, t, None);
     let expected: Vec<usize> = load(&dir, "tokens").iter().map(|v| *v as usize).collect();
     println!("text {:?}", engine.tokenizer.decode(&tokens));
     assert_eq!(tokens, expected);
@@ -96,8 +96,36 @@ fn the_int8_engine_stays_close_to_the_open_reference() {
         compare("encoder", &encoded, &load(&dir, "encoder"));
         let projected = engine.model.project(&encoded, t);
         let started = std::time::Instant::now();
-        let tokens = engine.model.decode(&projected, t);
+        let tokens = engine.model.decode(&projected, t, None);
         println!("decode {} ms", started.elapsed().as_millis());
         println!("text {:?}", engine.tokenizer.decode(&tokens));
+    }
+}
+
+#[test]
+#[ignore = "needs the installed model"]
+fn dictionary_terms_encode_like_the_reference_tokenizer() {
+    let Some(model_dir) = find_dir(DEFAULT, None) else {
+        println!("skipped: no model");
+        return;
+    };
+    let tokenizer =
+        super::tokenizer::Tokenizer::open(&model_dir.join("tokenizer.json")).expect("tokenizer");
+    // Ids from the Hugging Face tokenizers library on the same tokenizer.json.
+    let golden: [(&str, &[usize]); 7] = [
+        ("Kubernetes", &[3363, 748, 1999, 283]),
+        ("PostgreSQL", &[373, 487, 7881, 306, 7923, 8047, 7968]),
+        ("Nginx", &[382, 4739, 7950]),
+        ("NumPy", &[382, 385, 7946, 7893]),
+        ("systemd", &[6499, 7874]),
+        ("Heroku", &[3858, 5638]),
+        (
+            "Kubernetes secrets",
+            &[3363, 748, 1999, 283, 2655, 1531, 7870],
+        ),
+    ];
+    for (text, ids) in golden {
+        assert_eq!(tokenizer.encode(text).as_deref(), Some(ids), "{text}");
+        assert_eq!(tokenizer.decode(ids), text);
     }
 }

@@ -1,16 +1,17 @@
 //! Speech benchmark: latency after release and word error rate.
 //!
-//! `cargo run --release --bin bench-asr -- [--dir PATH] [--realtime] [--repeat N] [--native]`
+//! `cargo run --release --bin bench-asr -- [--dir PATH] [--realtime] [--repeat N] [--native] [--exact]`
 //!
 //! Each `clip.wav` may have a `clip.txt` reference transcript next to it.
 //! `--realtime` feeds audio at speaking pace, so latency is the wait a user
 //! has after the key is released. Without it, all audio arrives at once.
 //! `--native` runs TDT's Rust engine on each whole clip instead of the app path.
+//! `--exact` does the same with f32 activations, as the reference does.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use voice_stt_desktop::stt::models::{find_dir, ModelSpec, CATALOG};
-use voice_stt_desktop::stt::native::NativeParakeet;
+use voice_stt_desktop::stt::native::{BiasWeights, NativeParakeet, Precision};
 use voice_stt_desktop::stt::{pcm16_wav, LiveAudio, SttEngine};
 
 #[global_allocator]
@@ -35,6 +36,7 @@ struct Options {
     dir: PathBuf,
     realtime: bool,
     native: bool,
+    exact: bool,
     repeat: usize,
 }
 
@@ -45,6 +47,7 @@ fn parse_options() -> Options {
             .unwrap_or_else(|| std::env::temp_dir().join("tdt-bench-audio")),
         realtime: false,
         native: false,
+        exact: false,
         repeat: 1,
     };
     let mut args = std::env::args().skip(1);
@@ -53,6 +56,10 @@ fn parse_options() -> Options {
             "--dir" => options.dir = args.next().map(PathBuf::from).unwrap_or(options.dir),
             "--realtime" => options.realtime = true,
             "--native" => options.native = true,
+            "--exact" => {
+                options.native = true;
+                options.exact = true;
+            }
             "--repeat" => {
                 options.repeat = args
                     .next()
@@ -255,7 +262,12 @@ fn bench_native(clips: &[Clip], options: &Options) {
         return;
     };
     let started = Instant::now();
-    let engine = match NativeParakeet::load(&model_dir) {
+    let precision = if options.exact {
+        Precision::Exact
+    } else {
+        Precision::Int8
+    };
+    let engine = match NativeParakeet::load_with(&model_dir, precision) {
         Ok(engine) => engine,
         Err(e) => {
             println!("Failed to load the native engine: {e}");
@@ -263,10 +275,38 @@ fn bench_native(clips: &[Clip], options: &Options) {
         }
     };
     println!(
-        "
-Native engine. Init: {} ms",
+        "\nNative engine. Init: {} ms",
         started.elapsed().as_millis()
     );
+    // TDT_DICTIONARY: one term per line. TDT_BIAS: "start,cont,margin[,min_start,min_prefix]".
+    if let Some(path) = std::env::var_os("TDT_DICTIONARY") {
+        let terms: Vec<String> = std::fs::read_to_string(&path)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        let mut weights = BiasWeights::default();
+        if let Ok(spec) = std::env::var("TDT_BIAS") {
+            let values: Vec<f32> = spec
+                .split(',')
+                .filter_map(|v| v.trim().parse().ok())
+                .collect();
+            if let [start, cont, margin, rest @ ..] = values.as_slice() {
+                weights = BiasWeights {
+                    start: *start,
+                    cont: *cont,
+                    margin: *margin,
+                    min_start: rest.first().map_or(weights.min_start, |v| *v as usize),
+                    min_prefix: rest.get(1).map_or(weights.min_prefix, |v| *v as usize),
+                };
+            }
+        }
+        let skipped = engine.set_dictionary(&terms, weights);
+        println!(
+            "Dictionary: {} terms, {weights:?}, skipped {skipped:?}",
+            terms.len() - skipped.len()
+        );
+    }
     for run in 1..=options.repeat {
         let (mut errors, mut format_errors, mut words) = (0, 0, 0);
         let mut latencies = Vec::new();
