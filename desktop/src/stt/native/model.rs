@@ -7,6 +7,8 @@ use super::gemm::{Dense, Precision, Ternary};
 use super::half::HalfDense;
 use super::team;
 use super::tensors::Tensors;
+use parking_lot::RwLock;
+use std::sync::Arc;
 
 const LAYER_NORM_EPS: f32 = 1e-5;
 const BATCH_NORM_EPS: f32 = 1e-5;
@@ -333,6 +335,8 @@ struct Block {
     qkv: Ternary,
     o: Ternary,
     rel_k: Ternary,
+    /// `rel_k` applied to the position table, kept between takes.
+    rel_cache: RelCache,
     bias_u: Vec<f32>,
     bias_v: Vec<f32>,
     norm_conv: Norm,
@@ -372,6 +376,7 @@ impl Block {
             qkv: stacked(t, &p, &["q_proj", "k_proj", "v_proj"], (d, d), g, precision)?,
             o: tern("self_attn.o_proj", d, d)?,
             rel_k: tern("self_attn.relative_k_proj", d, d)?,
+            rel_cache: RelCache::default(),
             bias_u: t.f32_len(&format!("{p}.self_attn.bias_u"), d)?,
             bias_v: t.f32_len(&format!("{p}.self_attn.bias_v"), d)?,
             norm_conv: Norm::load(t, &format!("{p}.norm_conv"), d)?,
@@ -403,10 +408,10 @@ impl Block {
         down.forward(&hidden, frames)
     }
 
-    fn forward(&self, x: &mut Buf, frames: usize, positions: &[f32], c: &Config) {
+    fn forward(&self, x: &mut Buf, frames: usize, c: &Config) {
         let ff = Self::feed_forward(&self.ff1, &self.norm_ff1.apply(x), frames);
         let normed = self.norm_att.residual(x, &ff, 0.5);
-        let att = self.attention(&normed, frames, positions, c);
+        let att = self.attention(&normed, frames, c);
         let normed = self.norm_conv.residual(x, &att, 1.0);
         let conv = self.convolution(&normed, frames, c);
         let normed = self.norm_ff2.residual(x, &conv, 1.0);
@@ -415,11 +420,14 @@ impl Block {
     }
 
     /// Multi-head attention with Transformer-XL relative positions.
-    fn attention(&self, x: &[f32], t: usize, positions: &[f32], c: &Config) -> Buf {
+    fn attention(&self, x: &[f32], t: usize, c: &Config) -> Buf {
         let (d, heads) = (c.hidden, c.heads);
         let hd = d / heads;
         let qkv = self.qkv.forward(x, t);
-        let r = self.rel_k.forward(positions, 2 * t - 1);
+        let cache = self
+            .rel_cache
+            .rows(t, d, |table, rows| self.rel_k.forward(table, rows));
+        let r = cache.slice(t, d);
         let scale = 1.0 / (hd as f32).sqrt();
         let p = 2 * t - 1;
         let mut context = Buf::zeroed(t * d);
@@ -441,7 +449,7 @@ impl Block {
             let qu = head(&qkv, 3 * d, 0, t, Some(&self.bias_u[cols.clone()]));
             let qv = head(&qkv, 3 * d, 0, t, Some(&self.bias_v[cols.clone()]));
             let ac = fgemm::matmul(&qu, t, hd, &head(&qkv, 3 * d, d, t, None), t);
-            let bd = fgemm::matmul(&qv, t, hd, &head(&r, d, 0, p, None), p);
+            let bd = fgemm::matmul(&qv, t, hd, &head(r, d, 0, p, None), p);
             let mut probs = Buf::zeroed(t * t);
             for (i, row) in probs.chunks_exact_mut(t).enumerate() {
                 // Column t-1-i+j of the position product is relative position i - j.
@@ -506,6 +514,53 @@ impl Block {
             }
         });
         self.pw2.forward(&mixed, t)
+    }
+}
+
+/// Positions every take reaches without growing the cache: 30 s of 80 ms frames.
+pub const POSITION_REACH: usize = 375;
+
+/// Projected relative positions for `reach` down to `-reach`, one row each.
+/// A row depends only on its position, never on the take's length or on
+/// other rows, so one table serves every take up to `reach + 1` frames.
+#[derive(Default)]
+struct RelCache {
+    table: RwLock<Option<Arc<RelRows>>>,
+}
+
+struct RelRows {
+    reach: usize,
+    rows: Buf,
+}
+
+impl RelRows {
+    /// Rows for positions t-1 down to -(t-1).
+    fn slice(&self, t: usize, d: usize) -> &[f32] {
+        let first = self.reach - (t - 1);
+        &self.rows[first * d..(first + 2 * t - 1) * d]
+    }
+}
+
+impl RelCache {
+    /// The table, grown first when `t` frames reach past it.
+    fn rows(&self, t: usize, d: usize, project: impl Fn(&[f32], usize) -> Buf) -> Arc<RelRows> {
+        if let Some(rows) = self.table.read().as_ref().filter(|r| r.reach + 1 >= t) {
+            return Arc::clone(rows);
+        }
+        let mut table = self.table.write();
+        if let Some(rows) = table.as_ref().filter(|r| r.reach + 1 >= t) {
+            return Arc::clone(rows);
+        }
+        let reach = (t - 1)
+            .max(POSITION_REACH)
+            .max(table.as_ref().map_or(0, |r| 2 * r.reach));
+        let positions = relative_positions(reach + 1, d);
+        let rows = Arc::new(RelRows {
+            reach,
+            rows: project(&positions, 2 * reach + 1),
+        });
+        *table = Some(Arc::clone(&rows));
+        rows
     }
 }
 
@@ -597,12 +652,21 @@ impl Parakeet {
         let c = &self.config;
         let (mut x, t) = self.subsampling.forward(features, frames, c.mels);
         inspect(0, &x);
-        let positions = relative_positions(t, c.hidden);
         for (index, block) in self.blocks.iter().enumerate() {
-            block.forward(&mut x, t, &positions, c);
+            block.forward(&mut x, t, c);
             inspect(index + 1, &x);
         }
         (x, t)
+    }
+
+    /// Fills every layer's position table up front, so the first take does not wait.
+    pub fn warm_positions(&self) {
+        let d = self.config.hidden;
+        for block in &self.blocks {
+            block.rel_cache.rows(POSITION_REACH + 1, d, |table, rows| {
+                block.rel_k.forward(table, rows)
+            });
+        }
     }
 
     pub fn project(&self, encoded: &[f32], t: usize) -> Buf {
@@ -687,7 +751,23 @@ fn argmax(values: &[f32]) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{argmax, half, relative_positions, Config};
+    use super::{argmax, half, relative_positions, Config, RelCache, POSITION_REACH};
+    use crate::stt::native::buf::Buf;
+
+    #[test]
+    fn cached_position_rows_equal_the_table_of_each_take() {
+        let d = 8;
+        let cache = RelCache::default();
+        let copy = |table: &[f32], rows: usize| {
+            let mut out = Buf::zeroed(rows * d);
+            out.copy_from_slice(&table[..rows * d]);
+            out
+        };
+        for t in [1, 2, 29, POSITION_REACH + 1, POSITION_REACH + 40, 3] {
+            let rows = cache.rows(t, d, copy);
+            assert_eq!(rows.slice(t, d), &relative_positions(t, d)[..], "t = {t}");
+        }
+    }
 
     #[test]
     fn the_shipped_config_shape_parses_and_others_are_refused() {

@@ -39,6 +39,9 @@ impl NativeParakeet {
         let tensors = tensors::Tensors::open(&model_dir.join("model.safetensors"))?;
         let frontend = features::MelFrontend::new(config.mels);
         let model = model::Parakeet::load(&tensors, config, precision)?;
+        if precision == Precision::Int8 {
+            model.warm_positions();
+        }
         Ok(Self {
             model,
             frontend,
