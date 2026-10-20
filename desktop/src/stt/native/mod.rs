@@ -39,6 +39,9 @@ impl NativeParakeet {
         let tensors = tensors::Tensors::open(&model_dir.join("model.safetensors"))?;
         let frontend = features::MelFrontend::new(config.mels);
         let model = model::Parakeet::load(&tensors, config, precision)?;
+        // The 178 MB file is no longer needed; free it before the position
+        // tables grow, so load does not hold both at its peak.
+        drop(tensors);
         if precision == Precision::Int8 {
             model.warm_positions();
         }

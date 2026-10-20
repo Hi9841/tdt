@@ -143,7 +143,7 @@ fn ternary(
 ) -> Result<Ternary, String> {
     let scales = t.f32_len(&format!("{name}.scales"), out * (inp / group))?;
     Ternary::from_packed(
-        t.u8(&format!("{name}.qweight"))?,
+        &t.u8(&format!("{name}.qweight"))?,
         scales,
         out,
         inp,
@@ -165,7 +165,7 @@ fn stacked(
     let mut scales = Vec::new();
     for name in names {
         let name = format!("{prefix}.self_attn.{name}");
-        packed.extend_from_slice(t.u8(&format!("{name}.qweight"))?);
+        packed.extend_from_slice(&t.u8(&format!("{name}.qweight"))?);
         scales.extend(t.f32_len(&format!("{name}.scales"), out * (inp / group))?);
     }
     Ternary::from_packed(&packed, scales, names.len() * out, inp, group, precision)

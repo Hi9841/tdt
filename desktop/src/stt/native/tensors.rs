@@ -1,13 +1,22 @@
 //! Reads a `.safetensors` file: a little-endian u64 header length, a JSON
 //! header with dtype, shape, and byte range per tensor, then the raw data.
+//! Tensors are read from the file one at a time. Reading the whole 178 MB
+//! file into one buffer kept that memory in the process after load.
 
 use std::collections::HashMap;
+use std::fs::File;
 use std::path::Path;
 
 pub struct Tensors {
-    bytes: Vec<u8>,
+    source: Source,
     data_start: usize,
     entries: HashMap<String, Entry>,
+}
+
+enum Source {
+    File(File),
+    #[cfg(test)]
+    Memory(Vec<u8>),
 }
 
 struct Entry {
@@ -18,11 +27,27 @@ struct Entry {
 
 impl Tensors {
     pub fn open(path: &Path) -> Result<Self, String> {
-        let bytes =
-            std::fs::read(path).map_err(|e| format!("Could not read {}: {e}", path.display()))?;
-        Self::parse(bytes)
+        let error = |e: std::io::Error| format!("Could not read {}: {e}", path.display());
+        let file = File::open(path).map_err(error)?;
+        let total = file.metadata().map_err(error)?.len() as usize;
+        let mut length = [0u8; 8];
+        read_at(&file, &mut length, 0).map_err(error)?;
+        let header_len = u64::from_le_bytes(length) as usize;
+        let data_start = 8usize
+            .checked_add(header_len)
+            .filter(|end| *end <= total)
+            .ok_or("safetensors header runs past the end of the file")?;
+        let mut header = vec![0u8; header_len];
+        read_at(&file, &mut header, 8).map_err(error)?;
+        let entries = parse_header(&header, data_start, total)?;
+        Ok(Self {
+            source: Source::File(file),
+            data_start,
+            entries,
+        })
     }
 
+    #[cfg(test)]
     pub fn parse(bytes: Vec<u8>) -> Result<Self, String> {
         let header_len = bytes
             .get(..8)
@@ -32,34 +57,9 @@ impl Tensors {
             .checked_add(header_len)
             .filter(|end| *end <= bytes.len())
             .ok_or("safetensors header runs past the end of the file")?;
-        let header: serde_json::Map<String, serde_json::Value> =
-            serde_json::from_slice(&bytes[8..data_start])
-                .map_err(|e| format!("safetensors header is not JSON: {e}"))?;
-        let mut entries = HashMap::new();
-        for (name, value) in header {
-            if name == "__metadata__" {
-                continue;
-            }
-            let dtype = value["dtype"].as_str().unwrap_or_default().to_string();
-            let offsets: Vec<usize> = value["data_offsets"]
-                .as_array()
-                .map(|o| {
-                    o.iter()
-                        .filter_map(|d| d.as_u64())
-                        .map(|d| d as usize)
-                        .collect()
-                })
-                .unwrap_or_default();
-            let [start, end] = offsets[..] else {
-                return Err(format!("tensor {name} has no data_offsets"));
-            };
-            if start > end || data_start + end > bytes.len() {
-                return Err(format!("tensor {name} points outside the file"));
-            }
-            entries.insert(name, Entry { dtype, start, end });
-        }
+        let entries = parse_header(&bytes[8..data_start], data_start, bytes.len())?;
         Ok(Self {
-            bytes,
+            source: Source::Memory(bytes),
             data_start,
             entries,
         })
@@ -71,14 +71,24 @@ impl Tensors {
             .ok_or_else(|| format!("model file has no tensor {name}"))
     }
 
-    fn raw(&self, entry: &Entry) -> &[u8] {
-        &self.bytes[self.data_start + entry.start..self.data_start + entry.end]
+    fn raw(&self, name: &str, entry: &Entry) -> Result<Vec<u8>, String> {
+        let (start, end) = (self.data_start + entry.start, self.data_start + entry.end);
+        match &self.source {
+            #[cfg(test)]
+            Source::Memory(bytes) => Ok(bytes[start..end].to_vec()),
+            Source::File(file) => {
+                let mut bytes = vec![0u8; end - start];
+                read_at(file, &mut bytes, start as u64)
+                    .map_err(|e| format!("Could not read tensor {name}: {e}"))?;
+                Ok(bytes)
+            }
+        }
     }
 
     /// The tensor as f32 values, from F32, F16, or BF16 storage.
     pub fn f32(&self, name: &str) -> Result<Vec<f32>, String> {
         let entry = self.entry(name)?;
-        let raw = self.raw(entry);
+        let raw = self.raw(name, entry)?;
         let values = match entry.dtype.as_str() {
             "F32" => raw
                 .as_chunks::<4>()
@@ -122,7 +132,7 @@ impl Tensors {
             return Err(format!("tensor {name} has dtype {}, not F16", entry.dtype));
         }
         let bits: Vec<u16> = self
-            .raw(entry)
+            .raw(name, entry)?
             .as_chunks::<2>()
             .0
             .iter()
@@ -137,12 +147,68 @@ impl Tensors {
         Ok(bits)
     }
 
-    pub fn u8(&self, name: &str) -> Result<&[u8], String> {
+    pub fn u8(&self, name: &str) -> Result<Vec<u8>, String> {
         let entry = self.entry(name)?;
         if entry.dtype != "U8" {
             return Err(format!("tensor {name} has dtype {}, not U8", entry.dtype));
         }
-        Ok(self.raw(entry))
+        self.raw(name, entry)
+    }
+}
+
+/// Name to dtype and byte range, checked against the file length.
+fn parse_header(
+    header: &[u8],
+    data_start: usize,
+    total: usize,
+) -> Result<HashMap<String, Entry>, String> {
+    let header: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(header)
+        .map_err(|e| format!("safetensors header is not JSON: {e}"))?;
+    let mut entries = HashMap::new();
+    for (name, value) in header {
+        if name == "__metadata__" {
+            continue;
+        }
+        let dtype = value["dtype"].as_str().unwrap_or_default().to_string();
+        let offsets: Vec<usize> = value["data_offsets"]
+            .as_array()
+            .map(|o| {
+                o.iter()
+                    .filter_map(|d| d.as_u64())
+                    .map(|d| d as usize)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let [start, end] = offsets[..] else {
+            return Err(format!("tensor {name} has no data_offsets"));
+        };
+        if start > end || data_start + end > total {
+            return Err(format!("tensor {name} points outside the file"));
+        }
+        entries.insert(name, Entry { dtype, start, end });
+    }
+    Ok(entries)
+}
+
+/// Positional read of the whole buffer; safe to call from several threads.
+fn read_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        let mut done = 0;
+        while done < buf.len() {
+            let read = file.seek_read(&mut buf[done..], offset + done as u64)?;
+            if read == 0 {
+                return Err(std::io::ErrorKind::UnexpectedEof.into());
+            }
+            done += read;
+        }
+        Ok(())
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        file.read_exact_at(buf, offset)
     }
 }
 
@@ -185,6 +251,24 @@ mod tests {
     }
 
     #[test]
+    fn reading_from_the_file_equals_reading_from_memory() {
+        let header = br#"{"a":{"dtype":"F16","shape":[2],"data_offsets":[0,4]},"b":{"dtype":"U8","shape":[3],"data_offsets":[4,7]}}"#;
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(header);
+        bytes.extend_from_slice(&[0x00, 0x3c, 0x00, 0xc0, 7, 8, 9]);
+        let dir = std::env::temp_dir().join(format!("tdt-tensors-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("small.safetensors");
+        std::fs::write(&path, &bytes).expect("write");
+        let from_file = Tensors::open(&path).expect("open");
+        let in_memory = Tensors::parse(bytes).expect("parse");
+        assert_eq!(from_file.f32("a").unwrap(), in_memory.f32("a").unwrap());
+        assert_eq!(from_file.u8("b").unwrap(), in_memory.u8("b").unwrap());
+        assert!(from_file.u8("a").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_small_file_parses_and_reads_typed_values() {
         let header = br#"{"a":{"dtype":"F16","shape":[2],"data_offsets":[0,4]},"b":{"dtype":"U8","shape":[3],"data_offsets":[4,7]},"__metadata__":{}}"#;
         let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
@@ -192,7 +276,7 @@ mod tests {
         bytes.extend_from_slice(&[0x00, 0x3c, 0x00, 0xc0, 7, 8, 9]);
         let tensors = Tensors::parse(bytes).expect("parse");
         assert_eq!(tensors.f32("a").unwrap(), vec![1.0, -2.0]);
-        assert_eq!(tensors.u8("b").unwrap(), &[7, 8, 9]);
+        assert_eq!(tensors.u8("b").unwrap(), vec![7, 8, 9]);
         assert!(tensors.f32("missing").is_err());
         assert!(tensors.f32_len("a", 3).is_err());
     }
