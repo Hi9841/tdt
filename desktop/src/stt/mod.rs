@@ -3,16 +3,11 @@ pub mod engine;
 pub mod fillers;
 pub mod models;
 pub mod native;
-pub mod photon;
 pub mod segment;
 
 pub use engine::{LiveAudio, LiveTranscript, SttEngine};
 pub use fillers::remove_fillers;
 pub use models::{DownloadPhase, CATALOG, DEFAULT_MODEL_ID};
-// Used by the bench-asr bin through the library target; the app binary
-// declares its own module tree and does not touch it.
-#[allow(unused_imports)]
-pub use photon::pcm16_wav;
 
 use parking_lot::Mutex;
 use std::sync::Arc;

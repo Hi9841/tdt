@@ -1,19 +1,17 @@
 //! Speech benchmark: latency after release and word error rate.
 //!
-//! `cargo run --release --bin bench-asr -- [--dir PATH] [--realtime] [--repeat N] [--native] [--photon]`
+//! `cargo run --release --bin bench-asr -- [--dir PATH] [--realtime] [--repeat N] [--native]`
 //!
 //! Each `clip.wav` may have a `clip.txt` reference transcript next to it.
 //! `--realtime` feeds audio at speaking pace, so latency is the wait a user
 //! has after the key is released. Without it, all audio arrives at once.
 //! `--native` runs TDT's Rust engine on each whole clip instead of the app path.
-//! `--photon` runs the Python Photon worker on each whole clip.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use voice_stt_desktop::stt::models::{find_dir, ModelSpec, CATALOG};
 use voice_stt_desktop::stt::native::{BiasWeights, NativeParakeet};
-use voice_stt_desktop::stt::photon::PhotonParakeetEngine;
-use voice_stt_desktop::stt::{pcm16_wav, LiveAudio, SttEngine};
+use voice_stt_desktop::stt::{LiveAudio, SttEngine};
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -37,7 +35,6 @@ struct Options {
     dir: PathBuf,
     realtime: bool,
     native: bool,
-    photon: bool,
     repeat: usize,
 }
 
@@ -48,7 +45,6 @@ fn parse_options() -> Options {
             .unwrap_or_else(|| std::env::temp_dir().join("tdt-bench-audio")),
         realtime: false,
         native: false,
-        photon: false,
         repeat: 1,
     };
     let mut args = std::env::args().skip(1);
@@ -57,7 +53,6 @@ fn parse_options() -> Options {
             "--dir" => options.dir = args.next().map(PathBuf::from).unwrap_or(options.dir),
             "--realtime" => options.realtime = true,
             "--native" => options.native = true,
-            "--photon" => options.photon = true,
             "--repeat" => {
                 options.repeat = args
                     .next()
@@ -184,10 +179,7 @@ fn bench_model(spec: &ModelSpec, clips: &[Clip], options: &Options) {
     };
 
     let t0 = Instant::now();
-    let Ok(engine) = SttEngine::new(spec, &model_dir) else {
-        println!("Failed to create engine.");
-        return;
-    };
+    let engine = SttEngine::new(&model_dir);
     if let Err(e) = engine.prepare() {
         println!("Failed to prepare engine: {e}");
         return;
@@ -305,38 +297,6 @@ fn bench_native(clips: &[Clip], options: &Options) {
     });
 }
 
-fn bench_photon(clips: &[Clip], options: &Options) {
-    let spec = &CATALOG[0];
-    let Some(model_dir) = find_dir(spec, None) else {
-        println!("Skipped: model directory not found.");
-        return;
-    };
-    let started = Instant::now();
-    let engine = match PhotonParakeetEngine::new(spec, &model_dir) {
-        Ok(engine) => engine,
-        Err(e) => {
-            println!("Failed to create the Photon engine: {e}");
-            return;
-        }
-    };
-    if let Err(e) = engine.prepare() {
-        println!("Failed to start the Photon worker: {e}");
-        return;
-    }
-    println!(
-        "
-Photon worker. Init: {} ms",
-        started.elapsed().as_millis()
-    );
-    whole_clips(clips, options, "photon", |samples| {
-        engine.transcribe_samples(samples).unwrap_or_else(|e| {
-            eprintln!("{e}");
-            String::new()
-        })
-    });
-    engine.release();
-}
-
 /// Transcribes each whole clip in one call and reports latency and WER.
 fn whole_clips(
     clips: &[Clip],
@@ -395,11 +355,51 @@ fn main() {
         bench_native(&clips, &options);
         return;
     }
-    if options.photon {
-        bench_photon(&clips, &options);
-        return;
-    }
     for spec in CATALOG {
         bench_model(spec, &clips, &options);
     }
+}
+
+/// 16 kHz PCM16 WAV as mono f32; None for any other format.
+fn pcm16_wav(path: &Path) -> Option<Vec<f32>> {
+    let bytes = std::fs::read(path).ok()?;
+    if bytes.len() < 44 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return None;
+    }
+    let mut offset = 12usize;
+    let mut channels = 1u16;
+    let mut rate = 0u32;
+    let mut bits = 16u16;
+    let mut data: Option<&[u8]> = None;
+    while offset + 8 <= bytes.len() {
+        let id = &bytes[offset..offset + 4];
+        let size = u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().ok()?) as usize;
+        let body = offset + 8;
+        if body + size > bytes.len() {
+            break;
+        }
+        if id == b"fmt " && size >= 16 {
+            channels = u16::from_le_bytes(bytes[body + 2..body + 4].try_into().ok()?);
+            rate = u32::from_le_bytes(bytes[body + 4..body + 8].try_into().ok()?);
+            bits = u16::from_le_bytes(bytes[body + 14..body + 16].try_into().ok()?);
+        } else if id == b"data" {
+            data = Some(&bytes[body..body + size]);
+        }
+        offset = body + size + (size % 2);
+    }
+    let data = data?;
+    if bits != 16 || channels == 0 || rate != 16_000 {
+        return None;
+    }
+    let width = channels as usize;
+    let mut mono = Vec::with_capacity(data.len() / (2 * width));
+    for frame in data.chunks_exact(2 * width) {
+        let mut sum = 0.0f32;
+        for channel in 0..width {
+            let sample = i16::from_le_bytes([frame[channel * 2], frame[channel * 2 + 1]]);
+            sum += f32::from(sample) / f32::from(i16::MAX);
+        }
+        mono.push(sum / width as f32);
+    }
+    Some(mono)
 }

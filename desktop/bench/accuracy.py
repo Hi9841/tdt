@@ -4,12 +4,11 @@
 # ///
 """Word error rate and speed of bench-asr on folders of clips.
 
-usage: uv run bench/accuracy.py BENCH_EXE SET [SET ...] [--engine native|photon|app] [--show N]
+usage: uv run bench/accuracy.py BENCH_EXE SET [SET ...] [--engine native|app] [--show N]
 
 Run from desktop/. SET is a folder under target/accuracy (clean, other, tech, tts16).
 WER uses the Whisper English normalizer, as the Open ASR Leaderboard does.
 --engine native: TDT's Rust engine on each whole clip (default).
---engine photon: the Python Photon worker on each whole clip.
 --engine app: the app's own path (pause cuts and the dictionary file).
 Speed is total audio time divided by total transcription time.
 """
@@ -23,7 +22,7 @@ from whisper_normalizer.english import EnglishTextNormalizer
 
 DESKTOP = Path(__file__).resolve().parents[1]
 LINE = re.compile(r'^\[([\d.]+)s\] (\S+)\.wav -> ([\d.]+) ms[^:]*: "(.*)"$')
-FLAGS = {"native": ["--native"], "photon": ["--photon"], "app": []}
+FLAGS = {"native": ["--native"], "app": []}
 NORMALIZE = EnglishTextNormalizer()
 
 

@@ -961,13 +961,12 @@ impl HudView {
         let tx = self.model_ready_tx.clone();
         let ping = self.update_ping.clone();
         std::thread::spawn(move || {
-            let result = SttEngine::new(spec, &dir)
-                .and_then(|engine| {
-                    engine.prepare()?;
-                    Ok(PreparedModel {
-                        id: spec.id.into(),
-                        engine: Arc::new(engine),
-                    })
+            let engine = SttEngine::new(&dir);
+            let result = engine
+                .prepare()
+                .map(|()| PreparedModel {
+                    id: spec.id.into(),
+                    engine: Arc::new(engine),
                 })
                 .map_err(|error| {
                     format!(

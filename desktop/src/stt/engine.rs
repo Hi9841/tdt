@@ -1,12 +1,9 @@
 use super::dictionary;
-use super::models::ModelSpec;
 use super::native::{BiasWeights, NativeParakeet};
-use super::photon::PhotonParakeetEngine;
 use super::segment;
 use crossbeam_channel::{Receiver, RecvTimeoutError};
 use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -27,53 +24,32 @@ pub struct LiveTranscript {
     pub duration_secs: f32,
 }
 
-/// Speech to text for one installed model. TDT's own Rust engine runs it;
-/// the Python Photon worker remains for `TDT_ENGINE=photon` and for a model
-/// the Rust engine cannot load.
+/// Speech to text for one installed model, on TDT's own engine. The model
+/// loads on first use.
 pub struct SttEngine {
     model_dir: PathBuf,
     native: Mutex<Option<Arc<NativeParakeet>>>,
-    photon: PhotonParakeetEngine,
-    use_photon: AtomicBool,
-    /// The dictionary file as last applied to the Rust engine.
+    /// The dictionary file as last applied to the engine.
     dictionary: Mutex<dictionary::Watch>,
 }
 
 impl SttEngine {
-    pub fn new(spec: &ModelSpec, model_dir: &Path) -> Result<Self, String> {
-        let photon = PhotonParakeetEngine::new(spec, model_dir)?;
-        let forced = std::env::var("TDT_ENGINE").is_ok_and(|v| v.eq_ignore_ascii_case("photon"));
-        Ok(Self {
+    pub fn new(model_dir: &Path) -> Self {
+        Self {
             model_dir: model_dir.to_path_buf(),
             native: Mutex::new(None),
-            photon,
-            use_photon: AtomicBool::new(forced),
             dictionary: Mutex::new(dictionary::Watch::default()),
-        })
+        }
     }
 
     pub fn prepare(&self) -> Result<(), String> {
-        if !self.use_photon.load(Ordering::SeqCst) {
-            let mut native = self.native.lock();
-            if native.is_some() {
-                return Ok(());
-            }
-            match NativeParakeet::load(&self.model_dir) {
-                Ok(engine) => {
-                    *native = Some(Arc::new(engine));
-                    // A fresh engine has no dictionary yet.
-                    *self.dictionary.lock() = dictionary::Watch::default();
-                    return Ok(());
-                }
-                Err(error) => {
-                    eprintln!(
-                        "TDT speech engine could not load this model ({error}); using Photon."
-                    );
-                    self.use_photon.store(true, Ordering::SeqCst);
-                }
-            }
+        let mut native = self.native.lock();
+        if native.is_none() {
+            *native = Some(Arc::new(NativeParakeet::load(&self.model_dir)?));
+            // A fresh engine has no dictionary yet.
+            *self.dictionary.lock() = dictionary::Watch::default();
         }
-        self.photon.prepare()
+        Ok(())
     }
 
     /// Applies the built-in terms and the user's dictionary file when it changed.
@@ -92,13 +68,9 @@ impl SttEngine {
     }
 
     fn transcribe_samples(&self, samples: &[f32]) -> Result<String, String> {
-        if !self.use_photon.load(Ordering::SeqCst) {
-            let native = self.native.lock().clone();
-            if let Some(engine) = native {
-                return Ok(engine.transcribe(samples));
-            }
-        }
-        self.photon.transcribe_samples(samples)
+        let native = self.native.lock().clone();
+        let engine = native.ok_or("The speech model is not loaded.")?;
+        Ok(engine.transcribe(samples))
     }
 
     pub fn transcribe_live_reporting(
@@ -184,7 +156,6 @@ impl SttEngine {
 
     pub fn release(&self) {
         *self.native.lock() = None;
-        self.photon.release();
     }
 }
 

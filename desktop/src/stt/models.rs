@@ -52,7 +52,7 @@ pub struct DownloadProgress {
     pub file_count: usize,
 }
 
-/// Recommended default: Moondream Parakeet Redux 1.58-bit ternary, Photon runtime.
+/// Recommended default: Moondream Parakeet Redux 1.58-bit ternary.
 pub const DEFAULT_MODEL_ID: &str = "parakeet-redux";
 
 const REDUX_DIR: &str = "parakeet-redux";

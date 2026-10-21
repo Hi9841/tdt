@@ -353,7 +353,8 @@ pub fn replace_running_exe(new_exe: &Path, version: &str) -> Result<(), String> 
     Ok(())
 }
 
-/// Delete exes that updates moved aside. One a stuck process still holds
+/// Delete exes that updates moved aside, and the files of the Python worker
+/// that versions before 0.2.32 kept. An exe a stuck process still holds
 /// stays until that process is gone, so a later start removes it.
 pub fn remove_replaced_binaries() {
     let Some(dir) = std::env::current_exe()
@@ -366,10 +367,10 @@ pub fn remove_replaced_binaries() {
         return;
     };
     for entry in entries.flatten() {
-        if entry
-            .file_name()
-            .to_string_lossy()
-            .starts_with("TDT.exe.old")
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with("TDT.exe.old")
+            || name == "photon_worker.py"
+            || name == "photon-python.txt"
         {
             let _ = std::fs::remove_file(entry.path());
         }

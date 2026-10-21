@@ -102,7 +102,7 @@ with developer terms, the dictionary removes about a third of the errors. On
 Measured on 2026-10-20 with the Parakeet Redux model on an AMD Ryzen 9
 7950X3D (32 GB RAM, Windows 11). The four engines got the same 456 clips:
 
-- **Photon**: the Python worker. TDT now uses it only as a fallback.
+- **Photon**: the Python worker that TDT used before its own engine.
 - **v0.2.25**: the first release with TDT's own Rust engine.
 - **v0.2.26**: the Rust engine in this release.
 - **v0.2.26 + dictionary**: the same engine with the built-in developer terms.
@@ -168,10 +168,6 @@ operations:
 
 - The model download that you start in Settings.
 - The optional updater. The updater connects only to GitHub.
-
-If TDT's engine cannot load a model, TDT uses the Moondream Photon worker
-instead. That worker installs its runtime with uv on first use, and TDT blocks
-the runtime's usage reports and Hugging Face lookups.
 
 TDT copies the text to the clipboard by design. The maximum recording length
 is 120 seconds. This limit stops unbounded memory growth.

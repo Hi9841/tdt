@@ -199,23 +199,14 @@ fn main() {
     let stt_engine = EngineSlot::default();
     stt_engine.set(
         match models::find_dir(model_spec, config.model_dir.as_deref()) {
-            Some(dir) => match SttEngine::new(model_spec, &dir) {
-                Ok(engine) => {
-                    append_log(&format!(
-                        "{} speech model found at: {}",
-                        model_spec.label,
-                        dir.display()
-                    ));
-                    Some(Arc::new(engine))
-                }
-                Err(e) => {
-                    append_log(&format!(
-                        "Failed to initialize {} STT Engine: {e}",
-                        model_spec.label
-                    ));
-                    None
-                }
-            },
+            Some(dir) => {
+                append_log(&format!(
+                    "{} speech model found at: {}",
+                    model_spec.label,
+                    dir.display()
+                ));
+                Some(Arc::new(SttEngine::new(&dir)))
+            }
             None => {
                 append_log(&format!(
                     "{} is not downloaded. Open Settings to download it, or run models/download-models.ps1.",

@@ -44,7 +44,6 @@ cargo build --release --bin bench-asr
 $bench = "target/release/bench-asr.exe"
 
 # 3. Score each engine.
-uv run bench/accuracy.py $bench clean other tech tts16 --engine photon
 uv run bench/accuracy.py $bench clean other tech tts16 --engine native
 $env:TDT_DICTIONARY = "assets/dictionary/developer-terms.txt"
 uv run bench/accuracy.py $bench clean other tech tts16 --engine native
