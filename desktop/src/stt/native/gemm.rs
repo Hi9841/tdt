@@ -126,8 +126,8 @@ impl Ternary {
             if packed_row.iter().any(|byte| *byte >= 243) {
                 return Err(format!("ternary byte above 242 in row {row}"));
             }
-            for (col, code) in code_row.iter_mut().enumerate() {
-                *code = (packed_row[col / 5] / POW3[col % 5]) % 3;
+            for (five, byte) in code_row.chunks_mut(5).zip(packed_row) {
+                five.copy_from_slice(&DIGITS[usize::from(*byte)][..five.len()]);
             }
         }
         if precision == Precision::Int8 && group == GROUP {
@@ -186,7 +186,23 @@ impl Ternary {
     }
 }
 
-const POW3: [u8; 5] = [1, 3, 9, 27, 81];
+/// The five base-3 digits of every packed byte, least significant first.
+/// A table copy per byte replaces a division per code: model load spent
+/// most of its time on those divisions.
+const DIGITS: [[u8; 5]; 243] = {
+    let mut table = [[0u8; 5]; 243];
+    let mut byte = 0;
+    while byte < 243 {
+        let (mut value, mut digit) = (byte, 0);
+        while digit < 5 {
+            table[byte][digit] = (value % 3) as u8;
+            value /= 3;
+            digit += 1;
+        }
+        byte += 1;
+    }
+    table
+};
 
 #[derive(Clone, Copy)]
 struct SendPtr(*mut f32);
