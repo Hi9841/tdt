@@ -18,7 +18,6 @@ pub struct AudioRecorder {
     at_limit: Arc<AtomicBool>,
     last_error: Arc<Mutex<Option<String>>>,
     buffer: Arc<Mutex<Vec<f32>>>,
-    #[allow(dead_code)]
     samples_ready: Arc<Condvar>,
     captured: Arc<AtomicUsize>,
     current_rms: Arc<Mutex<f32>>,
@@ -30,7 +29,6 @@ pub struct AudioRecorder {
     _stream: cpal::Stream,
 }
 
-#[allow(dead_code)]
 #[derive(Clone)]
 pub struct CaptureHandle {
     is_recording: Arc<AtomicBool>,
@@ -255,7 +253,6 @@ impl AudioRecorder {
 
     /// Clone of the capture state. Safe to drain from a non-UI thread.
     /// The cpal stream stays inside AudioRecorder.
-    #[allow(dead_code)]
     pub fn handle(&self) -> CaptureHandle {
         CaptureHandle {
             is_recording: Arc::clone(&self.is_recording),
@@ -285,7 +282,6 @@ impl AudioRecorder {
     }
 }
 
-#[allow(dead_code)]
 impl CaptureHandle {
     pub fn drain(&self) -> Vec<f32> {
         drain_samples(&self.is_recording, &self.buffer, &self.captured)

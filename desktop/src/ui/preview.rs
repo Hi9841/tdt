@@ -59,44 +59,6 @@ pub enum Spec {
     PanelSettingsUpdateFailed,
 }
 
-/// Every named state the capture catalog launches.
-#[allow(dead_code)]
-pub const CATALOG: &[&str] = &[
-    "bubble.idle",
-    "bubble.hover",
-    "bubble.listening.quiet",
-    "bubble.listening.loud",
-    "bubble.transcribing",
-    "bubble.success.copied",
-    "bubble.success.pasted",
-    "bubble.error",
-    "bubble.setup",
-    "bubble.no-speech",
-    "bubble.copy-failed",
-    "bubble.paste-fallback",
-    "bubble.limit",
-    "panel.setup",
-    "panel.model.failed",
-    "panel.recovery",
-    "panel.history.clear",
-    "panel.stats.empty",
-    "panel.stats.history",
-    "panel.stats.overflow",
-    "panel.stats.expanded",
-    "panel.stats.copied",
-    "panel.settings.defaults",
-    "panel.settings.autopaste.off",
-    "panel.settings.startup.on",
-    "panel.settings.startup.error",
-    "panel.settings.hotkey.capture",
-    "panel.settings.update.checking",
-    "panel.settings.update.uptodate",
-    "panel.settings.update.available",
-    "panel.settings.update.downloading",
-    "panel.settings.update.ready",
-    "panel.settings.update.failed",
-];
-
 pub fn parse() -> Option<Spec> {
     parse_name(requested()?.as_str())
 }
