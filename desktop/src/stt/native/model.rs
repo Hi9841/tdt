@@ -102,8 +102,7 @@ impl Norm {
         let mut out = Buf::zeroed(x.len());
         team::chunks_mut(&mut out, size, |index, o| {
             let row = &x[index * size..(index + 1) * size];
-            let mean = row.iter().sum::<f32>() / size as f32;
-            let var = row.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / size as f32;
+            let (mean, var) = moments(row);
             let inv = 1.0 / (var + LAYER_NORM_EPS).sqrt();
             for i in 0..size {
                 o[i] = (row[i] - mean) * inv * self.weight[i] + self.bias[i];
@@ -124,8 +123,7 @@ impl Norm {
             for (v, a) in row.iter_mut().zip(add) {
                 *v += scale * a;
             }
-            let mean = row.iter().sum::<f32>() / size as f32;
-            let var = row.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / size as f32;
+            let (mean, var) = moments(row);
             let inv = 1.0 / (var + LAYER_NORM_EPS).sqrt();
             for i in 0..size {
                 o[i] = (row[i] - mean) * inv * self.weight[i] + self.bias[i];
@@ -133,6 +131,26 @@ impl Norm {
         });
         out
     }
+}
+
+/// Mean and variance of a row, two passes, each summed in 32 lanes so the
+/// adds do not wait on each other: eight 4-wide chains even on plain SSE2.
+fn moments(row: &[f32]) -> (f32, f32) {
+    let n = row.len() as f32;
+    let mean = lane_sum(row, |v| v) / n;
+    let var = lane_sum(row, |v| (v - mean) * (v - mean)) / n;
+    (mean, var)
+}
+
+fn lane_sum(row: &[f32], term: impl Fn(f32) -> f32) -> f32 {
+    let mut lanes = [0.0f32; 32];
+    let (chunks, tail) = row.as_chunks::<32>();
+    for chunk in chunks {
+        for (lane, v) in lanes.iter_mut().zip(chunk) {
+            *lane += term(*v);
+        }
+    }
+    lanes.iter().sum::<f32>() + tail.iter().map(|v| term(*v)).sum::<f32>()
 }
 
 fn ternary(
@@ -918,6 +936,30 @@ mod tests {
             let (strips, sh, sw) = sub.first_two_convs(&features, frames, mels);
             assert_eq!((sh, sw), (eh, ew));
             assert_eq!(&strips[..], &expected[..], "frames {frames}");
+        }
+    }
+
+    #[test]
+    fn lane_moments_match_double_precision() {
+        for len in [1024usize, 37, 5] {
+            let row: Vec<f32> = (0..len)
+                .map(|i| ((i * 37 % 101) as f32 - 50.0) * 0.07 + 3.0)
+                .collect();
+            let mean = row.iter().map(|v| f64::from(*v)).sum::<f64>() / len as f64;
+            let var = row
+                .iter()
+                .map(|v| (f64::from(*v) - mean).powi(2))
+                .sum::<f64>()
+                / len as f64;
+            let (m, v) = super::moments(&row);
+            assert!(
+                (f64::from(m) - mean).abs() < 1e-5 * mean.abs(),
+                "{len}: {m} vs {mean}"
+            );
+            assert!(
+                (f64::from(v) - var).abs() < 1e-5 * var,
+                "{len}: {v} vs {var}"
+            );
         }
     }
 
