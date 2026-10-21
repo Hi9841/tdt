@@ -77,7 +77,16 @@ pub struct PackedTernary {
 
 impl PackedTernary {
     /// `codes` is row-major `n x k` (values 0..=2), `scales` is `n x (k / GROUP)`.
-    pub fn new(isa: Isa, codes: &[u8], scales: &[f32], n: usize, k: usize) -> Self {
+    /// `row(r, codes)` writes the `k` codes (values 0..=2) of row `r`;
+    /// `scales` is `n x (k / GROUP)`. Rows come one block at a time, so the
+    /// whole byte-per-code matrix never exists.
+    pub fn from_rows(
+        isa: Isa,
+        scales: &[f32],
+        n: usize,
+        k: usize,
+        row: impl Fn(usize, &mut [u8]),
+    ) -> Self {
         let rows = isa.rows();
         // The SIMD tiles need whole blocks; other shapes run the scalar path.
         let isa = if k.is_multiple_of(GROUP) && n.is_multiple_of(2 * rows) {
@@ -89,18 +98,20 @@ impl PackedTernary {
         let groups = k / GROUP;
         // One row per block: the scalar layout is the row-major codes.
         let scalar = isa == Isa::Scalar;
-        let mut packed = if scalar {
-            codes.to_vec()
-        } else {
-            vec![0u8; n * k / 4]
-        };
+        let mut packed = vec![0u8; if scalar { n * k } else { n * k / 4 }];
         let mut packed_scales = vec![0.0f32; n * groups];
+        let mut codes = vec![0u8; rows * k];
         for block in 0..n / rows {
-            if !scalar {
+            for (r, codes) in codes.chunks_exact_mut(k).enumerate() {
+                row(block * rows + r, codes);
+            }
+            if scalar {
+                packed[block * k..(block + 1) * k].copy_from_slice(&codes);
+            } else {
                 // Byte j of a row's 16-code span holds codes j, 4 + j, 8 + j, 12 + j.
                 for k16 in 0..k / 16 {
                     for r in 0..rows {
-                        let src = &codes[(block * rows + r) * k + k16 * 16..][..16];
+                        let src = &codes[r * k + k16 * 16..][..16];
                         let dst = ((block * (k / 16) + k16) * rows + r) * 4;
                         for j in 0..4 {
                             packed[dst + j] =

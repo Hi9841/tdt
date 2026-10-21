@@ -117,22 +117,21 @@ impl Ternary {
                 "ternary layer {out_features}x{in_features} does not match its tensors"
             ));
         }
-        let mut codes = vec![0u8; out_features * in_features];
-        for (row, (packed_row, code_row)) in packed
+        if let Some(row) = packed
             .chunks_exact(row_bytes)
-            .zip(codes.chunks_exact_mut(in_features))
-            .enumerate()
+            .position(|row| row.iter().any(|b| *b >= 243))
         {
-            if packed_row.iter().any(|byte| *byte >= 243) {
-                return Err(format!("ternary byte above 242 in row {row}"));
-            }
-            for (five, byte) in code_row.chunks_mut(5).zip(packed_row) {
+            return Err(format!("ternary byte above 242 in row {row}"));
+        }
+        let decode = |row: usize, codes: &mut [u8]| {
+            let packed_row = &packed[row * row_bytes..(row + 1) * row_bytes];
+            for (five, byte) in codes.chunks_mut(5).zip(packed_row) {
                 five.copy_from_slice(&DIGITS[usize::from(*byte)][..five.len()]);
             }
-        }
+        };
         if precision == Precision::Int8 && group == GROUP {
             let packed =
-                PackedTernary::new(Isa::detect(), &codes, &scales, out_features, in_features);
+                PackedTernary::from_rows(Isa::detect(), &scales, out_features, in_features, decode);
             return Ok(Self {
                 out_features,
                 in_features,
@@ -141,6 +140,10 @@ impl Ternary {
                 scales: Vec::new(),
                 packed: Some(packed),
             });
+        }
+        let mut codes = vec![0u8; out_features * in_features];
+        for (row, codes) in codes.chunks_exact_mut(in_features).enumerate() {
+            decode(row, codes);
         }
         Ok(Self {
             out_features,
