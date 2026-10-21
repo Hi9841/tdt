@@ -101,12 +101,12 @@ impl Norm {
         let size = self.weight.len();
         let mut out = Buf::scratch(x.len());
         team::chunks_mut(&mut out, size, |index, o| {
-            let row = &x[index * size..(index + 1) * size];
-            let (mean, var) = moments(row);
-            let inv = 1.0 / (var + LAYER_NORM_EPS).sqrt();
-            for i in 0..size {
-                o[i] = (row[i] - mean) * inv * self.weight[i] + self.bias[i];
-            }
+            normalize_row(
+                &x[index * size..(index + 1) * size],
+                &self.weight,
+                &self.bias,
+                o,
+            );
         });
         out
     }
@@ -119,22 +119,37 @@ impl Norm {
         team::chunks_mut(&mut out, size, |index, o| {
             // SAFETY: each row of `x` belongs to the task of the same output row.
             let row = unsafe { rows.slice_mut(index * size, size) };
-            let add = &y[index * size..(index + 1) * size];
-            for (v, a) in row.iter_mut().zip(add) {
-                *v += scale * a;
-            }
-            let (mean, var) = moments(row);
-            let inv = 1.0 / (var + LAYER_NORM_EPS).sqrt();
-            for i in 0..size {
-                o[i] = (row[i] - mean) * inv * self.weight[i] + self.bias[i];
-            }
+            add_scaled(row, &y[index * size..(index + 1) * size], scale);
+            normalize_row(row, &self.weight, &self.bias, o);
         });
         out
     }
 }
 
+multiversion! {
+    /// `out = (row - mean) / sqrt(var + eps) * weight + bias`.
+    fn normalize_row(row: &[f32], weight: &[f32], bias: &[f32], out: &mut [f32]) {
+        let (mean, var) = moments(row);
+        let inv = 1.0 / (var + LAYER_NORM_EPS).sqrt();
+        for (((o, v), w), b) in out.iter_mut().zip(row).zip(weight).zip(bias) {
+            *o = (v - mean) * inv * w + b;
+        }
+    }
+}
+
+multiversion! {
+    /// `row += scale * add`.
+    fn add_scaled(row: &mut [f32], add: &[f32], scale: f32) {
+        for (v, a) in row.iter_mut().zip(add) {
+            *v += scale * a;
+        }
+    }
+}
+
 /// Mean and variance of a row, two passes, each summed in 32 lanes so the
 /// adds do not wait on each other: eight 4-wide chains even on plain SSE2.
+/// A lane adds the same values in the same order at any vector width.
+#[inline(always)]
 fn moments(row: &[f32]) -> (f32, f32) {
     let n = row.len() as f32;
     let mean = lane_sum(row, |v| v) / n;
@@ -142,6 +157,7 @@ fn moments(row: &[f32]) -> (f32, f32) {
     (mean, var)
 }
 
+#[inline(always)]
 fn lane_sum(row: &[f32], term: impl Fn(f32) -> f32) -> f32 {
     let mut lanes = [0.0f32; 32];
     let (chunks, tail) = row.as_chunks::<32>();
