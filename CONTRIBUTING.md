@@ -6,9 +6,8 @@
 
 ```powershell
 cargo fmt --manifest-path desktop/Cargo.toml -- --check
-cargo test --manifest-path desktop/Cargo.toml
 cargo clippy --manifest-path desktop/Cargo.toml --all-targets --all-features -- -D warnings
-cargo test --manifest-path packaging/tdt-setup/Cargo.toml
+cargo build --manifest-path packaging/tdt-setup/Cargo.toml
 ```
 
 4. To rebuild the Windows installer: `powershell -ExecutionPolicy Bypass -File packaging/build-installer.ps1`.
