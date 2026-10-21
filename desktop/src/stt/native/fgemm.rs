@@ -11,7 +11,7 @@ use std::sync::OnceLock;
 const BLOCK: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Level {
+pub(super) enum Level {
     Scalar,
     #[cfg(target_arch = "x86_64")]
     Avx2,
@@ -19,7 +19,8 @@ enum Level {
     Avx512,
 }
 
-fn level() -> Level {
+/// The widest float path this CPU runs. `TDT_NATIVE_ISA=scalar|avx2` forces a slower one.
+pub(super) fn level() -> Level {
     static LEVEL: OnceLock<Level> = OnceLock::new();
     *LEVEL.get_or_init(|| {
         let forced = std::env::var("TDT_NATIVE_ISA").unwrap_or_default();

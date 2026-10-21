@@ -1,6 +1,7 @@
 //! Parakeet TDT: a FastConformer encoder and a token-and-duration transducer.
 //! The structure follows the Apache-2.0 Hugging Face `ParakeetForTDT`.
 
+use super::activation;
 use super::bias::{Bias, BiasState};
 use super::buf::Buf;
 use super::fgemm;
@@ -187,10 +188,6 @@ fn dense(t: &Tensors, name: &str, out: usize, inp: usize, bias: bool) -> Result<
         None
     };
     Dense::new(weight, bias, out, inp)
-}
-
-fn silu(v: f32) -> f32 {
-    v / (1.0 + (-v).exp())
 }
 
 fn sigmoid(v: f32) -> f32 {
@@ -461,9 +458,7 @@ impl Block {
 
     fn feed_forward((up, down): &(Ternary, Ternary), x: &[f32], frames: usize) -> Buf {
         let mut hidden = up.forward(x, frames);
-        team::chunks_mut(&mut hidden, 4096, |_, values| {
-            values.iter_mut().for_each(|v| *v = silu(*v));
-        });
+        team::chunks_mut(&mut hidden, 4096, |_, values| activation::silu(values));
         down.forward(&hidden, frames)
     }
 
@@ -518,12 +513,9 @@ impl Block {
                     row[j] = (ac[i * t + j] + shifted[j]) * scale;
                     max = max.max(row[j]);
                 }
-                let mut total = 0.0f32;
-                for value in row.iter_mut() {
-                    *value = (*value - max).exp();
-                    total += *value;
-                }
-                let inv = 1.0 / total;
+                row.iter_mut().for_each(|value| *value -= max);
+                activation::exp(row);
+                let inv = 1.0 / row.iter().sum::<f32>();
                 row.iter_mut().for_each(|value| *value *= inv);
             }
             let mut v_t = Buf::zeroed(hd * t);
@@ -552,8 +544,10 @@ impl Block {
         let mut gated = Buf::zeroed(t * d);
         team::chunks_mut(&mut gated, d, |index, out| {
             let row = &wide[index * 2 * d..(index + 1) * 2 * d];
-            for ch in 0..d {
-                out[ch] = row[ch] * sigmoid(row[d + ch]);
+            out.copy_from_slice(&row[d..]);
+            activation::sigmoid(out);
+            for (o, value) in out.iter_mut().zip(&row[..d]) {
+                *o *= value;
             }
         });
         let mut mixed = Buf::zeroed(t * d);
@@ -569,8 +563,9 @@ impl Block {
                 }
             }
             for ((o, scale), shift) in out.iter_mut().zip(&self.bn_scale).zip(&self.bn_shift) {
-                *o = silu(*o * scale + shift);
+                *o = *o * scale + shift;
             }
+            activation::silu(out);
         });
         self.pw2.forward(&mixed, t)
     }
