@@ -1,5 +1,5 @@
 #[cfg(target_os = "windows")]
-use windows::Win32::Foundation::{BOOL, HWND, LPARAM, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{BOOL, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 #[cfg(target_os = "windows")]
 use windows::Win32::Graphics::Dwm::{
     DwmGetWindowAttribute, DwmSetWindowAttribute, DWMNCRP_DISABLED, DWMWA_BORDER_COLOR,
@@ -10,6 +10,7 @@ use windows::Win32::Graphics::Dwm::{
 use windows::Win32::Graphics::Gdi::{
     ClientToScreen, CreateRectRgn, EnumDisplayMonitors, GetMonitorInfoW, MonitorFromWindow,
     SetWindowRgn, HDC, HMONITOR, HRGN, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    MONITOR_DEFAULTTONULL,
 };
 #[cfg(target_os = "windows")]
 use windows::Win32::System::Com::{
@@ -21,13 +22,15 @@ use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::Shell::{IVirtualDesktopManager, VirtualDesktopManager};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetClassNameW, GetClientRect, GetForegroundWindow, GetSystemMetrics, GetWindow,
-    GetWindowLongW, GetWindowRect, GetWindowThreadProcessId, IsWindow, IsWindowVisible, LoadImageW,
-    SendMessageW, SetForegroundWindow, SetWindowLongW, SetWindowPos, ShowWindow,
-    SystemParametersInfoW, GWL_EXSTYLE, GWL_STYLE, GW_HWNDPREV, HWND_TOPMOST, ICON_BIG, ICON_SMALL,
-    IMAGE_ICON, LR_DEFAULTSIZE, LR_SHARED, SM_CXICON, SM_CXSMICON, SPI_GETCLIENTAREAANIMATION,
-    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
-    SWP_SHOWWINDOW, SW_SHOWNOACTIVATE, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WM_SETICON, WS_CAPTION,
+    CallWindowProcW, EnumWindows, GetClassNameW, GetClientRect, GetForegroundWindow,
+    GetSystemMetrics, GetWindow, GetWindowLongPtrW, GetWindowLongW, GetWindowRect,
+    GetWindowThreadProcessId, IsWindow, IsWindowVisible, IsZoomed, LoadImageW, SendMessageW,
+    SetForegroundWindow, SetWindowLongPtrW, SetWindowLongW, SetWindowPos, ShowWindow,
+    SystemParametersInfoW, GWLP_WNDPROC, GWL_EXSTYLE, GWL_STYLE, GW_HWNDPREV, HWND_BOTTOM,
+    HWND_TOPMOST, ICON_BIG, ICON_SMALL, IMAGE_ICON, LR_DEFAULTSIZE, LR_SHARED, MA_NOACTIVATE,
+    SM_CXICON, SM_CXSMICON, SPI_GETCLIENTAREAANIMATION, SWP_FRAMECHANGED, SWP_NOACTIVATE,
+    SWP_NOCOPYBITS, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_SHOWNOACTIVATE,
+    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WM_MOUSEACTIVATE, WM_SETICON, WNDPROC, WS_CAPTION,
     WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP,
     WS_THICKFRAME,
 };
@@ -58,13 +61,13 @@ fn pill_hit_rect() -> &'static parking_lot::Mutex<Option<(f32, f32, f32, f32)>> 
 }
 
 /// Limit input on the collapsed overlay to `rect`. Only a change reaches Win32.
-pub fn set_pill_hit_rect(rect: Option<(f32, f32, f32, f32)>) {
+pub fn set_pill_hit_rect(rect: (f32, f32, f32, f32)) {
     {
         let mut current = pill_hit_rect().lock();
-        if *current == rect {
+        if *current == Some(rect) {
             return;
         }
-        *current = rect;
+        *current = Some(rect);
     }
     #[cfg(target_os = "windows")]
     if let Some(hwnd) = find_app_hwnd() {
@@ -82,8 +85,6 @@ fn previous_foreground() -> &'static parking_lot::Mutex<Option<isize>> {
     &HWND
 }
 
-/// Shell popups the pill must not cover. The taskbar is absent on purpose:
-/// a topmost taskbar was painting over the pill and leaving it there.
 /// Opens a file with its default program, for example a text file in the user's editor.
 pub fn open_file(path: &std::path::Path) -> Result<(), String> {
     use std::os::windows::ffi::OsStrExt;
@@ -111,6 +112,8 @@ pub fn open_file(path: &std::path::Path) -> Result<(), String> {
     }
 }
 
+/// Shell popups the pill must not cover. The taskbar is absent on purpose:
+/// a topmost taskbar was painting over the pill and leaving it there.
 pub fn overlay_should_yield_to(class_name: &str) -> bool {
     matches!(
         class_name,
@@ -272,6 +275,25 @@ pub fn ensure_overlay_topmost() {
         return;
     };
     let ex = unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) };
+    if fullscreen_app_in_front(hwnd) {
+        // A window over a fullscreen game drops it out of fullscreen, and a
+        // raise on every poll pulls the game in and out of focus. Step behind
+        // it once; the next poll after the game leaves the front raises again.
+        if ex & WS_EX_TOPMOST.0 as i32 != 0 {
+            unsafe {
+                let _ = SetWindowPos(
+                    hwnd,
+                    HWND_BOTTOM,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOCOPYBITS,
+                );
+            }
+        }
+        return;
+    }
     let expanded = overlay_expanded().load(std::sync::atomic::Ordering::SeqCst);
     let style_is_current = overlay_extended_style(ex, expanded) == ex;
     let covered = covered_by_app_or_taskbar(hwnd);
@@ -293,6 +315,83 @@ pub fn ensure_overlay_topmost() {
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOCOPYBITS,
         );
     }
+}
+
+/// True when another app fills the overlay's whole monitor, as a game or a
+/// fullscreen video does. A maximized window fills only the work area, and
+/// the desktop and shell views are not apps.
+#[cfg(target_os = "windows")]
+fn fullscreen_app_in_front(overlay: HWND) -> bool {
+    unsafe {
+        let fg = GetForegroundWindow();
+        if fg.is_invalid() || fg == overlay || IsZoomed(fg).as_bool() {
+            return false;
+        }
+        let class_name = window_class_name(fg);
+        if matches!(class_name.as_str(), "Progman" | "WorkerW" | "Shell_TrayWnd")
+            || overlay_should_yield_to(&class_name)
+        {
+            return false;
+        }
+        let monitor = MonitorFromWindow(fg, MONITOR_DEFAULTTONULL);
+        if monitor.is_invalid() || monitor != MonitorFromWindow(overlay, MONITOR_DEFAULTTONEAREST) {
+            return false;
+        }
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        let mut rect = RECT::default();
+        if !GetMonitorInfoW(monitor, &mut info).as_bool() || GetWindowRect(fg, &mut rect).is_err() {
+            return false;
+        }
+        let screen = info.rcMonitor;
+        rect.left <= screen.left
+            && rect.top <= screen.top
+            && rect.right >= screen.right
+            && rect.bottom >= screen.bottom
+    }
+}
+
+/// GPUI's window procedure, saved by `keep_pill_from_activating`.
+#[cfg(target_os = "windows")]
+static GPUI_WNDPROC: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
+/// GPUI answers WM_MOUSEACTIVATE with MA_ACTIVATE, so a click on the pill
+/// would take focus from the app the user dictates into, or knock a game
+/// out of fullscreen. Only the open panel may take focus.
+#[cfg(target_os = "windows")]
+pub fn keep_pill_from_activating(hwnd: HWND) {
+    use std::sync::atomic::Ordering;
+    if hwnd.is_invalid() || GPUI_WNDPROC.load(Ordering::SeqCst) != 0 {
+        return;
+    }
+    unsafe {
+        let gpui = GetWindowLongPtrW(hwnd, GWLP_WNDPROC);
+        if gpui == 0 {
+            return;
+        }
+        // Saved before the swap, so the first message through the new
+        // procedure already finds GPUI's.
+        GPUI_WNDPROC.store(gpui, Ordering::SeqCst);
+        SetWindowLongPtrW(hwnd, GWLP_WNDPROC, overlay_wndproc as *const () as isize);
+    }
+}
+
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn overlay_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    use std::sync::atomic::Ordering;
+    if msg == WM_MOUSEACTIVATE && !overlay_expanded().load(Ordering::SeqCst) {
+        return LRESULT(MA_NOACTIVATE as isize);
+    }
+    // SAFETY: the value is the non-null WNDPROC read from this window.
+    let gpui: WNDPROC = std::mem::transmute(GPUI_WNDPROC.load(Ordering::SeqCst));
+    CallWindowProcW(gpui, hwnd, msg, wparam, lparam)
 }
 
 #[cfg(target_os = "windows")]

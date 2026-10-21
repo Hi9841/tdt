@@ -747,8 +747,11 @@ impl HudView {
     }
 
     pub fn close_stats_settings(&mut self, cx: &mut Context<Self>) {
-        if self.mode != WindowViewMode::StatsAndSettings
-            && !matches!(self.panel_motion, Some(PanelMotion::Opening { .. }))
+        // Already closing: the focus loss that follows a close must not
+        // restart the morph.
+        if matches!(self.panel_motion, Some(PanelMotion::Closing { .. }))
+            || (self.mode != WindowViewMode::StatsAndSettings
+                && !matches!(self.panel_motion, Some(PanelMotion::Opening { .. })))
         {
             return;
         }
@@ -1126,8 +1129,9 @@ impl HudView {
     fn render_bubble(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> AnyElement {
         let font_family = cx.theme().font_family.clone();
         let ready = self.model_ready();
-        // A mouse that leaves through the window edge sends no hover-out to
-        // the zone, but the window does know it lost the mouse.
+        // GPUI on Windows sends no mouse-exit event, so a mouse that leaves
+        // through the window edge never moves outside the zone. The window
+        // does know it lost the mouse.
         if !preview::is_active() && !window.is_window_hovered() {
             self.pill_hovered = false;
         }
@@ -1164,20 +1168,17 @@ impl HudView {
             window.request_animation_frame();
         }
 
-        // Input reaches only the pill, plus the tip while it shows.
+        // Input reaches only the pill, plus a strip for the tip while it
+        // shows, so the clear rest of the canvas never blocks clicks.
         let span = self.pill_motion.span();
-        let hit = (!hover_tip).then(|| {
-            let w = span.0 + 2.0 * HIT_PAD;
-            let h = span.1 + 2.0 * HIT_PAD;
-            let canvas = window.viewport_size();
-            (
-                (canvas.width / px(1.0) - w) / 2.0,
-                canvas.height / px(1.0) - h,
-                w,
-                h,
-            )
-        });
-        set_pill_hit_rect(hit);
+        let canvas = window.viewport_size();
+        let canvas_w = canvas.width / px(1.0);
+        let (w, h) = if hover_tip {
+            (canvas_w, span.1 + 2.0 * HIT_PAD + TIP_GAP + TIP_H)
+        } else {
+            (span.0 + 2.0 * HIT_PAD, span.1 + 2.0 * HIT_PAD)
+        };
+        set_pill_hit_rect(((canvas_w - w) / 2.0, canvas.height / px(1.0) - h, w, h));
 
         let at_rest = matches!(self.status, HudStatus::Idle) && ready && !hover_tip;
         let content: AnyElement = match (&self.status, message) {
@@ -1255,9 +1256,13 @@ impl HudView {
             .items_center()
             .gap(px(TIP_GAP))
             .p(px(HIT_PAD))
-            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
-                if this.pill_hovered != *hovered {
-                    this.pill_hovered = *hovered;
+            // Not `on_hover`: it fires only on a change, and its own hover
+            // state stays set after the mouse leaves through the window edge,
+            // so the next hover never fired.
+            .on_mouse_move(cx.listener(|this, _: &MouseMoveEvent, _, cx| {
+                cx.stop_propagation();
+                if !this.pill_hovered {
+                    this.pill_hovered = true;
                     cx.notify();
                 }
             }))
@@ -1271,6 +1276,13 @@ impl HudView {
             .items_center()
             .justify_end()
             .size_full()
+            // The zone stops its own moves, so a move here is outside it.
+            .on_mouse_move(cx.listener(|this, _: &MouseMoveEvent, _, cx| {
+                if this.pill_hovered {
+                    this.pill_hovered = false;
+                    cx.notify();
+                }
+            }))
             .child(zone)
             .into_any_element()
     }

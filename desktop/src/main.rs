@@ -334,6 +334,7 @@ fn main() {
             };
 
             ui::window_util::apply_overlay_window_style(hwnd);
+            ui::window_util::keep_pill_from_activating(hwnd);
             ui::window_util::show_overlay_window(hwnd);
 
             position_bubble_on_preferred_monitor(hwnd);
@@ -342,8 +343,16 @@ fn main() {
             lock_overlay_chrome();
         });
 
-        match cx.open_window(window_options, move |_window, cx| {
+        match cx.open_window(window_options, move |window, cx| {
             cx.new(|cx: &mut Context<HudView>| {
+                // The panel is a flyout: it closes when the user switches to
+                // another app, so it never stays on top of a game or a window.
+                cx.observe_window_activation(window, |view, window, cx| {
+                    if !window.is_window_active() {
+                        view.close_stats_settings(cx);
+                    }
+                })
+                .detach();
                 let rec = Rc::clone(&recorder_clone);
                 let inj = Arc::clone(&injector_clone);
                 let stt = stt_clone.clone();
