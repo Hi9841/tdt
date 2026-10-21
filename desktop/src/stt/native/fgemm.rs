@@ -26,7 +26,10 @@ pub(super) fn level() -> Level {
         let forced = std::env::var("TDT_NATIVE_ISA").unwrap_or_default();
         #[cfg(target_arch = "x86_64")]
         {
-            let avx2 = is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma");
+            // F16C comes with every AVX2 CPU; the f16 decoder layers need it.
+            let avx2 = is_x86_feature_detected!("avx2")
+                && is_x86_feature_detected!("fma")
+                && is_x86_feature_detected!("f16c");
             match forced.as_str() {
                 "scalar" => return Level::Scalar,
                 "avx2" if avx2 => return Level::Avx2,

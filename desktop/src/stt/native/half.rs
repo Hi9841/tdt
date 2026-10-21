@@ -3,9 +3,9 @@
 //! keeping the weights as stored (f16) halves it at no loss of precision.
 
 use super::buf::Buf;
+use super::fgemm::{level, Level};
 use super::team;
 use super::tensors::f16_to_f32;
-use std::sync::OnceLock;
 
 /// Output rows per parallel task.
 const ROWS_PER_TASK: usize = 128;
@@ -15,38 +15,6 @@ pub struct HalfDense {
     pub in_features: usize,
     weight: Vec<u16>,
     bias: Option<Vec<f32>>,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Level {
-    Scalar,
-    #[cfg(target_arch = "x86_64")]
-    Avx2,
-    #[cfg(target_arch = "x86_64")]
-    Avx512,
-}
-
-fn level() -> Level {
-    static LEVEL: OnceLock<Level> = OnceLock::new();
-    *LEVEL.get_or_init(|| {
-        #[cfg(target_arch = "x86_64")]
-        {
-            let forced = std::env::var("TDT_NATIVE_ISA").unwrap_or_default();
-            let avx2 = is_x86_feature_detected!("avx2")
-                && is_x86_feature_detected!("fma")
-                && is_x86_feature_detected!("f16c");
-            if forced == "scalar" {
-                return Level::Scalar;
-            }
-            if forced != "avx2" && is_x86_feature_detected!("avx512f") {
-                return Level::Avx512;
-            }
-            if avx2 {
-                return Level::Avx2;
-            }
-        }
-        Level::Scalar
-    })
 }
 
 impl HalfDense {
