@@ -2,6 +2,8 @@
 //! preemphasis, centered STFT with a Hann window, power spectrum, Slaney mel
 //! filters, log, and per-bin normalization over the take.
 
+use super::team;
+
 const N_FFT: usize = 512;
 const WIN_LENGTH: usize = 400;
 const HOP: usize = 160;
@@ -10,6 +12,8 @@ const PREEMPHASIS: f32 = 0.97;
 const LOG_GUARD: f32 = 5.960_464_5e-8; // 2^-24
 const NORM_EPSILON: f32 = 1e-5;
 const BINS: usize = N_FFT / 2 + 1;
+/// Frames per parallel task: a 2 s take still spreads over the team.
+const FRAMES_PER_TASK: usize = 16;
 
 pub struct MelFrontend {
     /// Per mel bin, the first FFT bin and the weights of its nonzero span.
@@ -50,37 +54,40 @@ impl MelFrontend {
 
         let mels = self.filters.len();
         let mut out = vec![0.0f32; frames * mels];
-        let mut re = vec![0.0f64; N_FFT];
-        let mut im = vec![0.0f64; N_FFT];
-        let mut power = vec![0.0f32; BINS];
-        for frame in 0..frames {
-            let start = frame * HOP;
-            for n in 0..N_FFT {
-                re[n] = f64::from(emphasized[start + n]) * self.window[n];
-                im[n] = 0.0;
+        // Frames are independent, so each task runs its own.
+        team::chunks_mut(&mut out, FRAMES_PER_TASK * mels, |task, rows| {
+            let (mut re, mut im) = ([0.0f64; N_FFT], [0.0f64; N_FFT]);
+            let mut power = [0.0f32; BINS];
+            for (offset, row) in rows.chunks_exact_mut(mels).enumerate() {
+                let start = (task * FRAMES_PER_TASK + offset) * HOP;
+                for n in 0..N_FFT {
+                    re[n] = f64::from(emphasized[start + n]) * self.window[n];
+                    im[n] = 0.0;
+                }
+                self.fft.run(&mut re, &mut im);
+                for bin in 0..BINS {
+                    power[bin] = (re[bin] * re[bin] + im[bin] * im[bin]) as f32;
+                }
+                for (value, (first, weights)) in row.iter_mut().zip(&self.filters) {
+                    let energy: f32 = weights
+                        .iter()
+                        .zip(&power[*first..])
+                        .map(|(w, p)| w * p)
+                        .sum();
+                    *value = (energy + LOG_GUARD).ln();
+                }
             }
-            self.fft.run(&mut re, &mut im);
-            for bin in 0..BINS {
-                power[bin] = (re[bin] * re[bin] + im[bin] * im[bin]) as f32;
-            }
-            let row = &mut out[frame * mels..(frame + 1) * mels];
-            for (value, (first, weights)) in row.iter_mut().zip(&self.filters) {
-                let energy: f32 = weights
-                    .iter()
-                    .zip(&power[*first..])
-                    .map(|(w, p)| w * p)
-                    .sum();
-                *value = (energy + LOG_GUARD).ln();
-            }
-        }
+        });
         normalize(&mut out, frames, mels);
         (out, frames)
     }
 }
 
-/// Mean and sample standard deviation per mel bin over all frames.
+/// Mean and sample standard deviation per mel bin over all frames. The
+/// statistics run per bin and the scaling per frame, both on the team; each
+/// value still takes the same steps in the same order.
 fn normalize(features: &mut [f32], frames: usize, mels: usize) {
-    for mel in 0..mels {
+    let stats = team::map(mels, |mel| {
         let mean = (0..frames)
             .map(|f| f64::from(features[f * mels + mel]))
             .sum::<f64>()
@@ -89,12 +96,15 @@ fn normalize(features: &mut [f32], frames: usize, mels: usize) {
             .map(|f| (f64::from(features[f * mels + mel]) - mean).powi(2))
             .sum::<f64>()
             / (frames - 1) as f64;
-        let std = variance.sqrt() as f32;
-        for f in 0..frames {
-            let value = &mut features[f * mels + mel];
-            *value = (*value - mean as f32) / (std + NORM_EPSILON);
+        (mean as f32, variance.sqrt() as f32 + NORM_EPSILON)
+    });
+    team::chunks_mut(features, FRAMES_PER_TASK * mels, |_, rows| {
+        for row in rows.chunks_exact_mut(mels) {
+            for (value, (mean, spread)) in row.iter_mut().zip(&stats) {
+                *value = (*value - mean) / spread;
+            }
         }
-    }
+    });
 }
 
 fn hz_to_mel(hz: f64) -> f64 {

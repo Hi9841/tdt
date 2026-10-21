@@ -100,13 +100,13 @@ impl NativeParakeet {
     }
 
     pub fn tokens(&self, samples: &[f32]) -> Vec<usize> {
+        // The calling thread works on every step, so it joins the team's L3 domain.
+        let _pinned = team::pin_caller();
         let (features, frames) = self.frontend.compute(samples);
         // The subsampling needs at least one output frame per stage.
         if frames < 8 {
             return Vec::new();
         }
-        // The calling thread works on every step, so it joins the team's L3 domain.
-        let _pinned = team::pin_caller();
         let (encoded, t) = self.model.encode(&features, frames);
         let projected = self.model.project(&encoded, t);
         let dictionary = self.dictionary.read();
