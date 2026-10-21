@@ -9,6 +9,8 @@ use super::team;
 
 /// Output columns per parallel task.
 const COLUMN_BLOCK: usize = 64;
+/// Output rows per task of the bias and ReLU pass.
+const EPILOGUE_ROWS: usize = 64;
 
 /// Dense layer with f32 weights.
 pub struct Dense {
@@ -43,14 +45,32 @@ impl Dense {
 
     /// `x` is `rows x in_features`; the result is `rows x out_features`.
     pub fn forward(&self, x: &[f32], rows: usize) -> Buf {
-        let mut out = fgemm::matmul(x, rows, self.in_features, &self.weight, self.out_features);
-        if let Some(bias) = &self.bias {
-            for row in out.chunks_exact_mut(self.out_features) {
-                for (value, b) in row.iter_mut().zip(bias) {
-                    *value += b;
+        self.forward_then(x, rows, false)
+    }
+
+    /// `forward`, then `max(0, v)` on every output.
+    pub fn forward_relu(&self, x: &[f32], rows: usize) -> Buf {
+        self.forward_then(x, rows, true)
+    }
+
+    fn forward_then(&self, x: &[f32], rows: usize, relu: bool) -> Buf {
+        let n = self.out_features;
+        let mut out = fgemm::matmul(x, rows, self.in_features, &self.weight, n);
+        if self.bias.is_none() && !relu {
+            return out;
+        }
+        team::chunks_mut(&mut out, EPILOGUE_ROWS * n, |_, block| {
+            for row in block.chunks_exact_mut(n) {
+                if let Some(bias) = &self.bias {
+                    for (value, b) in row.iter_mut().zip(bias) {
+                        *value += b;
+                    }
+                }
+                if relu {
+                    row.iter_mut().for_each(|v| *v = v.max(0.0));
                 }
             }
-        }
+        });
         out
     }
 }

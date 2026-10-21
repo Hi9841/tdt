@@ -259,20 +259,18 @@ impl Subsampling {
     fn forward(&self, features: &[f32], frames: usize, mels: usize) -> (Buf, usize) {
         let ch = self.channels;
         let (x, h2, w2) = self.first_two_convs(features, frames, mels);
-        let mut x = self.pw1.forward(&x, h2 * w2);
-        x.iter_mut().for_each(|v| *v = v.max(0.0));
+        let x = self.pw1.forward_relu(&x, h2 * w2);
         let (x, h3, w3) = depthwise(&x, h2, w2, ch, &self.dw2);
-        let mut x = self.pw2.forward(&x, h3 * w3);
-        x.iter_mut().for_each(|v| *v = v.max(0.0));
+        let x = self.pw2.forward_relu(&x, h3 * w3);
         // Flatten per frame as channel-major: index = c * w3 + w.
         let mut flat = Buf::zeroed(h3 * ch * w3);
-        for h in 0..h3 {
+        team::chunks_mut(&mut flat, ch * w3, |h, row| {
             for w in 0..w3 {
                 for c in 0..ch {
-                    flat[h * ch * w3 + c * w3 + w] = x[(h * w3 + w) * ch + c];
+                    row[c * w3 + w] = x[(h * w3 + w) * ch + c];
                 }
             }
-        }
+        });
         (self.linear.forward(&flat, h3), h3)
     }
 }
