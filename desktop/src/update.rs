@@ -25,6 +25,8 @@ pub enum UpdatePhase {
     Ready {
         installer: PathBuf,
     },
+    /// The new TDT.exe is staged; the app quits so the swap script can run.
+    Restarting,
     Failed(String),
 }
 
@@ -58,6 +60,26 @@ pub fn begin_update_check() -> u64 {
 /// True when the caller's ticket is still the newest update-check generation.
 pub fn update_check_is_current(ticket: u64) -> bool {
     UPDATE_EPOCH.load(std::sync::atomic::Ordering::SeqCst) == ticket
+}
+
+/// Starts a check or a download: under the phase lock, refuses while one is
+/// running, sets `busy`, and returns the new ticket. `only_when_idle` is for
+/// the boot check, which must never take over from something the user started.
+pub fn claim(
+    cell: &parking_lot::Mutex<UpdatePhase>,
+    busy: UpdatePhase,
+    only_when_idle: bool,
+) -> Option<u64> {
+    let mut phase = cell.lock();
+    let running = matches!(
+        *phase,
+        UpdatePhase::Checking | UpdatePhase::Downloading { .. } | UpdatePhase::Restarting
+    );
+    if running || (only_when_idle && *phase != UpdatePhase::Idle) {
+        return None;
+    }
+    *phase = busy;
+    Some(begin_update_check())
 }
 
 pub fn version_newer(latest: &str, current: &str) -> bool {
@@ -101,20 +123,14 @@ pub fn check_latest() -> Result<UpdatePhase, String> {
         return Ok(UpdatePhase::UpToDate);
     }
 
-    // Verify SHA256SUMS.txt exists before declaring the update available
+    // A release without SHA256SUMS.txt cannot be verified, and the download
+    // refuses it, so it is not offered.
     let sums_url = format!("https://github.com/{repo}/releases/download/{tag}/SHA256SUMS.txt");
     let sums_body = match http_get_string(&sums_url) {
         Ok(body) => body,
         Err(err) if is_no_release(&err) => {
-            let asset_name = "TDT.exe".to_string();
-            let asset_url =
-                format!("https://github.com/{repo}/releases/download/{tag}/{asset_name}");
-            return Ok(UpdatePhase::Available {
-                version: latest,
-                asset_url,
-                asset_name,
-                sums_url: None,
-            });
+            eprintln!("TDT: release {tag} has no SHA256SUMS.txt; not offered");
+            return Ok(UpdatePhase::UpToDate);
         }
         Err(err) => return Err(clean_error_message(&err)),
     };
@@ -303,12 +319,9 @@ pub fn replace_running_exe(new_exe: &Path, version: &str) -> Result<(), String> 
     let _ = std::fs::write(dir.join("VERSION"), version.trim().trim_start_matches('v'));
 
     let script = dir.join("tdt-apply-update.cmd");
-    let esc = |s: &str| {
-        s.replace('"', "")
-            .replace('%', "%%")
-            .replace('&', "^&")
-            .replace('^', "^^")
-    };
+    // Every path below is inside double quotes, where cmd reads & and ^ as
+    // plain characters; only % still expands.
+    let esc = |s: &str| s.replace('"', "").replace('%', "%%");
     let staged_s = esc(&staged.display().to_string());
     let current_s = esc(&current.display().to_string());
     let old_s = esc(&old.display().to_string());
@@ -335,14 +348,18 @@ pub fn replace_running_exe(new_exe: &Path, version: &str) -> Result<(), String> 
         .map_err(|error| format!("Could not write the update script: {error}"))?;
 
     let mut cmd = Command::new("cmd.exe");
-    cmd.args(["/C", &script.to_string_lossy()]);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         const DETACHED_PROCESS: u32 = 0x0000_0008;
+        // cmd drops the outer pair of quotes after /C when the path holds a
+        // character such as & or ^, so the path gets a second pair.
+        cmd.raw_arg(format!("/C \"\"{}\"\"", script.display()));
         cmd.creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
     }
+    #[cfg(not(windows))]
+    cmd.args(["/C", &script.to_string_lossy()]);
     cmd.spawn()
         .map_err(|error| format!("Could not start the update script: {error}"))?;
     Ok(())

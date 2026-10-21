@@ -315,6 +315,7 @@ fn main() {
         let update_state = Arc::new(Mutex::new(UpdatePhase::Idle));
         let update_for_view = Arc::clone(&update_state);
         let update_for_boot = Arc::clone(&update_state);
+        let update_for_loop = Arc::clone(&update_state);
         let (update_ping_tx, update_ping_rx) = crossbeam_channel::unbounded::<()>();
         let update_ping_view = update_ping_tx.clone();
         let update_ping_boot = update_ping_tx.clone();
@@ -365,6 +366,7 @@ fn main() {
                 let auto_paste_flag = Arc::clone(&auto_paste_bg);
                 let fillers_flag = Arc::clone(&fillers_bg);
                 let target_hwnd = Arc::clone(&target_hwnd_loop);
+                let update_phase = Arc::clone(&update_for_loop);
 
                 // Spawn UI coordination loop running on GPUI executor
                 cx.spawn(async move |this, cx| {
@@ -463,6 +465,12 @@ fn main() {
                                     });
                                 }
                             }
+                        }
+                        // A staged update quits like the Quit item, so the tray
+                        // icon is removed before the new TDT starts.
+                        if !quitting && *update_phase.lock() == UpdatePhase::Restarting {
+                            let _ = this.update(cx, |_, cx| cx.quit());
+                            quitting = true;
                         }
                         while let Ok(event) = TrayIconEvent::receiver().try_recv() {
                             match event {
@@ -927,8 +935,12 @@ fn main() {
                     if preview::is_active() || update::updates_disabled() {
                         return;
                     }
-                    let ticket = update::begin_update_check();
-                    *update_for_boot.lock() = UpdatePhase::Checking;
+                    // Only from Idle: a check or download the user started wins.
+                    let Some(ticket) =
+                        update::claim(&update_for_boot, UpdatePhase::Checking, true)
+                    else {
+                        return;
+                    };
                     let _ = update_ping_boot.send(());
                     let next = match update::check_latest() {
                         Ok(phase) => Some(phase),

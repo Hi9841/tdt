@@ -738,17 +738,12 @@ impl HudView {
         }
         // Ignore clicks while a check or download is already running; the
         // shared phase cell has a single writer at a time.
-        if matches!(
-            &*self.update.lock(),
-            UpdatePhase::Checking | UpdatePhase::Downloading { .. }
-        ) {
+        let Some(ticket) = update::claim(&self.update, UpdatePhase::Checking, false) else {
             return;
-        }
+        };
         let cell = Arc::clone(&self.update);
         let ping = self.update_ping.clone();
-        let ticket = update::begin_update_check();
         std::thread::spawn(move || {
-            *cell.lock() = UpdatePhase::Checking;
             let _ = ping.send(());
             let next = match update::check_latest() {
                 Ok(phase) => phase,
@@ -774,11 +769,13 @@ impl HudView {
                 asset_name,
                 sums_url,
             } => {
+                let busy = UpdatePhase::Downloading { done: 0, total: 1 };
+                let Some(ticket) = update::claim(&self.update, busy, false) else {
+                    return;
+                };
                 let cell = Arc::clone(&self.update);
                 let ping = self.update_ping.clone();
-                let ticket = update::begin_update_check();
                 std::thread::spawn(move || {
-                    *cell.lock() = UpdatePhase::Downloading { done: 0, total: 1 };
                     let _ = ping.send(());
                     let mut last_ping = Instant::now();
                     let next = match update::download_installer(
@@ -795,8 +792,10 @@ impl HudView {
                     ) {
                         Ok(path) => {
                             if update::is_app_binary(&asset_name) {
+                                // The main loop quits on Restarting, so the tray
+                                // icon goes away before the new TDT starts.
                                 match update::replace_running_exe(&path, &version) {
-                                    Ok(()) => std::process::exit(0),
+                                    Ok(()) => UpdatePhase::Restarting,
                                     Err(error) => UpdatePhase::Failed(error),
                                 }
                             } else {
@@ -2080,6 +2079,11 @@ impl HudView {
                 "Install update".to_string(),
                 false,
             ),
+            UpdatePhase::Restarting => (
+                "Restarting into the new version...".to_string(),
+                "Restarting".to_string(),
+                true,
+            ),
             UpdatePhase::Failed(error) => (clip_text(error, 48), "Try again".to_string(), false),
         };
 
@@ -2097,7 +2101,9 @@ impl HudView {
                 .on_click(cx.listener(move |this, _, _, cx| {
                     if matches!(
                         *this.update.lock(),
-                        UpdatePhase::Checking | UpdatePhase::Downloading { .. }
+                        UpdatePhase::Checking
+                            | UpdatePhase::Downloading { .. }
+                            | UpdatePhase::Restarting
                     ) {
                         return;
                     }
