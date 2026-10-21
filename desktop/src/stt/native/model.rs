@@ -287,41 +287,13 @@ impl Subsampling {
         // At least four strips per thread, so a short take still spreads out.
         let strip_rows = h2.div_ceil(4 * team::threads()).clamp(1, MAX_STRIP_ROWS);
         team::chunks_mut(&mut out, strip_rows * w2 * ch, |strip, rows| {
-            let first_out = strip * strip_rows;
-            let out_rows = rows.len() / (w2 * ch);
-            // Output row oh reads conv0 rows 2oh-1 ..= 2oh+1.
-            let first_in = (2 * first_out).saturating_sub(1);
-            let last_in = (2 * (first_out + out_rows - 1) + 1).min(h1 - 1);
-            let mut conv0 = vec![0.0f32; (last_in - first_in + 1) * w1 * ch];
-            for (offset, row) in conv0.chunks_exact_mut(w1 * ch).enumerate() {
-                self.conv0_row(features, frames, mels, first_in + offset, row);
-            }
-            let (weight, bias) = &self.dw1;
-            for local in 0..out_rows {
-                let oh = first_out + local;
-                for ow in 0..w2 {
-                    let cell = &mut rows[(local * w2 + ow) * ch..][..ch];
-                    cell.copy_from_slice(bias);
-                    for i in 0..3 {
-                        for j in 0..3 {
-                            let (ih, iw) = (2 * oh + i, 2 * ow + j);
-                            if ih == 0 || iw == 0 || ih > h1 || iw > w1 {
-                                continue;
-                            }
-                            let input = &conv0[((ih - 1 - first_in) * w1 + (iw - 1)) * ch..][..ch];
-                            let taps = &weight[(i * 3 + j) * ch..][..ch];
-                            for ((o, wt), v) in cell.iter_mut().zip(taps).zip(input) {
-                                *o += wt * v;
-                            }
-                        }
-                    }
-                }
-            }
+            conv_strip(self, features, (frames, mels), strip_rows, strip, rows);
         });
         (out, h2, w2)
     }
 
     /// One output row of conv0, channels-last, after ReLU.
+    #[inline(always)]
     fn conv0_row(&self, features: &[f32], frames: usize, mels: usize, h: usize, row: &mut [f32]) {
         let ch = self.channels;
         let (weight, bias) = &self.conv0;
@@ -337,6 +309,54 @@ impl Subsampling {
                 }
             }
             cell.iter_mut().for_each(|o| *o = o.max(0.0));
+        }
+    }
+}
+
+multiversion! {
+    /// Output rows `strip * strip_rows ..` of the first depthwise conv, from
+    /// the conv0 rows they read. `rows` holds those output rows.
+    fn conv_strip(
+        sub: &Subsampling,
+        features: &[f32],
+        frames_mels: (usize, usize),
+        strip_rows: usize,
+        strip: usize,
+        rows: &mut [f32],
+    ) {
+        let (frames, mels) = frames_mels;
+        let ch = sub.channels;
+        let (h1, w1) = (half(frames), half(mels));
+        let w2 = half(w1);
+        let first_out = strip * strip_rows;
+        let out_rows = rows.len() / (w2 * ch);
+        // Output row oh reads conv0 rows 2oh-1 ..= 2oh+1.
+        let first_in = (2 * first_out).saturating_sub(1);
+        let last_in = (2 * (first_out + out_rows - 1) + 1).min(h1 - 1);
+        let mut conv0 = vec![0.0f32; (last_in - first_in + 1) * w1 * ch];
+        for (offset, row) in conv0.chunks_exact_mut(w1 * ch).enumerate() {
+            sub.conv0_row(features, frames, mels, first_in + offset, row);
+        }
+        let (weight, bias) = &sub.dw1;
+        for local in 0..out_rows {
+            let oh = first_out + local;
+            for ow in 0..w2 {
+                let cell = &mut rows[(local * w2 + ow) * ch..][..ch];
+                cell.copy_from_slice(bias);
+                for i in 0..3 {
+                    for j in 0..3 {
+                        let (ih, iw) = (2 * oh + i, 2 * ow + j);
+                        if ih == 0 || iw == 0 || ih > h1 || iw > w1 {
+                            continue;
+                        }
+                        let input = &conv0[((ih - 1 - first_in) * w1 + (iw - 1)) * ch..][..ch];
+                        let taps = &weight[(i * 3 + j) * ch..][..ch];
+                        for ((o, wt), v) in cell.iter_mut().zip(taps).zip(input) {
+                            *o += wt * v;
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -358,6 +378,7 @@ fn half(n: usize) -> usize {
 }
 
 /// Input value at padded position (row, col), or None in the zero padding.
+#[inline(always)]
 fn sample(x: &[f32], rows: usize, cols: usize, row: usize, col: usize) -> Option<f32> {
     let (r, c) = (row.checked_sub(1)?, col.checked_sub(1)?);
     (r < rows && c < cols).then(|| x[r * cols + c])
@@ -374,8 +395,23 @@ fn depthwise(
     let (ho, wo) = (half(h), half(w));
     let mut out = Buf::scratch(ho * wo * ch);
     team::chunks_mut(&mut out, wo * ch, |oh, row| {
-        for ow in 0..wo {
-            let cell = &mut row[ow * ch..(ow + 1) * ch];
+        depthwise_row(x, (h, w, ch), weight, bias, oh, row);
+    });
+    (out, ho, wo)
+}
+
+multiversion! {
+    /// Output row `oh` of `depthwise`.
+    fn depthwise_row(
+        x: &[f32],
+        shape: (usize, usize, usize),
+        weight: &[f32],
+        bias: &[f32],
+        oh: usize,
+        row: &mut [f32],
+    ) {
+        let (h, w, ch) = shape;
+        for (ow, cell) in row.chunks_exact_mut(ch).enumerate() {
             cell.copy_from_slice(bias);
             for i in 0..3 {
                 for j in 0..3 {
@@ -391,8 +427,7 @@ fn depthwise(
                 }
             }
         }
-    });
-    (out, ho, wo)
+    }
 }
 
 struct Block {
@@ -551,7 +586,6 @@ impl Block {
     fn convolution(&self, x: &[f32], t: usize, c: &Config) -> Buf {
         let d = c.hidden;
         let kernel = c.conv_kernel;
-        let pad = (kernel - 1) / 2;
         let wide = self.pw1.forward(x, t);
         let mut gated = Buf::scratch(t * d);
         team::chunks_mut(&mut gated, d, |index, out| {
@@ -565,22 +599,33 @@ impl Block {
         // Accumulated with +=: the one buffer here that must start at zero.
         let mut mixed = Buf::zeroed(t * d);
         team::chunks_mut(&mut mixed, d, |i, out| {
-            for k in 0..kernel {
-                let src = i + k;
-                if src < pad || src - pad >= t {
-                    continue;
-                }
-                let taps = &self.dw_by_tap[k * d..(k + 1) * d];
-                for ((o, w), g) in out.iter_mut().zip(taps).zip(&gated[(src - pad) * d..][..d]) {
-                    *o += w * g;
-                }
-            }
-            for ((o, scale), shift) in out.iter_mut().zip(&self.bn_scale).zip(&self.bn_shift) {
-                *o = *o * scale + shift;
-            }
+            time_conv_row(self, &gated, (t, kernel), i, out);
             activation::silu(out);
         });
         self.pw2.forward(&mixed, t)
+    }
+}
+
+multiversion! {
+    /// Frame `i` of the conv module's depthwise conv over time, then its batch
+    /// norm. `out` starts at zero.
+    fn time_conv_row(block: &Block, gated: &[f32], t_kernel: (usize, usize), i: usize, out: &mut [f32]) {
+        let (t, kernel) = t_kernel;
+        let d = out.len();
+        let pad = (kernel - 1) / 2;
+        for k in 0..kernel {
+            let src = i + k;
+            if src < pad || src - pad >= t {
+                continue;
+            }
+            let taps = &block.dw_by_tap[k * d..(k + 1) * d];
+            for ((o, w), g) in out.iter_mut().zip(taps).zip(&gated[(src - pad) * d..][..d]) {
+                *o += w * g;
+            }
+        }
+        for ((o, scale), shift) in out.iter_mut().zip(&block.bn_scale).zip(&block.bn_shift) {
+            *o = *o * scale + shift;
+        }
     }
 }
 

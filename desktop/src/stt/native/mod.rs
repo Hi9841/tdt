@@ -2,6 +2,9 @@
 //! The model files are read as published (CC-BY-4.0); the network follows
 //! the Apache-2.0 Hugging Face Parakeet implementation.
 
+#[macro_use]
+mod simd;
+
 mod activation;
 mod bias;
 mod buf;
