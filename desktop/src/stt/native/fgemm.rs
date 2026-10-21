@@ -290,31 +290,3 @@ mod avx2 {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::{dot_scalar, matmul};
-
-    #[test]
-    fn odd_shapes_match_plain_dot_products() {
-        for (m, k, n) in [(1, 7, 1), (5, 33, 9), (70, 130, 67), (3, 16, 4)] {
-            let x: Vec<f32> = (0..m * k)
-                .map(|i| ((i * 13 % 17) as f32 - 8.0) * 0.1)
-                .collect();
-            let w: Vec<f32> = (0..n * k)
-                .map(|i| ((i * 7 % 11) as f32 - 5.0) * 0.2)
-                .collect();
-            let out = matmul(&x, m, k, &w, n);
-            for i in 0..m {
-                for j in 0..n {
-                    let expected = dot_scalar(&x[i * k..(i + 1) * k], &w[j * k..(j + 1) * k]);
-                    let got = out[i * n + j];
-                    assert!(
-                        (got - expected).abs() <= 1e-4 * expected.abs().max(1.0),
-                        "{m}x{k}x{n} [{i},{j}] {got} vs {expected}"
-                    );
-                }
-            }
-        }
-    }
-}

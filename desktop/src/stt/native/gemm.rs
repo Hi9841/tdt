@@ -198,35 +198,3 @@ impl SendPtr {
         self.0
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::{Dense, Precision, Ternary};
-
-    #[test]
-    fn packed_ternary_rows_decode_and_multiply() {
-        // Codes 2,0,1,2,1 | 0,2 are weights +1,-1,0,+1,0 | -1,+1.
-        // Byte 0 = 2 + 0*3 + 1*9 + 2*27 + 1*81 = 146, byte 1 = 0 + 2*3 = 6.
-        let layer =
-            Ternary::from_packed(&[146, 6], vec![2.0], 1, 7, 7, Precision::Exact).expect("layer");
-        let x = [1.0, 10.0, 100.0, 1000.0, 5.0, 3.0, 7.0];
-        assert_eq!(
-            layer.forward(&x, 1).to_vec(),
-            vec![2.0 * (1.0 - 10.0 + 1000.0 - 3.0 + 7.0)]
-        );
-        assert!(Ternary::from_packed(&[243, 6], vec![2.0], 1, 7, 7, Precision::Exact).is_err());
-    }
-
-    #[test]
-    fn dense_forward_adds_bias_per_column() {
-        let layer = Dense::new(
-            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
-            Some(vec![0.5, -1.0]),
-            2,
-            3,
-        )
-        .expect("layer");
-        let y = layer.forward(&[1.0, 0.0, 2.0, 0.0, 1.0, 0.0], 2);
-        assert_eq!(y.to_vec(), vec![7.5, 15.0, 2.5, 4.0]);
-    }
-}

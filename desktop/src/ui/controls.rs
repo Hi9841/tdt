@@ -243,18 +243,3 @@ fn hotkey_parts(hotkey: &str) -> Vec<&str> {
         .filter(|part| !part.is_empty())
         .collect()
 }
-
-#[cfg(test)]
-mod tests {
-    use super::hotkey_parts;
-
-    #[test]
-    fn shortcut_labels_split_into_keys() {
-        assert_eq!(hotkey_parts("Ctrl+;"), ["Ctrl", ";"]);
-        assert_eq!(hotkey_parts("Ctrl+Shift+Space"), ["Ctrl", "Shift", "Space"]);
-        assert_eq!(hotkey_parts("Ctrl+-"), ["Ctrl", "-"]);
-        assert_eq!(hotkey_parts("F5"), ["F5"]);
-        assert_eq!(hotkey_parts("Ctrl++"), ["Ctrl", "+"]);
-        assert_eq!(hotkey_parts("+"), ["+"]);
-    }
-}

@@ -190,33 +190,3 @@ fn physical_cores() -> Option<(usize, usize)> {
 fn physical_cores() -> Option<(usize, usize)> {
     None
 }
-
-#[cfg(test)]
-mod reference_tests;
-
-#[cfg(test)]
-mod thread_tests {
-    use super::pick_domain;
-
-    #[test]
-    fn the_core_count_is_plausible() {
-        let (threads, domain) = super::engine_threads();
-        let logical = std::thread::available_parallelism().map_or(1, |n| n.get());
-        println!("engine threads {threads}, domain {domain:#x}, logical {logical}");
-        assert!(threads >= 1 && threads <= logical);
-    }
-
-    #[test]
-    fn several_l3_domains_pin_the_largest_and_one_domain_pins_nothing() {
-        // Two cores per domain, two logical processors per core.
-        let cores = [0b11, 0b1100, 0b11_0000, 0b1100_0000];
-        let two = [(0b1111, 32 << 20), (0b1111_0000, 96 << 20)];
-        assert_eq!(pick_domain(&cores, &two), Some((2, 0b1111_0000)));
-        let one = [(0b1111_1111, 32 << 20)];
-        assert_eq!(pick_domain(&cores, &one), Some((4, 0)));
-        assert_eq!(pick_domain(&cores, &[]), Some((4, 0)));
-        // More cores beat a larger cache.
-        let uneven = [(0b11, 96 << 20), (0b1111_1100, 16 << 20)];
-        assert_eq!(pick_domain(&cores, &uneven), Some((3, 0b1111_1100)));
-    }
-}

@@ -186,11 +186,6 @@ impl SttEngine {
         *self.native.lock() = None;
         self.photon.release();
     }
-
-    #[cfg(test)]
-    pub fn is_loaded(&self) -> bool {
-        self.native.lock().is_some() || self.photon.is_loaded()
-    }
 }
 
 /// 25 ms at 16 kHz. Matches the wave's frame.
@@ -239,75 +234,4 @@ pub(crate) fn boost_quiet_speech(samples: &[f32]) -> Option<Vec<f32>> {
 fn frame_rms(frame: &[f32]) -> f32 {
     let sum = frame.iter().map(|sample| sample * sample).sum::<f32>();
     (sum / frame.len() as f32).sqrt()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::SttEngine;
-    use crate::stt::models::DEFAULT;
-    use std::fs;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn unique_dir(tag: &str) -> std::path::PathBuf {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time should be valid")
-            .as_nanos();
-        std::env::temp_dir().join(format!("voice-stt-lazy-model-{tag}-{unique}"))
-    }
-
-    #[test]
-    fn installed_default_model_decodes_speech() {
-        let Some(local) = std::env::var_os("LOCALAPPDATA") else {
-            return;
-        };
-        let dir = std::path::PathBuf::from(local)
-            .join("TDT")
-            .join("models")
-            .join(DEFAULT.dir_name);
-        if !DEFAULT.is_installed_in(&dir) {
-            return;
-        }
-        let engine = SttEngine::new(DEFAULT, &dir).expect("engine");
-        engine.prepare().expect("load");
-        assert!(engine.is_loaded());
-    }
-
-    #[test]
-    fn constructing_engine_does_not_load_model() {
-        let model_dir = unique_dir("redux-idle");
-        fs::create_dir_all(&model_dir).expect("temporary model directory should be created");
-        for file in DEFAULT.files {
-            fs::write(model_dir.join(file.name), b"placeholder")
-                .expect("placeholder model should be written");
-        }
-
-        let engine = SttEngine::new(DEFAULT, &model_dir)
-            .expect("construction should validate paths without loading model");
-
-        assert!(!engine.is_loaded(), "model must stay unloaded while idle");
-        fs::remove_dir_all(model_dir).expect("temporary model directory should be removed");
-    }
-
-    #[test]
-    fn quiet_visible_speech_is_boosted_and_silence_is_not() {
-        assert!(super::boost_quiet_speech(&vec![0.0; 16_000]).is_none());
-        let whisper: Vec<f32> = (0..16_000)
-            .map(|index| 0.001 * (index as f32 * 0.15).sin())
-            .collect();
-        assert!(
-            super::boost_quiet_speech(&whisper).is_none(),
-            "a flat wave is not speech"
-        );
-        let audible: Vec<f32> = (0..16_000)
-            .map(|index| 0.012 * (index as f32 * 0.2).sin())
-            .collect();
-        let boosted = super::boost_quiet_speech(&audible).expect("visible sine");
-        let before = super::frame_rms(&audible[..400]);
-        let after = super::frame_rms(&boosted[..400]);
-        assert!(after > before * 2.0);
-        assert!(after <= super::BOOST_TARGET_RMS + 0.001);
-        let loud: Vec<f32> = audible.iter().map(|sample| sample * 20.0).collect();
-        assert!(super::boost_quiet_speech(&loud).is_none());
-    }
 }

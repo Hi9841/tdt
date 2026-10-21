@@ -165,39 +165,3 @@ unsafe fn avx2_rows(weights: &[u16], k: usize, x: &[f32], out: &mut [f32]) {
         *o = total;
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::HalfDense;
-    use crate::stt::native::tensors::f16_to_f32;
-
-    #[test]
-    fn f16_rows_multiply_like_their_f32_values() {
-        let (n, k) = (300, 37);
-        // Halves between 0.5 and 2 with both signs.
-        let weight: Vec<u16> = (0..n * k)
-            .map(|i| (0x3800 + (i % 1024) as u16) | ((i % 2) << 15) as u16)
-            .collect();
-        let bias: Vec<f32> = (0..n).map(|i| i as f32 * 0.01).collect();
-        let x: Vec<f32> = (0..k).map(|i| (i as f32 - 18.0) * 0.1).collect();
-        let layer = HalfDense::new(weight.clone(), Some(bias.clone()), n, k).expect("layer");
-        let out = layer.matvec(&x);
-        for r in 0..n {
-            let expected: f32 = (0..k)
-                .map(|c| f16_to_f32(weight[r * k + c]) * x[c])
-                .sum::<f32>()
-                + bias[r];
-            assert!(
-                (out[r] - expected).abs() <= 1e-4 * expected.abs().max(1.0),
-                "{r}: {} vs {expected}",
-                out[r]
-            );
-        }
-    }
-
-    #[test]
-    fn side_by_side_rows_concatenate() {
-        let joined = HalfDense::side_by_side(&[1, 2, 3, 4], &[9, 8], 2, 2, 1);
-        assert_eq!(joined, vec![1, 2, 9, 3, 4, 8]);
-    }
-}

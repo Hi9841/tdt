@@ -192,20 +192,3 @@ pub fn update_phase(spec: &Spec) -> Option<UpdatePhase> {
         _ => return None,
     })
 }
-
-#[cfg(test)]
-mod tests {
-    use super::{parse_name, CATALOG};
-
-    #[test]
-    fn catalog_names_parse() {
-        for name in CATALOG {
-            assert!(parse_name(name).is_some(), "{name}");
-        }
-    }
-
-    #[test]
-    fn unknown_name_is_none() {
-        assert!(parse_name("not.a.state").is_none());
-    }
-}

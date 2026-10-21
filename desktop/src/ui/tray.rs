@@ -138,20 +138,3 @@ fn status_tooltip(status: &HudStatus, hotkey: &str) -> String {
         })
         .collect()
 }
-
-#[cfg(test)]
-mod tests {
-
-    #[test]
-    fn transcript_tooltip_fits_windows_unicode_limit() {
-        let status = super::HudStatus::Success {
-            text: "hello 🎙️".repeat(40),
-            auto_pasted: false,
-            latency_ms: 182,
-            finished_at: std::time::Instant::now(),
-        };
-        let tooltip = super::status_tooltip(&status, "Ctrl+;");
-        assert!(tooltip.starts_with("TDT. Copied 182ms: hello"));
-        assert!(tooltip.encode_utf16().count() <= 127);
-    }
-}

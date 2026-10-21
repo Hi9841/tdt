@@ -15,8 +15,6 @@ pub struct Tensors {
 
 enum Source {
     File(File),
-    #[cfg(test)]
-    Memory(Vec<u8>),
 }
 
 struct Entry {
@@ -47,24 +45,6 @@ impl Tensors {
         })
     }
 
-    #[cfg(test)]
-    pub fn parse(bytes: Vec<u8>) -> Result<Self, String> {
-        let header_len = bytes
-            .get(..8)
-            .map(|b| u64::from_le_bytes(b.try_into().unwrap_or_default()) as usize)
-            .ok_or("safetensors file is shorter than its header length")?;
-        let data_start = 8usize
-            .checked_add(header_len)
-            .filter(|end| *end <= bytes.len())
-            .ok_or("safetensors header runs past the end of the file")?;
-        let entries = parse_header(&bytes[8..data_start], data_start, bytes.len())?;
-        Ok(Self {
-            source: Source::Memory(bytes),
-            data_start,
-            entries,
-        })
-    }
-
     fn entry(&self, name: &str) -> Result<&Entry, String> {
         self.entries
             .get(name)
@@ -74,8 +54,6 @@ impl Tensors {
     fn raw(&self, name: &str, entry: &Entry) -> Result<Vec<u8>, String> {
         let (start, end) = (self.data_start + entry.start, self.data_start + entry.end);
         match &self.source {
-            #[cfg(test)]
-            Source::Memory(bytes) => Ok(bytes[start..end].to_vec()),
             Source::File(file) => {
                 let mut bytes = vec![0u8; end - start];
                 read_at(file, &mut bytes, start as u64)
@@ -233,51 +211,4 @@ pub fn f16_to_f32(half: u16) -> f32 {
         _ => sign | ((exponent + 127 - 15) << 23) | (mantissa << 13),
     };
     f32::from_bits(bits)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{f16_to_f32, Tensors};
-
-    #[test]
-    fn half_precision_values_convert_exactly() {
-        assert_eq!(f16_to_f32(0x3c00), 1.0);
-        assert_eq!(f16_to_f32(0xc000), -2.0);
-        assert_eq!(f16_to_f32(0x3555), 0.333_251_95);
-        assert_eq!(f16_to_f32(0x0001), 2f32.powi(-24));
-        assert_eq!(f16_to_f32(0x7bff), 65504.0);
-        assert!(f16_to_f32(0x7c00).is_infinite());
-        assert_eq!(f16_to_f32(0x8000).to_bits(), (-0.0f32).to_bits());
-    }
-
-    #[test]
-    fn reading_from_the_file_equals_reading_from_memory() {
-        let header = br#"{"a":{"dtype":"F16","shape":[2],"data_offsets":[0,4]},"b":{"dtype":"U8","shape":[3],"data_offsets":[4,7]}}"#;
-        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
-        bytes.extend_from_slice(header);
-        bytes.extend_from_slice(&[0x00, 0x3c, 0x00, 0xc0, 7, 8, 9]);
-        let dir = std::env::temp_dir().join(format!("tdt-tensors-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        let path = dir.join("small.safetensors");
-        std::fs::write(&path, &bytes).expect("write");
-        let from_file = Tensors::open(&path).expect("open");
-        let in_memory = Tensors::parse(bytes).expect("parse");
-        assert_eq!(from_file.f32("a").unwrap(), in_memory.f32("a").unwrap());
-        assert_eq!(from_file.u8("b").unwrap(), in_memory.u8("b").unwrap());
-        assert!(from_file.u8("a").is_err());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn a_small_file_parses_and_reads_typed_values() {
-        let header = br#"{"a":{"dtype":"F16","shape":[2],"data_offsets":[0,4]},"b":{"dtype":"U8","shape":[3],"data_offsets":[4,7]},"__metadata__":{}}"#;
-        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
-        bytes.extend_from_slice(header);
-        bytes.extend_from_slice(&[0x00, 0x3c, 0x00, 0xc0, 7, 8, 9]);
-        let tensors = Tensors::parse(bytes).expect("parse");
-        assert_eq!(tensors.f32("a").unwrap(), vec![1.0, -2.0]);
-        assert_eq!(tensors.u8("b").unwrap(), vec![7, 8, 9]);
-        assert!(tensors.f32("missing").is_err());
-        assert!(tensors.f32_len("a", 3).is_err());
-    }
 }

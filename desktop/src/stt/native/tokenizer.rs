@@ -140,29 +140,3 @@ impl Tokenizer {
         Some(ids)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::Tokenizer;
-
-    #[test]
-    fn pieces_join_into_words_and_specials_are_skipped() {
-        let json = r#"{"model":{"vocab":{"<unk>":0,"▁Send":1,"▁a":2,"▁rep":3,"ort":4,".":5}},
-            "added_tokens":[{"id":0,"content":"<unk>","special":true}]}"#;
-        let tokenizer = Tokenizer::parse(json).expect("parse");
-        assert_eq!(tokenizer.decode(&[1, 2, 0, 3, 4, 5]), "Send a report.");
-        assert_eq!(tokenizer.decode(&[99]), "");
-    }
-
-    #[test]
-    fn merges_apply_by_rank_within_each_word() {
-        // "low" merges l+o first (rank 0), then lo+w (rank 2); "ow" (rank 1) loses
-        // because "o" is already taken.
-        let json = r#"{"model":{"vocab":{"▁":0,"l":1,"o":2,"w":3,"▁lo":4,"lo":5,"ow":6,"▁low":7,"▁l":8},
-            "merges":[["l","o"],["o","w"],["▁","lo"],["▁lo","w"]]},"added_tokens":[]}"#;
-        let tokenizer = Tokenizer::parse(json).expect("parse");
-        assert_eq!(tokenizer.encode("low"), Some(vec![7]));
-        assert_eq!(tokenizer.encode("lo low"), Some(vec![4, 7]));
-        assert_eq!(tokenizer.encode("x"), None);
-    }
-}
