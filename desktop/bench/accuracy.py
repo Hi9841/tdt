@@ -22,7 +22,7 @@ from pathlib import Path
 from whisper_normalizer.english import EnglishTextNormalizer
 
 DESKTOP = Path(__file__).resolve().parents[1]
-LINE = re.compile(r'^\[([\d.]+)s\] (\S+)\.wav -> (\d+) ms[^:]*: "(.*)"$')
+LINE = re.compile(r'^\[([\d.]+)s\] (\S+)\.wav -> ([\d.]+) ms[^:]*: "(.*)"$')
 FLAGS = {"native": ["--native"], "photon": ["--photon"], "app": []}
 NORMALIZE = EnglishTextNormalizer()
 
@@ -57,7 +57,7 @@ def score(exe: str, name: str, engine: str) -> list[tuple[int, int, str, str, st
         m = LINE.match(line)
         if not m:
             continue
-        secs, clip, ms, hyp = float(m.group(1)), m.group(2), int(m.group(3)), unescape(m.group(4))
+        secs, clip, ms, hyp = float(m.group(1)), m.group(2), float(m.group(3)), unescape(m.group(4))
         # utf-8-sig: PowerShell writes a byte order mark that would count as an error.
         ref = (folder / f"{clip}.txt").read_text(encoding="utf-8-sig")
         r = words(ref)

@@ -362,8 +362,8 @@ fn whole_clips(
         for clip in clips {
             let started = Instant::now();
             let text = transcribe(&clip.samples);
-            let ms = started.elapsed().as_millis() as u64;
-            latencies.push(ms);
+            let elapsed = started.elapsed();
+            latencies.push(elapsed.as_millis() as u64);
             let mut note = String::new();
             if let Some(reference) = &clip.reference {
                 let (e, f, w) = score(reference, &text);
@@ -373,8 +373,10 @@ fn whole_clips(
                 note = format!(" {e}/{w} errors");
             }
             println!(
-                "[{:.2}s] {} -> {ms} ms{note}: {text:?}",
-                clip.duration_secs, clip.name
+                "[{:.2}s] {} -> {:.1} ms{note}: {text:?}",
+                clip.duration_secs,
+                clip.name,
+                elapsed.as_secs_f64() * 1e3
             );
         }
         latencies.sort_unstable();
