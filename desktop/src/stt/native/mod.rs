@@ -41,7 +41,8 @@ impl NativeParakeet {
         let config = Config::parse(&config_text)?;
         // One thread per physical core of one L3 domain. A second thread on a
         // core shares its vector units and only adds contention.
-        team::init(engine_threads());
+        let (threads, domain) = engine_threads();
+        team::init(threads, domain);
         let tensors = tensors::Tensors::open(&model_dir.join("model.safetensors"))?;
         let frontend = features::MelFrontend::new(config.mels);
         let model = model::Parakeet::load(&tensors, config, precision)?;
@@ -103,6 +104,8 @@ impl NativeParakeet {
         if frames < 8 {
             return Vec::new();
         }
+        // The calling thread works on every step, so it joins the team's L3 domain.
+        let _pinned = team::pin_caller();
         let (encoded, t) = self.model.encode(&features, frames);
         let projected = self.model.project(&encoded, t);
         let dictionary = self.dictionary.read();
@@ -110,23 +113,43 @@ impl NativeParakeet {
     }
 }
 
-/// `TDT_NATIVE_THREADS` overrides the physical core count.
-fn engine_threads() -> usize {
+/// Team size and the affinity mask of its L3 domain (0: no pinning).
+/// `TDT_NATIVE_THREADS` overrides the physical core count and turns pinning off.
+fn engine_threads() -> (usize, usize) {
     if let Some(threads) = std::env::var("TDT_NATIVE_THREADS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|t| *t > 0)
     {
-        return threads;
+        return (threads, 0);
     }
-    physical_cores().unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()))
+    physical_cores().unwrap_or_else(|| {
+        let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+        (threads, 0)
+    })
 }
 
 /// Physical cores that share one L3 cache: 8 on a two-CCD Ryzen, all cores
 /// on a CPU with one shared L3. Threads on another L3 domain pay for every
-/// exchange of the small per-layer matrices.
+/// exchange of the small per-layer matrices, so with several domains the
+/// team stays on one: the one with the most cores, then the largest L3
+/// (the V-cache CCD of an X3D part).
+/// `cores` holds one processor mask per physical core, `l3` a mask and a size per L3 cache.
+fn pick_domain(cores: &[usize], l3: &[(usize, u32)]) -> Option<(usize, usize)> {
+    let count = |domain: usize| cores.iter().filter(|core| *core & domain != 0).count();
+    let best = l3
+        .iter()
+        .max_by_key(|(domain, size)| (count(*domain), *size))
+        .filter(|(domain, _)| count(*domain) > 0);
+    match best {
+        Some((domain, _)) if l3.len() > 1 => Some((count(*domain), *domain)),
+        Some((domain, _)) => Some((count(*domain), 0)),
+        None => Some((cores.len(), 0)).filter(|(n, _)| *n > 0),
+    }
+}
+
 #[cfg(windows)]
-fn physical_cores() -> Option<usize> {
+fn physical_cores() -> Option<(usize, usize)> {
     use windows::Win32::System::SystemInformation::{
         CacheUnified, GetLogicalProcessorInformation, RelationCache, RelationProcessorCore,
         SYSTEM_LOGICAL_PROCESSOR_INFORMATION,
@@ -147,25 +170,20 @@ fn physical_cores() -> Option<usize> {
         .map(|entry| entry.ProcessorMask)
         .collect();
     // SAFETY: `Cache` is the active union member for RelationCache entries.
-    let l3_domains: Vec<usize> = info
+    let l3: Vec<(usize, u32)> = info
         .iter()
         .filter(|entry| entry.Relationship == RelationCache)
-        .filter(|entry| unsafe {
-            entry.Anonymous.Cache.Level == 3 && entry.Anonymous.Cache.Type == CacheUnified
+        .filter_map(|entry| unsafe {
+            let cache = entry.Anonymous.Cache;
+            (cache.Level == 3 && cache.Type == CacheUnified)
+                .then_some((entry.ProcessorMask, cache.Size))
         })
-        .map(|entry| entry.ProcessorMask)
         .collect();
-    let per_domain = l3_domains
-        .iter()
-        .map(|domain| cores.iter().filter(|core| *core & domain != 0).count())
-        .max()
-        .unwrap_or(0);
-    let total = cores.len();
-    Some(if per_domain > 0 { per_domain } else { total }).filter(|n| *n > 0)
+    pick_domain(&cores, &l3)
 }
 
 #[cfg(not(windows))]
-fn physical_cores() -> Option<usize> {
+fn physical_cores() -> Option<(usize, usize)> {
     None
 }
 
@@ -174,11 +192,27 @@ mod reference_tests;
 
 #[cfg(test)]
 mod thread_tests {
+    use super::pick_domain;
+
     #[test]
     fn the_core_count_is_plausible() {
-        let threads = super::engine_threads();
+        let (threads, domain) = super::engine_threads();
         let logical = std::thread::available_parallelism().map_or(1, |n| n.get());
-        println!("engine threads {threads}, logical {logical}");
+        println!("engine threads {threads}, domain {domain:#x}, logical {logical}");
         assert!(threads >= 1 && threads <= logical);
+    }
+
+    #[test]
+    fn several_l3_domains_pin_the_largest_and_one_domain_pins_nothing() {
+        // Two cores per domain, two logical processors per core.
+        let cores = [0b11, 0b1100, 0b11_0000, 0b1100_0000];
+        let two = [(0b1111, 32 << 20), (0b1111_0000, 96 << 20)];
+        assert_eq!(pick_domain(&cores, &two), Some((2, 0b1111_0000)));
+        let one = [(0b1111_1111, 32 << 20)];
+        assert_eq!(pick_domain(&cores, &one), Some((4, 0)));
+        assert_eq!(pick_domain(&cores, &[]), Some((4, 0)));
+        // More cores beat a larger cache.
+        let uneven = [(0b11, 96 << 20), (0b1111_1100, 16 << 20)];
+        assert_eq!(pick_domain(&cores, &uneven), Some((3, 0b1111_1100)));
     }
 }

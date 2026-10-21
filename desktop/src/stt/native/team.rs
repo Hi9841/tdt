@@ -34,6 +34,8 @@ struct Shared {
 pub struct Team {
     shared: Arc<Shared>,
     workers: usize,
+    /// Affinity mask of the team's L3 domain, 0 when the team is not pinned.
+    domain: usize,
     /// One caller at a time; a nested call from inside a task runs inline.
     submit: Mutex<()>,
 }
@@ -44,7 +46,7 @@ thread_local! {
 
 impl Team {
     /// `threads` includes the calling thread, which works on every job too.
-    fn new(threads: usize) -> Self {
+    fn new(threads: usize, domain: usize) -> Self {
         let shared = Arc::new(Shared {
             generation: AtomicUsize::new(0),
             job: AtomicPtr::new(std::ptr::null_mut()),
@@ -59,19 +61,23 @@ impl Team {
             let for_worker = Arc::clone(&shared);
             let spawned = std::thread::Builder::new()
                 .name(format!("tdt-speech-{index}"))
-                .spawn(move || work(&for_worker));
+                .spawn(move || {
+                    set_affinity(domain);
+                    work(&for_worker)
+                });
             if spawned.is_err() {
                 // Fewer threads only make the engine slower.
-                return Self::with_workers(shared, index);
+                return Self::with_workers(shared, index, domain);
             }
         }
-        Self::with_workers(shared, workers)
+        Self::with_workers(shared, workers, domain)
     }
 
-    fn with_workers(shared: Arc<Shared>, workers: usize) -> Self {
+    fn with_workers(shared: Arc<Shared>, workers: usize, domain: usize) -> Self {
         Self {
             shared,
             workers,
+            domain,
             submit: Mutex::new(()),
         }
     }
@@ -152,11 +158,46 @@ fn work(s: &Shared) {
 
 static TEAM: OnceLock<Team> = OnceLock::new();
 static THREADS: AtomicUsize = AtomicUsize::new(0);
+static DOMAIN: AtomicUsize = AtomicUsize::new(0);
 
-/// Sets the team size before the first parallel step. Later calls do nothing.
-pub fn init(threads: usize) {
+/// Sets the team size and its affinity mask (0: none) before the first
+/// parallel step. Later calls do nothing.
+pub fn init(threads: usize, domain: usize) {
     THREADS.store(threads.max(1), Ordering::Relaxed);
+    DOMAIN.store(domain, Ordering::Relaxed);
     let _ = team();
+}
+
+/// Moves the calling thread onto the team's L3 domain until the guard drops.
+pub fn pin_caller() -> Pinned {
+    Pinned(set_affinity(team().domain))
+}
+
+/// The caller's previous affinity mask, restored on drop (0: nothing to restore).
+pub struct Pinned(usize);
+
+impl Drop for Pinned {
+    fn drop(&mut self) {
+        set_affinity(self.0);
+    }
+}
+
+/// Sets this thread's affinity mask and returns the previous one. A mask of
+/// 0 changes nothing and returns 0.
+#[cfg(windows)]
+fn set_affinity(mask: usize) -> usize {
+    use windows::Win32::System::Threading::{GetCurrentThread, SetThreadAffinityMask};
+    if mask == 0 {
+        return 0;
+    }
+    // SAFETY: the pseudo handle names the calling thread. A mask outside the
+    // process mask fails, returns 0, and leaves the thread as it was.
+    unsafe { SetThreadAffinityMask(GetCurrentThread(), mask) }
+}
+
+#[cfg(not(windows))]
+fn set_affinity(_mask: usize) -> usize {
+    0
 }
 
 fn team() -> &'static Team {
@@ -165,7 +206,7 @@ fn team() -> &'static Team {
             0 => std::thread::available_parallelism().map_or(4, |n| n.get()),
             n => n,
         };
-        Team::new(threads)
+        Team::new(threads, DOMAIN.load(Ordering::Relaxed))
     })
 }
 
