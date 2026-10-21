@@ -5,6 +5,10 @@
 //! dot product is then `sum(code * q) - sum(q)`, done in i32 by
 //! `vpdpbusd` (AVX-512 VNNI) or `vpmaddubsw` (AVX2), and scaled into f32 by
 //! the weight scale and the activation scale of that group.
+//!
+//! The SIMD paths keep four codes per byte. A short take reads every weight
+//! once from memory, so at one byte per code the product waits on memory;
+//! two shifts and a mask per weight vector cost less than the bytes they save.
 
 use super::buf::Buf;
 use super::team;
@@ -59,7 +63,9 @@ impl Isa {
     }
 }
 
-/// Codes packed for one instruction set: `[n / rows][k / 4][rows][4]`.
+/// Codes packed for one instruction set. Scalar: `[n][k / 4][1][4]`, one
+/// code per byte. SIMD: `[n / rows][k / 16][rows][4]` bytes, where bits
+/// `2s..2s+2` of a byte hold the code of k4 step `4 * (k / 16 index) + s`.
 pub struct PackedTernary {
     pub isa: Isa,
     pub n: usize,
@@ -81,14 +87,26 @@ impl PackedTernary {
         };
         let rows = isa.rows();
         let groups = k / GROUP;
-        let mut packed = vec![0u8; n * k];
+        // One row per block: the scalar layout is the row-major codes.
+        let scalar = isa == Isa::Scalar;
+        let mut packed = if scalar {
+            codes.to_vec()
+        } else {
+            vec![0u8; n * k / 4]
+        };
         let mut packed_scales = vec![0.0f32; n * groups];
         for block in 0..n / rows {
-            for k4 in 0..k / 4 {
-                for r in 0..rows {
-                    let row = block * rows + r;
-                    let dst = ((block * (k / 4) + k4) * rows + r) * 4;
-                    packed[dst..dst + 4].copy_from_slice(&codes[row * k + k4 * 4..][..4]);
+            if !scalar {
+                // Byte j of a row's 16-code span holds codes j, 4 + j, 8 + j, 12 + j.
+                for k16 in 0..k / 16 {
+                    for r in 0..rows {
+                        let src = &codes[(block * rows + r) * k + k16 * 16..][..16];
+                        let dst = ((block * (k / 16) + k16) * rows + r) * 4;
+                        for j in 0..4 {
+                            packed[dst + j] =
+                                src[j] | src[4 + j] << 2 | src[8 + j] << 4 | src[12 + j] << 6;
+                        }
+                    }
                 }
             }
             for g in 0..groups {
@@ -191,21 +209,47 @@ impl PackedTernary {
     ) {
         use std::arch::x86_64::*;
         let (k, k4s, groups) = (self.k, self.k / 4, self.k / GROUP);
+        let k16s = k4s / 4;
         let blocks = [2 * task, 2 * task + 1];
+        let low = _mm512_set1_epi8(3);
         let mut acc = [[_mm512_setzero_ps(); F]; 2];
         for g in 0..groups {
             let mut dots = [[_mm512_setzero_si512(); F]; 2];
-            for step in 0..GROUP / 4 {
-                let k4 = g * (GROUP / 4) + step;
-                let w0 =
-                    _mm512_loadu_si512(self.codes.as_ptr().add((blocks[0] * k4s + k4) * 64).cast());
-                let w1 =
-                    _mm512_loadu_si512(self.codes.as_ptr().add((blocks[1] * k4s + k4) * 64).cast());
-                for f in 0..F {
-                    let src = q.values.as_ptr().add((frame0 + f) * k + k4 * 4);
-                    let x = _mm512_set1_epi32(std::ptr::read_unaligned(src.cast::<i32>()));
-                    dots[0][f] = _mm512_dpbusd_epi32(dots[0][f], w0, x);
-                    dots[1][f] = _mm512_dpbusd_epi32(dots[1][f], w1, x);
+            for quad in 0..GROUP / 16 {
+                let k16 = g * (GROUP / 16) + quad;
+                let z0 = _mm512_loadu_si512(
+                    self.codes
+                        .as_ptr()
+                        .add((blocks[0] * k16s + k16) * 64)
+                        .cast(),
+                );
+                let z1 = _mm512_loadu_si512(
+                    self.codes
+                        .as_ptr()
+                        .add((blocks[1] * k16s + k16) * 64)
+                        .cast(),
+                );
+                // A 16-bit shift is safe: the mask keeps the low two bits of each byte.
+                let w0 = [
+                    _mm512_and_si512(z0, low),
+                    _mm512_and_si512(_mm512_srli_epi16::<2>(z0), low),
+                    _mm512_and_si512(_mm512_srli_epi16::<4>(z0), low),
+                    _mm512_and_si512(_mm512_srli_epi16::<6>(z0), low),
+                ];
+                let w1 = [
+                    _mm512_and_si512(z1, low),
+                    _mm512_and_si512(_mm512_srli_epi16::<2>(z1), low),
+                    _mm512_and_si512(_mm512_srli_epi16::<4>(z1), low),
+                    _mm512_and_si512(_mm512_srli_epi16::<6>(z1), low),
+                ];
+                for s in 0..4 {
+                    let k4 = 4 * k16 + s;
+                    for f in 0..F {
+                        let src = q.values.as_ptr().add((frame0 + f) * k + k4 * 4);
+                        let x = _mm512_set1_epi32(std::ptr::read_unaligned(src.cast::<i32>()));
+                        dots[0][f] = _mm512_dpbusd_epi32(dots[0][f], w0[s], x);
+                        dots[1][f] = _mm512_dpbusd_epi32(dots[1][f], w1[s], x);
+                    }
                 }
             }
             for (b, block) in blocks.iter().enumerate() {
@@ -256,19 +300,32 @@ impl PackedTernary {
     ) {
         use std::arch::x86_64::*;
         let (k, k4s, groups) = (self.k, self.k / 4, self.k / GROUP);
+        let k16s = k4s / 4;
         let ones = _mm256_set1_epi16(1);
+        let low = _mm256_set1_epi8(3);
         let mut acc = [_mm256_setzero_ps(); F];
         for g in 0..groups {
             let mut dots = [_mm256_setzero_si256(); F];
-            for step in 0..GROUP / 4 {
-                let k4 = g * (GROUP / 4) + step;
-                let w = _mm256_loadu_si256(self.codes.as_ptr().add((block * k4s + k4) * 32).cast());
-                for f in 0..F {
-                    let src = q.values.as_ptr().add((frame0 + f) * k + k4 * 4);
-                    let x = _mm256_set1_epi32(std::ptr::read_unaligned(src.cast::<i32>()));
-                    // Codes are at most 2 and |q| at most 127: pair sums fit in i16.
-                    let pairs = _mm256_maddubs_epi16(w, x);
-                    dots[f] = _mm256_add_epi32(dots[f], _mm256_madd_epi16(pairs, ones));
+            for quad in 0..GROUP / 16 {
+                let k16 = g * (GROUP / 16) + quad;
+                let z =
+                    _mm256_loadu_si256(self.codes.as_ptr().add((block * k16s + k16) * 32).cast());
+                // A 16-bit shift is safe: the mask keeps the low two bits of each byte.
+                let ws = [
+                    _mm256_and_si256(z, low),
+                    _mm256_and_si256(_mm256_srli_epi16::<2>(z), low),
+                    _mm256_and_si256(_mm256_srli_epi16::<4>(z), low),
+                    _mm256_and_si256(_mm256_srli_epi16::<6>(z), low),
+                ];
+                for (s, w) in ws.iter().enumerate() {
+                    let k4 = 4 * k16 + s;
+                    for f in 0..F {
+                        let src = q.values.as_ptr().add((frame0 + f) * k + k4 * 4);
+                        let x = _mm256_set1_epi32(std::ptr::read_unaligned(src.cast::<i32>()));
+                        // Codes are at most 2 and |q| at most 127: pair sums fit in i16.
+                        let pairs = _mm256_maddubs_epi16(*w, x);
+                        dots[f] = _mm256_add_epi32(dots[f], _mm256_madd_epi16(pairs, ones));
+                    }
                 }
             }
             let wscale = _mm256_loadu_ps(self.scales.as_ptr().add((block * groups + g) * 8));
