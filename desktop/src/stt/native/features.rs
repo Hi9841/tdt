@@ -12,9 +12,8 @@ const NORM_EPSILON: f32 = 1e-5;
 const BINS: usize = N_FFT / 2 + 1;
 
 pub struct MelFrontend {
-    mels: usize,
-    /// `mels x BINS` filter weights.
-    filters: Vec<f32>,
+    /// Per mel bin, the first FFT bin and the weights of its nonzero span.
+    filters: Vec<(usize, Vec<f32>)>,
     /// Hann window of WIN_LENGTH, centered inside N_FFT.
     window: Vec<f64>,
     fft: Fft,
@@ -29,8 +28,7 @@ impl MelFrontend {
             window[offset + n] = 0.5 - 0.5 * phase.cos();
         }
         Self {
-            mels,
-            filters: slaney_filters(mels),
+            filters: spans(&slaney_filters(mels)),
             window,
             fft: Fft::new(N_FFT),
         }
@@ -50,7 +48,8 @@ impl MelFrontend {
         }
         emphasized.resize(emphasized.len() + N_FFT / 2, 0.0);
 
-        let mut out = vec![0.0f32; frames * self.mels];
+        let mels = self.filters.len();
+        let mut out = vec![0.0f32; frames * mels];
         let mut re = vec![0.0f64; N_FFT];
         let mut im = vec![0.0f64; N_FFT];
         let mut power = vec![0.0f32; BINS];
@@ -64,14 +63,17 @@ impl MelFrontend {
             for bin in 0..BINS {
                 power[bin] = (re[bin] * re[bin] + im[bin] * im[bin]) as f32;
             }
-            let row = &mut out[frame * self.mels..(frame + 1) * self.mels];
-            for (mel, value) in row.iter_mut().enumerate() {
-                let weights = &self.filters[mel * BINS..(mel + 1) * BINS];
-                let energy: f32 = weights.iter().zip(&power).map(|(w, p)| w * p).sum();
+            let row = &mut out[frame * mels..(frame + 1) * mels];
+            for (value, (first, weights)) in row.iter_mut().zip(&self.filters) {
+                let energy: f32 = weights
+                    .iter()
+                    .zip(&power[*first..])
+                    .map(|(w, p)| w * p)
+                    .sum();
                 *value = (energy + LOG_GUARD).ln();
             }
         }
-        normalize(&mut out, frames, self.mels);
+        normalize(&mut out, frames, mels);
         (out, frames)
     }
 }
@@ -142,6 +144,21 @@ fn slaney_filters(mels: usize) -> Vec<f32> {
     filters
 }
 
+/// The nonzero span of each `BINS`-wide filter row. A filter covers a few
+/// bins, so the product skips the zeros; the sum stays the same, in the same order.
+fn spans(filters: &[f32]) -> Vec<(usize, Vec<f32>)> {
+    filters
+        .as_chunks::<BINS>()
+        .0
+        .iter()
+        .map(|row| {
+            let first = row.iter().position(|w| *w != 0.0).unwrap_or(0);
+            let last = row.iter().rposition(|w| *w != 0.0).unwrap_or(0);
+            (first, row[first..=last.max(first)].to_vec())
+        })
+        .collect()
+}
+
 /// Iterative radix-2 complex FFT for one power-of-two size.
 struct Fft {
     size: usize,
@@ -195,7 +212,7 @@ impl Fft {
 
 #[cfg(test)]
 mod tests {
-    use super::{hz_to_mel, mel_to_hz, slaney_filters, Fft, MelFrontend, BINS};
+    use super::{hz_to_mel, mel_to_hz, slaney_filters, spans, Fft, MelFrontend, BINS};
 
     #[test]
     fn the_fft_matches_a_direct_transform() {
@@ -224,6 +241,16 @@ mod tests {
             assert!(filters[mel * BINS..(mel + 1) * BINS]
                 .iter()
                 .any(|w| *w > 0.0));
+        }
+    }
+
+    #[test]
+    fn filter_spans_expand_back_to_the_full_filters() {
+        let filters = slaney_filters(128);
+        for (mel, (first, weights)) in spans(&filters).iter().enumerate() {
+            let mut row = vec![0.0f32; BINS];
+            row[*first..first + weights.len()].copy_from_slice(weights);
+            assert_eq!(row, filters[mel * BINS..(mel + 1) * BINS], "mel {mel}");
         }
     }
 
