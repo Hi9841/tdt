@@ -1,104 +1,70 @@
-# Build a portable zip and a self-contained TDT-Setup.exe (no Inno Setup required).
+# Builds dist/TDT-Setup.exe, the one file a release ships.
+#
+# The setup stub (packaging/tdt-setup) carries TDT.exe compressed at its end:
+# [stub][deflate(TDT.exe)][SHA-256 of TDT.exe: 32][version: 16][deflate length: 8][TDTSFX2\0]
 [CmdletBinding()]
 param(
-    [string]$RepoRoot = "",
-    [string]$Version = "0.2.1"
+    # The release tag. The build stops when it does not match desktop/Cargo.toml.
+    [string]$Version = ""
 )
 
 $ErrorActionPreference = "Stop"
-$ScriptDir = $PSScriptRoot
-if (-not $ScriptDir -and $MyInvocation.MyCommand.Path) {
-    $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-}
-if (-not $ScriptDir) {
-    $ScriptDir = Join-Path (Get-Location) "packaging"
-}
-if (-not $RepoRoot) {
-    $RepoRoot = (Resolve-Path (Join-Path $ScriptDir "..")).Path
-}
-$Version = $Version.TrimStart("vV")
+$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $Desktop = Join-Path $RepoRoot "desktop"
-$SetupCrate = Join-Path $ScriptDir "tdt-setup"
-$Stage = Join-Path $ScriptDir "stage"
+$SetupCrate = Join-Path $PSScriptRoot "tdt-setup"
 $Dist = Join-Path $RepoRoot "dist"
-$ReleaseExe = Join-Path $Desktop "target\release\TDT.exe"
-$StubExe = Join-Path $SetupCrate "target\release\tdt-setup.exe"
 
-Write-Host "Building TDT $Version..."
-& cargo build --release --locked --manifest-path (Join-Path $Desktop 'Cargo.toml')
-if ($LASTEXITCODE -ne 0) { throw "cargo build --release failed" }
-
-& cargo build --release --locked --manifest-path (Join-Path $SetupCrate 'Cargo.toml')
-if ($LASTEXITCODE -ne 0) { throw "tdt-setup build failed" }
-
-if (-not (Test-Path $ReleaseExe)) {
-    throw "Missing $ReleaseExe"
+$CargoVersion = (Select-String -Path (Join-Path $Desktop "Cargo.toml") -Pattern '^version = "(.+)"' |
+    Select-Object -First 1).Matches[0].Groups[1].Value
+if ($Version -and $Version.TrimStart("vV") -ne $CargoVersion) {
+    throw "Tag $Version does not match desktop/Cargo.toml version $CargoVersion"
 }
-if (-not (Test-Path $StubExe)) {
-    throw "Missing $StubExe"
+if ([Text.Encoding]::ASCII.GetByteCount($CargoVersion) -gt 16) {
+    throw "Version $CargoVersion is longer than 16 bytes"
 }
 
-if (Test-Path $Stage) { Remove-Item $Stage -Recurse -Force }
+Write-Host "Building TDT $CargoVersion..."
+& cargo build --release --locked --manifest-path (Join-Path $Desktop "Cargo.toml") --bin TDT
+if ($LASTEXITCODE -ne 0) { throw "TDT build failed" }
+& cargo build --release --locked --manifest-path (Join-Path $SetupCrate "Cargo.toml")
+if ($LASTEXITCODE -ne 0) { throw "Setup build failed" }
+
+$app = [IO.File]::ReadAllBytes((Join-Path $Desktop "target\release\TDT.exe"))
+$stub = [IO.File]::ReadAllBytes((Join-Path $SetupCrate "target\release\tdt-setup.exe"))
+
+$packed = New-Object IO.MemoryStream
+$deflate = New-Object IO.Compression.DeflateStream($packed, [IO.Compression.CompressionLevel]::Optimal, $true)
+$deflate.Write($app, 0, $app.Length)
+$deflate.Dispose()
+$packedBytes = $packed.ToArray()
+
+$sha = [Security.Cryptography.SHA256]::Create()
+$hash = $sha.ComputeHash($app)
+$versionBytes = New-Object byte[] 16
+[Text.Encoding]::ASCII.GetBytes($CargoVersion).CopyTo($versionBytes, 0)
+
 if (Test-Path $Dist) { Remove-Item $Dist -Recurse -Force }
-New-Item -ItemType Directory -Path $Stage -Force | Out-Null
-New-Item -ItemType Directory -Path $Dist -Force | Out-Null
-
-Copy-Item $ReleaseExe (Join-Path $Stage "TDT.exe")
-Copy-Item (Join-Path $RepoRoot "LICENSE") $Stage
-Copy-Item (Join-Path $RepoRoot "NOTICE") $Stage
-Copy-Item (Join-Path $RepoRoot "THIRD_PARTY_NOTICES.md") $Stage
-Copy-Item (Join-Path $RepoRoot "README.md") $Stage
-Copy-Item (Join-Path $ScriptDir "tdt-setup.ps1") (Join-Path $Stage "Install-TDT.ps1")
-Set-Content -LiteralPath (Join-Path $Stage "VERSION") -Value $Version -NoNewline
-
-# Never bundle speech models. First run downloads Parakeet Redux from Settings. Updates
-# must not reinstall a 200 MB model the user already has.
-$manifest = Join-Path $Stage "payload-sha256.txt"
-$manifestLines = @()
-Get-ChildItem -LiteralPath $Stage -File | Where-Object { $_.Name -ne "payload-sha256.txt" } | ForEach-Object {
-    $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant()
-    $manifestLines += "$hash  $($_.Name)"
-}
-Set-Content -LiteralPath $manifest -Value $manifestLines
-$portable = Join-Path $Dist "TDT-$Version-windows-x64.zip"
-if (Test-Path $portable) { Remove-Item $portable -Force }
-Compress-Archive -Path (Join-Path $Stage "*") -DestinationPath $portable -Force
-Write-Host "Wrote $portable"
-
-Copy-Item $ReleaseExe (Join-Path $Dist "TDT.exe") -Force
-
-$payload = Join-Path $ScriptDir "payload.zip"
-if (Test-Path $payload) { Remove-Item $payload -Force }
-Compress-Archive -Path (Join-Path $Stage "*") -DestinationPath $payload -Force
-
+New-Item -ItemType Directory -Path $Dist | Out-Null
 $setup = Join-Path $Dist "TDT-Setup.exe"
-if (Test-Path $setup) { Remove-Item $setup -Force }
-$setupStream = [System.IO.File]::Open($setup, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write)
+$out = [IO.File]::Open($setup, [IO.FileMode]::Create)
 try {
-    $stubStream = [System.IO.File]::OpenRead($StubExe)
-    try { $stubStream.CopyTo($setupStream) } finally { $stubStream.Dispose() }
-    $zipStream = [System.IO.File]::OpenRead($payload)
-    try {
-        $zipLen = $zipStream.Length
-        $zipStream.CopyTo($setupStream)
-    } finally { $zipStream.Dispose() }
-    $sizeBytes = [BitConverter]::GetBytes([int64]$zipLen)
-    $setupStream.Write($sizeBytes, 0, 8)
-    $magic = [byte[]](0x54, 0x44, 0x54, 0x5A, 0x49, 0x50, 0x31, 0x00)
-    $setupStream.Write($magic, 0, 8)
+    foreach ($part in @(
+            $stub,
+            $packedBytes,
+            $hash,
+            $versionBytes,
+            [BitConverter]::GetBytes([int64]$packedBytes.Length),
+            [Text.Encoding]::ASCII.GetBytes("TDTSFX2`0")
+        )) {
+        $out.Write($part, 0, $part.Length)
+    }
 } finally {
-    $setupStream.Dispose()
+    $out.Dispose()
 }
-Remove-Item $payload -Force
-Write-Host "Wrote $setup"
+$size = [math]::Round((Get-Item $setup).Length / 1MB, 1)
+Write-Host "Wrote $setup ($size MB)"
 
-Copy-Item (Join-Path $Stage "Install-TDT.ps1") (Join-Path $Dist "Install-TDT.ps1") -Force
-
-$sums = Join-Path $Dist "SHA256SUMS.txt"
-$lines = @()
-Get-ChildItem $Dist -File | Where-Object { $_.Name -ne "SHA256SUMS.txt" } | ForEach-Object {
-    $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant()
-    $lines += "$hash  $($_.Name)"
-}
-Set-Content -LiteralPath $sums -Value $lines
-Write-Host "Wrote $sums"
+# TDT 0.2.32 and older only offer an update that SHA256SUMS.txt lists.
+# Keep publishing it until those versions are gone.
+$setupHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $setup).Hash.ToLowerInvariant()
+Set-Content -LiteralPath (Join-Path $Dist "SHA256SUMS.txt") -Value "$setupHash  TDT-Setup.exe"

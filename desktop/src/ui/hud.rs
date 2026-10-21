@@ -707,7 +707,7 @@ impl HudView {
             | PreviewSpec::PanelSettingsUpdateUpToDate
             | PreviewSpec::PanelSettingsUpdateAvailable
             | PreviewSpec::PanelSettingsUpdateDownloading
-            | PreviewSpec::PanelSettingsUpdateReady
+            | PreviewSpec::PanelSettingsUpdateInstalling
             | PreviewSpec::PanelSettingsUpdateFailed => {}
         }
 
@@ -730,90 +730,20 @@ impl HudView {
         }
     }
 
-    pub fn start_update_check(&self) {
+    /// Opening the panel also asks for an automatic check, so a new
+    /// version shows up where the user looks for it.
+    pub fn check_for_update(&self, manual: bool) {
         if preview::is_active() {
             return;
         }
-        // Ignore clicks while a check or download is already running; the
-        // shared phase cell has a single writer at a time.
-        if !update::claim(&self.update, UpdatePhase::Checking, false) {
-            return;
-        }
-        let cell = Arc::clone(&self.update);
-        let ping = self.update_ping.clone();
-        std::thread::spawn(move || {
-            let _ = ping.send(());
-            let next = match update::check_latest() {
-                Ok(phase) => phase,
-                Err(error) => UpdatePhase::Failed(error),
-            };
-            *cell.lock() = next;
-            let _ = ping.send(());
-        });
+        update::check(&self.update, manual, &self.update_ping);
     }
 
-    fn start_update_install(&self) {
+    fn install_update(&self) {
         if preview::is_active() {
             return;
         }
-        let snapshot = self.update.lock().clone();
-        match snapshot {
-            UpdatePhase::Available {
-                version,
-                asset_url,
-                asset_name,
-                sums_url,
-            } => {
-                let busy = UpdatePhase::Downloading { done: 0, total: 1 };
-                if !update::claim(&self.update, busy, false) {
-                    return;
-                }
-                let cell = Arc::clone(&self.update);
-                let ping = self.update_ping.clone();
-                std::thread::spawn(move || {
-                    let _ = ping.send(());
-                    let mut last_ping = Instant::now();
-                    let next = match update::download_installer(
-                        &asset_url,
-                        &asset_name,
-                        sums_url.as_deref(),
-                        |done, total| {
-                            *cell.lock() = UpdatePhase::Downloading { done, total };
-                            if last_ping.elapsed() >= Duration::from_millis(100) {
-                                let _ = ping.send(());
-                                last_ping = Instant::now();
-                            }
-                        },
-                    ) {
-                        Ok(path) => {
-                            if update::is_app_binary(&asset_name) {
-                                // The main loop quits on Restarting, so the tray
-                                // icon goes away before the new TDT starts.
-                                match update::replace_running_exe(&path, &version) {
-                                    Ok(()) => UpdatePhase::Restarting,
-                                    Err(error) => UpdatePhase::Failed(error),
-                                }
-                            } else {
-                                match update::launch_installer(&path) {
-                                    Ok(()) => UpdatePhase::Ready { installer: path },
-                                    Err(error) => UpdatePhase::Failed(error),
-                                }
-                            }
-                        }
-                        Err(error) => UpdatePhase::Failed(error),
-                    };
-                    *cell.lock() = next;
-                    let _ = ping.send(());
-                });
-            }
-            UpdatePhase::Ready { installer } => {
-                if let Err(error) = update::launch_installer(&installer) {
-                    *self.update.lock() = UpdatePhase::Failed(error);
-                    let _ = self.update_ping.send(());
-                }
-            }
-            _ => self.start_update_check(),
-        }
+        update::install(&self.update, &self.update_ping);
     }
 
     pub fn close_stats_settings(&mut self, cx: &mut Context<Self>) {
@@ -861,6 +791,7 @@ impl HudView {
         }
         self.active_tab = SettingsTab::Settings;
         self.panel_needs_focus = true;
+        self.check_for_update(false);
         let started_at = Instant::now();
         self.panel_motion = Some(PanelMotion::Opening { started_at });
         set_window_mode(true);
@@ -1120,6 +1051,12 @@ impl HudView {
         }
     }
 
+    fn open_dictionary(&mut self) {
+        let opened = voice_stt_desktop::stt::dictionary::ensure_user_file()
+            .and_then(|path| crate::ui::window_util::open_file(&path));
+        self.dictionary_error = opened.err();
+    }
+
     fn toggle_history_preview(&mut self, key: &str) {
         self.expanded_history_key = if self.expanded_history_key.as_deref() == Some(key) {
             None
@@ -1299,7 +1236,12 @@ impl HudView {
             .border_1()
             .when(at_rest, |pill| pill.bg(rest_bg()).border_color(rest_edge()))
             .when(!at_rest, |pill| pill.bg(bg()).border_color(edge()))
-            .when(self.pill_action().is_some(), |pill| pill.cursor_pointer())
+            .when(self.pill_action().is_some(), |pill| {
+                pill.cursor_pointer().when(!at_rest, |pill| {
+                    pill.hover(|style| style.border_color(theme::edge_strong()))
+                        .active(|style| style.bg(theme::raised()))
+                })
+            })
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| this.pill_clicked(cx)),
@@ -1430,6 +1372,7 @@ impl HudView {
 
     /// The tip over the resting pill: how to start, and a way into Settings.
     fn rest_tip(&self, cx: &mut Context<'_, Self>) -> AnyElement {
+        let update_ready = matches!(*self.update.lock(), UpdatePhase::Available(_));
         div()
             .flex()
             .flex_none()
@@ -1459,12 +1402,14 @@ impl HudView {
                     .flex_none()
                     .items_center()
                     .justify_center()
+                    .relative()
                     .ml(px(2.0))
                     .size(px(22.0))
                     .rounded_full()
                     .cursor_pointer()
                     .text_color(soft())
                     .hover(|button| button.bg(chip()).text_color(text()))
+                    .active(|button| button.bg(theme::pressed()))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _, _, cx| {
@@ -1473,7 +1418,19 @@ impl HudView {
                             cx.notify();
                         }),
                     )
-                    .child(Icon::new(IconName::Settings).size(IconSize::Xs)),
+                    .child(Icon::new(IconName::Settings).size(IconSize::Xs))
+                    // A new version waits in Settings.
+                    .when(update_ready, |button| {
+                        button.child(
+                            div()
+                                .absolute()
+                                .top(px(2.0))
+                                .right(px(2.0))
+                                .size(px(6.0))
+                                .rounded_full()
+                                .bg(theme::accent()),
+                        )
+                    }),
             )
             .into_any_element()
     }
@@ -1753,6 +1710,7 @@ impl HudView {
                         .rounded(r_chip())
                         .border_1()
                         .border_color(theme::transparent())
+                        .group("history_row")
                         .when(can_expand, |row| {
                             row.tab_index(0)
                                 .cursor_pointer()
@@ -1786,7 +1744,13 @@ impl HudView {
                                             item.timestamp, item.latency_ms
                                         )),
                                 )
-                                .child(copy_btn),
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .when(!is_copied, |slot| slot.opacity(0.5))
+                                        .group_hover("history_row", |slot| slot.opacity(1.0))
+                                        .child(copy_btn),
+                                ),
                         )
                         .child(
                             div()
@@ -1943,6 +1907,13 @@ impl HudView {
             }
             .to_string(),
             auto_paste_switch.into_any_element(),
+        )
+        .on_click(
+            "auto_paste_row",
+            cx.listener(|this, _, _, cx| {
+                this.toggle_auto_paste();
+                cx.notify();
+            }),
         );
 
         let fillers_switch =
@@ -1966,6 +1937,14 @@ impl HudView {
             }
             .to_string(),
             fillers_switch.into_any_element(),
+        )
+        .on_click(
+            "fillers_row",
+            cx.listener(|this, _, _, cx| {
+                let on = !this.remove_fillers_enabled;
+                this.set_remove_fillers(on);
+                cx.notify();
+            }),
         );
 
         let startup_switch = Switch::new("start_with_windows", self.autostart_enabled).on_change({
@@ -1984,17 +1963,29 @@ impl HudView {
             "Names and terms TDT should spell your way.".to_string(),
             controls::secondary_button("dictionary_btn", "Edit")
                 .on_click(cx.listener(|this, _, _, cx| {
-                    let opened = voice_stt_desktop::stt::dictionary::ensure_user_file()
-                        .and_then(|path| crate::ui::window_util::open_file(&path));
-                    this.dictionary_error = opened.err();
+                    this.open_dictionary();
                     cx.notify();
                 }))
                 .into_any_element(),
+        )
+        .on_click(
+            "dictionary_row",
+            cx.listener(|this, _, _, cx| {
+                this.open_dictionary();
+                cx.notify();
+            }),
         );
         let startup_row = settings_row(
             "Start with Windows",
             "Opens TDT when you sign in.".to_string(),
             startup_switch.into_any_element(),
+        )
+        .on_click(
+            "startup_row",
+            cx.listener(|this, _, _, cx| {
+                this.toggle_autostart();
+                cx.notify();
+            }),
         );
 
         let capturing = self.hotkey_capturing;
@@ -2021,94 +2012,78 @@ impl HudView {
                     "hotkey_bind_btn",
                     if capturing { "Cancel" } else { "Change" },
                 )
-                .on_click(cx.listener(move |this, _, window, cx| {
+                .on_click(cx.listener(|this, _, window, cx| {
                     this.toggle_hotkey_capture();
                     window.focus(&this.panel_focus, cx);
                     cx.notify();
                 })),
             )
             .into_any_element();
-        let hotkey_row = settings_row("Shortcut", hotkey_sub, hotkey_control);
+        let hotkey_row = settings_row("Shortcut", hotkey_sub, hotkey_control).on_click(
+            "hotkey_row",
+            cx.listener(|this, _, window, cx| {
+                this.toggle_hotkey_capture();
+                window.focus(&this.panel_focus, cx);
+                cx.notify();
+            }),
+        );
 
-        let guard = self.update.lock();
-        let phase = &*guard;
-        let (update_sub, update_action, update_busy) = match phase {
+        let phase = self.update.lock().clone();
+        let current = update::current_version();
+        let (update_sub, update_action) = match &phase {
             UpdatePhase::Idle => (
-                format!("Current version v{}", update::current_version()),
+                format!("Version {current}"),
                 "Check for updates".to_string(),
-                false,
             ),
-            UpdatePhase::Checking => (
-                "Checking for updates...".to_string(),
-                "Checking".to_string(),
-                true,
-            ),
+            UpdatePhase::Checking => ("Checking for updates.".to_string(), "Checking".to_string()),
             UpdatePhase::UpToDate => (
-                format!("You're up to date - v{}", update::current_version()),
+                format!("Version {current} is the latest."),
                 "Check again".to_string(),
-                false,
             ),
-            UpdatePhase::Available { version, .. } => (
-                format!("v{version} is ready."),
-                "Download and restart".to_string(),
-                false,
+            UpdatePhase::Available(release) => (
+                format!("Version {} is ready. You have {current}.", release.version),
+                "Update now".to_string(),
             ),
-            UpdatePhase::Downloading { done, total } => {
-                let pct = models::percent(*done, *total);
-                (
-                    format!(
-                        "{}% - {} of {}",
-                        pct,
-                        models::format_mb(*done),
-                        models::format_mb(*total)
-                    ),
-                    format!("{pct}%"),
-                    true,
-                )
-            }
-            UpdatePhase::Ready { .. } => (
-                "Update downloaded. Install when ready.".to_string(),
-                "Install update".to_string(),
-                false,
+            UpdatePhase::Downloading { done, total } => (
+                format!(
+                    "Downloading {} of {}.",
+                    models::format_mb(*done),
+                    models::format_mb(*total)
+                ),
+                format!("{}%", models::percent(*done, *total)),
             ),
-            UpdatePhase::Restarting => (
-                "Restarting into the new version...".to_string(),
+            UpdatePhase::Installing => (
+                "Installing. TDT opens again in a moment.".to_string(),
                 "Restarting".to_string(),
-                true,
             ),
-            UpdatePhase::Failed(error) => (clip_text(error, 48), "Try again".to_string(), false),
+            UpdatePhase::Failed(error) => (clip_text(error, 48), "Try again".to_string()),
         };
-
-        let update_btn = if matches!(
-            *phase,
-            UpdatePhase::Available { .. } | UpdatePhase::Ready { .. }
-        ) {
+        let update_btn = if matches!(phase, UpdatePhase::Available(_)) {
             controls::primary_button("check_updates_btn", update_action)
         } else {
             controls::secondary_button("check_updates_btn", update_action)
         };
-        let update_btn =
-            update_btn
-                .disabled(update_busy)
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    if matches!(
-                        *this.update.lock(),
-                        UpdatePhase::Checking
-                            | UpdatePhase::Downloading { .. }
-                            | UpdatePhase::Restarting
-                    ) {
-                        return;
-                    }
-                    this.start_update_install();
-                    cx.notify();
-                }));
+        let update_btn = update_btn
+            .loading(matches!(
+                phase,
+                UpdatePhase::Checking | UpdatePhase::Installing
+            ))
+            .disabled(phase.is_busy())
+            .on_click(cx.listener(move |this, _, _, cx| {
+                let phase = this.update.lock().clone();
+                match phase {
+                    UpdatePhase::Available(_) => this.install_update(),
+                    phase if !phase.is_busy() => this.check_for_update(true),
+                    _ => {}
+                }
+                cx.notify();
+            }));
         let update_meter = match phase {
             UpdatePhase::Downloading { done, total } => {
-                Some(controls::progress_bar("update_progress", *done, *total))
+                Some(controls::progress_bar("update_progress", done, total))
             }
             _ => None,
         };
-        drop(guard);
         let update_row = settings_row("Updates", update_sub, update_btn.into_any_element());
 
         let spec = models::resolve(&self.selected_model);
@@ -2242,56 +2217,50 @@ impl HudView {
                 )
             });
 
+        let inset = |content: AnyElement| controls::inset().child(content);
         div()
             .flex()
             .flex_col()
             .w_full()
-            .gap(px(GAP_SECTION))
+            .gap(px(GAP_SECTION + 4.0))
             .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .w_full()
-                    .gap(px(GAP_TIGHT))
-                    .child(controls::group_label("Dictation"))
+                controls::section("Dictation")
                     .child(hotkey_row)
                     .child(auto_paste_row)
                     .child(fillers_row),
             )
             .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .w_full()
-                    .gap(px(GAP_TIGHT))
-                    .child(controls::group_label("Recognition"))
+                controls::section("Recognition")
                     .child(controls::labeled("Model", model_sub))
-                    .child(model_chips)
-                    .when_some(running_note, |column, note| {
-                        column.child(InlineMessage::new(Severity::Info, note))
+                    .child(inset(model_chips.into_any_element()))
+                    .when_some(running_note, |card, note| {
+                        card.child(inset(
+                            InlineMessage::new(Severity::Info, note).into_any_element(),
+                        ))
                     })
-                    .when_some(model_meter, |column, meter| column.child(meter))
-                    .when(show_activate || show_download, |column| {
-                        column.child(model_actions)
+                    .when_some(model_meter, |card, meter| {
+                        card.child(inset(meter.into_any_element()))
+                    })
+                    .when(show_activate || show_download, |card| {
+                        card.child(inset(model_actions.into_any_element()))
                     })
                     .child(dictionary_row)
-                    .when_some(self.dictionary_error.clone(), |column, error| {
-                        column.child(InlineMessage::new(Severity::Danger, error))
+                    .when_some(self.dictionary_error.clone(), |card, error| {
+                        card.child(inset(
+                            InlineMessage::new(Severity::Danger, error).into_any_element(),
+                        ))
                     }),
             )
             .when_some(self.model_error.clone(), |column, error| {
                 column.child(InlineMessage::new(Severity::Danger, error))
             })
             .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .w_full()
-                    .gap(px(GAP_TIGHT))
-                    .child(controls::group_label("App"))
+                controls::section("App")
                     .child(startup_row)
                     .child(update_row)
-                    .when_some(update_meter, |column, meter| column.child(meter)),
+                    .when_some(update_meter, |card, meter| {
+                        card.child(inset(meter.into_any_element()))
+                    }),
             )
             .when_some(self.autostart_error.clone(), |column, error| {
                 column.child(InlineMessage::new(Severity::Danger, error))

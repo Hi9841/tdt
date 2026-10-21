@@ -4,7 +4,7 @@ version = "0.2.1"
 edition = "2021"
 license = "Apache-2.0"
 publish = false
-description = "Per-user TDT installer stub. packaging/build-installer.ps1 appends the payload zip."
+description = "TDT-Setup.exe: installs, updates, and uninstalls TDT. packaging/build-installer.ps1 appends the app."
 
 [[bin]]
 name = "tdt-setup"
@@ -14,7 +14,17 @@ path = "src/main.rs"
 embed-resource = "3.0"
 
 [dependencies]
+miniz_oxide = "0.8"
 sha2 = "0.10"
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Com",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [profile.release]
 opt-level = "z"

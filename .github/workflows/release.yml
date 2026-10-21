@@ -14,17 +14,15 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Build installer
+      - name: Build TDT-Setup.exe
         shell: pwsh
-        run: |
-          $script = Join-Path $pwd "packaging/build-installer.ps1"
-          & $script -Version "${{ github.ref_name }}"
+        run: ./packaging/build-installer.ps1 -Version "${{ github.ref_name }}"
+      # TDT-Setup.exe is the release. SHA256SUMS.txt only lets TDT 0.2.32
+      # and older find it; drop it when those versions are gone.
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/TDT.exe
             dist/TDT-Setup.exe
-            dist/TDT-*-windows-x64.zip
             dist/SHA256SUMS.txt
           generate_release_notes: true

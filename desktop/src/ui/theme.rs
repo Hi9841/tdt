@@ -6,6 +6,7 @@
 use gpui::{hsla, px, rgb, rgba, Hsla, Pixels};
 
 pub const BG: u32 = 0x000000;
+pub const RAISED: u32 = 0x18181b;
 pub const EDGE: u32 = 0x27272a;
 pub const EDGE_STRONG: u32 = 0x3f3f46;
 pub const TEXT: u32 = 0xfafafa;
@@ -71,6 +72,16 @@ pub fn hover() -> Hsla {
 }
 pub fn pressed() -> Hsla {
     rgba(PRESSED).into()
+}
+pub fn edge_strong() -> Hsla {
+    rgb(EDGE_STRONG).into()
+}
+pub fn accent() -> Hsla {
+    rgb(ACCENT).into()
+}
+/// A pressed black surface, such as the pill.
+pub fn raised() -> Hsla {
+    rgb(RAISED).into()
 }
 pub fn rest_bg() -> Hsla {
     rgba(REST_BG).into()

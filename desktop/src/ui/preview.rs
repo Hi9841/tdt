@@ -1,8 +1,7 @@
 //! Frozen UI states for visual capture. Active only when `TDT_PREVIEW_STATE` is set.
 
 use crate::config::{AppStats, HistoryItem};
-use crate::update::UpdatePhase;
-use std::path::PathBuf;
+use crate::update::{Release, UpdatePhase};
 
 pub fn is_active() -> bool {
     requested().is_some()
@@ -55,7 +54,7 @@ pub enum Spec {
     PanelSettingsUpdateUpToDate,
     PanelSettingsUpdateAvailable,
     PanelSettingsUpdateDownloading,
-    PanelSettingsUpdateReady,
+    PanelSettingsUpdateInstalling,
     PanelSettingsUpdateFailed,
 }
 
@@ -96,7 +95,7 @@ pub fn parse_name(name: &str) -> Option<Spec> {
         "panel.settings.update.uptodate" => Spec::PanelSettingsUpdateUpToDate,
         "panel.settings.update.available" => Spec::PanelSettingsUpdateAvailable,
         "panel.settings.update.downloading" => Spec::PanelSettingsUpdateDownloading,
-        "panel.settings.update.ready" => Spec::PanelSettingsUpdateReady,
+        "panel.settings.update.installing" => Spec::PanelSettingsUpdateInstalling,
         "panel.settings.update.failed" => Spec::PanelSettingsUpdateFailed,
         _ => return None,
     })
@@ -132,19 +131,12 @@ pub fn update_phase(spec: &Spec) -> Option<UpdatePhase> {
     Some(match spec {
         Spec::PanelSettingsUpdateChecking => UpdatePhase::Checking,
         Spec::PanelSettingsUpdateUpToDate => UpdatePhase::UpToDate,
-        Spec::PanelSettingsUpdateAvailable => UpdatePhase::Available {
-            version: "0.2.0".into(),
-            asset_url: "https://example.invalid/TDT.exe".into(),
-            asset_name: "TDT.exe".into(),
-            sums_url: None,
-        },
+        Spec::PanelSettingsUpdateAvailable => UpdatePhase::Available(Release::preview("0.3.0")),
         Spec::PanelSettingsUpdateDownloading => UpdatePhase::Downloading {
             done: 12_000_000,
             total: 28_000_000,
         },
-        Spec::PanelSettingsUpdateReady => UpdatePhase::Ready {
-            installer: PathBuf::from(r"C:\TDT-Setup.exe"),
-        },
+        Spec::PanelSettingsUpdateInstalling => UpdatePhase::Installing,
         Spec::PanelSettingsUpdateFailed => UpdatePhase::Failed("Could not reach GitHub.".into()),
         Spec::PanelSettingsDefaults
         | Spec::PanelSettingsAutoPasteOff

@@ -1,28 +1,15 @@
 # Build
 desktop/target/
-dist/
-packaging/stage/
-packaging/.cache/
-packaging/Output/
-packaging/payload.zip
 packaging/tdt-setup/target/
+dist/
 *.pdb
 
 # Models (download with models/download-models.ps1)
 models/*/
 models/**/*.download
 
-# Logs and local captures
+# Logs
 *.log
-desktop/*.log
-overlay-*.png
-verification-*.png
-settings-page.png
-stats-page.png
-
-# Python bytecode from the tray verification scripts
-__pycache__/
-*.pyc
 
 # OS
 Thumbs.db

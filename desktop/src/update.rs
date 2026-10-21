@@ -1,37 +1,82 @@
-use sha2::Digest;
-use std::fs::File;
-use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::Duration;
+//! In-app updates, the same way as Prism: read the latest GitHub release,
+//! download its `TDT-Setup.exe`, verify it, start it silently, and quit.
+//! Setup replaces TDT.exe and starts the new version. Speech models stay.
 
-pub const DEFAULT_GITHUB_REPO: &str = "Hi9841/tdt";
+use std::io::{Read, Write};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use crossbeam_channel::Sender;
+use parking_lot::Mutex;
+use sha2::Digest;
+
+/// Fixed at compile time, so a release build cannot be redirected at runtime.
+const REPO: &str = match option_env!("TDT_UPDATE_REPO") {
+    Some(repo) => repo,
+    None => "Hi9841/tdt",
+};
+const ASSET: &str = "TDT-Setup.exe";
+/// Automatic checks (start, every hour, panel open) run at most this often.
+const AUTO_CHECK_EVERY: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum UpdatePhase {
     Idle,
     Checking,
     UpToDate,
-    Available {
-        version: String,
-        asset_url: String,
-        asset_name: String,
-        sums_url: Option<String>,
-    },
+    Available(Release),
     Downloading {
         done: u64,
         total: u64,
     },
-    Ready {
-        installer: PathBuf,
-    },
-    /// The new TDT.exe is staged; the app quits so the swap script can run.
-    Restarting,
+    /// Setup is running. TDT quits so that setup can replace it.
+    Installing,
     Failed(String),
 }
 
-pub fn github_repo() -> String {
-    std::env::var("TDT_GITHUB_REPO").unwrap_or_else(|_| DEFAULT_GITHUB_REPO.to_string())
+impl UpdatePhase {
+    pub fn is_busy(&self) -> bool {
+        matches!(
+            self,
+            Self::Checking | Self::Downloading { .. } | Self::Installing
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Release {
+    pub version: String,
+    url: String,
+    size: u64,
+    sha256: Option<String>,
+}
+
+impl Release {
+    /// A frozen release for the preview captures.
+    pub fn preview(version: &str) -> Self {
+        Self {
+            version: version.into(),
+            url: String::new(),
+            size: 7_900_000,
+            sha256: None,
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct GitHubRelease {
+    tag_name: String,
+    assets: Vec<GitHubAsset>,
+}
+
+#[derive(serde::Deserialize)]
+struct GitHubAsset {
+    name: String,
+    browser_download_url: String,
+    size: u64,
+    /// `sha256:<hex>`, which GitHub computes for each uploaded asset.
+    digest: Option<String>,
 }
 
 pub fn current_version() -> &'static str {
@@ -41,487 +86,218 @@ pub fn current_version() -> &'static str {
 pub fn updates_disabled() -> bool {
     matches!(
         std::env::var("TDT_DISABLE_UPDATES")
-            .as_deref()
             .map(|v| v.trim().to_ascii_lowercase())
             .as_deref(),
         Ok("1" | "true" | "yes" | "on")
     )
 }
 
-/// Starts a check or a download: under the phase lock, refuses while one is
-/// running and otherwise sets `busy`. One job at a time, so the job that
-/// claimed the phase is its only writer until it sets the result.
-/// `only_when_idle` is for the boot check, which must never take over from
-/// something the user started.
-pub fn claim(
-    cell: &parking_lot::Mutex<UpdatePhase>,
-    busy: UpdatePhase,
-    only_when_idle: bool,
-) -> bool {
-    let mut phase = cell.lock();
-    let running = matches!(
-        *phase,
-        UpdatePhase::Checking | UpdatePhase::Downloading { .. } | UpdatePhase::Restarting
-    );
-    if running || (only_when_idle && *phase != UpdatePhase::Idle) {
+/// Starts one check. The phase changes on the calling thread, so a second
+/// call finds it busy; the network work runs on a new thread. A manual
+/// check always runs and shows its errors. An automatic check runs only when
+/// the last one is `AUTO_CHECK_EVERY` old, and a failure keeps the previous
+/// state.
+pub fn check(cell: &Arc<Mutex<UpdatePhase>>, manual: bool, ping: &Sender<()>) {
+    if updates_disabled() {
+        return;
+    }
+    let previous = {
+        let mut phase = cell.lock();
+        if phase.is_busy() || !claim_check_slot(manual) {
+            return;
+        }
+        std::mem::replace(&mut *phase, UpdatePhase::Checking)
+    };
+    let _ = ping.send(());
+    let (cell, ping) = (Arc::clone(cell), ping.clone());
+    std::thread::spawn(move || {
+        let next = match latest_release() {
+            Ok(Some(release)) => UpdatePhase::Available(release),
+            Ok(None) => UpdatePhase::UpToDate,
+            Err(error) if manual => UpdatePhase::Failed(error),
+            Err(error) => {
+                eprintln!("TDT: update check failed: {error}");
+                previous
+            }
+        };
+        *cell.lock() = next;
+        let _ = ping.send(());
+    });
+}
+
+/// Downloads the available release on a new thread and starts its setup.
+/// On success the phase becomes `Installing`, and the main loop quits TDT.
+pub fn install(cell: &Arc<Mutex<UpdatePhase>>, ping: &Sender<()>) {
+    let release = {
+        let mut phase = cell.lock();
+        let UpdatePhase::Available(release) = &*phase else {
+            return;
+        };
+        let release = release.clone();
+        *phase = UpdatePhase::Downloading {
+            done: 0,
+            total: release.size,
+        };
+        release
+    };
+    let _ = ping.send(());
+    let (cell, ping) = (Arc::clone(cell), ping.clone());
+    std::thread::spawn(move || {
+        let mut last_ping = Instant::now();
+        let result = download(&release, |done| {
+            *cell.lock() = UpdatePhase::Downloading {
+                done,
+                total: release.size,
+            };
+            if last_ping.elapsed() >= Duration::from_millis(100) {
+                let _ = ping.send(());
+                last_ping = Instant::now();
+            }
+        })
+        .and_then(|setup| {
+            std::process::Command::new(&setup)
+                .arg("/S")
+                .spawn()
+                .map(drop)
+                .map_err(|e| format!("Could not start the update: {e}"))
+        });
+        *cell.lock() = match result {
+            Ok(()) => UpdatePhase::Installing,
+            Err(error) => UpdatePhase::Failed(error),
+        };
+        let _ = ping.send(());
+    });
+}
+
+fn claim_check_slot(manual: bool) -> bool {
+    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+    let mut last = LAST.lock();
+    if !manual && last.is_some_and(|at| at.elapsed() < AUTO_CHECK_EVERY) {
         return false;
     }
-    *phase = busy;
+    *last = Some(Instant::now());
     true
 }
 
-pub fn version_newer(latest: &str, current: &str) -> bool {
-    match (parse_semver(latest), parse_semver(current)) {
-        (Some(left), Some(right)) => left > right,
-        _ => false,
-    }
-}
-
-pub fn check_latest() -> Result<UpdatePhase, String> {
-    if updates_disabled() {
-        return Ok(UpdatePhase::UpToDate);
-    }
-
-    let repo = github_repo();
-    let url = format!("https://github.com/{repo}/releases/latest");
-    let response = check_redirect_agent()
+fn latest_release() -> Result<Option<Release>, String> {
+    let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
+    let response = match agent(Duration::from_secs(15))
         .get(&url)
+        .set("Accept", "application/vnd.github+json")
         .call()
-        .map_err(|e| match e {
-            ureq::Error::Status(404, _) => "404 Not Found".to_string(),
-            other => clean_error_message(&format!("{other}")),
-        })?;
-
-    let location = match response.header("location") {
-        Some(loc) => loc,
-        None => return Ok(UpdatePhase::UpToDate),
-    };
-
-    let tag = match parse_tag_from_location(location) {
-        Some(t) => t,
-        None => return Ok(UpdatePhase::UpToDate),
-    };
-
-    let latest = tag.trim().trim_start_matches('v').to_string();
-    if parse_semver(&latest).is_none() {
-        eprintln!("TDT: ignoring unparseable release tag {tag}");
-        return Ok(UpdatePhase::UpToDate);
-    }
-    if !version_newer(&latest, current_version()) {
-        return Ok(UpdatePhase::UpToDate);
-    }
-
-    // A release without SHA256SUMS.txt cannot be verified, and the download
-    // refuses it, so it is not offered.
-    let sums_url = format!("https://github.com/{repo}/releases/download/{tag}/SHA256SUMS.txt");
-    let sums_body = match http_get_string(&sums_url) {
-        Ok(body) => body,
-        Err(err) if is_no_release(&err) => {
-            eprintln!("TDT: release {tag} has no SHA256SUMS.txt; not offered");
-            return Ok(UpdatePhase::UpToDate);
+    {
+        Ok(response) => response,
+        // No published release yet.
+        Err(ureq::Error::Status(404, _)) => return Ok(None),
+        Err(ureq::Error::Status(403 | 429, _)) => {
+            return Err("GitHub is busy. Try again in a few minutes.".into())
         }
-        Err(err) => return Err(clean_error_message(&err)),
+        Err(_) => return Err("Could not reach GitHub. Check your connection.".into()),
     };
-
-    let asset_name = if expected_hash_for(&sums_body, "TDT.exe").is_some() {
-        "TDT.exe".to_string()
-    } else if expected_hash_for(&sums_body, "TDT-Setup.exe").is_some() {
-        "TDT-Setup.exe".to_string()
-    } else {
-        return Ok(UpdatePhase::UpToDate);
+    let release: GitHubRelease = response
+        .into_json()
+        .map_err(|_| "GitHub sent an unexpected answer.".to_string())?;
+    let version = release.tag_name.trim().trim_start_matches(['v', 'V']);
+    if !is_newer(version, current_version()) {
+        return Ok(None);
+    }
+    // A release that is still uploading has no setup yet.
+    let Some(asset) = release.assets.into_iter().find(|a| a.name == ASSET) else {
+        return Ok(None);
     };
-
-    let asset_url = format!("https://github.com/{repo}/releases/download/{tag}/{asset_name}");
-    Ok(UpdatePhase::Available {
-        version: latest,
-        asset_url,
-        asset_name,
-        sums_url: Some(sums_url),
-    })
+    Ok(Some(Release {
+        version: version.to_string(),
+        url: asset.browser_download_url,
+        size: asset.size,
+        sha256: asset
+            .digest
+            .and_then(|d| d.strip_prefix("sha256:").map(str::to_ascii_lowercase)),
+    }))
 }
 
-/// Download a release binary, streaming to a temp file, and verify SHA256
-/// against the published `SHA256SUMS.txt`. Prefers the slim `TDT.exe` app
-/// binary (Prism-style in-place replace) over the full setup SFX.
-pub fn download_installer(
-    asset_url: &str,
-    asset_name: &str,
-    sums_url: Option<&str>,
-    mut on_progress: impl FnMut(u64, u64),
-) -> Result<PathBuf, String> {
-    let Some(sums_url) = sums_url else {
-        return Err(
-            "Release has no SHA256SUMS.txt; refusing to run an unverified installer".to_string(),
-        );
-    };
-    let sums_url = sums_url.to_string();
-    let sums_job = std::thread::spawn(move || http_get_string(&sums_url));
-
-    let file_name = if is_app_binary(asset_name) {
-        "TDT.exe"
-    } else {
-        "TDT-Setup.exe"
-    };
-    let path = std::env::temp_dir().join(format!("{file_name}.{}.download", std::process::id()));
-    let mut file = File::create(&path).map_err(|e| format!("Could not write update: {e}"))?;
-    let mut hasher = sha2::Sha256::new();
-
-    let response = voice_stt_desktop::stt::models::download_agent(&user_agent())
-        .get(asset_url)
+fn download(release: &Release, mut on_progress: impl FnMut(u64)) -> Result<PathBuf, String> {
+    let failed = |e: &dyn std::fmt::Display| format!("Download failed: {e}");
+    let path = std::env::temp_dir().join(format!("TDT-Setup-{}.exe", release.version));
+    let response = agent(Duration::from_secs(10 * 60))
+        .get(&release.url)
         .set("Accept", "application/octet-stream")
         .call()
-        .map_err(|e| format!("Download failed: {e}"))?;
-    let content_len = response
-        .header("Content-Length")
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(0);
-    on_progress(0, content_len.max(1));
+        .map_err(|e| failed(&e))?;
     let mut reader = response.into_reader();
-    let mut chunk = [0u8; 256 * 1024];
-    let mut total: u64 = 0;
+    let mut file = std::fs::File::create(&path).map_err(|e| failed(&e))?;
+    let mut hasher = sha2::Sha256::new();
+    let mut chunk = vec![0u8; 256 * 1024];
+    let mut done = 0u64;
+    let mut head = [0u8; 2];
     loop {
-        let read = reader
-            .read(&mut chunk)
-            .map_err(|e| format!("Download failed: {e}"))?;
+        let read = reader.read(&mut chunk).map_err(|e| failed(&e))?;
         if read == 0 {
             break;
         }
+        if done == 0 && read >= 2 {
+            head.copy_from_slice(&chunk[..2]);
+        }
         hasher.update(&chunk[..read]);
-        file.write_all(&chunk[..read])
-            .map_err(|e| format!("Could not write update: {e}"))?;
-        total += read as u64;
-        on_progress(total, content_len.max(total).max(1));
+        file.write_all(&chunk[..read]).map_err(|e| failed(&e))?;
+        done += read as u64;
+        on_progress(done);
     }
-    let _ = file.sync_all();
     drop(file);
 
-    if total < 64 {
-        let _ = std::fs::remove_file(&path);
-        return Err("Downloaded update was empty".to_string());
-    }
-
-    let mut head = [0u8; 2];
-    File::open(&path)
-        .and_then(|mut f| f.read_exact(&mut head))
-        .map_err(|e| format!("Could not read update: {e}"))?;
-    if !looks_like_pe(&head) {
-        let _ = std::fs::remove_file(&path);
-        return Err("Downloaded file is not a Windows executable".to_string());
-    }
-
-    let sums = match sums_job.join() {
-        Ok(Ok(body)) => body,
-        Ok(Err(error)) => {
-            let _ = std::fs::remove_file(&path);
-            return Err(error);
-        }
-        Err(_) => {
-            let _ = std::fs::remove_file(&path);
-            return Err("Could not read release checksums".to_string());
-        }
-    };
-    let expected = expected_hash_for(&sums, file_name)
-        .or_else(|| expected_hash_for(&sums, asset_name))
-        .or_else(|| expected_hash_for(&sums, &download_file_name(asset_url)));
-    let Some(expected) = expected else {
-        let _ = std::fs::remove_file(&path);
-        return Err("Release checksums do not list the update; update aborted".to_string());
-    };
-    if format!("{:x}", hasher.finalize()) != expected {
-        let _ = std::fs::remove_file(&path);
-        return Err("Downloaded update failed SHA256 verification; update aborted".to_string());
-    }
-
-    let final_path = std::env::temp_dir().join(file_name);
-    if let Err(error) = std::fs::rename(&path, &final_path) {
-        std::fs::copy(&path, &final_path).map_err(|e| {
-            format!("Could not finalize update download: {error}; copy failed: {e}")
-        })?;
-        let _ = std::fs::remove_file(&path);
-    }
-    Ok(final_path)
-}
-
-fn download_file_name(url: &str) -> String {
-    url.rsplit('/').next().unwrap_or_default().to_string()
-}
-
-fn expected_hash_for(sums: &str, file_name: &str) -> Option<String> {
-    for line in sums.lines() {
-        let mut parts = line.split_whitespace();
-        let (Some(hash), Some(raw_name)) = (parts.next(), parts.next()) else {
-            continue;
-        };
-        let name = raw_name.strip_prefix('*').unwrap_or(raw_name);
-        if name.eq_ignore_ascii_case(file_name) {
-            return Some(hash.to_ascii_lowercase());
-        }
-    }
-    None
-}
-
-pub fn launch_installer(path: &Path) -> Result<(), String> {
-    let mut command = Command::new(path);
-    if !is_app_binary(&path.to_string_lossy()) {
-        command.args(["/SILENT", "/CLOSEAPPLICATIONS", "/NORESTART"]);
-    }
-    command
-        .spawn()
-        .map_err(|e| format!("Could not start installer: {e}"))?;
-    Ok(())
-}
-
-/// True when the release asset is the slim app binary, not the setup SFX.
-pub fn is_app_binary(name: &str) -> bool {
-    Path::new(name)
-        .file_name()
-        .and_then(|value| value.to_str())
-        .is_some_and(|file| file.eq_ignore_ascii_case("TDT.exe"))
-}
-
-/// Replace the running TDT.exe and relaunch, same idea as Prism's NSIS
-/// updater: swap the binary, do not re-download models.
-pub fn replace_running_exe(new_exe: &Path, version: &str) -> Result<(), String> {
-    let current =
-        std::env::current_exe().map_err(|error| format!("Could not locate TDT.exe: {error}"))?;
-    let dir = current
-        .parent()
-        .ok_or_else(|| "Could not locate the TDT folder".to_string())?;
-    let staged = dir.join("TDT.exe.new");
-    // A fresh file takes the install folder's permissions. A copy can carry
-    // the download's low-rights label, and Windows would then start TDT with
-    // low rights, where the shortcut cannot work.
-    std::fs::read(new_exe)
-        .and_then(|bytes| std::fs::write(&staged, bytes))
-        .map_err(|error| format!("Could not stage the update: {error}"))?;
-    // Windows lets an exe in use be renamed but not replaced, so the old one
-    // moves aside first. That works even while a stuck process still holds it.
-    let old = dir.join(format!("TDT.exe.old-{}", std::process::id()));
-    let _ = std::fs::write(dir.join("VERSION"), version.trim().trim_start_matches('v'));
-
-    let script = dir.join("tdt-apply-update.cmd");
-    // Every path below is inside double quotes, where cmd reads & and ^ as
-    // plain characters; only % still expands.
-    let esc = |s: &str| s.replace('"', "").replace('%', "%%");
-    let staged_s = esc(&staged.display().to_string());
-    let current_s = esc(&current.display().to_string());
-    let old_s = esc(&old.display().to_string());
-    let body = [
-        "@echo off".to_string(),
-        "set /a tries=0".to_string(),
-        ":retry".to_string(),
-        "ping -n 2 127.0.0.1 >nul".to_string(),
-        format!("if exist \"{current_s}\" move /Y \"{current_s}\" \"{old_s}\" >nul 2>&1"),
-        format!("if not exist \"{current_s}\" move /Y \"{staged_s}\" \"{current_s}\" >nul 2>&1"),
-        format!("if not exist \"{staged_s}\" goto done"),
-        "set /a tries+=1".to_string(),
-        "if %tries% LSS 60 goto retry".to_string(),
-        // Never leave the folder without TDT.exe: put the old one back.
-        format!("if not exist \"{current_s}\" move /Y \"{old_s}\" \"{current_s}\" >nul 2>&1"),
-        "exit /b 1".to_string(),
-        ":done".to_string(),
-        format!("start \"\" \"{current_s}\""),
-        "del \"%~f0\"".to_string(),
-    ]
-    .join("\r\n")
-        + "\r\n";
-    std::fs::write(&script, body)
-        .map_err(|error| format!("Could not write the update script: {error}"))?;
-
-    let mut cmd = Command::new("cmd.exe");
-    #[cfg(windows)]
+    let hash = format!("{:x}", hasher.finalize());
+    let problem = if done != release.size {
+        Some("The download is incomplete. Try again.")
+    } else if release
+        .sha256
+        .as_ref()
+        .is_some_and(|expected| *expected != hash)
     {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
-        // cmd drops the outer pair of quotes after /C when the path holds a
-        // character such as & or ^, so the path gets a second pair.
-        cmd.raw_arg(format!("/C \"\"{}\"\"", script.display()));
-        cmd.creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
+        Some("The download failed its integrity check. Try again.")
+    } else if &head != b"MZ" {
+        Some("The download is not a Windows program.")
+    } else {
+        None
+    };
+    if let Some(problem) = problem {
+        let _ = std::fs::remove_file(&path);
+        return Err(problem.into());
     }
-    #[cfg(not(windows))]
-    cmd.args(["/C", &script.to_string_lossy()]);
-    cmd.spawn()
-        .map_err(|error| format!("Could not start the update script: {error}"))?;
-    Ok(())
+    Ok(path)
 }
 
-/// Delete exes that updates moved aside, and the files of the Python worker
-/// that versions before 0.2.32 kept. An exe a stuck process still holds
-/// stays until that process is gone, so a later start removes it.
-pub fn remove_replaced_binaries() {
-    let Some(dir) = std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(Path::to_path_buf))
-    else {
-        return;
-    };
-    let Ok(entries) = std::fs::read_dir(&dir) else {
+fn is_newer(latest: &str, current: &str) -> bool {
+    fn parse(raw: &str) -> Option<(u64, u64, u64)> {
+        let mut parts = raw.split(['.', '-', '+']);
+        Some((
+            parts.next()?.parse().ok()?,
+            parts.next()?.parse().ok()?,
+            parts.next().unwrap_or("0").parse().ok()?,
+        ))
+    }
+    matches!((parse(latest), parse(current)), (Some(l), Some(c)) if l > c)
+}
+
+fn agent(timeout: Duration) -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(10))
+        .timeout(timeout)
+        .user_agent(&format!(
+            "TDT/{} (+https://github.com/{REPO})",
+            current_version()
+        ))
+        .build()
+}
+
+/// Deletes the setup that an earlier update downloaded.
+pub fn remove_downloaded_setups() {
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
         return;
     };
     for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with("TDT.exe.old")
-            || name == "photon_worker.py"
-            || name == "photon-python.txt"
-        {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("TDT-Setup-") && name.ends_with(".exe") {
             let _ = std::fs::remove_file(entry.path());
         }
-    }
-}
-
-/// The Windows app list shows what the installer wrote. An in-app update
-/// replaces only TDT.exe, so on the first start of a new version, write the
-/// version and ask Windows to reload app icons. Copies outside the install
-/// folder (dev builds, portable zips) leave the record alone.
-#[cfg(windows)]
-pub fn sync_install_record() {
-    use windows::core::HSTRING;
-    use windows::Win32::System::Registry::{
-        RegGetValueW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_SZ,
-    };
-    use windows::Win32::UI::Shell::{SHChangeNotify, SHCNE_ASSOCCHANGED, SHCNF_IDLIST};
-
-    let key = HSTRING::from(r"Software\Microsoft\Windows\CurrentVersion\Uninstall\TDT");
-    let read = |name: &str| -> Option<String> {
-        let name = HSTRING::from(name);
-        let mut buf = [0u16; 512];
-        let mut len = std::mem::size_of_val(&buf) as u32;
-        let status = unsafe {
-            RegGetValueW(
-                HKEY_CURRENT_USER,
-                &key,
-                &name,
-                RRF_RT_REG_SZ,
-                None,
-                Some(buf.as_mut_ptr().cast()),
-                Some(&mut len),
-            )
-        };
-        status.is_ok().then(|| {
-            let chars = (len as usize / 2).saturating_sub(1);
-            String::from_utf16_lossy(&buf[..chars.min(buf.len())])
-        })
-    };
-
-    let Some(dir) = std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(Path::to_path_buf))
-    else {
-        return;
-    };
-    let same_dir = |location: &str| {
-        location.trim_end_matches('\\').eq_ignore_ascii_case(
-            dir.to_string_lossy()
-                .trim_start_matches(r"\\?\")
-                .trim_end_matches('\\'),
-        )
-    };
-    if !read("InstallLocation").is_some_and(|location| same_dir(&location)) {
-        return;
-    }
-    if read("DisplayVersion").as_deref() == Some(current_version()) {
-        return;
-    }
-    let version: Vec<u16> = current_version()
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
-    unsafe {
-        let _ = RegSetKeyValueW(
-            HKEY_CURRENT_USER,
-            &key,
-            &HSTRING::from("DisplayVersion"),
-            REG_SZ.0,
-            Some(version.as_ptr().cast()),
-            (version.len() * 2) as u32,
-        );
-        SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, None, None);
-    }
-}
-
-fn parse_semver(raw: &str) -> Option<(u64, u64, u64)> {
-    let trimmed = raw.trim().trim_start_matches('v');
-    let mut parts = trimmed.split('.');
-    let major = parts.next()?.parse().ok()?;
-    let minor = parts.next()?.parse().ok()?;
-    let patch = parts
-        .next()
-        .unwrap_or("0")
-        .chars()
-        .take_while(char::is_ascii_digit)
-        .collect::<String>()
-        .parse()
-        .ok()?;
-    Some((major, minor, patch))
-}
-
-fn user_agent() -> String {
-    format!(
-        "TDT/{} (+https://github.com/{})",
-        current_version(),
-        github_repo()
-    )
-}
-
-fn is_no_release(error: &str) -> bool {
-    error.contains("404") || error.contains("Not Found")
-}
-
-fn looks_like_pe(bytes: &[u8]) -> bool {
-    bytes.len() >= 2 && bytes[0] == b'M' && bytes[1] == b'Z'
-}
-
-fn check_redirect_agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(10))
-        .timeout_read(Duration::from_secs(15))
-        .timeout_write(Duration::from_secs(15))
-        .redirects(0)
-        .user_agent(&user_agent())
-        .build()
-}
-
-pub fn parse_tag_from_location(location: &str) -> Option<&str> {
-    let marker = "/releases/tag/";
-    let index = location.find(marker)?;
-    let rest = &location[index + marker.len()..];
-    let tag = rest.split(['/', '?', '#']).next()?;
-    if tag.is_empty() {
-        None
-    } else {
-        Some(tag)
-    }
-}
-
-pub fn clean_error_message(error: &str) -> String {
-    if error.contains("timed out")
-        || error.contains("Connection refused")
-        || error.contains("dns")
-        || error.contains("Could not reach")
-        || error.contains("network")
-    {
-        "Could not reach GitHub; check your connection.".to_string()
-    } else {
-        "Could not check for updates.".to_string()
-    }
-}
-
-fn check_agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(20))
-        .timeout_read(Duration::from_secs(30))
-        .timeout_write(Duration::from_secs(30))
-        .user_agent(&user_agent())
-        .build()
-}
-
-fn http_get_string(url: &str) -> Result<String, String> {
-    match check_agent().get(url).call() {
-        Ok(response) => response
-            .into_string()
-            .map_err(|e| format!("Read failed: {e}")),
-        Err(ureq::Error::Status(404, _)) => Err("404 Not Found".to_string()),
-        Err(error) => Err(format!("{error}")),
     }
 }

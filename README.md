@@ -15,33 +15,28 @@ License: Apache-2.0. Source: https://github.com/Hi9841/tdt
 
 ## Install (Windows)
 
+Download `TDT-Setup.exe` from the
+[latest release](https://github.com/Hi9841/tdt/releases/latest) and run it.
+That is the only file you need.
+
+Setup installs TDT for the current user in `%LOCALAPPDATA%\TDT`, adds a
+Start menu shortcut, and opens the app. It needs no admin rights. Speech
+models are not bundled: open Settings and download Parakeet Redux on first
+run. To uninstall, use Settings > Apps. Uninstall keeps your speech models
+and your dictionary.
+
+To build `TDT-Setup.exe` yourself:
+
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\packaging\build-installer.ps1
 .\dist\TDT-Setup.exe
-```
-
-That writes:
-
-- `dist/TDT.exe` slim app binary used by in-app updates
-- `dist/TDT-Setup.exe` per-user installer (app only, no speech model)
-- `dist/TDT-0.2.26-windows-x64.zip` portable copy (app only, no speech model)
-- `dist/SHA256SUMS.txt`
-
-The installer copies TDT and the license files into `%LOCALAPPDATA%\TDT`,
-adds a Start Menu shortcut, and opens the app. Speech models are not bundled.
-Open Settings and download Parakeet Redux on first run, or keep a model you already
-have. No admin rights. Uninstall from Settings > Apps, or:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\TDT\uninstall-tdt.ps1" -Uninstall
 ```
 
 ## Desktop (dev)
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\models\download-models.ps1
-cargo build --release --manifest-path .\desktop\Cargo.toml
-.\run-desktop.bat
+cargo run --release --bin TDT --manifest-path .\desktop\Cargo.toml
 ```
 
 The first short hotkey tap starts recording and the second stops it. Holding
@@ -142,22 +137,28 @@ in [desktop/bench](desktop/bench/README.md).
 
 ## Updates
 
-GitHub Releases is the update source (`Hi9841/tdt` by default, or
-`TDT_GITHUB_REPO`). Checking happens in the background after launch, never as
-part of recording. Installing an update downloads `TDT.exe` (the app only)
-and replaces the running binary, the same way Prism updates. The speech
-model is not re-downloaded. Older releases fall back to `TDT-Setup.exe`.
-Set `TDT_DISABLE_UPDATES=1` to turn that off.
+TDT updates the same way as Prism. It checks the latest GitHub Release
+shortly after it starts, every hour, and when you open Settings. When a newer
+version is available, Settings shows **Update now**. One click downloads
+`TDT-Setup.exe`, verifies its size and the SHA-256 digest that GitHub
+publishes, and runs it silently. Setup replaces TDT.exe and opens the new
+version. Your speech models and settings stay.
 
-Publish a release tagged `v0.1.0` (or later) so the in-app checker can find
-it. The `Release` workflow publishes `TDT.exe`, `TDT-Setup.exe`, and the
-portable zip on tag `v*`.
+Checks never run during a recording. Set `TDT_DISABLE_UPDATES=1` to turn
+updates off.
+
+To publish a release, set the version in `desktop/Cargo.toml` and push a
+matching tag, such as `v0.3.0`. The `Release` workflow builds
+`TDT-Setup.exe` and attaches it to the release. It also attaches
+`SHA256SUMS.txt`, because TDT 0.2.32 and older need that file to find the
+update.
 
 ## Repository layout
 
 - `desktop/`: Rust + GPUI Windows app with global `Ctrl + ;` tap or hold-to-talk.
-- `models/`: downloader for the FluidAudio Parakeet Unified INT8/Q8 package.
-- `packaging/`: Windows installer stub and build script.
+- `models/`: downloader for the Parakeet Redux model.
+- `packaging/`: `TDT-Setup.exe` (install, update, and uninstall) and its build script.
+- `site/`: the marketing website.
 - `THIRD_PARTY_NOTICES.md`: upstream license and attribution information.
 
 ## Privacy and limits

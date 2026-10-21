@@ -7,10 +7,10 @@
 ```powershell
 cargo fmt --manifest-path desktop/Cargo.toml -- --check
 cargo clippy --manifest-path desktop/Cargo.toml --all-targets --all-features -- -D warnings
-cargo build --manifest-path packaging/tdt-setup/Cargo.toml
+cargo clippy --manifest-path packaging/tdt-setup/Cargo.toml --all-targets -- -D warnings
 ```
 
-4. To rebuild the Windows installer: `powershell -ExecutionPolicy Bypass -File packaging/build-installer.ps1`.
+4. To build `dist/TDT-Setup.exe`: `powershell -ExecutionPolicy Bypass -File packaging/build-installer.ps1`.
 
 Keep model weights and generated build directories out of commits. Describe
 user-visible behavior and include the checks you ran in pull requests.

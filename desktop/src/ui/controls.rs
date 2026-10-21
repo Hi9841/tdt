@@ -46,6 +46,7 @@ pub fn labeled(title: impl Into<SharedString>, caption: impl Into<SharedString>)
         title: title.into(),
         caption: Some(caption.into()),
         control: None,
+        click: None,
     }
 }
 
@@ -58,6 +59,61 @@ pub fn line_row(
         title: title.into(),
         caption: Some(caption.into()),
         control: Some(control.into_any_element()),
+        click: None,
+    }
+}
+
+/// A titled group of settings: the title, then the rows on one card.
+pub fn section(title: impl Into<SharedString>) -> Section {
+    Section {
+        title: title.into(),
+        children: Vec::new(),
+    }
+}
+
+/// Content on a section card that is not a row, aligned with the row text.
+pub fn inset() -> Div {
+    div().px(px(ROW_PAD_X)).py(px(4.0))
+}
+
+const ROW_PAD_X: f32 = 8.0;
+const CARD_PAD: f32 = 4.0;
+
+#[derive(IntoElement)]
+pub struct Section {
+    title: SharedString,
+    children: Vec<AnyElement>,
+}
+
+impl ParentElement for Section {
+    fn extend(&mut self, elements: impl IntoIterator<Item = AnyElement>) {
+        self.children.extend(elements);
+    }
+}
+
+impl RenderOnce for Section {
+    fn render(self, _: &mut Window, _: &mut App) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .gap(px(6.0))
+            .child(
+                div()
+                    .pl(px(CARD_PAD + ROW_PAD_X))
+                    .child(group_label(self.title)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .w_full()
+                    .gap(px(2.0))
+                    .p(px(CARD_PAD))
+                    .rounded(theme::r_section())
+                    .bg(theme::well())
+                    .children(self.children),
+            )
     }
 }
 
@@ -147,24 +203,43 @@ impl RenderOnce for GroupLabel {
     }
 }
 
+type ClickHandler = Box<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
+
 #[derive(IntoElement)]
 pub struct LineRow {
     title: SharedString,
     caption: Option<SharedString>,
     control: Option<AnyElement>,
+    click: Option<(&'static str, ClickHandler)>,
+}
+
+impl LineRow {
+    /// The whole row acts like its control: a larger target, with hover
+    /// and press states. A click on the control itself goes only to the
+    /// control, so a switch does not toggle twice.
+    pub fn on_click(
+        mut self,
+        id: &'static str,
+        handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.click = Some((id, Box::new(handler)));
+        self
+    }
 }
 
 impl RenderOnce for LineRow {
     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = cx.theme();
         let colors = &theme.colors;
-        div()
+        let row = div()
             .flex()
             .items_center()
             .justify_between()
             .w_full()
             .gap_3()
-            .py_1()
+            .px(px(ROW_PAD_X))
+            .py(px(6.0))
+            .rounded(crate::ui::theme::r_chip())
             .child(
                 div()
                     .flex()
@@ -187,10 +262,29 @@ impl RenderOnce for LineRow {
                                 .child(caption),
                         )
                     }),
-            )
+            );
+        let Some((id, handler)) = self.click else {
+            return row
+                .when_some(self.control, |row, control| {
+                    row.child(div().flex_none().child(control))
+                })
+                .into_any_element();
+        };
+        row.id(id)
+            .cursor_pointer()
+            .hover(|style| style.bg(crate::ui::theme::hover()))
+            .active(|style| style.bg(crate::ui::theme::pressed()))
+            .on_click(move |event, window, cx| handler(event, window, cx))
             .when_some(self.control, |row, control| {
-                row.child(div().flex_none().child(control))
+                row.child(
+                    div()
+                        .id(SharedString::from(format!("{id}:control")))
+                        .flex_none()
+                        .on_click(|_, _, cx| cx.stop_propagation())
+                        .child(control),
+                )
             })
+            .into_any_element()
     }
 }
 

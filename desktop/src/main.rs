@@ -135,8 +135,7 @@ fn main() {
     };
     if !preview::is_active() {
         autostart::refresh_if_enabled();
-        update::sync_install_record();
-        update::remove_replaced_binaries();
+        update::remove_downloaded_setups();
     }
 
     let mut config = if preview::is_active() {
@@ -445,15 +444,15 @@ fn main() {
                                     });
                                 } else if event.id == tray.updates_item.id() {
                                     let _ = this.update(cx, |view, cx| {
-                                        view.start_update_check();
+                                        view.check_for_update(true);
                                         view.open_settings(cx);
                                     });
                                 }
                             }
                         }
-                        // A staged update quits like the Quit item, so the tray
-                        // icon is removed before the new TDT starts.
-                        if !quitting && *update_phase.lock() == UpdatePhase::Restarting {
+                        // Setup replaces TDT.exe, so TDT quits like the Quit
+                        // item and removes its tray icon first.
+                        if !quitting && *update_phase.lock() == UpdatePhase::Installing {
                             let _ = this.update(cx, |_, cx| cx.quit());
                             quitting = true;
                         }
@@ -915,28 +914,16 @@ fn main() {
                 })
                 .detach();
 
-                std::thread::spawn(move || {
-                    std::thread::sleep(Duration::from_secs(8));
-                    if preview::is_active() || update::updates_disabled() {
-                        return;
-                    }
-                    // Only from Idle: a check or download the user started wins.
-                    if !update::claim(&update_for_boot, UpdatePhase::Checking, true) {
-                        return;
-                    }
-                    let _ = update_ping_boot.send(());
-                    let next = match update::check_latest() {
-                        Ok(phase) => Some(phase),
-                        Err(error) => {
-                            // A failed boot-time check is logged, not shown;
-                            // the settings UI keeps its idle state.
-                            eprintln!("Boot-time update check failed: {error}");
-                            None
+                // Check soon after start, then every hour, like Prism.
+                if !preview::is_active() {
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_secs(8));
+                        loop {
+                            update::check(&update_for_boot, false, &update_ping_boot);
+                            std::thread::sleep(Duration::from_secs(60 * 60));
                         }
-                    };
-                    *update_for_boot.lock() = next.unwrap_or(UpdatePhase::Idle);
-                    let _ = update_ping_boot.send(());
-                });
+                    });
+                }
 
                 let mut view = HudView::new(
                     hotkey_label,
