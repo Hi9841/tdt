@@ -94,7 +94,7 @@ impl HalfDense {
     pub fn matvec(&self, x: &[f32]) -> Buf {
         assert_eq!(x.len(), self.in_features);
         let (n, k) = (self.out_features, self.in_features);
-        let mut out = Buf::zeroed(n);
+        let mut out = Buf::scratch(n);
         let level = level();
         team::chunks_mut(&mut out, ROWS_PER_TASK, |task, rows| {
             let first = task * ROWS_PER_TASK;

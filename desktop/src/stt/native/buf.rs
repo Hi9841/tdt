@@ -2,6 +2,10 @@
 //! same few sizes in every layer. Fresh large allocations come from Windows
 //! as untouched pages, and the page faults on first write stall all threads.
 //! A buffer goes back to the pool when it is dropped.
+//!
+//! Most buffers are outputs that a parallel step writes in full. Zeroing them
+//! first ran on the calling thread alone, about a tenth of a take, so those
+//! take `scratch` buffers, which keep the stale values of their last use.
 
 use parking_lot::Mutex;
 use std::ops::{Deref, DerefMut};
@@ -11,11 +15,24 @@ static POOL: Mutex<Vec<Vec<f32>>> = Mutex::new(Vec::new());
 /// Enough for every live buffer of one forward pass.
 const MAX_POOLED: usize = 64;
 
-pub struct Buf(Vec<f32>);
+/// `data` keeps every value it ever held, so reuse never fills it again;
+/// the buffer is its first `len` values.
+pub struct Buf {
+    data: Vec<f32>,
+    len: usize,
+}
 
 impl Buf {
     /// `len` zeros, in memory that a previous buffer already touched when one fits.
     pub fn zeroed(len: usize) -> Self {
+        let mut buf = Self::scratch(len);
+        buf.fill(0.0);
+        buf
+    }
+
+    /// `len` values left from an earlier use (zeros where there was none),
+    /// for an output that is written in full before it is read.
+    pub fn scratch(len: usize) -> Self {
         let reused = {
             let mut pool = POOL.lock();
             // Smallest pooled buffer that fits.
@@ -27,16 +44,17 @@ impl Buf {
                 .map(|(i, _)| i);
             best.map(|i| pool.swap_remove(i))
         };
-        let mut vec = reused.unwrap_or_else(|| Vec::with_capacity(len));
-        vec.clear();
-        vec.resize(len, 0.0);
-        Buf(vec)
+        let mut data = reused.unwrap_or_else(|| Vec::with_capacity(len));
+        if data.len() < len {
+            data.resize(len, 0.0);
+        }
+        Buf { data, len }
     }
 }
 
 impl Drop for Buf {
     fn drop(&mut self) {
-        let vec = std::mem::take(&mut self.0);
+        let vec = std::mem::take(&mut self.data);
         if vec.capacity() == 0 {
             return;
         }
@@ -50,19 +68,38 @@ impl Drop for Buf {
 impl Deref for Buf {
     type Target = [f32];
     fn deref(&self) -> &[f32] {
-        &self.0
+        &self.data[..self.len]
     }
 }
 
 impl DerefMut for Buf {
     fn deref_mut(&mut self) -> &mut [f32] {
-        &mut self.0
+        &mut self.data[..self.len]
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::Buf;
+
+    #[test]
+    fn zeroed_clears_a_reused_buffer_and_scratch_only_sets_its_length() {
+        // A size no other test uses, so this test gets its own buffer back.
+        let len = 12_345;
+        let mut first = Buf::scratch(len);
+        assert!(
+            first.iter().all(|v| *v == 0.0),
+            "fresh scratch memory starts at zero"
+        );
+        first.fill(7.0);
+        drop(first);
+        let zeroed = Buf::zeroed(len - 5);
+        assert_eq!(zeroed.len(), len - 5);
+        assert!(zeroed.iter().all(|v| *v == 0.0));
+        drop(zeroed);
+        let grown = Buf::scratch(len + 10);
+        assert_eq!(grown.len(), len + 10);
+    }
 
     #[test]
     fn a_dropped_buffer_is_reused_with_the_requested_length() {

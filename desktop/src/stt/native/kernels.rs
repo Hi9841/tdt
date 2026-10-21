@@ -127,7 +127,7 @@ impl PackedTernary {
 
     /// `x` is `m x k` f32; returns `m x n`.
     pub fn forward(&self, x: &[f32], m: usize) -> Buf {
-        let mut out = Buf::zeroed(m * self.n);
+        let mut out = Buf::scratch(m * self.n);
         self.forward_into(x, m, &mut out);
         out
     }

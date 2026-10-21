@@ -99,7 +99,7 @@ impl Norm {
 
     fn apply(&self, x: &[f32]) -> Buf {
         let size = self.weight.len();
-        let mut out = Buf::zeroed(x.len());
+        let mut out = Buf::scratch(x.len());
         team::chunks_mut(&mut out, size, |index, o| {
             let row = &x[index * size..(index + 1) * size];
             let (mean, var) = moments(row);
@@ -114,7 +114,7 @@ impl Norm {
     /// `x += scale * y`, then the normalized `x`, in one pass per row.
     fn residual(&self, x: &mut [f32], y: &[f32], scale: f32) -> Buf {
         let size = self.weight.len();
-        let mut out = Buf::zeroed(x.len());
+        let mut out = Buf::scratch(x.len());
         let rows = team::SendPtr::new(x);
         team::chunks_mut(&mut out, size, |index, o| {
             // SAFETY: each row of `x` belongs to the task of the same output row.
@@ -263,7 +263,7 @@ impl Subsampling {
         let (x, h3, w3) = depthwise(&x, h2, w2, ch, &self.dw2);
         let x = self.pw2.forward_relu(&x, h3 * w3);
         // Flatten per frame as channel-major: index = c * w3 + w.
-        let mut flat = Buf::zeroed(h3 * ch * w3);
+        let mut flat = Buf::scratch(h3 * ch * w3);
         team::chunks_mut(&mut flat, ch * w3, |h, row| {
             for w in 0..w3 {
                 for c in 0..ch {
@@ -283,7 +283,7 @@ impl Subsampling {
         let ch = self.channels;
         let (h1, w1) = (half(frames), half(mels));
         let (h2, w2) = (half(h1), half(w1));
-        let mut out = Buf::zeroed(h2 * w2 * ch);
+        let mut out = Buf::scratch(h2 * w2 * ch);
         // At least four strips per thread, so a short take still spreads out.
         let strip_rows = h2.div_ceil(4 * team::threads()).clamp(1, MAX_STRIP_ROWS);
         team::chunks_mut(&mut out, strip_rows * w2 * ch, |strip, rows| {
@@ -372,7 +372,7 @@ fn depthwise(
     (weight, bias): &(Vec<f32>, Vec<f32>),
 ) -> (Buf, usize, usize) {
     let (ho, wo) = (half(h), half(w));
-    let mut out = Buf::zeroed(ho * wo * ch);
+    let mut out = Buf::scratch(ho * wo * ch);
     team::chunks_mut(&mut out, wo * ch, |oh, row| {
         for ow in 0..wo {
             let cell = &mut row[ow * ch..(ow + 1) * ch];
@@ -496,7 +496,7 @@ impl Block {
         let r = cache.slice(t, d);
         let scale = 1.0 / (hd as f32).sqrt();
         let p = 2 * t - 1;
-        let mut context = Buf::zeroed(t * d);
+        let mut context = Buf::scratch(t * d);
         let per_head: Vec<Buf> = team::map(heads, |h| {
             let cols = h * hd..(h + 1) * hd;
             // Columns of head h from a matrix with `stride` values per row.
@@ -516,7 +516,7 @@ impl Block {
             let qv = head(&qkv, 3 * d, 0, t, Some(&self.bias_v[cols.clone()]));
             let ac = fgemm::matmul(&qu, t, hd, &head(&qkv, 3 * d, d, t, None), t);
             let bd = fgemm::matmul(&qv, t, hd, &head(r, d, 0, p, None), p);
-            let mut probs = Buf::zeroed(t * t);
+            let mut probs = Buf::scratch(t * t);
             for (i, row) in probs.chunks_exact_mut(t).enumerate() {
                 // Column t-1-i+j of the position product is relative position i - j.
                 let shifted = &bd[i * p + (t - 1 - i)..][..t];
@@ -530,7 +530,7 @@ impl Block {
                 let inv = 1.0 / row.iter().sum::<f32>();
                 row.iter_mut().for_each(|value| *value *= inv);
             }
-            let mut v_t = Buf::zeroed(hd * t);
+            let mut v_t = Buf::scratch(hd * t);
             for j in 0..t {
                 for (e, value) in qkv[j * 3 * d + 2 * d..][cols.clone()].iter().enumerate() {
                     v_t[e * t + j] = *value;
@@ -553,7 +553,7 @@ impl Block {
         let kernel = c.conv_kernel;
         let pad = (kernel - 1) / 2;
         let wide = self.pw1.forward(x, t);
-        let mut gated = Buf::zeroed(t * d);
+        let mut gated = Buf::scratch(t * d);
         team::chunks_mut(&mut gated, d, |index, out| {
             let row = &wide[index * 2 * d..(index + 1) * 2 * d];
             out.copy_from_slice(&row[d..]);
@@ -562,6 +562,7 @@ impl Block {
                 *o *= value;
             }
         });
+        // Accumulated with +=: the one buffer here that must start at zero.
         let mut mixed = Buf::zeroed(t * d);
         team::chunks_mut(&mut mixed, d, |i, out| {
             for k in 0..kernel {

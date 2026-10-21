@@ -52,7 +52,7 @@ unsafe impl Sync for OutPtr {}
 
 /// `out[i][j] = sum_k x[i][k] * w[j][k]`, parallel over 64 x 64 blocks.
 pub fn matmul(x: &[f32], m: usize, k: usize, w: &[f32], n: usize) -> Buf {
-    let mut out = Buf::zeroed(m * n);
+    let mut out = Buf::scratch(m * n);
     matmul_into(x, m, k, w, n, &mut out);
     out
 }

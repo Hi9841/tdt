@@ -159,7 +159,7 @@ impl Ternary {
         }
         let (k, n, group) = (self.in_features, self.out_features, self.group);
         let groups = k / group;
-        let mut out = Buf::zeroed(rows * n);
+        let mut out = Buf::scratch(rows * n);
         let out_ptr = SendPtr(out.as_mut_ptr());
         team::for_each(n.div_ceil(COLUMN_BLOCK), |block| {
             let columns = block * COLUMN_BLOCK..((block + 1) * COLUMN_BLOCK).min(n);
