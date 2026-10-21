@@ -936,11 +936,9 @@ fn main() {
                         return;
                     }
                     // Only from Idle: a check or download the user started wins.
-                    let Some(ticket) =
-                        update::claim(&update_for_boot, UpdatePhase::Checking, true)
-                    else {
+                    if !update::claim(&update_for_boot, UpdatePhase::Checking, true) {
                         return;
-                    };
+                    }
                     let _ = update_ping_boot.send(());
                     let next = match update::check_latest() {
                         Ok(phase) => Some(phase),
@@ -951,16 +949,8 @@ fn main() {
                             None
                         }
                     };
-                    // A user-initiated check superseded this boot check; do not
-                    // clobber its result.
-                    if update::update_check_is_current(ticket) {
-                        if let Some(next) = next {
-                            *update_for_boot.lock() = next;
-                        } else {
-                            *update_for_boot.lock() = UpdatePhase::Idle;
-                        }
-                        let _ = update_ping_boot.send(());
-                    }
+                    *update_for_boot.lock() = next.unwrap_or(UpdatePhase::Idle);
+                    let _ = update_ping_boot.send(());
                 });
 
                 let mut view = HudView::new(

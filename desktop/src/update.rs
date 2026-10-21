@@ -48,38 +48,26 @@ pub fn updates_disabled() -> bool {
     )
 }
 
-static UPDATE_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Start a new update-check generation and return its ticket. Any thread
-/// holding a superseded ticket must drop its result instead of writing it,
-/// so a slow boot-time check can never overwrite a newer user-initiated one.
-pub fn begin_update_check() -> u64 {
-    UPDATE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
-}
-
-/// True when the caller's ticket is still the newest update-check generation.
-pub fn update_check_is_current(ticket: u64) -> bool {
-    UPDATE_EPOCH.load(std::sync::atomic::Ordering::SeqCst) == ticket
-}
-
 /// Starts a check or a download: under the phase lock, refuses while one is
-/// running, sets `busy`, and returns the new ticket. `only_when_idle` is for
-/// the boot check, which must never take over from something the user started.
+/// running and otherwise sets `busy`. One job at a time, so the job that
+/// claimed the phase is its only writer until it sets the result.
+/// `only_when_idle` is for the boot check, which must never take over from
+/// something the user started.
 pub fn claim(
     cell: &parking_lot::Mutex<UpdatePhase>,
     busy: UpdatePhase,
     only_when_idle: bool,
-) -> Option<u64> {
+) -> bool {
     let mut phase = cell.lock();
     let running = matches!(
         *phase,
         UpdatePhase::Checking | UpdatePhase::Downloading { .. } | UpdatePhase::Restarting
     );
     if running || (only_when_idle && *phase != UpdatePhase::Idle) {
-        return None;
+        return false;
     }
     *phase = busy;
-    Some(begin_update_check())
+    true
 }
 
 pub fn version_newer(latest: &str, current: &str) -> bool {

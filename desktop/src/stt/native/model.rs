@@ -758,22 +758,10 @@ impl Parakeet {
 
     /// Encoder output after the 24 blocks: `frames x hidden`.
     pub fn encode(&self, features: &[f32], frames: usize) -> (Buf, usize) {
-        self.encode_inspect(features, frames, |_, _| {})
-    }
-
-    /// `inspect(0, x)` sees the subsampling output, `inspect(n, x)` the output of block n - 1.
-    pub fn encode_inspect(
-        &self,
-        features: &[f32],
-        frames: usize,
-        mut inspect: impl FnMut(usize, &[f32]),
-    ) -> (Buf, usize) {
         let c = &self.config;
         let (mut x, t) = self.subsampling.forward(features, frames, c.mels);
-        inspect(0, &x);
-        for (index, block) in self.blocks.iter().enumerate() {
+        for block in &self.blocks {
             block.forward(&mut x, t, c);
-            inspect(index + 1, &x);
         }
         (x, t)
     }

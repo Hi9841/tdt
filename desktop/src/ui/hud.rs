@@ -736,9 +736,9 @@ impl HudView {
         }
         // Ignore clicks while a check or download is already running; the
         // shared phase cell has a single writer at a time.
-        let Some(ticket) = update::claim(&self.update, UpdatePhase::Checking, false) else {
+        if !update::claim(&self.update, UpdatePhase::Checking, false) {
             return;
-        };
+        }
         let cell = Arc::clone(&self.update);
         let ping = self.update_ping.clone();
         std::thread::spawn(move || {
@@ -747,11 +747,8 @@ impl HudView {
                 Ok(phase) => phase,
                 Err(error) => UpdatePhase::Failed(error),
             };
-            // A newer user action superseded this check; do not clobber it.
-            if update::update_check_is_current(ticket) {
-                *cell.lock() = next;
-                let _ = ping.send(());
-            }
+            *cell.lock() = next;
+            let _ = ping.send(());
         });
     }
 
@@ -768,9 +765,9 @@ impl HudView {
                 sums_url,
             } => {
                 let busy = UpdatePhase::Downloading { done: 0, total: 1 };
-                let Some(ticket) = update::claim(&self.update, busy, false) else {
+                if !update::claim(&self.update, busy, false) {
                     return;
-                };
+                }
                 let cell = Arc::clone(&self.update);
                 let ping = self.update_ping.clone();
                 std::thread::spawn(move || {
@@ -805,11 +802,8 @@ impl HudView {
                         }
                         Err(error) => UpdatePhase::Failed(error),
                     };
-                    // Only the newest install action may write the phase.
-                    if update::update_check_is_current(ticket) {
-                        *cell.lock() = next;
-                        let _ = ping.send(());
-                    }
+                    *cell.lock() = next;
+                    let _ = ping.send(());
                 });
             }
             UpdatePhase::Ready { installer } => {

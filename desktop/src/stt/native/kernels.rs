@@ -177,13 +177,6 @@ impl Ternary {
     /// `x` is `m x k` f32; returns `m x n`.
     pub fn forward(&self, x: &[f32], m: usize) -> Buf {
         let mut out = Buf::scratch(m * self.n);
-        self.forward_into(x, m, &mut out);
-        out
-    }
-
-    /// Writes `m x n` into `out`, which must hold exactly that many values.
-    pub fn forward_into(&self, x: &[f32], m: usize, out: &mut [f32]) {
-        assert_eq!(out.len(), m * self.n);
         let q = Quantized::new(self.isa, x, m, self.k);
         let ptr = OutPtr(out.as_mut_ptr());
         let rows = self.isa.rows();
@@ -203,6 +196,7 @@ impl Ternary {
             // SAFETY: Isa::detect confirmed the CPU features.
             Isa::Avx512Vnni => unsafe { self.vnni_task(&q, task, ptr) },
         });
+        out
     }
 
     fn scalar_rows(&self, q: &Quantized, row: usize, out: OutPtr) {

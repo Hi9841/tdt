@@ -52,13 +52,8 @@ unsafe impl Sync for OutPtr {}
 
 /// `out[i][j] = sum_k x[i][k] * w[j][k]`, parallel over 64 x 64 blocks.
 pub fn matmul(x: &[f32], m: usize, k: usize, w: &[f32], n: usize) -> Buf {
+    assert!(x.len() >= m * k && w.len() >= n * k);
     let mut out = Buf::scratch(m * n);
-    matmul_into(x, m, k, w, n, &mut out);
-    out
-}
-
-pub fn matmul_into(x: &[f32], m: usize, k: usize, w: &[f32], n: usize, out: &mut [f32]) {
-    assert!(x.len() >= m * k && w.len() >= n * k && out.len() >= m * n);
     let (row_blocks, col_blocks) = (m.div_ceil(BLOCK), n.div_ceil(BLOCK));
     let ptr = OutPtr(out.as_mut_ptr());
     let level = level();
@@ -69,6 +64,7 @@ pub fn matmul_into(x: &[f32], m: usize, k: usize, w: &[f32], n: usize, out: &mut
         // the level was detected from the CPU.
         unsafe { block(level, x, k, w, n, rows, cols, ptr) };
     });
+    out
 }
 
 /// One block, on the calling thread.
