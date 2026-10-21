@@ -89,6 +89,20 @@ impl Tokenizer {
             .collect()
     }
 
+    /// Ids of pieces with letters that English does not use: Cyrillic,
+    /// Greek, and accented Latin from the model's other languages. TDT is
+    /// English only, so the decoder never picks them.
+    pub fn non_english(&self) -> Vec<usize> {
+        let english = |c: char| c.is_ascii() || matches!(c, WORD_START | '£' | '€');
+        self.pieces
+            .iter()
+            .zip(&self.special)
+            .enumerate()
+            .filter(|(_, (piece, special))| !**special && !piece.chars().all(english))
+            .map(|(id, _)| id)
+            .collect()
+    }
+
     /// Characters in a piece, not counting the word-start mark.
     pub fn letters(&self, id: usize) -> usize {
         self.pieces.get(id).map_or(0, |piece| {

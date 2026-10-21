@@ -812,8 +812,15 @@ impl Parakeet {
     }
 
     /// Greedy TDT decoding over projected encoder frames (`t x decoder_hidden`).
-    /// `bias` boosts dictionary terms; see `bias.rs`.
-    pub fn decode(&self, projected: &[f32], t: usize, bias: Option<&Bias>) -> Vec<usize> {
+    /// `bias` boosts dictionary terms; see `bias.rs`. `banned` tokens are
+    /// never picked.
+    pub fn decode(
+        &self,
+        projected: &[f32],
+        t: usize,
+        bias: Option<&Bias>,
+        banned: &[usize],
+    ) -> Vec<usize> {
         let c = &self.config;
         let dh = c.decoder_hidden;
         let mut state = DecoderState {
@@ -835,6 +842,9 @@ impl Parakeet {
                 joint_in[i] = (enc[i] + dec[i]).max(0.0);
             }
             let mut logits = self.joint.matvec(&joint_in);
+            for &id in banned {
+                logits[id] = f32::NEG_INFINITY;
+            }
             let own = argmax(&logits[..c.vocab]);
             if let Some(bias) = bias {
                 bias.apply(matched, &mut logits[..c.vocab]);

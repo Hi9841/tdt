@@ -31,6 +31,8 @@ pub struct NativeParakeet {
     dictionary: RwLock<Option<bias::Bias>>,
     frontend: features::MelFrontend,
     tokenizer: tokenizer::Tokenizer,
+    /// Tokens the decoder never picks; see `Tokenizer::non_english`.
+    non_english: Vec<usize>,
 }
 
 impl NativeParakeet {
@@ -49,11 +51,13 @@ impl NativeParakeet {
         // tables grow, so load does not hold both at its peak.
         drop(tensors);
         model.warm_positions();
+        let tokenizer = tokenizer::Tokenizer::open(&model_dir.join("tokenizer.json"))?;
         Ok(Self {
             dictionary: RwLock::new(None),
             model,
             frontend,
-            tokenizer: tokenizer::Tokenizer::open(&model_dir.join("tokenizer.json"))?,
+            non_english: tokenizer.non_english(),
+            tokenizer,
         })
     }
 
@@ -106,7 +110,8 @@ impl NativeParakeet {
         let (encoded, t) = self.model.encode(&features, frames);
         let projected = self.model.project(&encoded, t);
         let dictionary = self.dictionary.read();
-        self.model.decode(&projected, t, dictionary.as_ref())
+        self.model
+            .decode(&projected, t, dictionary.as_ref(), &self.non_english)
     }
 }
 
