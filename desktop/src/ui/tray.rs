@@ -33,28 +33,16 @@ impl SystemTray {
         let quit_item = MenuItem::new("Quit TDT", true, None);
 
         tray_menu
-            .append(&show_item)
-            .map_err(|e| format!("Menu error: {e}"))?;
-        tray_menu
-            .append(&settings_item)
-            .map_err(|e| format!("Menu error: {e}"))?;
-        tray_menu
-            .append(&stop_item)
-            .map_err(|e| format!("Menu error: {e}"))?;
-        tray_menu
-            .append(&PredefinedMenuItem::separator())
-            .map_err(|e| format!("Menu error: {e}"))?;
-        tray_menu
-            .append(&auto_paste_item)
-            .map_err(|e| format!("Menu error: {e}"))?;
-        tray_menu
-            .append(&updates_item)
-            .map_err(|e| format!("Menu error: {e}"))?;
-        tray_menu
-            .append(&PredefinedMenuItem::separator())
-            .map_err(|e| format!("Menu error: {e}"))?;
-        tray_menu
-            .append(&quit_item)
+            .append_items(&[
+                &show_item,
+                &settings_item,
+                &stop_item,
+                &PredefinedMenuItem::separator(),
+                &auto_paste_item,
+                &updates_item,
+                &PredefinedMenuItem::separator(),
+                &quit_item,
+            ])
             .map_err(|e| format!("Menu error: {e}"))?;
 
         let icon = app_icon()?;

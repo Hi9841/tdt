@@ -40,9 +40,10 @@ struct Options {
 
 fn parse_options() -> Options {
     let mut options = Options {
-        dir: std::env::var_os("LOCALAPPDATA")
-            .map(|l| PathBuf::from(l).join("Temp").join("tdt-bench-audio"))
-            .unwrap_or_else(|| std::env::temp_dir().join("tdt-bench-audio")),
+        dir: std::env::var_os("LOCALAPPDATA").map_or_else(
+            || std::env::temp_dir().join("tdt-bench-audio"),
+            |l| PathBuf::from(l).join("Temp").join("tdt-bench-audio"),
+        ),
         realtime: false,
         native: false,
         repeat: 1,
@@ -58,7 +59,7 @@ fn parse_options() -> Options {
                     .next()
                     .and_then(|value| value.parse().ok())
                     .unwrap_or(1)
-                    .max(1)
+                    .max(1);
             }
             other => eprintln!("ignored argument {other}"),
         }

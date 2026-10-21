@@ -152,7 +152,7 @@ fn parse_header(
             .as_array()
             .map(|o| {
                 o.iter()
-                    .filter_map(|d| d.as_u64())
+                    .filter_map(serde_json::Value::as_u64)
                     .map(|d| d as usize)
                     .collect()
             })

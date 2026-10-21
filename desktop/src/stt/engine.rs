@@ -184,7 +184,7 @@ pub(crate) fn boost_quiet_speech(samples: &[f32]) -> Option<Vec<f32>> {
     if audible.len() < MIN_AUDIBLE_FRAMES {
         return None;
     }
-    audible.sort_by(|left, right| left.total_cmp(right));
+    audible.sort_by(f32::total_cmp);
     let level = audible[(audible.len() * 3) / 4];
     if !level.is_finite() || level >= BOOST_TARGET_RMS {
         return None;

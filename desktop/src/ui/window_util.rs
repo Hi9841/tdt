@@ -639,8 +639,7 @@ pub fn client_animations_enabled() -> bool {
     fn now_ms() -> u64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0)
+            .map_or(0, |d| d.as_millis() as u64)
     }
     let now = now_ms();
     let last = LAST_CHECK.load(std::sync::atomic::Ordering::Relaxed);
@@ -845,8 +844,7 @@ pub fn follow_current_virtual_desktop() {
                 };
                 if vdm
                     .IsWindowOnCurrentVirtualDesktop(hwnd)
-                    .ok()
-                    .is_some_and(|v| v.as_bool())
+                    .is_ok_and(|v| v.as_bool())
                 {
                     return;
                 }

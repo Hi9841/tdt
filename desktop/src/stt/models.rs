@@ -178,7 +178,6 @@ pub fn file_label(name: &str) -> String {
         .trim_end_matches(".onnx")
         .trim_end_matches(".txt")
         .replace(".int8", "")
-        .to_string()
 }
 
 pub fn download(
@@ -238,7 +237,7 @@ pub fn download(
     }
 
     spec.require_installed(dest_dir)?;
-    let last = spec.files.last().map(|file| file.name).unwrap_or("");
+    let last = spec.files.last().map_or("", |file| file.name);
     on_progress(DownloadProgress {
         done: total,
         total,
@@ -345,7 +344,7 @@ fn file_sha256(path: &Path) -> Result<String, String> {
 }
 
 fn file_len(path: &Path) -> u64 {
-    fs::metadata(path).map(|meta| meta.len()).unwrap_or(0)
+    fs::metadata(path).map_or(0, |meta| meta.len())
 }
 
 /// Shared long-read HTTP agent: model downloads and update downloads both need

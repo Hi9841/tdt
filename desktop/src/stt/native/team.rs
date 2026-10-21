@@ -63,7 +63,7 @@ impl Team {
                 .name(format!("tdt-speech-{index}"))
                 .spawn(move || {
                     set_affinity(domain);
-                    work(&for_worker)
+                    work(&for_worker);
                 });
             if spawned.is_err() {
                 // Fewer threads only make the engine slower.

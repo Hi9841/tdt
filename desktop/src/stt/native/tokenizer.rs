@@ -30,7 +30,7 @@ impl Tokenizer {
             .ok_or("tokenizer.json has no model.vocab")?;
         let size = vocab
             .values()
-            .filter_map(|id| id.as_u64())
+            .filter_map(serde_json::Value::as_u64)
             .max()
             .map_or(0, |max| max as usize + 1);
         let mut pieces = vec![String::new(); size];

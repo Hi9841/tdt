@@ -109,7 +109,7 @@ fn open_named(host: &cpal::Host, device_name: &str) -> Result<AudioRecorder, Str
 
     stream
         .play()
-        .map_err(|e| format!("Failed to start input stream: {}", e))?;
+        .map_err(|e| format!("Failed to start input stream: {e}"))?;
 
     eprintln!("Microphone open: {device_name}");
 
@@ -382,7 +382,7 @@ fn stream_error_callback(
     envelope: Arc<Mutex<SpeechEnvelope>>,
 ) -> impl FnMut(cpal::StreamError) + Send + 'static {
     move |err| {
-        eprintln!("Audio stream error: {}", err);
+        eprintln!("Audio stream error: {err}");
         apply_stream_error(&last_error, &is_recording, err);
         *rms.lock() = 0.0;
         *envelope.lock() = SpeechEnvelope::default();
@@ -407,12 +407,9 @@ fn ordered_input_names(host: &cpal::Host) -> Result<Vec<String>, String> {
 }
 
 fn find_input(host: &cpal::Host, name: &str) -> Option<cpal::Device> {
-    host.input_devices().ok()?.find(|device| {
-        device
-            .name()
-            .ok()
-            .is_some_and(|device_name| device_name == name)
-    })
+    host.input_devices()
+        .ok()?
+        .find(|device| device.name().is_ok_and(|device_name| device_name == name))
 }
 
 /// Default endpoint first, then other real inputs. Loopback endpoints are omitted.
@@ -468,8 +465,7 @@ fn nonzero(value: u64) -> Option<u64> {
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_millis() as u64)
-        .unwrap_or(0)
+        .map_or(0, |elapsed| elapsed.as_millis() as u64)
 }
 
 fn note_callback(last_callback_ms: &AtomicU64) {

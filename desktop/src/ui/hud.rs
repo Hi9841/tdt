@@ -921,7 +921,7 @@ impl HudView {
                     Err(error) => {
                         self.model_error = Some(format!(
                             "Could not save the model choice. Try again. {error}"
-                        ))
+                        ));
                     }
                 }
             }

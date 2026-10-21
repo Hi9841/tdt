@@ -83,8 +83,7 @@ impl SpeechTail {
         let mut quiet_frames = 0usize;
         let start = self
             .release_sample
-            .map(|sample| (sample / FRAME_SAMPLES).min(self.frames.len()))
-            .unwrap_or(0);
+            .map_or(0, |sample| (sample / FRAME_SAMPLES).min(self.frames.len()));
         for db in self.frames[start..].iter().rev() {
             if !frame_is_quiet(*db, noise, peak) {
                 break;
@@ -139,14 +138,14 @@ fn frame_db(samples: &[f32]) -> f32 {
 
 fn percentile_15(values: &[f32]) -> f32 {
     let mut sorted = values.to_vec();
-    sorted.sort_by(|a, b| a.total_cmp(b));
+    sorted.sort_by(f32::total_cmp);
     let rank = ((sorted.len() as f32) * 0.15).ceil() as usize;
     sorted[rank.saturating_sub(1).min(sorted.len() - 1)]
 }
 
 fn median(values: &[f32]) -> f32 {
     let mut sorted = values.to_vec();
-    sorted.sort_by(|a, b| a.total_cmp(b));
+    sorted.sort_by(f32::total_cmp);
     let mid = sorted.len() / 2;
     if sorted.len().is_multiple_of(2) {
         (sorted[mid - 1] + sorted[mid]) * 0.5

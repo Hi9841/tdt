@@ -64,8 +64,7 @@ pub fn refresh_if_enabled() {
         return;
     }
     let unchanged = shortcut_target(&shortcut)
-        .map(|target| target.eq_ignore_ascii_case(&exe.to_string_lossy()))
-        .unwrap_or(false);
+        .is_some_and(|target| target.eq_ignore_ascii_case(&exe.to_string_lossy()));
     if unchanged {
         return;
     }
@@ -263,8 +262,7 @@ fn write_shortcut_sta(exe: &Path, path: &Path) -> Result<(), String> {
     }
     let workdir = exe
         .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
     let init = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
     if init.is_err() {
         return Err("Could not initialize COM for the startup shortcut.".into());

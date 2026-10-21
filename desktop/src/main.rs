@@ -155,21 +155,18 @@ fn main() {
     }
     let auto_paste = config.auto_paste;
     let remove_fillers_state = Arc::new(AtomicBool::new(config.remove_fillers));
-    let hotkey_binding = match HotkeyBinding::parse(&config.hotkey) {
-        Some(binding) => binding,
-        None => {
-            eprintln!(
-                "Could not parse the configured hotkey '{}'; using the default.",
-                config.hotkey
-            );
-            let binding = HotkeyBinding::default();
-            config.hotkey = binding.display();
-            if !preview::is_active() {
-                let _ = config.save();
-            }
-            binding
+    let hotkey_binding = HotkeyBinding::parse(&config.hotkey).unwrap_or_else(|| {
+        eprintln!(
+            "Could not parse the configured hotkey '{}'; using the default.",
+            config.hotkey
+        );
+        let binding = HotkeyBinding::default();
+        config.hotkey = binding.display();
+        if !preview::is_active() {
+            let _ = config.save();
         }
-    };
+        binding
+    });
     set_binding(hotkey_binding);
     let hotkey_label = hotkey_binding.display();
 
@@ -198,22 +195,19 @@ fn main() {
     let model_spec = models::resolve(&config.model_id);
     let stt_engine = EngineSlot::default();
     stt_engine.set(
-        match models::find_dir(model_spec, config.model_dir.as_deref()) {
-            Some(dir) => {
-                append_log(&format!(
-                    "{} speech model found at: {}",
-                    model_spec.label,
-                    dir.display()
-                ));
-                Some(Arc::new(SttEngine::new(&dir)))
-            }
-            None => {
-                append_log(&format!(
-                    "{} is not downloaded. Open Settings to download it, or run models/download-models.ps1.",
-                    model_spec.label
-                ));
-                None
-            }
+        if let Some(dir) = models::find_dir(model_spec, config.model_dir.as_deref()) {
+            append_log(&format!(
+                "{} speech model found at: {}",
+                model_spec.label,
+                dir.display()
+            ));
+            Some(Arc::new(SttEngine::new(&dir)))
+        } else {
+            append_log(&format!(
+                "{} is not downloaded. Open Settings to download it, or run models/download-models.ps1.",
+                model_spec.label
+            ));
+            None
         },
     );
 
@@ -802,7 +796,7 @@ fn main() {
                                     is_processing_state = false;
                                     play_sound(SoundEffect::Success);
                                     let word_count = text.split_whitespace().count();
-                                    println!("Transcription completed ({} words, latency: {}ms)", word_count, latency_ms);
+                                    println!("Transcription completed ({word_count} words, latency: {latency_ms}ms)");
                                     let finished_at = Instant::now();
                                     let _ = this.update(cx, |view, cx| {
                                         view.stats = AppStats::load();

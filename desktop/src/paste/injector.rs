@@ -112,7 +112,7 @@ impl PasteInjector {
                 match cb.set_text(text) {
                     Ok(_) => return Ok(()),
                     Err(e) => {
-                        last_err = format!("Clipboard error: {}", e);
+                        last_err = format!("Clipboard error: {e}");
                         *guard = None; // Reset clipboard handle and retry
                     }
                 }

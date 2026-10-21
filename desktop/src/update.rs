@@ -44,7 +44,7 @@ pub fn updates_disabled() -> bool {
             .as_deref()
             .map(|v| v.trim().to_ascii_lowercase())
             .as_deref(),
-        Ok("1") | Ok("true") | Ok("yes") | Ok("on")
+        Ok("1" | "true" | "yes" | "on")
     )
 }
 
@@ -223,20 +223,13 @@ pub fn download_installer(
     let expected = expected_hash_for(&sums, file_name)
         .or_else(|| expected_hash_for(&sums, asset_name))
         .or_else(|| expected_hash_for(&sums, &download_file_name(asset_url)));
-    match expected {
-        Some(expected) => {
-            let actual = format!("{:x}", hasher.finalize());
-            if actual != expected {
-                let _ = std::fs::remove_file(&path);
-                return Err(
-                    "Downloaded update failed SHA256 verification; update aborted".to_string(),
-                );
-            }
-        }
-        None => {
-            let _ = std::fs::remove_file(&path);
-            return Err("Release checksums do not list the update; update aborted".to_string());
-        }
+    let Some(expected) = expected else {
+        let _ = std::fs::remove_file(&path);
+        return Err("Release checksums do not list the update; update aborted".to_string());
+    };
+    if format!("{:x}", hasher.finalize()) != expected {
+        let _ = std::fs::remove_file(&path);
+        return Err("Downloaded update failed SHA256 verification; update aborted".to_string());
     }
 
     let final_path = std::env::temp_dir().join(file_name);
@@ -456,7 +449,7 @@ fn parse_semver(raw: &str) -> Option<(u64, u64, u64)> {
         .next()
         .unwrap_or("0")
         .chars()
-        .take_while(|c| c.is_ascii_digit())
+        .take_while(char::is_ascii_digit)
         .collect::<String>()
         .parse()
         .ok()?;
