@@ -208,10 +208,6 @@ fn dense(t: &Tensors, name: &str, out: usize, inp: usize, bias: bool) -> Result<
     Dense::new(weight, bias, out, inp)
 }
 
-fn sigmoid(v: f32) -> f32 {
-    1.0 / (1.0 + (-v).exp())
-}
-
 /// Stride-2 convolution stack that turns 10 ms mel frames into 80 ms frames.
 struct Subsampling {
     channels: usize,
@@ -757,14 +753,19 @@ impl Parakeet {
                 *g += b;
             }
             // PyTorch gate order: input, forget, cell, output.
+            let (input_forget, rest) = gates.split_at_mut(2 * dh);
+            let (cell_gate, output) = rest.split_at_mut(dh);
+            activation::sigmoid(input_forget);
+            activation::tanh(cell_gate);
+            activation::sigmoid(output);
             let (h, c) = (&mut state.hidden[layer], &mut state.cell[layer]);
             for u in 0..dh {
-                let ig = sigmoid(gates[u]);
-                let fg = sigmoid(gates[dh + u]);
-                let gg = gates[2 * dh + u].tanh();
-                let og = sigmoid(gates[3 * dh + u]);
-                c[u] = fg * c[u] + ig * gg;
-                h[u] = og * c[u].tanh();
+                c[u] = input_forget[dh + u] * c[u] + input_forget[u] * cell_gate[u];
+            }
+            h.copy_from_slice(c);
+            activation::tanh(h);
+            for (value, gate) in h.iter_mut().zip(output.iter()) {
+                *value *= gate;
             }
             input = h.clone();
         }

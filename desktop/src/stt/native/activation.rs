@@ -1,4 +1,4 @@
-//! Element-wise exp, SiLU, and sigmoid on whole slices. The Windows target
+//! Element-wise exp, SiLU, sigmoid, and tanh on whole slices. The Windows target
 //! has no vector math library, so `f32::exp` runs one value at a time. These
 //! run one polynomial (Cephes `expf`, within about 2 ulp) on 16 or 8 lanes,
 //! and the scalar path runs the same polynomial.
@@ -26,6 +26,7 @@ enum Op {
     Exp,
     Silu,
     Sigmoid,
+    Tanh,
 }
 
 /// `v = e^v`.
@@ -41,6 +42,11 @@ pub fn silu(values: &mut [f32]) {
 /// `v = 1 / (1 + e^-v)`.
 pub fn sigmoid(values: &mut [f32]) {
     apply(values, Op::Sigmoid);
+}
+
+/// `v = tanh(v)`, as `2 / (1 + e^-2v) - 1`: within 2e-7 of tanh, absolute.
+pub fn tanh(values: &mut [f32]) {
+    apply(values, Op::Tanh);
 }
 
 fn apply(values: &mut [f32], op: Op) {
@@ -60,6 +66,7 @@ fn scalar(v: f32, op: Op) -> f32 {
         Op::Exp => exp_scalar(v),
         Op::Silu => v / (1.0 + exp_scalar(-v)),
         Op::Sigmoid => 1.0 / (1.0 + exp_scalar(-v)),
+        Op::Tanh => 2.0 / (1.0 + exp_scalar(-2.0 * v)) - 1.0,
     }
 }
 
@@ -98,6 +105,11 @@ mod avx512 {
             Op::Exp => exp(v),
             Op::Silu => _mm512_div_ps(v, _mm512_add_ps(one, exp(neg(v)))),
             Op::Sigmoid => _mm512_div_ps(one, _mm512_add_ps(one, exp(neg(v)))),
+            Op::Tanh => {
+                let two = _mm512_set1_ps(2.0);
+                let e = exp(neg(_mm512_mul_ps(two, v)));
+                _mm512_sub_ps(_mm512_div_ps(two, _mm512_add_ps(one, e)), one)
+            }
         }
     }
 
@@ -157,6 +169,11 @@ mod avx2 {
             Op::Exp => exp(v),
             Op::Silu => _mm256_div_ps(v, _mm256_add_ps(one, exp(neg(v)))),
             Op::Sigmoid => _mm256_div_ps(one, _mm256_add_ps(one, exp(neg(v)))),
+            Op::Tanh => {
+                let two = _mm256_set1_ps(2.0);
+                let e = exp(neg(_mm256_mul_ps(two, v)));
+                _mm256_sub_ps(_mm256_div_ps(two, _mm256_add_ps(one, e)), one)
+            }
         }
     }
 
@@ -183,7 +200,7 @@ mod avx2 {
 
 #[cfg(test)]
 mod tests {
-    use super::{exp, scalar, sigmoid, silu, Op};
+    use super::{exp, scalar, sigmoid, silu, tanh, Op};
 
     /// 1001 values across the range, a length that leaves a tail for every lane width.
     fn sweep() -> Vec<f32> {
@@ -217,6 +234,15 @@ mod tests {
         let mut g = small.clone();
         sigmoid(&mut g);
         check("sigmoid", &g, &small, |v| 1.0 / (1.0 + (-v).exp()), 1e-6);
+        let mut h = x.clone();
+        tanh(&mut h);
+        for (got, v) in h.iter().zip(&x) {
+            let want = f64::from(*v).tanh();
+            assert!(
+                (f64::from(*got) - want).abs() < 2e-7,
+                "tanh({v}) = {got}, want {want}"
+            );
+        }
     }
 
     #[test]
