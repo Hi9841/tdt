@@ -5,8 +5,9 @@ use super::activation;
 use super::bias::{Bias, BiasState};
 use super::buf::Buf;
 use super::fgemm;
-use super::gemm::{Dense, Precision, Ternary};
+use super::gemm::Dense;
 use super::half::HalfDense;
+use super::kernels::Ternary;
 use super::team;
 use super::tensors::Tensors;
 use parking_lot::RwLock;
@@ -175,17 +176,9 @@ fn ternary(
     out: usize,
     inp: usize,
     group: usize,
-    precision: Precision,
 ) -> Result<Ternary, String> {
     let scales = t.f32_len(&format!("{name}.scales"), out * (inp / group))?;
-    Ternary::from_packed(
-        &t.u8(&format!("{name}.qweight"))?,
-        scales,
-        out,
-        inp,
-        group,
-        precision,
-    )
+    Ternary::from_base3(&t.u8(&format!("{name}.qweight"))?, &scales, out, inp, group)
 }
 
 /// Several attention layers with the same input, stacked by output rows.
@@ -195,7 +188,6 @@ fn stacked(
     names: &[&str],
     (out, inp): (usize, usize),
     group: usize,
-    precision: Precision,
 ) -> Result<Ternary, String> {
     let mut packed = Vec::new();
     let mut scales = Vec::new();
@@ -204,7 +196,7 @@ fn stacked(
         packed.extend_from_slice(&t.u8(&format!("{name}.qweight"))?);
         scales.extend(t.f32_len(&format!("{name}.scales"), out * (inp / group))?);
     }
-    Ternary::from_packed(&packed, scales, names.len() * out, inp, group, precision)
+    Ternary::from_base3(&packed, &scales, names.len() * out, inp, group)
 }
 
 /// Decoder layer with f16 weights as stored and an f32 bias.
@@ -471,12 +463,11 @@ struct Block {
 }
 
 impl Block {
-    fn load(t: &Tensors, c: &Config, index: usize, precision: Precision) -> Result<Self, String> {
+    fn load(t: &Tensors, c: &Config, index: usize) -> Result<Self, String> {
         let p = format!("encoder.layers.{index}");
         let (d, g) = (c.hidden, c.group);
-        let tern = |name: &str, out: usize, inp: usize| {
-            ternary(t, &format!("{p}.{name}"), out, inp, g, precision)
-        };
+        let tern =
+            |name: &str, out: usize, inp: usize| ternary(t, &format!("{p}.{name}"), out, inp, g);
         let mean = t.f32_len(&format!("{p}.conv.norm.running_mean"), d)?;
         let var = t.f32_len(&format!("{p}.conv.norm.running_var"), d)?;
         let weight = t.f32_len(&format!("{p}.conv.norm.weight"), d)?;
@@ -492,7 +483,7 @@ impl Block {
                 tern("feed_forward1.linear2", d, c.ff)?,
             ),
             norm_att: Norm::load(t, &format!("{p}.norm_self_att"), d)?,
-            qkv: stacked(t, &p, &["q_proj", "k_proj", "v_proj"], (d, d), g, precision)?,
+            qkv: stacked(t, &p, &["q_proj", "k_proj", "v_proj"], (d, d), g)?,
             o: tern("self_attn.o_proj", d, d)?,
             rel_k: tern("self_attn.relative_k_proj", d, d)?,
             rel_cache: RelCache::default(),
@@ -733,10 +724,10 @@ pub struct Parakeet {
 }
 
 impl Parakeet {
-    pub fn load(t: &Tensors, config: Config, precision: Precision) -> Result<Self, String> {
+    pub fn load(t: &Tensors, config: Config) -> Result<Self, String> {
         let c = &config;
         let dh = c.decoder_hidden;
-        let blocks = team::map(c.layers, |index| Block::load(t, c, index, precision))
+        let blocks = team::map(c.layers, |index| Block::load(t, c, index))
             .into_iter()
             .collect::<Result<Vec<_>, _>>()?;
         let lstm = (0..c.decoder_layers)

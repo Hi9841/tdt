@@ -1,18 +1,17 @@
 //! Speech benchmark: latency after release and word error rate.
 //!
-//! `cargo run --release --bin bench-asr -- [--dir PATH] [--realtime] [--repeat N] [--native] [--exact] [--photon]`
+//! `cargo run --release --bin bench-asr -- [--dir PATH] [--realtime] [--repeat N] [--native] [--photon]`
 //!
 //! Each `clip.wav` may have a `clip.txt` reference transcript next to it.
 //! `--realtime` feeds audio at speaking pace, so latency is the wait a user
 //! has after the key is released. Without it, all audio arrives at once.
 //! `--native` runs TDT's Rust engine on each whole clip instead of the app path.
-//! `--exact` does the same with f32 activations, as the reference does.
 //! `--photon` runs the Python Photon worker on each whole clip.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use voice_stt_desktop::stt::models::{find_dir, ModelSpec, CATALOG};
-use voice_stt_desktop::stt::native::{BiasWeights, NativeParakeet, Precision};
+use voice_stt_desktop::stt::native::{BiasWeights, NativeParakeet};
 use voice_stt_desktop::stt::photon::PhotonParakeetEngine;
 use voice_stt_desktop::stt::{pcm16_wav, LiveAudio, SttEngine};
 
@@ -38,7 +37,6 @@ struct Options {
     dir: PathBuf,
     realtime: bool,
     native: bool,
-    exact: bool,
     photon: bool,
     repeat: usize,
 }
@@ -50,7 +48,6 @@ fn parse_options() -> Options {
             .unwrap_or_else(|| std::env::temp_dir().join("tdt-bench-audio")),
         realtime: false,
         native: false,
-        exact: false,
         photon: false,
         repeat: 1,
     };
@@ -61,10 +58,6 @@ fn parse_options() -> Options {
             "--realtime" => options.realtime = true,
             "--native" => options.native = true,
             "--photon" => options.photon = true,
-            "--exact" => {
-                options.native = true;
-                options.exact = true;
-            }
             "--repeat" => {
                 options.repeat = args
                     .next()
@@ -267,12 +260,7 @@ fn bench_native(clips: &[Clip], options: &Options) {
         return;
     };
     let started = Instant::now();
-    let precision = if options.exact {
-        Precision::Exact
-    } else {
-        Precision::Int8
-    };
-    let engine = match NativeParakeet::load_with(&model_dir, precision) {
+    let engine = match NativeParakeet::load(&model_dir) {
         Ok(engine) => engine,
         Err(e) => {
             println!("Failed to load the native engine: {e}");

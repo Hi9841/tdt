@@ -66,7 +66,7 @@ impl Isa {
 /// Codes packed for one instruction set. Scalar: `[n][k / 4][1][4]`, one
 /// code per byte. SIMD: `[n / rows][k / 16][rows][4]` bytes, where bits
 /// `2s..2s+2` of a byte hold the code of k4 step `4 * (k / 16 index) + s`.
-pub struct PackedTernary {
+pub struct Ternary {
     pub isa: Isa,
     pub n: usize,
     pub k: usize,
@@ -75,7 +75,45 @@ pub struct PackedTernary {
     scales: Vec<f32>,
 }
 
-impl PackedTernary {
+impl Ternary {
+    /// A layer as the model file stores it: `packed` holds 5 base-3 digits
+    /// per byte, least significant first, `ceil(k / 5)` bytes per row, and
+    /// `w = scale[row][col / GROUP] * (code - 1)`.
+    pub fn from_base3(
+        packed: &[u8],
+        scales: &[f32],
+        n: usize,
+        k: usize,
+        group: usize,
+    ) -> Result<Self, String> {
+        let row_bytes = k.div_ceil(5);
+        if packed.len() != n * row_bytes
+            || group != GROUP
+            || !k.is_multiple_of(GROUP)
+            || scales.len() != n * (k / GROUP)
+        {
+            return Err(format!("ternary layer {n}x{k} does not match its tensors"));
+        }
+        if let Some(row) = packed
+            .chunks_exact(row_bytes)
+            .position(|row| row.iter().any(|b| *b >= 243))
+        {
+            return Err(format!("ternary byte above 242 in row {row}"));
+        }
+        Ok(Self::from_rows(
+            Isa::detect(),
+            scales,
+            n,
+            k,
+            |row, codes| {
+                let packed_row = &packed[row * row_bytes..(row + 1) * row_bytes];
+                for (five, byte) in codes.chunks_mut(5).zip(packed_row) {
+                    five.copy_from_slice(&DIGITS[usize::from(*byte)][..five.len()]);
+                }
+            },
+        ))
+    }
+
     /// `codes` is row-major `n x k` (values 0..=2), `scales` is `n x (k / GROUP)`.
     /// `row(r, codes)` writes the `k` codes (values 0..=2) of row `r`;
     /// `scales` is `n x (k / GROUP)`. Rows come one block at a time, so the
@@ -352,6 +390,24 @@ impl PackedTernary {
         }
     }
 }
+
+/// The five base-3 digits of every packed byte, least significant first.
+/// A table copy per byte replaces a division per code: model load spent
+/// most of its time on those divisions.
+const DIGITS: [[u8; 5]; 243] = {
+    let mut table = [[0u8; 5]; 243];
+    let mut byte = 0;
+    while byte < 243 {
+        let (mut value, mut digit) = (byte, 0);
+        while digit < 5 {
+            table[byte][digit] = (value % 3) as u8;
+            value /= 3;
+            digit += 1;
+        }
+        byte += 1;
+    }
+    table
+};
 
 /// Activations as i8 with one scale and one sum per 128-value group.
 pub struct Quantized {

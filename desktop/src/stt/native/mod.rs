@@ -23,7 +23,6 @@ use std::path::Path;
 
 pub use bias::BiasWeights;
 
-pub use gemm::Precision;
 pub use model::Config;
 
 pub struct NativeParakeet {
@@ -36,10 +35,6 @@ pub struct NativeParakeet {
 
 impl NativeParakeet {
     pub fn load(model_dir: &Path) -> Result<Self, String> {
-        Self::load_with(model_dir, Precision::Int8)
-    }
-
-    pub fn load_with(model_dir: &Path, precision: Precision) -> Result<Self, String> {
         let config_text = std::fs::read_to_string(model_dir.join("config.json"))
             .map_err(|e| format!("Could not read config.json: {e}"))?;
         let config = Config::parse(&config_text)?;
@@ -49,13 +44,11 @@ impl NativeParakeet {
         team::init(threads, domain);
         let tensors = tensors::Tensors::open(&model_dir.join("model.safetensors"))?;
         let frontend = features::MelFrontend::new(config.mels);
-        let model = model::Parakeet::load(&tensors, config, precision)?;
+        let model = model::Parakeet::load(&tensors, config)?;
         // The 178 MB file is no longer needed; free it before the position
         // tables grow, so load does not hold both at its peak.
         drop(tensors);
-        if precision == Precision::Int8 {
-            model.warm_positions();
-        }
+        model.warm_positions();
         Ok(Self {
             dictionary: RwLock::new(None),
             model,
