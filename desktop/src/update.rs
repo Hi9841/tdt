@@ -378,7 +378,11 @@ pub fn remove_replaced_binaries() {
         return;
     };
     for entry in entries.flatten() {
-        if entry.file_name().to_string_lossy().starts_with("TDT.exe.old") {
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("TDT.exe.old")
+        {
             let _ = std::fs::remove_file(entry.path());
         }
     }
@@ -418,7 +422,9 @@ pub fn sync_install_record() {
         })
     };
 
-    let Some(dir) = std::env::current_exe().ok().and_then(|exe| exe.parent().map(Path::to_path_buf))
+    let Some(dir) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf))
     else {
         return;
     };
@@ -435,7 +441,10 @@ pub fn sync_install_record() {
     if read("DisplayVersion").as_deref() == Some(current_version()) {
         return;
     }
-    let version: Vec<u16> = current_version().encode_utf16().chain(std::iter::once(0)).collect();
+    let version: Vec<u16> = current_version()
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
     unsafe {
         let _ = RegSetKeyValueW(
             HKEY_CURRENT_USER,

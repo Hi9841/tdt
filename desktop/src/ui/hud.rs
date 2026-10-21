@@ -10,9 +10,7 @@ use crate::ui::theme::{
     soft, text, well, GAP_SECTION, GAP_TIGHT, MUTED, TAB_FADE_MS, TEXT, TYPE_DESC, TYPE_LABEL,
     TYPE_META, TYPE_TITLE,
 };
-use crate::ui::window_util::{
-    client_animations_enabled, set_pill_hit_rect, set_window_mode,
-};
+use crate::ui::window_util::{client_animations_enabled, set_pill_hit_rect, set_window_mode};
 use crate::update::{self, UpdatePhase};
 use ely_gpui_component::buttons::{ButtonVariant, IconButton, SegmentedControl};
 use ely_gpui_component::feedback::{Alert, InlineMessage};
@@ -1242,7 +1240,12 @@ impl HudView {
             let w = span.0 + 2.0 * HIT_PAD;
             let h = span.1 + 2.0 * HIT_PAD;
             let canvas = window.viewport_size();
-            ((canvas.width / px(1.0) - w) / 2.0, canvas.height / px(1.0) - h, w, h)
+            (
+                (canvas.width / px(1.0) - w) / 2.0,
+                canvas.height / px(1.0) - h,
+                w,
+                h,
+            )
         });
         set_pill_hit_rect(hit);
 
@@ -1301,12 +1304,8 @@ impl HudView {
             .rounded_full()
             .overflow_hidden()
             .border_1()
-            .when(at_rest, |pill| {
-                pill.bg(rest_bg()).border_color(rest_edge())
-            })
-            .when(!at_rest, |pill| {
-                pill.bg(bg()).border_color(edge())
-            })
+            .when(at_rest, |pill| pill.bg(rest_bg()).border_color(rest_edge()))
+            .when(!at_rest, |pill| pill.bg(bg()).border_color(edge()))
             .when(self.pill_action().is_some(), |pill| pill.cursor_pointer())
             .on_mouse_down(
                 MouseButton::Left,
