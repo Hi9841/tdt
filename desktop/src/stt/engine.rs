@@ -215,7 +215,12 @@ pub(crate) fn boost_quiet_speech(samples: &[f32]) -> Option<Vec<f32>> {
     if levels.len() < MIN_SPEECH_FRAMES {
         return None;
     }
-    let mut sorted = levels.clone();
+    // Digital silence, as from a device that starts muted, is not the
+    // noise floor: with it the gate would fall back to `VISIBLE_FRAME_RMS`.
+    let mut sorted: Vec<f32> = levels.iter().copied().filter(|l| *l > 1e-6).collect();
+    if sorted.is_empty() {
+        return None;
+    }
     sorted.sort_by(f32::total_cmp);
     let floor = sorted[sorted.len() / 10];
     let speech_min = (floor * SPEECH_OVER_FLOOR).max(VISIBLE_FRAME_RMS);
