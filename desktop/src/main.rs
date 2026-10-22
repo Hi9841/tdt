@@ -293,6 +293,10 @@ fn main() {
             // GPUI only requests frames for windows it owns as visible. Showing
             // a hidden HWND later through Win32 leaves the surface transparent.
             show: true,
+            // GPUI caps a window without focus at 30 fps. The pill never
+            // takes focus, so the cap would hold every animation at 30 fps.
+            // It only draws while it moves, so it can match the display.
+            inactive_frame_interval: None,
             is_resizable: false,
             kind: WindowKind::PopUp,
             window_background: WindowBackgroundAppearance::Transparent,
@@ -730,10 +734,11 @@ fn main() {
                                         is_recording_state = true;
                                         no_speech_at = None;
                                         let started_at = Instant::now();
+                                        let wave = rec.borrow().as_ref().map(AudioRecorder::live_wave);
                                         let _ = this.update(cx, |view, cx| {
                                             view.recovery_message = None;
+                                            view.wave_source = wave;
                                             view.status = HudStatus::Listening {
-                                                audio_level: 0.0,
                                                 started_at,
                                             };
                                             cx.notify();
@@ -810,6 +815,7 @@ fn main() {
                                 // Recording is over; drop the live
                                 // waveform here rather than in render.
                                 view.wave_peaks = [0.0; VIS_BARS];
+                                view.wave_source = None;
                                 let recorded_for = match &view.status {
                                     HudStatus::Listening { started_at, .. } => {
                                         started_at.elapsed()
@@ -880,10 +886,6 @@ fn main() {
                                 active.pause_input();
                             }
                         }
-                        let current_level = if is_recording_state { rec.borrow().as_ref().map_or(0.0, AudioRecorder::audio_level) } else { 0.0 };
-                        // Avoid locking the audio visualization buffer when it
-                        // cannot be displayed.
-                        let vis_peaks = if is_recording_state { rec.borrow().as_ref().map(AudioRecorder::vis_peaks) } else { None };
                         let clear_no_speech = !preview::is_active()
                             && no_speech_at.is_some_and(|at| {
                                 ui::hud::success_returns_to_idle(at.elapsed(), true)
@@ -904,16 +906,11 @@ fn main() {
                             }
 
                             match &mut view.status {
-                                HudStatus::Listening { audio_level, .. } => {
+                                // The live wave requests a frame on every vsync and
+                                // reads the microphone itself, so this 40 Hz loop
+                                // does not pace it.
+                                HudStatus::Listening { .. } => {
                                     if preview::is_active() {
-                                        cx.notify();
-                                    } else {
-                                        *audio_level = current_level;
-                                        if let Some(peaks) = vis_peaks {
-                                            // Already smoothed in audio time. A second frame-based
-                                            // filter would smear syllables across historical bars.
-                                            view.wave_peaks = peaks;
-                                        }
                                         cx.notify();
                                     }
                                 }

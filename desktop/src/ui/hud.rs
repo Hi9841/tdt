@@ -1,4 +1,4 @@
-use crate::audio::VIS_BARS;
+use crate::audio::{LiveWave, VIS_BARS};
 use crate::config::{AppConfig, AppStats};
 use crate::hotkey;
 use crate::paste::PasteInjector;
@@ -354,7 +354,6 @@ pub enum HudStatus {
     Idle,
     NoSpeech,
     Listening {
-        audio_level: f32,
         started_at: Instant,
     },
     Transcribing {
@@ -421,6 +420,8 @@ pub struct HudView {
     auto_updates_enabled: bool,
     pub hotkey_label: String,
     pub wave_peaks: [f32; WAVE_BARS],
+    /// The open microphone while listening. The wave reads it on each frame.
+    pub wave_source: Option<LiveWave>,
     pub mode: WindowViewMode,
     pub active_tab: SettingsTab,
     pub stats: AppStats,
@@ -507,6 +508,7 @@ impl HudView {
             auto_updates_enabled: config.check_updates,
             hotkey_label,
             wave_peaks: [0.0; WAVE_BARS],
+            wave_source: None,
             mode: if open_panel {
                 WindowViewMode::StatsAndSettings
             } else {
@@ -597,7 +599,6 @@ impl HudView {
             PreviewSpec::BubbleHover => self.pill_hovered = true,
             PreviewSpec::BubbleListening { loud } => {
                 self.status = HudStatus::Listening {
-                    audio_level: if loud { 0.8 } else { 0.12 },
                     started_at: Instant::now() - Duration::from_secs(12),
                 };
                 self.wave_peaks = preview_wave(loud);
@@ -646,7 +647,6 @@ impl HudView {
             }
             PreviewSpec::BubbleLimit => {
                 self.status = HudStatus::Listening {
-                    audio_level: 0.5,
                     started_at: Instant::now() - Duration::from_secs(115),
                 };
                 self.wave_peaks = preview_wave(true);
@@ -1208,7 +1208,7 @@ impl HudView {
                         .map(|part| part.render(window, &font_family)),
                 )
                 .into_any_element(),
-            (HudStatus::Listening { .. }, _) => self.live_wave(limit_left),
+            (HudStatus::Listening { .. }, _) => self.live_wave(limit_left, window),
             (HudStatus::Transcribing { .. }, _) => finishing_dots(),
             _ => div().into_any_element(),
         };
@@ -1361,8 +1361,16 @@ impl HudView {
     }
 
     /// The live pill: a blue orb and a short white wave, as in Aqua Voice.
-    fn live_wave(&self, limit_left: Option<u64>) -> AnyElement {
-        let bars = live_peaks(&self.wave_peaks).into_iter().map(|peak| {
+    fn live_wave(&self, limit_left: Option<u64>, window: &mut Window) -> AnyElement {
+        // The live wave draws on every vsync, at the display's refresh rate.
+        let peaks = match &self.wave_source {
+            Some(source) => {
+                window.request_animation_frame();
+                source.bars_at(Instant::now())
+            }
+            None => self.wave_peaks,
+        };
+        let bars = live_peaks(&peaks).into_iter().map(|peak| {
             div()
                 .flex_none()
                 .w(px(LIVE_BAR_W))
