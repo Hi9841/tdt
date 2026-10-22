@@ -101,9 +101,21 @@ To add your own words:
 3. Write one word or name on each line, spelled the way you want it.
 4. Save the file. The next dictation uses it.
 
-TDT changes a word only when the speech supports it. On the test sentences
-with developer terms, the dictionary removes about a third of the errors. On
-400 recordings of ordinary speech (LibriSpeech), it changes no transcript.
+After each dictation, TDT looks for words that are spelled close to a term
+("Perakeet", "trip run time", "wire shark"). The speech model then scores
+the words it heard and the term on the same audio. TDT writes the term only
+when the audio supports it, so "the mayor" stays "the mayor" when Maor is in
+the dictionary.
+
+On the test sentences with developer terms, the dictionary removes about
+half of the errors (from 34 to 18). On sentences with names and product
+names, it writes 27 of 37 names correctly; without it, 11. On 400
+recordings of ordinary speech (LibriSpeech), it changes 2 transcripts and
+adds no error.
+
+TDT writes English only. It never writes word pieces that only other
+languages use. When most words of a dictation are not English, TDT
+transcribes it again with a preference for English words.
 
 ## Benchmarks
 

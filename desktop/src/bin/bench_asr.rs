@@ -264,7 +264,8 @@ fn bench_native(clips: &[Clip], options: &Options) {
         "\nNative engine. Init: {} ms",
         started.elapsed().as_millis()
     );
-    // TDT_DICTIONARY: one term per line. TDT_BIAS: "start,cont,margin[,min_start,min_prefix]".
+    // TDT_DICTIONARY: one term per line. TDT_BIAS: "start,cont,margin[,min_start,min_prefix]"
+    // (Canary, Moonshine).
     if let Some(path) = std::env::var_os("TDT_DICTIONARY") {
         let terms: Vec<String> = std::fs::read_to_string(&path)
             .unwrap_or_default()
@@ -284,7 +285,19 @@ fn bench_native(clips: &[Clip], options: &Options) {
                     margin: *margin,
                     min_start: rest.first().map_or(weights.min_start, |v| *v as usize),
                     min_prefix: rest.get(1).map_or(weights.min_prefix, |v| *v as usize),
+                    ..weights
                 };
+            }
+        }
+        // TDT_TERMS: "prior,distance" for the sound check of Parakeet TDT.
+        if let Ok(spec) = std::env::var("TDT_TERMS") {
+            let values: Vec<f32> = spec
+                .split(',')
+                .filter_map(|v| v.trim().parse().ok())
+                .collect();
+            if let [prior, distance] = values.as_slice() {
+                weights.prior = *prior;
+                weights.distance = *distance;
             }
         }
         let skipped = engine.set_dictionary(&terms, weights);

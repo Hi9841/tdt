@@ -1,0 +1,32 @@
+names-01|Trit is the speech engine inside the app.
+names-02|The Trit Runtime loads the model in a fraction of a second.
+names-03|Parakeet Redux is the default model for dictation.
+names-04|Send the report to Maor before the meeting.
+names-05|Maor Azarov wrote the first version of the hotkey code.
+names-06|Ask Claude to review the pull request.
+names-07|Anthropic released a new model this morning.
+names-08|The window is drawn with GPUI on the graphics card.
+names-09|We keep the client state in Zustand.
+names-10|Tauri builds a small desktop app around a web view.
+names-11|Run Oxlint before you push the branch.
+names-12|The users table lives in Supabase.
+names-13|Deploy the preview to Vercel.
+names-14|Install the packages with pnpm.
+names-15|Moondream trained the ternary model.
+names-16|I use Ghostty as my terminal.
+names-17|Open Raycast and search for the clipboard history.
+names-18|Draw the architecture in Excalidraw.
+names-19|Siobhan will join the call at noon.
+names-20|Please add Nguyen to the review.
+names-21|Kowalski fixed the memory leak.
+names-22|Saoirse sent the slides last night.
+names-23|Connect to the server over Tailscale.
+names-24|The latency graph is in Grafana.
+names-25|Datadog paged the team at three in the morning.
+names-26|The mockups are in Figma.
+names-27|Capture the packets with Wireshark.
+names-28|The site is built with Nuxt.
+names-29|Deno runs the script without a build step.
+names-30|Tell Claude that Trit is faster than the old engine.
+names-31|Maor asked whether Redux works on every computer.
+names-32|Trit Runtime and Parakeet are both written in Rust.

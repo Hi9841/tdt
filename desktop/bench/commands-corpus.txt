@@ -1,0 +1,16 @@
+cmd-01|When you are done, make a release and skip CI.
+cmd-02|Commit and push the changes.
+cmd-03|Run the tests again.
+cmd-04|Open the settings and change the shortcut.
+cmd-05|Fix the bug in the hotkey code.
+cmd-06|Make it faster.
+cmd-07|Yes, that looks good.
+cmd-08|No, stop.
+cmd-09|Also refine the runtime and make sure everything is stable.
+cmd-10|Do a bunch of runs and check the results.
+cmd-11|The custom dictionary does not work.
+cmd-12|Sometimes it writes words I did not say.
+cmd-13|Check the microphone.
+cmd-14|Send me a summary.
+cmd-15|Delete the old branch.
+cmd-16|Thank you.

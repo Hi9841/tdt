@@ -1,0 +1,24 @@
+neg-01|The mayor opened the new bridge today.
+neg-02|That was a clever trick with the cards.
+neg-03|We planted a tree in the garden.
+neg-04|The cloud moved slowly over the hill.
+neg-05|Please reduce the noise in the room.
+neg-06|The parrot repeated every word.
+neg-07|He used a towel to dry his hands.
+neg-08|The runtime of the film is two hours.
+neg-09|I want to read the next chapter.
+neg-10|The guy in the blue shirt left early.
+neg-11|She wore a red dress to the party.
+neg-12|The super base of the tower is concrete.
+neg-13|The marine biologist studied the coral.
+neg-14|The moon dream was a strange story.
+neg-15|The ghost story scared the children.
+neg-16|The ray cast a shadow on the wall.
+neg-17|We went down to the river.
+neg-18|The figure in the painting is a dancer.
+neg-19|The new tent was easy to set up.
+neg-20|My grandmother made a fine soup.
+neg-21|Count the trees in the park.
+neg-22|The clock struck nine.
+neg-23|The tower was built in the last century.
+neg-24|The data dog is a stuffed toy.

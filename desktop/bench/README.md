@@ -12,6 +12,9 @@ the raw output is in [results-2026-10-20.txt](results-2026-10-20.txt).
 | `other` | 200 | LibriSpeech test-other: every 14th of the 2939 utterances |
 | `tech` | 40 | `tech-corpus.txt`: sentences with developer terms, spoken by the Windows voices |
 | `tts16` | 16 | `corpus.txt`: everyday dictation, spoken by the Windows voices |
+| `names` | 32 | `names-corpus.txt`: names and product names (`names-terms.txt`), spoken by the Windows voices |
+| `names-neg` | 24 | `names-negative.txt`: ordinary words that sound like those names |
+| `accent` | 160 | `corpus.txt`, `commands-corpus.txt`, and `names-corpus.txt`, spoken by five non-English Piper voices (`accent.py`) |
 
 LibriSpeech is recorded human speech. `tech` and `tts16` are synthetic speech
 from the Microsoft David and Zira voices. Other voices give other audio, so
@@ -38,6 +41,9 @@ Run these commands from `desktop/` in PowerShell:
 uv run bench/librispeech.py
 powershell -ExecutionPolicy Bypass -File bench/make-clips.ps1 -Corpus bench/tech-corpus.txt -OutDir target/accuracy/tech
 powershell -ExecutionPolicy Bypass -File bench/make-clips.ps1 -OutDir target/accuracy/tts16
+powershell -ExecutionPolicy Bypass -File bench/make-clips.ps1 -Corpus bench/names-corpus.txt -OutDir target/accuracy/names
+powershell -ExecutionPolicy Bypass -File bench/make-clips.ps1 -Corpus bench/names-negative.txt -OutDir target/accuracy/names-neg
+uv run bench/accent.py <piper voices dir> target/accuracy/accent bench/corpus.txt bench/commands-corpus.txt bench/names-corpus.txt
 
 # 2. Build the bench.
 cargo build --release --bin bench-asr
@@ -48,6 +54,10 @@ uv run bench/accuracy.py $bench clean other tech tts16 --engine native
 $env:TDT_DICTIONARY = "assets/dictionary/developer-terms.txt"
 uv run bench/accuracy.py $bench clean other tech tts16 --engine native
 Remove-Item Env:TDT_DICTIONARY
+
+# 4. The dictionary on names, and on words that only sound like them.
+uv run bench/terms.py $bench bench/names-terms.txt names names-neg --show
+uv run bench/terms.py $bench assets/dictionary/developer-terms.txt tech clean other
 ```
 
 For the v0.2.25 column, check out tag `v0.2.25`, build the bench, and run the
@@ -80,6 +90,8 @@ NVIDIA GPU with CUDA 12.
 
 | Script | What it does |
 |---|---|
+| `terms.py` | The dictionary: names spelled right, names put where nobody said them, and word errors, with and without a dictionary file |
+| `accent.py` | Speaks corpora with non-English Piper voices (the `accent` set) |
 | `accuracy.py` | Errors and speed of the TDT model through `bench-asr` (the ratchet in `engine-budget.json`) |
 | `librispeech.py` | Writes the 200 LibriSpeech clips per set as 16 kHz WAV and text |
 | `runtimes.py` | The same model on every runtime (above) |
