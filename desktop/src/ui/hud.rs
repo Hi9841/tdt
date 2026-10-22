@@ -612,7 +612,8 @@ impl HudView {
                 self.status = HudStatus::Success {
                     text: "Restart the Kubernetes pod, then check the PostgreSQL logs.".into(),
                     auto_pasted: pasted,
-                    latency_ms: 182,
+                    // Measured: Parakeet Redux takes 27 ms for this sentence (5 s of speech).
+                    latency_ms: 27,
                     finished_at: Instant::now(),
                 };
             }

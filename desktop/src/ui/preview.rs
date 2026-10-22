@@ -114,10 +114,13 @@ pub fn fixture_stats(count: usize) -> AppStats {
         "Send the invoice to Dana and copy the finance team.",
         "Call the dentist on Monday morning.",
     ];
+    // Release-to-text times like those of real dictations of these lengths
+    // (9 to 35 ms for short ones, about 170 ms for 40 words).
+    const LATENCIES: [u64; 8] = [164, 27, 19, 22, 18, 15, 21, 14];
     let history = (0..count)
         .map(|index| HistoryItem {
             text: TEXTS[index % TEXTS.len()].to_string(),
-            latency_ms: 90 + (index as u64) * 15,
+            latency_ms: LATENCIES[index % LATENCIES.len()],
             timestamp: format!(
                 "2026-10-06 12:{:02}:{:02}",
                 (index * 15) / 60,
