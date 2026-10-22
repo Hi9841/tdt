@@ -14,4 +14,5 @@ cargo clippy --manifest-path packaging/tdt-setup/Cargo.toml --all-targets -- -D 
 
 Keep model weights and generated build directories out of commits. Describe
 user-visible behavior and include the checks you ran in pull requests.
-By contributing you agree the change is licensed under Apache-2.0.
+By contributing you agree the change is licensed under the PolyForm
+Noncommercial License 1.0.0 (see LICENSE).
