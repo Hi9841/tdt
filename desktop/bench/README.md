@@ -54,3 +54,24 @@ For the v0.2.25 column, check out tag `v0.2.25`, build the bench, and run the
 `--engine native` line. Add `--show 10` to see the clips with the most errors.
 `--engine app` scores the app's own path, which also cuts long recordings at
 pauses and reads the user's dictionary file.
+
+## Same model on other runtimes
+
+`runtimes.py` runs each model on every runtime that supports it, on the same
+clips and with the same scorer: Trit and Photon for Parakeet Redux; ONNX
+Runtime and sherpa-onnx for Parakeet TDT; faster-whisper, whisper.cpp,
+Transformers and OpenAI Whisper for Whisper; Transformers and sherpa-onnx for
+Moonshine. Each engine runs in its own process and its own uv environment.
+
+```powershell
+cargo build --release -p trit-ffi --manifest-path ../trit/Cargo.toml   # Trit for Python
+uv run --no-project --python 3.12 python bench/runtimes.py --list      # engines and models
+uv run --no-project --python 3.12 python bench/runtimes.py parakeet-redux whisper-turbo
+uv run --no-project --python 3.12 python bench/runtimes.py all         # about 2 hours
+python bench/runtimes_report.py                                        # ../docs/engine-comparison.html
+```
+
+Results append to `target/runtimes/results.jsonl` (the last line of each
+engine wins), and each engine's transcripts go next to it. The committed run
+is [runtimes-results.jsonl](runtimes-results.jsonl). GPU engines need an
+NVIDIA GPU with CUDA 12.
