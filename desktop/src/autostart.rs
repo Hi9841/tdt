@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 
 use windows::core::{Interface, BSTR, HSTRING, PCWSTR, PWSTR, VARIANT};
 use windows::Win32::Foundation::{
-    CloseHandle, LocalFree, E_FAIL, ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, HANDLE, HLOCAL, TRUE,
+    CloseHandle, LocalFree, ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, E_FAIL, HANDLE, HLOCAL, TRUE,
 };
 use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
 use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
