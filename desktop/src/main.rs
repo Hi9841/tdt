@@ -124,7 +124,7 @@ fn main() {
         }));
         // A crashed process that stays open holds the single-instance claim,
         // so the next start would do nothing.
-        std::process::exit(1);
+        exit_now(1);
     }));
 
     let _instance = if preview::is_active() {
@@ -361,6 +361,13 @@ fn main() {
                     }
                 })
                 .detach();
+                // Alt+F4 or another close message closes the panel. TDT lives
+                // in the tray, so only Quit in the tray menu ends it.
+                let hud = cx.weak_entity();
+                window.on_window_should_close(cx, move |_, cx| {
+                    let _ = hud.update(cx, |view, cx| view.close_stats_settings(cx));
+                    false
+                });
                 let rec = Rc::clone(&recorder_clone);
                 let inj = Arc::clone(&injector_clone);
                 let stt = stt_clone.clone();
@@ -986,6 +993,21 @@ fn main() {
             }
         }
     });
+    drop(_hotkey_guard);
+    drop(_instance);
+    exit_now(0);
+}
+
+/// Ends the process without DLL and thread-local teardown. Teardown runs
+/// after Windows stops every other thread, so a step that waits on one, as a
+/// COM release into Explorer did, keeps a windowless TDT alive forever.
+fn exit_now(code: u32) -> ! {
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
+        let _ = TerminateProcess(GetCurrentProcess(), code);
+    }
+    std::process::exit(code as i32)
 }
 
 enum InstanceClaim {

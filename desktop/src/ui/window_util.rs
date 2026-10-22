@@ -944,18 +944,23 @@ pub fn follow_current_virtual_desktop() {
         };
         unsafe {
             thread_local! {
-                static VDM: Option<IVirtualDesktopManager> = unsafe {
+                // Never released. The manager is a proxy into Explorer, and the
+                // release at process exit is an RPC call that never returns
+                // after Windows stops the COM threads, so TDT never exits.
+                static VDM: std::mem::ManuallyDrop<Option<IVirtualDesktopManager>> = unsafe {
                     let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-                    CoCreateInstance::<_, IVirtualDesktopManager>(
-                        &VirtualDesktopManager,
-                        None,
-                        CLSCTX_ALL,
+                    std::mem::ManuallyDrop::new(
+                        CoCreateInstance::<_, IVirtualDesktopManager>(
+                            &VirtualDesktopManager,
+                            None,
+                            CLSCTX_ALL,
+                        )
+                        .ok(),
                     )
-                    .ok()
                 };
             }
             VDM.with(|vdm| {
-                let Some(vdm) = vdm else {
+                let Some(vdm) = &**vdm else {
                     return;
                 };
                 if vdm

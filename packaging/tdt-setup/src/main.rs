@@ -260,14 +260,8 @@ fn close_tdt() -> Result<(), String> {
         }
     };
     wait(Duration::from_secs(5));
-    if running() {
-        log("Ending the running TDT");
-        let _ = Command::new("taskkill.exe")
-            .args(["/F", "/IM", "TDT.exe"])
-            .creation_flags(CREATE_NO_WINDOW)
-            .status();
-        wait(Duration::from_secs(5));
-    }
+    end_tdt_processes();
+    wait(Duration::from_secs(5));
     if running() {
         return Err(
             "TDT is still running, possibly as administrator. Quit TDT from its tray icon, then run setup again."
@@ -275,6 +269,48 @@ fn close_tdt() -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+/// Ends every TDT.exe that is left. TDT 0.4.0 and older can hang while they
+/// exit, with or without the mutex, and still lock TDT.exe. taskkill skips a
+/// process that is exiting, so each one ends directly.
+fn end_tdt_processes() {
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+    use windows::Win32::System::Threading::{
+        OpenProcess, TerminateProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+    };
+    unsafe {
+        let Ok(snapshot) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
+            return;
+        };
+        let mut entry = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        let mut more = Process32FirstW(snapshot, &mut entry).is_ok();
+        while more {
+            let len = entry.szExeFile.iter().position(|&c| c == 0).unwrap_or(0);
+            let name = String::from_utf16_lossy(&entry.szExeFile[..len]);
+            if name.eq_ignore_ascii_case("TDT.exe") {
+                if let Ok(process) = OpenProcess(
+                    PROCESS_TERMINATE | PROCESS_SYNCHRONIZE,
+                    false,
+                    entry.th32ProcessID,
+                ) {
+                    log(&format!("Ending TDT ({})", entry.th32ProcessID));
+                    if TerminateProcess(process, 1).is_ok() {
+                        let _ = WaitForSingleObject(process, 5000);
+                    }
+                    let _ = CloseHandle(process);
+                }
+            }
+            more = Process32NextW(snapshot, &mut entry).is_ok();
+        }
+        let _ = CloseHandle(snapshot);
+    }
 }
 
 /// Writes a fresh file. Windows lets a locked exe be renamed but not
