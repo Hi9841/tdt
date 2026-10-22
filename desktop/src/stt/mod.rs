@@ -2,7 +2,6 @@ pub mod dictionary;
 pub mod engine;
 pub mod fillers;
 pub mod models;
-pub mod native;
 pub mod segment;
 
 pub use engine::{LiveAudio, LiveTranscript, SttEngine};

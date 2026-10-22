@@ -1,92 +1,90 @@
-# TDT (Talk Don't Type)
+<p align="center">
+  <img src="branding/tdt-logo-lockup.png" alt="TDT, Talk Don't Type" width="420">
+</p>
 
+<p align="center">
+  <b>Offline dictation for Windows.</b> Press a key, speak, and the text appears in the app you use.<br>
+  No cloud, no account, no audio leaves your computer.
+</p>
 
-https://github.com/user-attachments/assets/8bb3021b-f878-4d41-9b1d-32040b7e1897
+<p align="center">
+  <a href="https://github.com/Hi9841/tdt/releases/latest"><b>Download TDT-Setup.exe</b></a>
+  ·
+  <a href="trit/README.md">Trit speech engine</a>
+  ·
+  <a href="docs/engine-comparison.md">Benchmarks</a>
+  ·
+  <a href="#license">License</a>
+</p>
 
+<p align="center">
+  <img src="docs/images/how-it-works.svg" alt="Press Ctrl+;, speak, Trit transcribes on your CPU, the text appears in your app" width="760">
+</p>
 
-TDT is an offline speech-to-text app for Windows. TDT's own speech engine,
-written in Rust, transcribes the audio on your computer, and TDT copies the
-recognized text to the clipboard. The default model is Parakeet Redux, a
-178 MB model with 1.58-bit ternary weights. The model downloads on demand and
-stays on disk. When TDT starts, the model loads in the background in about
-0.2 seconds. Then it stays in memory, so a recording does not wait for it.
+## Why TDT
 
-License: Apache-2.0. Source: https://github.com/Hi9841/tdt
+- **Private.** TDT records and transcribes on your computer. It uses the
+  network only to download a model and to look for updates.
+- **Fast.** TDT's own speech engine, [Trit](trit/README.md), is written in
+  Rust. The default model loads in about 0.2 seconds and stays in memory, so a
+  recording never waits for it.
+- **Accurate.** The default model, Parakeet Redux, has 1.58-bit ternary
+  weights and is only 178 MB. On 456 test clips it makes fewer errors than the
+  same model on any other runtime that we tested.
+- **Small.** TDT-Setup.exe is about 8 MB. It needs no admin rights and no
+  Python.
 
-## Install (Windows)
+## Install
 
-Download `TDT-Setup.exe` from the
-[latest release](https://github.com/Hi9841/tdt/releases/latest) and run it.
-That is the only file you need.
+1. Download `TDT-Setup.exe` from the
+   [latest release](https://github.com/Hi9841/tdt/releases/latest).
+2. Run it. Setup installs TDT for the current user in `%LOCALAPPDATA%\TDT`,
+   adds a Start menu shortcut, and opens the app.
+3. Open Settings and download **Parakeet Redux** (178 MB). The model stays on
+   disk.
 
-Setup installs TDT for the current user in `%LOCALAPPDATA%\TDT`, adds a
-Start menu shortcut, and opens the app. It needs no admin rights. Speech
-models are not bundled: open Settings and download Parakeet Redux on first
-run. To uninstall, use Settings > Apps. Uninstall keeps your speech models
+To uninstall, use Windows Settings > Apps. Uninstall keeps your speech models
 and your dictionary.
 
-To build `TDT-Setup.exe` yourself:
+## Use
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\packaging\build-installer.ps1
-.\dist\TDT-Setup.exe
-```
+| Action | How |
+|---|---|
+| Start and stop a recording | Tap `Ctrl + ;` once to start and once to stop. |
+| Record while you hold the key | Hold `Ctrl + ;`, speak, and release. |
+| Change the shortcut | Settings > **Shortcut** > **Change**, then press the new keys. |
+| Open Settings | Click the tray icon. |
 
-## Desktop (dev)
+The floating pill shows the recording state. The tray icon shows the same
+state; hover over it to see the latest transcript. **History** keeps the full
+text of your recent dictations.
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\models\download-models.ps1
-cargo run --release --bin TDT --manifest-path .\desktop\Cargo.toml
-```
+With **auto-paste** on (the default), TDT types the text into the window that
+had focus. TDT also copies the text to the clipboard. A recording can be up to
+120 seconds long.
 
-The first short hotkey tap starts recording and the second stops it. Holding
-the hotkey records until release. Default shortcut is `Ctrl+;`. Change it in
-Settings by clicking the shortcut chip, then press the new combo. The tray
-menu controls auto-paste. Auto-paste writes the result to the clipboard and
-injects Unicode text directly into the previously focused application.
+## Settings
 
-TDT removes filler sounds such as "um", "uh", "erm", and "hmm" before it
-delivers the text, together with the commas around them. Words that can carry
-meaning, such as "like" or "you know", stay. Turn this off in Settings with
-**Remove filler words**.
-
-The floating bubble stays on screen while TDT runs and shows recording state
-directly. The tray icon mirrors that state, so hovering it gives status or the
-latest transcript, and History holds the full text. Windows' animation setting
-is respected.
-
-Click the tray icon to open settings. Its menu offers **Stop recording**,
-**Open settings**, and **Quit TDT**. If Windows puts TDT under the tray arrow,
-drag its icon onto the visible taskbar area. Windows controls which tray icons
-remain visible.
-
-In Settings, Parakeet Redux is the default model. If missing, it shows Download model (178 MB).
-To fetch the model directly via PowerShell:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\models\download-models.ps1
-```
-
-To run the speech benchmark (WER and speed tables: see [Benchmarks](#benchmarks)):
-
-```powershell
-cargo run --release --bin bench-asr --manifest-path .\desktop\Cargo.toml
-```
-
-```powershell
-cargo fmt --manifest-path .\desktop\Cargo.toml -- --check
-cargo test --manifest-path .\desktop\Cargo.toml
-cargo clippy --manifest-path .\desktop\Cargo.toml --all-targets --all-features -- -D warnings
-```
+| Setting | What it does |
+|---|---|
+| Model | **Parakeet Redux** (178 MB, the default) or **Parakeet v3** (2.5 GB). |
+| Remove filler words | Removes "um", "uh", "erm", and "hmm", and the commas around them. Words that can carry meaning, such as "like", stay. On by default. |
+| Dictionary | Names and terms that TDT must spell your way. See [Dictionary](#dictionary). |
+| Start with Windows | Opens TDT when you sign in. |
+| Check for updates automatically | Looks for a new release at start, every hour, and when Settings opens. Turn it off to check only when you select **Check for updates**. |
 
 ## Dictionary
 
 TDT spells names and technical terms better when they are in its dictionary.
-A list of about 130 developer terms (for example Kubernetes, PostgreSQL, and
-GitHub) is always active. To add your own words, open Settings, find
-Dictionary, and select Edit. TDT opens `%LOCALAPPDATA%\TDT\dictionary.txt`.
-Write one word or name per line, the way you want it spelled, and save the
-file. The next dictation uses it.
+A list of about 130 developer terms, for example Kubernetes, PostgreSQL, and
+GitHub, is always active.
+
+To add your own words:
+
+1. Open Settings and find **Dictionary**.
+2. Select **Edit**. TDT opens `%LOCALAPPDATA%\TDT\dictionary.txt`.
+3. Write one word or name on each line, spelled the way you want it.
+4. Save the file. The next dictation uses it.
 
 TDT changes a word only when the speech supports it. On the test sentences
 with developer terms, the dictionary removes about a third of the errors. On
@@ -94,86 +92,84 @@ with developer terms, the dictionary removes about a third of the errors. On
 
 ## Benchmarks
 
-Measured on 2026-10-20 with the Parakeet Redux model on an AMD Ryzen 9
-7950X3D (32 GB RAM, Windows 11). The four engines got the same 456 clips:
+The same models on Trit and on the other CPU runtimes, with the same 456
+clips: LibriSpeech test-clean (200), test-other (200), developer terms (40),
+and everyday dictation (16). AMD Ryzen 9 7950X3D, Windows 11.
 
-- **Photon**: the Python worker that TDT used before its own engine.
-- **v0.2.25**: the first release with TDT's own Rust engine.
-- **v0.2.26**: the Rust engine in this release.
-- **v0.2.26 + dictionary**: the same engine with the built-in developer terms.
-  This is what the app does by default.
+<p align="center">
+  <img src="docs/images/errors.svg" alt="Word errors on 456 clips: Trit against the most accurate other runtime, per model" width="760">
+</p>
 
-**Word error rate.** Lower is better. The error count is in brackets.
+<p align="center">
+  <img src="docs/images/speed.svg" alt="Median time per clip: Trit against the fastest other runtime, per model" width="760">
+</p>
 
-| Set | Clips | Photon | v0.2.25 | v0.2.26 | v0.2.26 + dictionary |
-|---|---:|---:|---:|---:|---:|
-| LibriSpeech test-clean | 200 | 2.07 % (83) | 2.02 % (81) | 2.02 % (81) | 2.02 % (81) |
-| LibriSpeech test-other | 200 | 4.64 % (177) | 4.59 % (175) | 4.59 % (175) | 4.59 % (175) |
-| Developer terms | 40 | 7.19 % (34) | 7.19 % (34) | 7.19 % (34) | **4.65 % (22)** |
-| Everyday dictation | 16 | 1.55 % (6) | 1.55 % (6) | 1.55 % (6) | **1.04 % (4)** |
-
-**Speed.** The number is audio time divided by transcription time, so 90×
-means that 1 minute of speech takes less than 1 second. Higher is better. The
-median time per clip is in brackets.
-
-| Set | Photon | v0.2.25 | v0.2.26 | v0.2.26 + dictionary |
-|---|---:|---:|---:|---:|
-| LibriSpeech test-clean | 36× (168 ms) | 86× (68 ms) | 84× (69 ms) | 78× (74 ms) |
-| LibriSpeech test-other | 36× (159 ms) | 89× (62 ms) | 96× (56 ms) | 99× (54 ms) |
-| Developer terms | 32× (127 ms) | 80× (52 ms) | 93× (43 ms) | 91× (44 ms) |
-| Everyday dictation | 38× (142 ms) | 88× (59 ms) | 86× (64 ms) | 98× (54 ms) |
-
-- Each value comes from one run. The speed changes by about 10 % from one run
-  to the next, so the three Rust columns have the same speed. The Rust engine
-  is about 2.5 times as fast as Photon.
-- The developer-term and everyday sets are synthetic speech from the Windows
-  voices. LibriSpeech is recorded human speech.
-- The bench gives each whole clip to the engine. The app cuts long
-  recordings at pauses, so text comes sooner. On LibriSpeech test-other this
-  gives 184 errors instead of 175.
-
-The method, the raw output, and the commands that reproduce these tables are
-in [desktop/bench](desktop/bench/README.md).
+For each model, Trit makes the fewest errors or ties for the fewest, and it
+has the shortest time per clip. The runtimes are faster-whisper, whisper.cpp,
+ONNX Runtime, sherpa-onnx, Transformers, OpenAI Whisper, and Photon. The full
+tables, memory use, the text cleanup model, and the method are in
+[docs/engine-comparison.md](docs/engine-comparison.md). The commands that
+reproduce them are in [desktop/bench](desktop/bench/README.md).
 
 ## Updates
 
-TDT updates the same way as Prism. It checks the latest GitHub Release
-shortly after it starts, every hour, and when you open Settings. When a newer
-version is available, Settings shows **Update now**. One click downloads
-`TDT-Setup.exe`, verifies its size and the SHA-256 digest that GitHub
-publishes, and runs it silently. Setup replaces TDT.exe and opens the new
+When a newer version is available, Settings shows **Update now**. One click
+downloads `TDT-Setup.exe` from GitHub, verifies its size and its SHA-256
+digest, and runs it silently. Setup replaces TDT.exe and opens the new
 version. Your speech models and settings stay.
 
-Checks never run during a recording. Set `TDT_DISABLE_UPDATES=1` to turn
-updates off.
+## Privacy
+
+Recording and transcription stay on your computer. TDT uses the network only
+for these operations:
+
+- The model download that you start in Settings.
+- The update check. It connects only to GitHub.
+
+## Build from source
+
+You need Rust stable on Windows.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\models\download-models.ps1
+cargo run --release --bin TDT --manifest-path .\desktop\Cargo.toml
+```
+
+Checks before a change:
+
+```powershell
+cargo fmt --manifest-path .\desktop\Cargo.toml -- --check
+cargo clippy --manifest-path .\desktop\Cargo.toml --all-targets --all-features -- -D warnings
+```
+
+To build `dist\TDT-Setup.exe`:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\packaging\build-installer.ps1
+```
 
 To publish a release, set the version in `desktop/Cargo.toml` and push a
-matching tag, such as `v0.3.0`. The `Release` workflow builds
-`TDT-Setup.exe` and attaches it to the release. It also attaches
-`SHA256SUMS.txt`, because TDT 0.2.32 and older need that file to find the
-update.
+matching tag, such as `v0.4.0`. The `Release` workflow builds `TDT-Setup.exe`
+and attaches it with `SHA256SUMS.txt`. TDT 0.2.32 and older need
+`SHA256SUMS.txt` to find the update.
 
 ## Repository layout
 
-- `desktop/`: Rust + GPUI Windows app with global `Ctrl + ;` tap or hold-to-talk.
-- `models/`: downloader for the Parakeet Redux model.
-- `packaging/`: `TDT-Setup.exe` (install, update, and uninstall) and its build script.
-- `site/`: the marketing website.
-- `THIRD_PARTY_NOTICES.md`: upstream license and attribution information.
-
-## Privacy and limits
-
-Recording and transcription stay on-device. The speech engine is part of
-TDT and needs no Python and no network. TDT uses the network only for these
-operations:
-
-- The model download that you start in Settings.
-- The optional updater. The updater connects only to GitHub.
-
-TDT copies the text to the clipboard by design. The maximum recording length
-is 120 seconds. This limit stops unbounded memory growth.
+| Folder | Contents |
+|---|---|
+| `desktop/` | The Windows app (Rust and GPUI) and the speech benchmark. |
+| `trit/` | Trit, the speech engine: a Rust crate, a CLI, a C ABI, and Python, C#, and Node bindings. |
+| `models/` | The model downloader. |
+| `packaging/` | `TDT-Setup.exe` (install, update, uninstall) and its build script. |
+| `docs/` | The engine comparison and the README images. |
+| `site/` | The TDT website. |
 
 ## License
 
-The application source is Apache-2.0. Model weights and bundled dependencies
-have their own terms. Read `THIRD_PARTY_NOTICES.md` before you redistribute them.
+TDT and Trit are under the [PolyForm Noncommercial License 1.0.0](LICENSE).
+You can use, change, and share them for any noncommercial purpose. You cannot
+sell them or use them to make money. Versions 0.3.2 and older were released
+under Apache-2.0 and stay under that license.
+
+Model weights and third-party code have their own licenses. Read
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) before you share them.

@@ -19,6 +19,8 @@ pub struct ModelSpec {
     pub size_label: &'static str,
     pub size_bytes: u64,
     pub hf_repo: &'static str,
+    /// The repository revision the checksums belong to.
+    pub revision: &'static str,
     pub dir_name: &'static str,
     pub files: &'static [ModelFile],
 }
@@ -77,15 +79,46 @@ const REDUX_FILES: &[ModelFile] = &[
     },
 ];
 
-pub const CATALOG: &[ModelSpec] = &[ModelSpec {
-    id: DEFAULT_MODEL_ID,
-    label: "Parakeet Redux",
-    size_label: "178 MB",
-    size_bytes: 179_005_408,
-    hf_repo: REDUX_REPO,
-    dir_name: REDUX_DIR,
-    files: REDUX_FILES,
-}];
+/// NVIDIA Parakeet TDT 0.6B v3 as published for Transformers: 207 errors
+/// against Redux's 293 on the 456 English test clips, at about the same
+/// speed with int8; 2.5 GB on disk and about 0.8 GB in memory.
+const V3_FILES: &[ModelFile] = &[
+    ModelFile {
+        name: "config.json",
+        sha256: "E747B85E1BDFD300C8B8AC63BAC8DD5221F8FE9BC275B48D06C735FCD6971B6E",
+    },
+    ModelFile {
+        name: "model.safetensors",
+        sha256: "3A2026366188C8C68598EDBBFF92F8D11590A08E0AE2E6775544E7B07D6A5E11",
+    },
+    ModelFile {
+        name: "tokenizer.json",
+        sha256: "BD321B096832A3F270BD3B2A88823957920F1A5C5ADA71114A26EA729D0CBE91",
+    },
+];
+
+pub const CATALOG: &[ModelSpec] = &[
+    ModelSpec {
+        id: DEFAULT_MODEL_ID,
+        label: "Parakeet Redux",
+        size_label: "178 MB",
+        size_bytes: 179_005_408,
+        hf_repo: REDUX_REPO,
+        revision: "main",
+        dir_name: REDUX_DIR,
+        files: REDUX_FILES,
+    },
+    ModelSpec {
+        id: "parakeet-tdt-0.6b-v3",
+        label: "Parakeet v3",
+        size_label: "2.5 GB",
+        size_bytes: 2_509_472_233,
+        hf_repo: "nvidia/parakeet-tdt-0.6b-v3",
+        revision: "541d1f99c6b0c3cd0b11a95167540bb8edefd82b",
+        dir_name: "parakeet-tdt-0.6b-v3",
+        files: V3_FILES,
+    },
+];
 
 pub const DEFAULT: &ModelSpec = &CATALOG[0];
 
@@ -221,8 +254,8 @@ pub fn download(
         }
 
         let url = format!(
-            "{HF_BASE}/{}/resolve/main/{}?download=true",
-            spec.hf_repo, file.name
+            "{HF_BASE}/{}/resolve/{}/{}?download=true",
+            spec.hf_repo, spec.revision, file.name
         );
         download_file(&url, &dest, file.sha256, &mut |chunk| {
             done = (done + chunk).min(total);

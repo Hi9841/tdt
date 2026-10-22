@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="170" viewBox="0 0 760 170" font-family="Segoe UI, Helvetica, Arial, sans-serif">
+<defs><marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#a3a8b8"/></marker></defs>
+<rect width="760" height="170" rx="12" fill="#ffffff" stroke="#e6e8ef"/>
+<g font-size="13" text-anchor="middle">
+<rect x="24" y="40" width="150" height="76" rx="10" fill="#eef0fe" stroke="#5b6cf0"/>
+<text x="99" y="72" font-weight="600" fill="#1d2030">Press Ctrl + ;</text>
+<text x="99" y="94" font-size="12" fill="#5d6275">tap, or hold to talk</text>
+<rect x="210" y="40" width="150" height="76" rx="10" fill="#f6f7fa" stroke="#d5d8e2"/>
+<text x="285" y="72" font-weight="600" fill="#1d2030">You speak</text>
+<text x="285" y="94" font-size="12" fill="#5d6275">the pill shows the level</text>
+<rect x="396" y="40" width="150" height="76" rx="10" fill="#f6f7fa" stroke="#d5d8e2"/>
+<text x="471" y="72" font-weight="600" fill="#1d2030">Trit transcribes</text>
+<text x="471" y="94" font-size="12" fill="#5d6275">on your CPU, offline</text>
+<rect x="582" y="40" width="154" height="76" rx="10" fill="#eef0fe" stroke="#5b6cf0"/>
+<text x="659" y="72" font-weight="600" fill="#1d2030">Text appears</text>
+<text x="659" y="94" font-size="12" fill="#5d6275">in the app you use</text>
+</g>
+<g stroke="#a3a8b8" stroke-width="2" marker-end="url(#a)">
+<line x1="176" y1="78" x2="206" y2="78"/><line x1="362" y1="78" x2="392" y2="78"/><line x1="548" y1="78" x2="578" y2="78"/>
+</g>
+<text x="380" y="148" font-size="12" text-anchor="middle" fill="#5d6275">No audio leaves your computer. The speech model runs inside TDT.</text>
+</svg>

@@ -24,6 +24,12 @@ jobs:
         run: cargo build --locked --manifest-path desktop/Cargo.toml
       - name: Clippy
         run: cargo clippy --locked --manifest-path desktop/Cargo.toml --all-targets --all-features -- -D warnings
+      - name: Trit engine
+        run: |
+          cargo fmt --manifest-path trit/Cargo.toml --all -- --check
+          cargo build --locked --release --manifest-path trit/Cargo.toml --workspace
+          cargo clippy --locked --manifest-path trit/Cargo.toml --workspace --all-targets -- -D warnings
+          trit/target/release/trit.exe skill --check trit/skill/SKILL.md
       - name: Installer stub
         run: |
           cargo fmt --manifest-path packaging/tdt-setup/Cargo.toml -- --check

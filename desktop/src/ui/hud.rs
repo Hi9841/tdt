@@ -418,6 +418,7 @@ pub struct HudView {
     remove_fillers_state: Arc<AtomicBool>,
     autostart_enabled: bool,
     autostart_error: Option<String>,
+    auto_updates_enabled: bool,
     pub hotkey_label: String,
     pub wave_peaks: [f32; WAVE_BARS],
     pub mode: WindowViewMode,
@@ -503,6 +504,7 @@ impl HudView {
             remove_fillers_state,
             autostart_enabled: crate::autostart::is_enabled(),
             autostart_error: None,
+            auto_updates_enabled: config.check_updates,
             hotkey_label,
             wave_peaks: [0.0; WAVE_BARS],
             mode: if open_panel {
@@ -569,6 +571,7 @@ impl HudView {
         self.remove_fillers_enabled = true;
         self.autostart_enabled = false;
         self.autostart_error = None;
+        self.auto_updates_enabled = true;
 
         self.selected_model = models::DEFAULT_MODEL_ID.into();
         self.hotkey_capturing = false;
@@ -1030,6 +1033,17 @@ impl HudView {
         cfg.remove_fillers = on;
         let _ = cfg.save();
         self.remove_fillers_state.store(on, Ordering::Relaxed);
+    }
+
+    fn set_auto_updates(&mut self, on: bool) {
+        self.auto_updates_enabled = on;
+        if preview::is_active() {
+            return;
+        }
+        let mut cfg = AppConfig::load();
+        cfg.check_updates = on;
+        let _ = cfg.save();
+        update::set_auto_checks(on);
     }
 
     fn toggle_autostart(&mut self) {
@@ -2097,6 +2111,36 @@ impl HudView {
             _ => None,
         };
         let update_row = settings_row("Updates", update_sub, update_btn.into_any_element());
+        let auto_updates_switch =
+            Switch::new("auto_updates", self.auto_updates_enabled).on_change({
+                let hud = hud.clone();
+                move |on, _, cx| {
+                    hud.update(cx, |this, cx| {
+                        if this.auto_updates_enabled != on {
+                            this.set_auto_updates(on);
+                        }
+                        cx.notify();
+                    });
+                }
+            });
+        let auto_updates_row = settings_row(
+            "Check for updates automatically",
+            if self.auto_updates_enabled {
+                "At start, every hour, and when Settings opens."
+            } else {
+                "Only when you select Check for updates."
+            }
+            .to_string(),
+            auto_updates_switch.into_any_element(),
+        )
+        .on_click(
+            "auto_updates_row",
+            cx.listener(|this, _, _, cx| {
+                let on = !this.auto_updates_enabled;
+                this.set_auto_updates(on);
+                cx.notify();
+            }),
+        );
 
         let spec = models::resolve(&self.selected_model);
         let installed = self.installed_models.iter().any(|id| id == spec.id);
@@ -2269,6 +2313,7 @@ impl HudView {
             .child(
                 controls::section("App")
                     .child(startup_row)
+                    .child(auto_updates_row)
                     .child(update_row)
                     .when_some(update_meter, |card, meter| {
                         card.child(inset(meter.into_any_element()))
