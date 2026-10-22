@@ -75,3 +75,17 @@ Results append to `target/runtimes/results.jsonl` (the last line of each
 engine wins), and each engine's transcripts go next to it. The committed run
 is [runtimes-results.jsonl](runtimes-results.jsonl). GPU engines need an
 NVIDIA GPU with CUDA 12.
+
+## Scripts
+
+| Script | What it does |
+|---|---|
+| `accuracy.py` | Errors and speed of the TDT model through `bench-asr` (the ratchet in `engine-budget.json`) |
+| `librispeech.py` | Writes the 200 LibriSpeech clips per set as 16 kHz WAV and text |
+| `runtimes.py` | The same model on every runtime (above) |
+| `cleanup_runtimes.py` | S1-mini on Trit, Transformers, and llama.cpp, scored the same way |
+| `runtimes_table.py` | Errors per model and runtime from `target/runtimes/results.jsonl`, as text |
+| `wer_rule.py` | Exits 1 when Trit's default makes more errors than another runtime on a model |
+| `runtimes_report.py` | Writes `docs/engine-comparison.{md,html}` and `benchmarks.json` for the site |
+| `readme_charts.py` | Draws the README charts in `docs/images/` from `benchmarks.json` |
+| `memory.py` | Memory and speed of one Trit model over N clips |

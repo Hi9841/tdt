@@ -28,3 +28,8 @@ Desktop.ini
 # OpLoop: the pristine baseline and built libraries (rebuilt from the patches)
 oploop/baseline/
 oploop/results/*.dll
+
+# Skills installed by the local skill tool
+.agents/
+.claude/
+skills-lock.json
