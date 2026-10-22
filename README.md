@@ -1,6 +1,8 @@
 <p align="center">
-  <img src="branding/tdt-logo-lockup.png" alt="TDT, Talk Don't Type" width="420">
+  <img src="branding/tdt-app-icon.png" alt="The TDT orb" width="120">
 </p>
+
+<h1 align="center">TDT (Talk Don't Type)</h1>
 
 <p align="center">
   <b>Offline dictation for Windows.</b> Press a key, speak, and the text appears in the app you use.<br>
