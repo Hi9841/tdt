@@ -11,6 +11,7 @@
 //! only where the model itself starts a word, and a continuation is boosted
 //! only once `min_prefix` letters of the term are matched.
 
+use crate::text::sentencepiece::Tokenizer;
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -257,4 +258,118 @@ pub fn variants(term: &str) -> Vec<(String, bool)> {
         out.push((split, true));
     }
     out
+}
+
+/// The dictionary of `terms` for a SentencePiece model, with the terms it
+/// cannot spell; `None` when no term is left.
+pub fn build(
+    tokenizer: &Tokenizer,
+    terms: &[String],
+    weights: BiasWeights,
+) -> (Option<Bias>, Vec<String>) {
+    let mut paths = Vec::new();
+    let mut skipped = Vec::new();
+    let mut seen = HashSet::new();
+    for term in terms.iter().map(|t| t.trim()).filter(|t| !t.is_empty()) {
+        let Some(written) = tokenizer.encode(term) else {
+            skipped.push(term.to_string());
+            continue;
+        };
+        for (variant, rewrite) in variants(term) {
+            let Some(path) = tokenizer.encode(&variant) else {
+                continue;
+            };
+            if seen.insert(path.clone()) {
+                paths.push(Term {
+                    written: (path != written).then(|| written.clone()),
+                    always: rewrite,
+                    path,
+                });
+            }
+        }
+    }
+    let letters: Vec<usize> = (0..tokenizer.len())
+        .map(|id| tokenizer.letters(id))
+        .collect();
+    let bias = Bias::new(paths, &letters, tokenizer.word_starts(), weights);
+    ((!bias.is_empty()).then_some(bias), skipped)
+}
+
+/// A dictionary over one greedy decode of a text decoder (Canary,
+/// Moonshine): `pick` boosts the logits and chooses the token, `push`
+/// records it, `finish` gives the tokens with completed terms written as
+/// the user wrote them. The same rules as Parakeet's decoder.
+pub struct Run<'a> {
+    bias: &'a Bias,
+    matched: BiasState,
+    /// Whether a bonus changed a choice in the current match.
+    decisive: bool,
+    /// A completed term waiting for the next word to start before it is rewritten.
+    pending: Option<(std::ops::Range<usize>, Vec<usize>)>,
+    tokens: Vec<usize>,
+    own: usize,
+}
+
+impl<'a> Run<'a> {
+    pub fn new(bias: &'a Bias) -> Self {
+        Self {
+            bias,
+            matched: BiasState::default(),
+            decisive: false,
+            pending: None,
+            tokens: Vec::new(),
+            own: 0,
+        }
+    }
+
+    /// The next token after the bonuses.
+    pub fn pick(&mut self, logits: &mut [f32]) -> usize {
+        self.own = argmax(logits);
+        self.bias.apply(self.matched, logits);
+        argmax(logits)
+    }
+
+    /// Records the token `pick` chose (end of text excluded).
+    pub fn push(&mut self, token: usize) {
+        // "rest" must not become "REST" inside "restart": a term is
+        // rewritten only when the next word starts.
+        if let Some((span, written)) = self.pending.take() {
+            if self.bias.starts_word(token) {
+                self.tokens.splice(span, written);
+            }
+        }
+        let fresh = self.matched == BiasState::default();
+        self.decisive = (self.decisive && !fresh) || token != self.own;
+        self.tokens.push(token);
+        let (next, completion) = self.bias.advance(self.matched, token);
+        self.matched = next;
+        if let Some(done) = completion {
+            if let Some(written) = self.bias.replacement(done, self.decisive) {
+                let end = self.tokens.len();
+                self.pending = Some((end - done.len..end, written.to_vec()));
+            }
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.tokens.len()
+    }
+
+    pub fn finish(mut self) -> Vec<usize> {
+        if let Some((span, written)) = self.pending.take() {
+            self.tokens.splice(span, written);
+        }
+        self.tokens
+    }
+}
+
+/// Index of the largest value; the first one wins a tie.
+fn argmax(values: &[f32]) -> usize {
+    let mut best = 0;
+    for (i, v) in values.iter().enumerate() {
+        if *v > values[best] {
+            best = i;
+        }
+    }
+    best
 }

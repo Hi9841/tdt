@@ -2,7 +2,7 @@
 //! preemphasis, centered STFT with a Hann window, power spectrum, Slaney mel
 //! filters, log, and per-bin normalization over the take.
 
-use super::team;
+use crate::cpu::team;
 
 const N_FFT: usize = 512;
 const WIN_LENGTH: usize = 400;
@@ -32,7 +32,7 @@ impl MelFrontend {
             window[offset + n] = 0.5 - 0.5 * phase.cos();
         }
         Self {
-            filters: spans(&slaney_filters(mels)),
+            filters: spans(&slaney_filters(mels, N_FFT)),
             window,
             fft: Fft::new(N_FFT),
         }
@@ -131,16 +131,18 @@ fn mel_to_hz(mel: f64) -> f64 {
     }
 }
 
-/// librosa.filters.mel(sr=16000, n_fft=512, fmin=0, fmax=8000, htk=False, norm="slaney").
-fn slaney_filters(mels: usize) -> Vec<f32> {
-    let fft_freqs: Vec<f64> = (0..BINS)
-        .map(|bin| bin as f64 * SAMPLE_RATE / N_FFT as f64)
+/// librosa.filters.mel(sr=16000, n_fft, fmin=0, fmax=8000, htk=False,
+/// norm="slaney"): `mels x (n_fft / 2 + 1)`. Parakeet and Whisper both use it.
+pub fn slaney_filters(mels: usize, n_fft: usize) -> Vec<f32> {
+    let bins = n_fft / 2 + 1;
+    let fft_freqs: Vec<f64> = (0..bins)
+        .map(|bin| bin as f64 * SAMPLE_RATE / n_fft as f64)
         .collect();
     let max_mel = hz_to_mel(SAMPLE_RATE / 2.0);
     let points: Vec<f64> = (0..mels + 2)
         .map(|i| mel_to_hz(max_mel * i as f64 / (mels + 1) as f64))
         .collect();
-    let mut filters = vec![0.0f32; mels * BINS];
+    let mut filters = vec![0.0f32; mels * bins];
     for mel in 0..mels {
         let lower_width = points[mel + 1] - points[mel];
         let upper_width = points[mel + 2] - points[mel + 1];
@@ -148,7 +150,7 @@ fn slaney_filters(mels: usize) -> Vec<f32> {
         for (bin, freq) in fft_freqs.iter().enumerate() {
             let lower = (freq - points[mel]) / lower_width;
             let upper = (points[mel + 2] - freq) / upper_width;
-            filters[mel * BINS + bin] = (lower.min(upper).max(0.0) * norm) as f32;
+            filters[mel * bins + bin] = (lower.min(upper).max(0.0) * norm) as f32;
         }
     }
     filters

@@ -42,6 +42,8 @@ pub struct Team {
 
 thread_local! {
     static INSIDE: Cell<bool> = const { Cell::new(false) };
+    /// The team this thread's steps run on (see `enter`).
+    static CURRENT: Cell<usize> = const { Cell::new(0) };
 }
 
 impl Team {
@@ -156,29 +158,40 @@ fn work(s: &Shared) {
     }
 }
 
-static TEAM: OnceLock<Team> = OnceLock::new();
-static THREADS: AtomicUsize = AtomicUsize::new(0);
-static DOMAIN: AtomicUsize = AtomicUsize::new(0);
+/// The teams a process may start, one per spread of `cpu::Spread`. A
+/// process that runs Parakeet and Whisper gets both; each parks when idle.
+pub const TEAMS: usize = 2;
+static TEAM: [OnceLock<Team>; TEAMS] = [OnceLock::new(), OnceLock::new()];
 
-/// Sets the team size and its affinity mask (0: none) before the first
-/// parallel step. Later calls do nothing.
-pub fn init(threads: usize, domain: usize) {
-    THREADS.store(threads.max(1), Ordering::Relaxed);
-    DOMAIN.store(domain, Ordering::Relaxed);
-    let _ = team();
+/// Starts team `slot` with the threads (the caller included) and the
+/// affinity mask (0: none) that `size` gives. Later calls do nothing.
+pub fn start(slot: usize, size: impl FnOnce() -> (usize, usize)) {
+    TEAM[slot].get_or_init(|| {
+        let (threads, domain) = size();
+        Team::new(threads.max(1), domain)
+    });
 }
 
-/// Moves the calling thread onto the team's L3 domain until the guard drops.
-pub fn pin_caller() -> Pinned {
-    Pinned(set_affinity(team().domain))
+/// Runs the calling thread's steps on team `slot`, pinned to its L3 domain,
+/// until the guard drops.
+pub fn enter(slot: usize) -> Entered {
+    let previous = CURRENT.replace(slot);
+    Entered {
+        previous,
+        affinity: set_affinity(team().domain),
+    }
 }
 
-/// The caller's previous affinity mask, restored on drop (0: nothing to restore).
-pub struct Pinned(usize);
+/// The caller's previous team and affinity mask (0: nothing to restore).
+pub struct Entered {
+    previous: usize,
+    affinity: usize,
+}
 
-impl Drop for Pinned {
+impl Drop for Entered {
     fn drop(&mut self) {
-        set_affinity(self.0);
+        set_affinity(self.affinity);
+        CURRENT.set(self.previous);
     }
 }
 
@@ -195,18 +208,65 @@ fn set_affinity(mask: usize) -> usize {
     unsafe { SetThreadAffinityMask(GetCurrentThread(), mask) }
 }
 
-#[cfg(not(windows))]
+/// Linux: the same, with `sched_setaffinity` on the calling thread.
+#[cfg(target_os = "linux")]
+fn set_affinity(mask: usize) -> usize {
+    extern "C" {
+        fn sched_getaffinity(pid: i32, size: usize, mask: *mut usize) -> i32;
+        fn sched_setaffinity(pid: i32, size: usize, mask: *const usize) -> i32;
+    }
+    if mask == 0 {
+        return 0;
+    }
+    let size = std::mem::size_of::<usize>();
+    let mut previous = 0usize;
+    // SAFETY: pid 0 is the calling thread; both masks are `size` bytes. A
+    // mask outside the allowed processors fails and changes nothing. A
+    // previous mask with processors past the first 64 reads as 0: nothing
+    // to restore.
+    unsafe {
+        if sched_getaffinity(0, size, &mut previous) != 0 || sched_setaffinity(0, size, &mask) != 0
+        {
+            return 0;
+        }
+    }
+    previous
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 fn set_affinity(_mask: usize) -> usize {
     0
 }
 
+/// Runs `run` once on every thread of every started team, the workers
+/// included: work that must happen on each thread, such as returning the
+/// memory a thread's allocator keeps. Each task waits until every thread of
+/// its team holds one, so no thread takes two.
+pub fn on_every_thread(run: impl Fn() + Sync) {
+    for team in TEAM.iter().filter_map(OnceLock::get) {
+        let threads = team.workers + 1;
+        let started = AtomicUsize::new(0);
+        team.for_each(threads, &|_| {
+            started.fetch_add(1, Ordering::AcqRel);
+            while started.load(Ordering::Acquire) < threads {
+                std::hint::spin_loop();
+            }
+            run();
+        });
+    }
+    if TEAM.iter().all(|team| team.get().is_none()) {
+        run();
+    }
+}
+
+/// The calling thread's team; one of every core, unpinned, if `start` did
+/// not run for it.
 fn team() -> &'static Team {
-    TEAM.get_or_init(|| {
-        let threads = match THREADS.load(Ordering::Relaxed) {
-            0 => std::thread::available_parallelism().map_or(4, |n| n.get()),
-            n => n,
-        };
-        Team::new(threads, DOMAIN.load(Ordering::Relaxed))
+    TEAM[CURRENT.get()].get_or_init(|| {
+        Team::new(
+            std::thread::available_parallelism().map_or(4, |n| n.get()),
+            0,
+        )
     })
 }
 
@@ -217,6 +277,11 @@ pub fn threads() -> usize {
 
 /// `run(task)` for every task in `0..tasks`, spread over the team.
 pub fn for_each(tasks: usize, run: impl Fn(usize) + Sync) {
+    // A step inside a task (on a worker or the caller) runs inline.
+    if INSIDE.get() {
+        (0..tasks).for_each(run);
+        return;
+    }
     team().for_each(tasks, &run);
 }
 

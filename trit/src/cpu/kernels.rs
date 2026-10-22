@@ -26,8 +26,18 @@ pub enum Isa {
 }
 
 impl Isa {
+    pub fn name(self) -> &'static str {
+        match self {
+            Isa::Scalar => "scalar",
+            #[cfg(target_arch = "x86_64")]
+            Isa::Avx2 => "avx2",
+            #[cfg(target_arch = "x86_64")]
+            Isa::Avx512Vnni => "avx512-vnni",
+        }
+    }
+
     /// Rows per packed block.
-    fn rows(self) -> usize {
+    pub(super) fn rows(self) -> usize {
         match self {
             Isa::Scalar => 1,
             #[cfg(target_arch = "x86_64")]
@@ -37,9 +47,9 @@ impl Isa {
         }
     }
 
-    /// The fastest path this CPU runs. `TDT_NATIVE_ISA=scalar|avx2` forces a slower one.
+    /// The fastest path this CPU runs. `TRIT_ISA=scalar|avx2` forces a slower one.
     pub fn detect() -> Self {
-        let forced = std::env::var("TDT_NATIVE_ISA").unwrap_or_default();
+        let forced = std::env::var("TRIT_ISA").unwrap_or_default();
         #[cfg(target_arch = "x86_64")]
         {
             let vnni = is_x86_feature_detected!("avx512f")
@@ -405,10 +415,10 @@ const DIGITS: [[u8; 5]; 243] = {
 
 /// Activations as i8 with one scale and one sum per 128-value group.
 pub struct Quantized {
-    m: usize,
-    values: Vec<i8>,
-    scales: Vec<f32>,
-    sums: Vec<i32>,
+    pub(super) m: usize,
+    pub(super) values: Vec<i8>,
+    pub(super) scales: Vec<f32>,
+    pub(super) sums: Vec<i32>,
 }
 
 impl Quantized {
@@ -416,8 +426,11 @@ impl Quantized {
         let groups = k / GROUP;
         // Reuse this thread's buffer: a fresh one would fault in new pages.
         let mut values = QUANTIZED.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
-        values.clear();
-        values.resize(m * k, 0);
+        // The quantizer writes every value of the first m x k, so a buffer that
+        // is long enough is used as it is: no fill on the calling thread.
+        if values.len() < m * k {
+            values.resize(m * k, 0);
+        }
         let mut scales = vec![0.0f32; m * groups];
         let mut sums = vec![0i32; m * groups];
         let (all_values, all_scales, all_sums) = (

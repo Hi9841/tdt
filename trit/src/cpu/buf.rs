@@ -14,6 +14,10 @@ use std::ops::{Deref, DerefMut};
 static POOL: Mutex<Vec<Vec<f32>>> = Mutex::new(Vec::new());
 /// Enough for every live buffer of one forward pass.
 const MAX_POOLED: usize = 64;
+/// Bytes the pool may hold. 16 MB against 64 MB, 60 clips: Whisper base.en
+/// and Moonshine base keep 20 to 75 MB less, at about 5 % of Whisper's
+/// speed; Parakeet Redux runs the same.
+const MAX_POOLED_BYTES: usize = 16 << 20;
 
 /// `data` keeps every value it ever held, so reuse never fills it again;
 /// the buffer is its first `len` values.
@@ -52,6 +56,11 @@ impl Buf {
     }
 }
 
+/// Frees every pooled buffer.
+pub fn clear_pool() {
+    POOL.lock().clear();
+}
+
 impl Drop for Buf {
     fn drop(&mut self) {
         let vec = std::mem::take(&mut self.data);
@@ -59,7 +68,8 @@ impl Drop for Buf {
             return;
         }
         let mut pool = POOL.lock();
-        if pool.len() < MAX_POOLED {
+        let held: usize = pool.iter().map(|v| v.capacity() * 4).sum();
+        if pool.len() < MAX_POOLED && held + vec.capacity() * 4 <= MAX_POOLED_BYTES {
             pool.push(vec);
         }
     }

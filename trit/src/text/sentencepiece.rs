@@ -76,6 +76,11 @@ impl Tokenizer {
         })
     }
 
+    /// The id of a piece as written in the vocabulary, for example `<|en|>`.
+    pub fn id(&self, piece: &str) -> Option<usize> {
+        self.ids.get(piece).copied()
+    }
+
     pub fn len(&self) -> usize {
         self.pieces.len()
     }
@@ -111,14 +116,25 @@ impl Tokenizer {
     }
 
     /// Unknown and special ids are skipped, as the reference tokenizer does.
+    /// A byte-fallback piece (`<0x0A>`) adds its byte; the bytes join as UTF-8.
     pub fn decode(&self, ids: &[usize]) -> String {
-        let mut text = String::new();
+        let mut bytes = Vec::new();
         for &id in ids {
             if self.special.get(id).copied().unwrap_or(true) {
                 continue;
             }
-            text.push_str(&self.pieces[id].replace(WORD_START, " "));
+            let piece = &self.pieces[id];
+            let byte = piece
+                .strip_prefix("<0x")
+                .and_then(|hex| hex.strip_suffix('>'))
+                .filter(|hex| hex.len() == 2)
+                .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+            match byte {
+                Some(byte) => bytes.push(byte),
+                None => bytes.extend_from_slice(piece.replace(WORD_START, " ").as_bytes()),
+            }
         }
+        let text = String::from_utf8_lossy(&bytes);
         text.trim_start_matches(' ').to_string()
     }
 

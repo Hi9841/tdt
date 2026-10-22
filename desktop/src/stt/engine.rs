@@ -1,15 +1,35 @@
 use super::dictionary;
-use super::native::{BiasWeights, NativeParakeet};
 use super::segment;
 use crossbeam_channel::{Receiver, RecvTimeoutError};
 use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use trit::{BiasWeights, Trit};
 
 const MAX_CAPTURED_SAMPLES: usize = 120 * 16_000;
 /// After a cut, a remainder shorter than 200 ms is the pause itself, not speech.
 const MIN_REMAINDER_SAMPLES: usize = 3_200;
+
+/// Dictation starts and ends so far; a release waits for this to stay the same.
+static DICTATIONS: AtomicU64 = AtomicU64::new(0);
+/// Idle time after a dictation before its memory goes back to the system.
+const IDLE_RELEASE: Duration = Duration::from_secs(5);
+
+/// Returns the memory of the last dictation to the system once no new one
+/// has started for `IDLE_RELEASE`. During dictations the engine keeps its
+/// buffers, so a quick next one does not wait for the system to give them
+/// back.
+fn release_when_idle() {
+    let dictation = DICTATIONS.fetch_add(1, Ordering::Relaxed) + 1;
+    std::thread::spawn(move || {
+        std::thread::sleep(IDLE_RELEASE);
+        if DICTATIONS.load(Ordering::Relaxed) == dictation {
+            trit::release_memory();
+        }
+    });
+}
 
 /// Audio captured while the user is still holding the hotkey.
 pub enum LiveAudio {
@@ -28,7 +48,7 @@ pub struct LiveTranscript {
 /// loads on first use.
 pub struct SttEngine {
     model_dir: PathBuf,
-    native: Mutex<Option<Arc<NativeParakeet>>>,
+    native: Mutex<Option<Arc<Trit>>>,
     /// The dictionary file as last applied to the engine.
     dictionary: Mutex<dictionary::Watch>,
 }
@@ -45,7 +65,9 @@ impl SttEngine {
     pub fn prepare(&self) -> Result<(), String> {
         let mut native = self.native.lock();
         if native.is_none() {
-            *native = Some(Arc::new(NativeParakeet::load(&self.model_dir)?));
+            *native = Some(Arc::new(Trit::load(&self.model_dir)?));
+            // Loading converts weights through buffers that are freed again.
+            trit::release_memory();
             // A fresh engine has no dictionary yet.
             *self.dictionary.lock() = dictionary::Watch::default();
         }
@@ -70,13 +92,16 @@ impl SttEngine {
     fn transcribe_samples(&self, samples: &[f32]) -> Result<String, String> {
         let native = self.native.lock().clone();
         let engine = native.ok_or("The speech model is not loaded.")?;
-        Ok(engine.transcribe(samples))
+        // TDT is English only (0.3.1): the decoder never writes other languages.
+        Ok(engine.transcribe_with(samples, &trit::Options::language("en")))
     }
 
     pub fn transcribe_live_reporting(
         &self,
         rx: &Receiver<LiveAudio>,
     ) -> Result<LiveTranscript, String> {
+        // A release waiting from the last dictation must not run during this one.
+        DICTATIONS.fetch_add(1, Ordering::Relaxed);
         self.prepare()?;
         self.refresh_dictionary();
         let mut stopped_at = None;
@@ -147,11 +172,13 @@ impl SttEngine {
             }
         }
 
-        Ok(LiveTranscript {
+        let transcript = LiveTranscript {
             text,
             latency_ms: stopped_at.elapsed().as_millis() as u64,
             duration_secs,
-        })
+        };
+        release_when_idle();
+        Ok(transcript)
     }
 
     pub fn release(&self) {

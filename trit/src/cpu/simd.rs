@@ -24,14 +24,14 @@ macro_rules! multiversion {
             unsafe fn avx2($($arg: $ty),*) {
                 imp($($arg),*)
             }
-            match $crate::stt::native::fgemm::level() {
+            match $crate::cpu::fgemm::level() {
                 #[cfg(target_arch = "x86_64")]
                 // SAFETY: the level was detected from the CPU.
-                $crate::stt::native::fgemm::Level::Avx512 => unsafe { avx512($($arg),*) },
+                $crate::cpu::fgemm::Level::Avx512 => unsafe { avx512($($arg),*) },
                 #[cfg(target_arch = "x86_64")]
                 // SAFETY: the level was detected from the CPU.
-                $crate::stt::native::fgemm::Level::Avx2 => unsafe { avx2($($arg),*) },
-                $crate::stt::native::fgemm::Level::Scalar => imp($($arg),*),
+                $crate::cpu::fgemm::Level::Avx2 => unsafe { avx2($($arg),*) },
+                $crate::cpu::fgemm::Level::Scalar => imp($($arg),*),
             }
         }
     };

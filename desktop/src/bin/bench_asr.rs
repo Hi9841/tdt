@@ -9,8 +9,8 @@
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+use trit::{BiasWeights, Trit};
 use voice_stt_desktop::stt::models::{find_dir, ModelSpec, CATALOG};
-use voice_stt_desktop::stt::native::{BiasWeights, NativeParakeet};
 use voice_stt_desktop::stt::{LiveAudio, SttEngine};
 
 #[global_allocator]
@@ -253,7 +253,7 @@ fn bench_native(clips: &[Clip], options: &Options) {
         return;
     };
     let started = Instant::now();
-    let engine = match NativeParakeet::load(&model_dir) {
+    let engine = match Trit::load(&model_dir) {
         Ok(engine) => engine,
         Err(e) => {
             println!("Failed to load the native engine: {e}");
@@ -294,7 +294,7 @@ fn bench_native(clips: &[Clip], options: &Options) {
         );
     }
     whole_clips(clips, options, "native", |samples| {
-        engine.transcribe(samples)
+        engine.transcribe_with(samples, &trit::Options::language("en"))
     });
 }
 

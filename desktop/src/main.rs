@@ -113,11 +113,18 @@ fn main() {
     lock_working_directory();
     std::panic::set_hook(Box::new(|info| {
         let msg = format!("TDT crashed: {info}");
-        append_log(&msg);
+        // The dialog shows where it panicked, not how it got there; the log does.
+        append_log(&format!(
+            "{msg}\n{}",
+            std::backtrace::Backtrace::force_capture()
+        ));
         // Best effort: a panic here would abort without a useful log.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             show_error(&msg);
         }));
+        // A crashed process that stays open holds the single-instance claim,
+        // so the next start would do nothing.
+        std::process::exit(1);
     }));
 
     let _instance = if preview::is_active() {
@@ -401,23 +408,33 @@ fn main() {
                             });
                         }
                         while update_ping_rx.try_recv().is_ok() {}
-                        let _ = this.update(cx, |view, cx| {
-                            view.take_ready_model();
-                            if view.retry_microphone {
-                                view.retry_microphone = false;
-                                if !preview::is_active() && !is_recording_state && !is_processing_state {
-                                    match AudioRecorder::new() {
-                                        Ok(recorder) => {
-                                            *rec.borrow_mut() = Some(recorder);
-                                            view.status = HudStatus::Idle;
-                                            view.recovery_message = None;
-                                        }
-                                        Err(error) => view.set_error(format!("Could not open the microphone. Check Windows microphone access and try again. {error}")),
+                        let retry = this
+                            .update(cx, |view, _| {
+                                view.take_ready_model();
+                                std::mem::take(&mut view.retry_microphone)
+                            })
+                            .unwrap_or(false);
+                        if retry {
+                            // Opening the microphone makes COM calls, and COM on
+                            // this thread can run a message loop. Inside an
+                            // update that loop would run GPUI tasks and panic
+                            // ("RefCell already borrowed"), so open it between
+                            // updates.
+                            let opened = (!preview::is_active() && !is_recording_state && !is_processing_state)
+                                .then(AudioRecorder::new);
+                            let _ = this.update(cx, |view, cx| {
+                                match opened {
+                                    Some(Ok(recorder)) => {
+                                        *rec.borrow_mut() = Some(recorder);
+                                        view.status = HudStatus::Idle;
+                                        view.recovery_message = None;
                                     }
+                                    Some(Err(error)) => view.set_error(format!("Could not open the microphone. Check Windows microphone access and try again. {error}")),
+                                    None => {}
                                 }
                                 cx.notify();
-                            }
-                        });
+                            });
+                        }
 
                         // 1. Process Menu Events from tray. Drain every queued
                         // event so quick tray clicks are never dropped.

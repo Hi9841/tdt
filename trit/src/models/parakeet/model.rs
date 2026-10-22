@@ -1,20 +1,29 @@
 //! Parakeet TDT: a FastConformer encoder and a token-and-duration transducer.
 //! The structure follows the Apache-2.0 Hugging Face `ParakeetForTDT`.
 
-use super::activation;
 use super::bias::{Bias, BiasState};
-use super::buf::Buf;
-use super::fgemm;
-use super::gemm::Dense;
-use super::half::HalfDense;
-use super::kernels::Ternary;
-use super::team;
-use super::tensors::Tensors;
+use crate::cpu::activation;
+use crate::cpu::buf::Buf;
+use crate::cpu::fgemm;
+use crate::cpu::gemm::Dense;
+use crate::cpu::half::HalfDense;
+use crate::cpu::kernels::Ternary;
+use crate::cpu::team;
+use crate::cpu::tensors::Tensors;
+use crate::models::transformer::Norm;
 use parking_lot::RwLock;
 use std::sync::Arc;
 
-const LAYER_NORM_EPS: f32 = 1e-5;
 const BATCH_NORM_EPS: f32 = 1e-5;
+
+thread_local! {
+    /// One attention head's query (two biases), key, and position columns.
+    /// Each grows to the longest take once per thread and is then reused,
+    /// so the worker threads allocate nothing per head.
+    static HEADS: std::cell::RefCell<[Vec<f32>; 4]> = const {
+        std::cell::RefCell::new([Vec::new(), Vec::new(), Vec::new(), Vec::new()])
+    };
+}
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -32,6 +41,22 @@ pub struct Config {
     pub durations: Vec<usize>,
     pub max_symbols: usize,
     pub group: usize,
+    /// `sqrt(hidden)` when the encoder scales its input (`scale_input`), else 1.
+    pub input_scale: f32,
+    pub head: HeadKind,
+    /// Before every `encoder.` tensor name: `model.` in Canary files.
+    pub prefix: &'static str,
+}
+
+/// What follows the encoder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeadKind {
+    /// TDT decoder and joint network (`parakeet_tdt`).
+    Tdt,
+    /// One projection per frame (`parakeet_ctc`).
+    Ctc,
+    /// None: another model (Canary) decodes the encoder output.
+    Encoder,
 }
 
 impl Config {
@@ -45,39 +70,72 @@ impl Config {
                 .map(|v| v as usize)
                 .ok_or_else(|| format!("config.json has no {key}"))
         };
+        let head = match json["model_type"].as_str() {
+            Some("parakeet_ctc") => HeadKind::Ctc,
+            Some("canary") => HeadKind::Encoder,
+            _ => HeadKind::Tdt,
+        };
         // Only the shape this engine implements is accepted.
         if num(enc, "subsampling_factor")? != 8
             || num(enc, "subsampling_conv_kernel_size")? != 3
             || num(enc, "subsampling_conv_stride")? != 2
-            || enc["scale_input"].as_bool() == Some(true)
-            || json["model_type"].as_str() != Some("parakeet_tdt")
         {
             return Err("config.json describes a model shape this engine does not run".into());
         }
+        let hidden = num(enc, "hidden_size")?;
+        // Only TDT has the decoder fields; a CTC blank is the pad token.
+        let tdt = |key: &str| {
+            if head == HeadKind::Tdt {
+                num(&json, key)
+            } else {
+                Ok(0)
+            }
+        };
         let config = Self {
-            hidden: num(enc, "hidden_size")?,
+            hidden,
             ff: num(enc, "intermediate_size")?,
             heads: num(enc, "num_attention_heads")?,
             layers: num(enc, "num_hidden_layers")?,
             mels: num(enc, "num_mel_bins")?,
             conv_kernel: num(enc, "conv_kernel_size")?,
             sub_channels: num(enc, "subsampling_conv_channels")?,
-            decoder_hidden: num(&json, "decoder_hidden_size")?,
-            decoder_layers: num(&json, "num_decoder_layers")?,
+            decoder_hidden: tdt("decoder_hidden_size")?,
+            decoder_layers: tdt("num_decoder_layers")?,
             vocab: num(&json, "vocab_size")?,
-            blank: num(&json, "blank_token_id")?,
-            durations: json["durations"]
-                .as_array()
-                .ok_or("config.json has no durations")?
-                .iter()
-                .map(|d| d.as_u64().map(|d| d as usize).ok_or("bad duration"))
-                .collect::<Result<_, _>>()?,
-            max_symbols: num(&json, "max_symbols_per_step")?,
-            group: num(&json, "ternary_group_size")?,
+            blank: num(
+                &json,
+                if head == HeadKind::Tdt {
+                    "blank_token_id"
+                } else {
+                    "pad_token_id"
+                },
+            )?,
+            durations: match json["durations"].as_array() {
+                Some(list) => list
+                    .iter()
+                    .map(|d| d.as_u64().map(|d| d as usize).ok_or("bad duration"))
+                    .collect::<Result<_, _>>()?,
+                None if head != HeadKind::Tdt => Vec::new(),
+                None => return Err("config.json has no durations".into()),
+            },
+            max_symbols: tdt("max_symbols_per_step")?,
+            // Ternary models (Redux) only; dense models have no groups.
+            group: json["ternary_group_size"].as_u64().unwrap_or(0) as usize,
+            input_scale: if enc["scale_input"].as_bool() == Some(true) {
+                (hidden as f32).sqrt()
+            } else {
+                1.0
+            },
+            head,
+            prefix: if head == HeadKind::Encoder {
+                "model."
+            } else {
+                ""
+            },
         };
         if !config.hidden.is_multiple_of(config.heads)
             || !config.mels.is_multiple_of(8)
-            || config.durations.is_empty()
+            || (head == HeadKind::Tdt && config.durations.is_empty())
         {
             return Err("config.json has inconsistent sizes".into());
         }
@@ -85,118 +143,47 @@ impl Config {
     }
 }
 
-struct Norm {
-    weight: Vec<f32>,
-    bias: Vec<f32>,
+/// A projection of the encoder: ternary weights (Parakeet Redux) or dense
+/// weights (Parakeet TDT v3), whichever the file holds.
+enum Linear {
+    Ternary(Ternary),
+    Dense(Dense),
 }
 
-impl Norm {
-    fn load(t: &Tensors, name: &str, size: usize) -> Result<Self, String> {
-        Ok(Self {
-            weight: t.f32_len(&format!("{name}.weight"), size)?,
-            bias: t.f32_len(&format!("{name}.bias"), size)?,
-        })
-    }
-
-    fn apply(&self, x: &[f32]) -> Buf {
-        let size = self.weight.len();
-        let mut out = Buf::scratch(x.len());
-        team::chunks_mut(&mut out, size, |index, o| {
-            normalize_row(
-                &x[index * size..(index + 1) * size],
-                &self.weight,
-                &self.bias,
-                o,
-            );
-        });
-        out
-    }
-
-    /// `x += scale * y`, then the normalized `x`, in one pass per row.
-    fn residual(&self, x: &mut [f32], y: &[f32], scale: f32) -> Buf {
-        let size = self.weight.len();
-        let mut out = Buf::scratch(x.len());
-        let rows = team::SendPtr::new(x);
-        team::chunks_mut(&mut out, size, |index, o| {
-            // SAFETY: each row of `x` belongs to the task of the same output row.
-            let row = unsafe { rows.slice_mut(index * size, size) };
-            add_scaled(row, &y[index * size..(index + 1) * size], scale);
-            normalize_row(row, &self.weight, &self.bias, o);
-        });
-        out
-    }
-}
-
-multiversion! {
-    /// `out = (row - mean) / sqrt(var + eps) * weight + bias`.
-    fn normalize_row(row: &[f32], weight: &[f32], bias: &[f32], out: &mut [f32]) {
-        let (mean, var) = moments(row);
-        let inv = 1.0 / (var + LAYER_NORM_EPS).sqrt();
-        for (((o, v), w), b) in out.iter_mut().zip(row).zip(weight).zip(bias) {
-            *o = (v - mean) * inv * w + b;
+impl Linear {
+    fn forward(&self, x: &[f32], rows: usize) -> Buf {
+        match self {
+            Self::Ternary(layer) => layer.forward(x, rows),
+            Self::Dense(layer) => layer.forward(x, rows),
         }
     }
 }
 
-multiversion! {
-    /// `row += scale * add`.
-    fn add_scaled(row: &mut [f32], add: &[f32], scale: f32) {
-        for (v, a) in row.iter_mut().zip(add) {
-            *v += scale * a;
-        }
-    }
+/// `name` as ternary (`.qweight` + `.scales`) or dense (`.weight`, any float
+/// dtype, `[out, in]` or `[out, in, 1]` for a pointwise conv).
+fn linear(t: &Tensors, name: &str, out: usize, inp: usize, group: usize) -> Result<Linear, String> {
+    stacked(t, &[name.to_string()], (out, inp), group)
 }
 
-/// Mean and variance of a row, two passes, each summed in 32 lanes so the
-/// adds do not wait on each other: eight 4-wide chains even on plain SSE2.
-/// A lane adds the same values in the same order at any vector width.
-#[inline(always)]
-fn moments(row: &[f32]) -> (f32, f32) {
-    let n = row.len() as f32;
-    let mean = lane_sum(row, |v| v) / n;
-    let var = lane_sum(row, |v| (v - mean) * (v - mean)) / n;
-    (mean, var)
-}
-
-#[inline(always)]
-fn lane_sum(row: &[f32], term: impl Fn(f32) -> f32) -> f32 {
-    let mut lanes = [0.0f32; 32];
-    let (chunks, tail) = row.as_chunks::<32>();
-    for chunk in chunks {
-        for (lane, v) in lanes.iter_mut().zip(chunk) {
-            *lane += term(*v);
-        }
-    }
-    lanes.iter().sum::<f32>() + tail.iter().map(|v| term(*v)).sum::<f32>()
-}
-
-fn ternary(
-    t: &Tensors,
-    name: &str,
-    out: usize,
-    inp: usize,
-    group: usize,
-) -> Result<Ternary, String> {
-    let scales = t.f32_len(&format!("{name}.scales"), out * (inp / group))?;
-    Ternary::from_base3(&t.u8(&format!("{name}.qweight"))?, &scales, out, inp, group)
-}
-
-/// Several attention layers with the same input, stacked by output rows.
+/// Several layers with the same input, stacked by output rows into one.
 fn stacked(
     t: &Tensors,
-    prefix: &str,
-    names: &[&str],
+    names: &[String],
     (out, inp): (usize, usize),
     group: usize,
-) -> Result<Ternary, String> {
-    let mut packed = Vec::new();
-    let mut scales = Vec::new();
-    for name in names {
-        let name = format!("{prefix}.self_attn.{name}");
-        packed.extend_from_slice(&t.u8(&format!("{name}.qweight"))?);
-        scales.extend(t.f32_len(&format!("{name}.scales"), out * (inp / group))?);
+) -> Result<Linear, String> {
+    if t.has(&format!("{}.qweight", names[0])) {
+        let mut packed = Vec::new();
+        let mut scales = Vec::new();
+        for name in names {
+            packed.extend_from_slice(&t.u8(&format!("{name}.qweight"))?);
+            scales.extend(t.f32_len(&format!("{name}.scales"), out * (inp / group))?);
+        }
+        return Ternary::from_base3(&packed, &scales, names.len() * out, inp, group)
+            .map(Linear::Ternary);
     }
-    Ternary::from_base3(&packed, &scales, names.len() * out, inp, group)
+    let parts: Vec<(&str, usize)> = names.iter().map(|name| (name.as_str(), out)).collect();
+    Dense::load(t, &parts, inp).map(Linear::Dense)
 }
 
 /// Decoder layer with f16 weights as stored and an f32 bias.
@@ -234,10 +221,13 @@ impl Subsampling {
         let conv = |index: usize| -> Result<(Vec<f32>, Vec<f32>), String> {
             Ok((
                 t.f32_len(
-                    &format!("encoder.subsampling.layers.{index}.weight"),
+                    &format!("{}encoder.subsampling.layers.{index}.weight", c.prefix),
                     ch * 9,
                 )?,
-                t.f32_len(&format!("encoder.subsampling.layers.{index}.bias"), ch)?,
+                t.f32_len(
+                    &format!("{}encoder.subsampling.layers.{index}.bias", c.prefix),
+                    ch,
+                )?,
             ))
         };
         Ok(Self {
@@ -250,12 +240,24 @@ impl Subsampling {
                 )
             },
             dw1: tap_major(conv(2)?, ch),
-            pw1: dense(t, "encoder.subsampling.layers.3", ch, ch, true)?,
+            pw1: dense(
+                t,
+                &format!("{}encoder.subsampling.layers.3", c.prefix),
+                ch,
+                ch,
+                true,
+            )?,
             dw2: tap_major(conv(5)?, ch),
-            pw2: dense(t, "encoder.subsampling.layers.6", ch, ch, true)?,
+            pw2: dense(
+                t,
+                &format!("{}encoder.subsampling.layers.6", c.prefix),
+                ch,
+                ch,
+                true,
+            )?,
             linear: dense(
                 t,
-                "encoder.subsampling.linear",
+                &format!("{}encoder.subsampling.linear", c.prefix),
                 c.hidden,
                 ch * (c.mels / 8),
                 true,
@@ -440,34 +442,34 @@ multiversion! {
 
 struct Block {
     norm_ff1: Norm,
-    ff1: (Ternary, Ternary),
+    ff1: (Linear, Linear),
     norm_att: Norm,
     /// q, k, and v stacked into one `3d x d` layer: one quantization, one product.
-    qkv: Ternary,
-    o: Ternary,
-    rel_k: Ternary,
+    qkv: Linear,
+    o: Linear,
+    rel_k: Linear,
     /// `rel_k` applied to the position table, kept between takes.
     rel_cache: RelCache,
     bias_u: Vec<f32>,
     bias_v: Vec<f32>,
     norm_conv: Norm,
-    pw1: Ternary,
+    pw1: Linear,
     /// Depthwise conv weights as `[tap][channel]`, so a tap is one contiguous row.
     dw_by_tap: Vec<f32>,
     bn_scale: Vec<f32>,
     bn_shift: Vec<f32>,
-    pw2: Ternary,
+    pw2: Linear,
     norm_ff2: Norm,
-    ff2: (Ternary, Ternary),
+    ff2: (Linear, Linear),
     norm_out: Norm,
 }
 
 impl Block {
     fn load(t: &Tensors, c: &Config, index: usize) -> Result<Self, String> {
-        let p = format!("encoder.layers.{index}");
+        let p = format!("{}encoder.layers.{index}", c.prefix);
         let (d, g) = (c.hidden, c.group);
-        let tern =
-            |name: &str, out: usize, inp: usize| ternary(t, &format!("{p}.{name}"), out, inp, g);
+        let layer =
+            |name: &str, out: usize, inp: usize| linear(t, &format!("{p}.{name}"), out, inp, g);
         let mean = t.f32_len(&format!("{p}.conv.norm.running_mean"), d)?;
         let var = t.f32_len(&format!("{p}.conv.norm.running_var"), d)?;
         let weight = t.f32_len(&format!("{p}.conv.norm.weight"), d)?;
@@ -475,22 +477,34 @@ impl Block {
         let bn_scale: Vec<f32> = (0..d)
             .map(|i| weight[i] / (var[i] + BATCH_NORM_EPS).sqrt())
             .collect();
-        let bn_shift = (0..d).map(|i| bias[i] - mean[i] * bn_scale[i]).collect();
+        // A depthwise conv bias `b` adds `b * scale` after the batch norm.
+        let dw_bias = match t.has(&format!("{p}.conv.depthwise_conv.bias")) {
+            true => t.f32_len(&format!("{p}.conv.depthwise_conv.bias"), d)?,
+            false => vec![0.0; d],
+        };
+        let bn_shift = (0..d)
+            .map(|i| bias[i] + (dw_bias[i] - mean[i]) * bn_scale[i])
+            .collect();
         Ok(Self {
             norm_ff1: Norm::load(t, &format!("{p}.norm_feed_forward1"), d)?,
             ff1: (
-                tern("feed_forward1.linear1", c.ff, d)?,
-                tern("feed_forward1.linear2", d, c.ff)?,
+                layer("feed_forward1.linear1", c.ff, d)?,
+                layer("feed_forward1.linear2", d, c.ff)?,
             ),
             norm_att: Norm::load(t, &format!("{p}.norm_self_att"), d)?,
-            qkv: stacked(t, &p, &["q_proj", "k_proj", "v_proj"], (d, d), g)?,
-            o: tern("self_attn.o_proj", d, d)?,
-            rel_k: tern("self_attn.relative_k_proj", d, d)?,
+            qkv: stacked(
+                t,
+                &["q_proj", "k_proj", "v_proj"].map(|n| format!("{p}.self_attn.{n}")),
+                (d, d),
+                g,
+            )?,
+            o: layer("self_attn.o_proj", d, d)?,
+            rel_k: layer("self_attn.relative_k_proj", d, d)?,
             rel_cache: RelCache::default(),
             bias_u: t.f32_len(&format!("{p}.self_attn.bias_u"), d)?,
             bias_v: t.f32_len(&format!("{p}.self_attn.bias_v"), d)?,
             norm_conv: Norm::load(t, &format!("{p}.norm_conv"), d)?,
-            pw1: tern("conv.pointwise_conv1", 2 * d, d)?,
+            pw1: layer("conv.pointwise_conv1", 2 * d, d)?,
             dw_by_tap: {
                 let kernel = c.conv_kernel;
                 let dw = t.f32_len(&format!("{p}.conv.depthwise_conv.weight"), d * kernel)?;
@@ -500,24 +514,24 @@ impl Block {
             },
             bn_scale,
             bn_shift,
-            pw2: tern("conv.pointwise_conv2", d, d)?,
+            pw2: layer("conv.pointwise_conv2", d, d)?,
             norm_ff2: Norm::load(t, &format!("{p}.norm_feed_forward2"), d)?,
             ff2: (
-                tern("feed_forward2.linear1", c.ff, d)?,
-                tern("feed_forward2.linear2", d, c.ff)?,
+                layer("feed_forward2.linear1", c.ff, d)?,
+                layer("feed_forward2.linear2", d, c.ff)?,
             ),
             norm_out: Norm::load(t, &format!("{p}.norm_out"), d)?,
         })
     }
 
-    fn feed_forward((up, down): &(Ternary, Ternary), x: &[f32], frames: usize) -> Buf {
+    fn feed_forward((up, down): &(Linear, Linear), x: &[f32], frames: usize) -> Buf {
         let mut hidden = up.forward(x, frames);
         team::chunks_mut(&mut hidden, 4096, |_, values| activation::silu(values));
         down.forward(&hidden, frames)
     }
 
     fn forward(&self, x: &mut Buf, frames: usize, c: &Config) {
-        let ff = Self::feed_forward(&self.ff1, &self.norm_ff1.apply(x), frames);
+        let ff = Self::feed_forward(&self.ff1, &self.norm_ff1.apply(x, c.hidden), frames);
         let normed = self.norm_att.residual(x, &ff, 0.5);
         let att = self.attention(&normed, frames, c);
         let normed = self.norm_conv.residual(x, &att, 1.0);
@@ -541,23 +555,34 @@ impl Block {
         let mut context = Buf::scratch(t * d);
         let per_head: Vec<Buf> = team::map(heads, |h| {
             let cols = h * hd..(h + 1) * hd;
-            // Columns of head h from a matrix with `stride` values per row.
-            let head =
-                |src: &[f32], stride: usize, offset: usize, rows: usize, bias: Option<&[f32]>| {
-                    let mut out = Vec::with_capacity(rows * hd);
-                    for i in 0..rows {
-                        let row = &src[i * stride + offset..][cols.clone()];
-                        match bias {
-                            Some(b) => out.extend(row.iter().zip(b).map(|(v, b)| v + b)),
-                            None => out.extend_from_slice(row),
-                        }
+            // Columns of head h from a matrix with `stride` values per row,
+            // into `out`, which keeps its memory for the next call.
+            let head = |out: &mut Vec<f32>,
+                        src: &[f32],
+                        stride: usize,
+                        offset: usize,
+                        rows: usize,
+                        bias: Option<&[f32]>| {
+                out.clear();
+                for i in 0..rows {
+                    let row = &src[i * stride + offset..][cols.clone()];
+                    match bias {
+                        Some(b) => out.extend(row.iter().zip(b).map(|(v, b)| v + b)),
+                        None => out.extend_from_slice(row),
                     }
-                    out
-                };
-            let qu = head(&qkv, 3 * d, 0, t, Some(&self.bias_u[cols.clone()]));
-            let qv = head(&qkv, 3 * d, 0, t, Some(&self.bias_v[cols.clone()]));
-            let ac = fgemm::matmul(&qu, t, hd, &head(&qkv, 3 * d, d, t, None), t);
-            let bd = fgemm::matmul(&qv, t, hd, &head(r, d, 0, p, None), p);
+                }
+            };
+            let (ac, bd) = HEADS.with(|heads| {
+                let [qu, qv, k, pos] = &mut *heads.borrow_mut();
+                head(qu, &qkv, 3 * d, 0, t, Some(&self.bias_u[cols.clone()]));
+                head(qv, &qkv, 3 * d, 0, t, Some(&self.bias_v[cols.clone()]));
+                head(k, &qkv, 3 * d, d, t, None);
+                head(pos, r, d, 0, p, None);
+                (
+                    fgemm::matmul(qu, t, hd, &k[..], t),
+                    fgemm::matmul(qv, t, hd, &pos[..], p),
+                )
+            });
             let mut probs = Buf::scratch(t * t);
             for (i, row) in probs.chunks_exact_mut(t).enumerate() {
                 // Column t-1-i+j of the position product is relative position i - j.
@@ -716,6 +741,95 @@ pub struct Parakeet {
     pub config: Config,
     subsampling: Subsampling,
     blocks: Vec<Block>,
+    head: Head,
+    /// The speech head some checkpoints carry (Redux: `vad_head.*`).
+    vad: Option<VadHead>,
+}
+
+/// Speech probability per 80 ms frame from the subsampler output, as
+/// Kestrel runs it: a 1x1 conv to 128, SiLU, a width-5 conv, SiLU, a 1x1
+/// conv to one logit, sigmoid. The subsampler is local, so this costs a
+/// fraction of one encoder layer.
+struct VadHead {
+    proj: Dense,
+    ctx: Dense,
+    out: Dense,
+}
+
+/// Seconds per subsampled frame of the speech head.
+const FRAME_SECONDS: f32 = 0.08;
+/// Shorter gaps between speech join; shorter speech does not count.
+const MIN_GAP_SECONDS: f32 = 0.1;
+const MIN_SPEECH_SECONDS: f32 = 0.1;
+
+impl VadHead {
+    const KERNEL: usize = 5;
+
+    fn load(t: &Tensors, c: &Config) -> Result<Option<Self>, String> {
+        if !t.has("vad_head.proj.weight") {
+            return Ok(None);
+        }
+        let hidden = 128;
+        Ok(Some(Self {
+            proj: Dense::load(t, &[("vad_head.proj", hidden)], c.hidden)?,
+            ctx: Dense::load(t, &[("vad_head.ctx", hidden)], hidden * Self::KERNEL)?,
+            out: Dense::load(t, &[("vad_head.out", 1)], hidden)?,
+        }))
+    }
+
+    /// Whether `t` subsampled frames hold speech: a run of frames with a
+    /// probability of 0.5 or more lasting `MIN_SPEECH_SECONDS`, after gaps
+    /// under `MIN_GAP_SECONDS` are bridged (Kestrel's `speech_regions`).
+    fn speech(&self, x: &[f32], t: usize) -> bool {
+        let mut h = self.proj.forward(x, t);
+        activation::silu(&mut h);
+        let hidden = self.proj.out_features;
+        let cols = crate::models::transformer::conv_columns(
+            &h,
+            (t, hidden),
+            (Self::KERNEL, 1, Self::KERNEL / 2),
+            t,
+        );
+        let mut h = self.ctx.forward(&cols, t);
+        activation::silu(&mut h);
+        let logits = self.out.forward(&h, t);
+        // sigmoid(v) >= 0.5 exactly when v >= 0.
+        let speaking: Vec<bool> = logits.iter().map(|v| *v >= 0.0).collect();
+        let mut regions: Vec<(usize, usize)> = Vec::new();
+        let mut i = 0;
+        while i < t {
+            if !speaking[i] {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i < t && speaking[i] {
+                i += 1;
+            }
+            match regions.last_mut() {
+                Some(last) if (start - last.1) as f32 * FRAME_SECONDS < MIN_GAP_SECONDS => {
+                    last.1 = i
+                }
+                _ => regions.push((start, i)),
+            }
+        }
+        regions
+            .iter()
+            .any(|(start, end)| (end - start) as f32 * FRAME_SECONDS >= MIN_SPEECH_SECONDS)
+    }
+}
+
+/// What turns encoder frames into tokens.
+enum Head {
+    /// Token and duration transducer: LSTM prediction network and joint network.
+    Tdt(Tdt),
+    /// One projection to token logits per frame, greedy with repeats merged.
+    Ctc(Dense),
+    /// No head: the encoder output is the result.
+    Encoder,
+}
+
+struct Tdt {
     encoder_projector: Dense,
     embedding: Vec<f32>,
     lstm: Vec<Lstm>,
@@ -726,10 +840,27 @@ pub struct Parakeet {
 impl Parakeet {
     pub fn load(t: &Tensors, config: Config) -> Result<Self, String> {
         let c = &config;
-        let dh = c.decoder_hidden;
         let blocks = team::map(c.layers, |index| Block::load(t, c, index))
             .into_iter()
             .collect::<Result<Vec<_>, _>>()?;
+        let head = match c.head {
+            HeadKind::Ctc => Head::Ctc(dense(t, "ctc_head", c.vocab, c.hidden, true)?),
+            HeadKind::Tdt => Head::Tdt(Tdt::load(t, c)?),
+            HeadKind::Encoder => Head::Encoder,
+        };
+        Ok(Self {
+            subsampling: Subsampling::load(t, c)?,
+            blocks,
+            head,
+            vad: VadHead::load(t, c)?,
+            config,
+        })
+    }
+}
+
+impl Tdt {
+    fn load(t: &Tensors, c: &Config) -> Result<Self, String> {
+        let dh = c.decoder_hidden;
         let lstm = (0..c.decoder_layers)
             .map(|l| -> Result<Lstm, String> {
                 let b_ih = t.f32_len(&format!("decoder.lstm.bias_ih_l{l}"), 4 * dh)?;
@@ -745,21 +876,40 @@ impl Parakeet {
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
-            subsampling: Subsampling::load(t, c)?,
-            blocks,
             encoder_projector: dense(t, "encoder_projector", dh, c.hidden, true)?,
             embedding: t.f32_len("decoder.embedding.weight", c.vocab * dh)?,
             lstm,
             decoder_projector: half_dense(t, "decoder.decoder_projector", dh, dh)?,
             joint: half_dense(t, "joint.head", c.vocab + c.durations.len(), dh)?,
-            config,
         })
     }
+}
 
+impl Parakeet {
     /// Encoder output after the 24 blocks: `frames x hidden`.
     pub fn encode(&self, features: &[f32], frames: usize) -> (Buf, usize) {
+        let (x, t) = self.subsampling.forward(features, frames, self.config.mels);
+        self.encode_subsampled(x, t)
+    }
+
+    /// `encode`, or `None` when the model's speech head finds no speech
+    /// (a model without one always encodes).
+    pub fn encode_speech(&self, features: &[f32], frames: usize) -> Option<(Buf, usize)> {
+        let (x, t) = self.subsampling.forward(features, frames, self.config.mels);
+        if self.vad.as_ref().is_some_and(|vad| !vad.speech(&x, t)) {
+            return None;
+        }
+        Some(self.encode_subsampled(x, t))
+    }
+
+    fn encode_subsampled(&self, mut x: Buf, t: usize) -> (Buf, usize) {
         let c = &self.config;
-        let (mut x, t) = self.subsampling.forward(features, frames, c.mels);
+        if c.input_scale != 1.0 {
+            let scale = c.input_scale;
+            team::chunks_mut(&mut x, c.hidden, |_, row| {
+                row.iter_mut().for_each(|v| *v *= scale)
+            });
+        }
         for block in &self.blocks {
             block.forward(&mut x, t, c);
         }
@@ -776,12 +926,56 @@ impl Parakeet {
         }
     }
 
-    pub fn project(&self, encoded: &[f32], t: usize) -> Buf {
-        self.encoder_projector.forward(encoded, t)
+    /// Tokens of the encoder output `t x hidden`, each with the encoder
+    /// frame it was emitted at. `bias` boosts dictionary terms (TDT only);
+    /// `banned` tokens are never picked.
+    pub fn decode(
+        &self,
+        encoded: &[f32],
+        t: usize,
+        bias: Option<&Bias>,
+        banned: &[usize],
+    ) -> (Vec<usize>, Vec<usize>) {
+        let c = &self.config;
+        match &self.head {
+            Head::Tdt(tdt) => {
+                let projected = tdt.encoder_projector.forward(encoded, t);
+                tdt.decode(c, &projected, t, bias, banned)
+            }
+            Head::Ctc(head) => ctc_greedy(&head.forward(encoded, t), c.vocab, c.blank, banned),
+            Head::Encoder => (Vec::new(), Vec::new()),
+        }
     }
+}
 
-    fn decoder_step(&self, token: usize, state: &mut DecoderState) -> Buf {
-        let dh = self.config.decoder_hidden;
+/// Greedy CTC: the best token per frame, repeats merged, blanks dropped.
+fn ctc_greedy(
+    logits: &[f32],
+    vocab: usize,
+    blank: usize,
+    banned: &[usize],
+) -> (Vec<usize>, Vec<usize>) {
+    let mut tokens = Vec::new();
+    let mut frames = Vec::new();
+    let mut previous = blank;
+    for (index, frame) in logits.chunks_exact(vocab).enumerate() {
+        let mut row = frame.to_vec();
+        for &id in banned {
+            row[id] = f32::NEG_INFINITY;
+        }
+        let token = argmax(&row);
+        if token != blank && token != previous {
+            tokens.push(token);
+            frames.push(index);
+        }
+        previous = token;
+    }
+    (tokens, frames)
+}
+
+impl Tdt {
+    fn decoder_step(&self, c: &Config, token: usize, state: &mut DecoderState) -> Buf {
+        let dh = c.decoder_hidden;
         let mut input = self.embedding[token * dh..(token + 1) * dh].to_vec();
         let mut joined = vec![0.0f32; 2 * dh];
         for (layer, lstm) in self.lstm.iter().enumerate() {
@@ -812,23 +1006,24 @@ impl Parakeet {
     }
 
     /// Greedy TDT decoding over projected encoder frames (`t x decoder_hidden`).
-    /// `bias` boosts dictionary terms; see `bias.rs`. `banned` tokens are
-    /// never picked.
-    pub fn decode(
+    /// `bias` boosts dictionary terms; see `bias.rs`.
+    fn decode(
         &self,
+        c: &Config,
         projected: &[f32],
         t: usize,
         bias: Option<&Bias>,
         banned: &[usize],
-    ) -> Vec<usize> {
-        let c = &self.config;
+    ) -> (Vec<usize>, Vec<usize>) {
         let dh = c.decoder_hidden;
         let mut state = DecoderState {
             hidden: vec![vec![0.0; dh]; c.decoder_layers],
             cell: vec![vec![0.0; dh]; c.decoder_layers],
         };
-        let mut dec = self.decoder_step(c.blank, &mut state);
+        let mut dec = self.decoder_step(c, c.blank, &mut state);
         let mut tokens = Vec::new();
+        // The frame of each token; a rewritten term takes the frame of its start.
+        let mut frames: Vec<usize> = Vec::new();
         let (mut frame, mut symbols) = (0usize, 0usize);
         let mut joint_in = vec![0.0f32; dh];
         let mut matched = BiasState::default();
@@ -859,12 +1054,15 @@ impl Parakeet {
                     // rewritten only when the next word starts.
                     if let Some((span, written)) = pending.take() {
                         if bias.starts_word(token) {
+                            let at = frames[span.start];
+                            frames.splice(span.clone(), std::iter::repeat_n(at, written.len()));
                             tokens.splice(span, written);
                         }
                     }
                     let fresh = matched == BiasState::default();
                     decisive = (decisive && !fresh) || token != own;
                     tokens.push(token);
+                    frames.push(frame);
                     let (next, completion) = bias.advance(matched, token);
                     matched = next;
                     if let Some(done) = completion {
@@ -875,8 +1073,9 @@ impl Parakeet {
                     }
                 } else {
                     tokens.push(token);
+                    frames.push(frame);
                 }
-                dec = self.decoder_step(token, &mut state);
+                dec = self.decoder_step(c, token, &mut state);
                 symbols += 1;
                 if duration == 0 && symbols >= c.max_symbols {
                     duration = 1;
@@ -888,9 +1087,11 @@ impl Parakeet {
             frame += duration;
         }
         if let Some((span, written)) = pending {
+            let at = frames[span.start];
+            frames.splice(span.clone(), std::iter::repeat_n(at, written.len()));
             tokens.splice(span, written);
         }
-        tokens
+        (tokens, frames)
     }
 }
 

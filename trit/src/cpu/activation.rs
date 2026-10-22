@@ -1,4 +1,4 @@
-//! Element-wise exp, SiLU, sigmoid, and tanh on whole slices. The Windows target
+//! Element-wise exp, SiLU, sigmoid, tanh, and GELU on whole slices. The Windows target
 //! has no vector math library, so `f32::exp` runs one value at a time. These
 //! run one polynomial (Cephes `expf`, within about 2 ulp) on 16 or 8 lanes,
 //! and the scalar path runs the same polynomial.
@@ -12,6 +12,22 @@ const LN2_LO: f32 = -2.121_944_4e-4;
 /// `exp` of these stays a normal f32, and `n` stays in -126..=127.
 const LOW: f32 = -87.3;
 const HIGH: f32 = 88.0;
+/// `erfc(z) = t * exp(-z^2 + P(t))`, `t = 1 / (1 + z / 2)`, for `z >= 0`:
+/// Numerical Recipes' `erfcc`, within 1.2e-7 relative everywhere, so GELU
+/// stays exact also where `x` is far below 0 and `erfc` is small.
+const ERFC: [f32; 10] = [
+    0.170_872_77,
+    -0.822_152_23,
+    1.488_515_9,
+    -1.135_204,
+    0.278_868_07,
+    -0.186_288_06,
+    0.096_784_18,
+    0.374_091_96,
+    1.000_023_7,
+    -1.265_512_2,
+];
+const FRAC_1_SQRT_2: f32 = std::f32::consts::FRAC_1_SQRT_2;
 const POLY: [f32; 6] = [
     1.987_569_1e-4,
     1.398_199_9e-3,
@@ -27,6 +43,7 @@ enum Op {
     Silu,
     Sigmoid,
     Tanh,
+    Gelu,
 }
 
 /// `v = e^v`.
@@ -49,6 +66,12 @@ pub fn tanh(values: &mut [f32]) {
     apply(values, Op::Tanh);
 }
 
+/// `v = v * (1 + erf(v / sqrt 2)) / 2`, the exact GELU (PyTorch's default),
+/// as `v * erfc(-v / sqrt 2) / 2`.
+pub fn gelu(values: &mut [f32]) {
+    apply(values, Op::Gelu);
+}
+
 fn apply(values: &mut [f32], op: Op) {
     match level() {
         #[cfg(target_arch = "x86_64")]
@@ -67,6 +90,13 @@ fn scalar(v: f32, op: Op) -> f32 {
         Op::Silu => v / (1.0 + exp_scalar(-v)),
         Op::Sigmoid => 1.0 / (1.0 + exp_scalar(-v)),
         Op::Tanh => 2.0 / (1.0 + exp_scalar(-2.0 * v)) - 1.0,
+        Op::Gelu => {
+            let z = v.abs() * FRAC_1_SQRT_2;
+            let t = 1.0 / (1.0 + 0.5 * z);
+            let p = ERFC.iter().fold(0.0f32, |p, c| p * t + c);
+            let tail = t * exp_scalar(p - z * z);
+            0.5 * v * if v >= 0.0 { 2.0 - tail } else { tail }
+        }
     }
 }
 
@@ -81,7 +111,7 @@ fn exp_scalar(x: f32) -> f32 {
 
 #[cfg(target_arch = "x86_64")]
 mod avx512 {
-    use super::{Op, HIGH, LN2_HI, LN2_LO, LOG2E, LOW, POLY};
+    use super::{Op, ERFC, FRAC_1_SQRT_2, HIGH, LN2_HI, LN2_LO, LOG2E, LOW, POLY};
     use std::arch::x86_64::*;
 
     #[target_feature(enable = "avx512f")]
@@ -109,6 +139,19 @@ mod avx512 {
                 let two = _mm512_set1_ps(2.0);
                 let e = exp(neg(_mm512_mul_ps(two, v)));
                 _mm512_sub_ps(_mm512_div_ps(two, _mm512_add_ps(one, e)), one)
+            }
+            Op::Gelu => {
+                let z = _mm512_mul_ps(_mm512_abs_ps(v), _mm512_set1_ps(FRAC_1_SQRT_2));
+                let t = _mm512_div_ps(one, _mm512_fmadd_ps(z, _mm512_set1_ps(0.5), one));
+                let mut p = _mm512_setzero_ps();
+                for c in ERFC {
+                    p = _mm512_fmadd_ps(p, t, _mm512_set1_ps(c));
+                }
+                let tail = _mm512_mul_ps(t, exp(_mm512_fnmadd_ps(z, z, p)));
+                let positive = _mm512_cmp_ps_mask::<_CMP_GE_OQ>(v, _mm512_setzero_ps());
+                let erfc =
+                    _mm512_mask_blend_ps(positive, tail, _mm512_sub_ps(_mm512_set1_ps(2.0), tail));
+                _mm512_mul_ps(_mm512_mul_ps(_mm512_set1_ps(0.5), v), erfc)
             }
         }
     }
@@ -141,7 +184,7 @@ mod avx512 {
 
 #[cfg(target_arch = "x86_64")]
 mod avx2 {
-    use super::{Op, HIGH, LN2_HI, LN2_LO, LOG2E, LOW, POLY};
+    use super::{Op, ERFC, FRAC_1_SQRT_2, HIGH, LN2_HI, LN2_LO, LOG2E, LOW, POLY};
     use std::arch::x86_64::*;
 
     #[target_feature(enable = "avx2,fma")]
@@ -173,6 +216,20 @@ mod avx2 {
                 let two = _mm256_set1_ps(2.0);
                 let e = exp(neg(_mm256_mul_ps(two, v)));
                 _mm256_sub_ps(_mm256_div_ps(two, _mm256_add_ps(one, e)), one)
+            }
+            Op::Gelu => {
+                let abs = _mm256_andnot_ps(_mm256_set1_ps(-0.0), v);
+                let z = _mm256_mul_ps(abs, _mm256_set1_ps(FRAC_1_SQRT_2));
+                let t = _mm256_div_ps(one, _mm256_fmadd_ps(z, _mm256_set1_ps(0.5), one));
+                let mut p = _mm256_setzero_ps();
+                for c in ERFC {
+                    p = _mm256_fmadd_ps(p, t, _mm256_set1_ps(c));
+                }
+                let tail = _mm256_mul_ps(t, exp(_mm256_fnmadd_ps(z, z, p)));
+                let positive = _mm256_cmp_ps::<_CMP_GE_OQ>(v, _mm256_setzero_ps());
+                let erfc =
+                    _mm256_blendv_ps(tail, _mm256_sub_ps(_mm256_set1_ps(2.0), tail), positive);
+                _mm256_mul_ps(_mm256_mul_ps(_mm256_set1_ps(0.5), v), erfc)
             }
         }
     }

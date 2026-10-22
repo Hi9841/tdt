@@ -87,12 +87,25 @@ fn previous_foreground() -> &'static parking_lot::Mutex<Option<isize>> {
 
 /// Opens a file with its default program, for example a text file in the user's editor.
 pub fn open_file(path: &std::path::Path) -> Result<(), String> {
+    // ShellExecute runs a message loop while it starts the handler. On the UI
+    // thread that loop would run GPUI tasks inside the current update and
+    // panic with "RefCell already borrowed", so it runs on its own thread.
+    let path = path.to_path_buf();
+    std::thread::spawn(move || shell_open(&path))
+        .join()
+        .unwrap_or_else(|_| Err("Windows could not open the file".into()))
+}
+
+fn shell_open(path: &std::path::Path) -> Result<(), String> {
     use std::os::windows::ffi::OsStrExt;
     use windows::core::PCWSTR;
+    use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
     use windows::Win32::UI::Shell::ShellExecuteW;
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
     let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
     let verb: Vec<u16> = "open\0".encode_utf16().collect();
+    // SAFETY: ShellExecute wants COM on its thread; this thread is ours alone.
+    let com = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.is_ok();
     // SAFETY: both strings are null-terminated and live until the call returns.
     let result = unsafe {
         ShellExecuteW(
@@ -104,6 +117,10 @@ pub fn open_file(path: &std::path::Path) -> Result<(), String> {
             SW_SHOWNORMAL,
         )
     };
+    if com {
+        // SAFETY: balances the successful CoInitializeEx above.
+        unsafe { CoUninitialize() };
+    }
     // ShellExecute reports success with a value above 32.
     if result.0 as isize > 32 {
         Ok(())

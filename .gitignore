@@ -1,11 +1,14 @@
 # Build
 desktop/target/
+trit/target/
+trit/bindings/node/node_modules/
 packaging/tdt-setup/target/
 dist/
 *.pdb
 
 # Models (download with models/download-models.ps1)
 models/*/
+trit/models/
 models/**/*.download
 
 # Logs
@@ -18,3 +21,10 @@ __pycache__/
 Thumbs.db
 Desktop.ini
 .DS_Store
+
+# Working plans of agents
+.plan/
+
+# OpLoop: the pristine baseline and built libraries (rebuilt from the patches)
+oploop/baseline/
+oploop/results/*.dll
