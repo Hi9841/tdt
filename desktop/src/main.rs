@@ -118,10 +118,13 @@ fn main() {
             "{msg}\n{}",
             std::backtrace::Backtrace::force_capture()
         ));
-        // Best effort: a panic here would abort without a useful log.
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            show_error(&msg);
-        }));
+        // MessageBox runs a message loop. On the UI thread that loop would run
+        // GPUI tasks while the panicked update still holds the app, and a
+        // second panic there aborts before the user sees the dialog. So the
+        // dialog gets its own thread.
+        if let Ok(dialog) = std::thread::Builder::new().spawn(move || show_error(&msg)) {
+            let _ = dialog.join();
+        }
         // A crashed process that stays open holds the single-instance claim,
         // so the next start would do nothing.
         exit_now(1);
@@ -895,7 +898,7 @@ fn main() {
                             no_speech_at = None;
                         }
 
-                        let _ = this.update(cx, |view, cx| {
+                        let tray_state = this.update(cx, |view, cx| {
                             if !preview::is_active() {
                                 if let Some(copied_at) = view.copied_at {
                                     if copied_at.elapsed() > Duration::from_millis(1400) {
@@ -938,10 +941,17 @@ fn main() {
                                 }
                                 HudStatus::NoSpeech | HudStatus::Error { .. } | HudStatus::Idle => {}
                             }
-                            if let Some(tray) = tray.as_mut() {
-                                tray.update(&view.status, &view.hotkey_label);
-                            }
+                            tray.is_some()
+                                .then(|| (view.status.clone(), view.hotkey_label.clone()))
                         });
+                        // A tooltip change waits on Explorer, and during that wait
+                        // Windows delivers tray clicks to the tray window. A right
+                        // click opens the tray menu, whose message loop runs GPUI
+                        // tasks. Inside an update they would panic ("RefCell
+                        // already borrowed"), so update the tray between updates.
+                        if let (Some(tray), Ok(Some((status, hotkey)))) = (tray.as_mut(), tray_state) {
+                            tray.update(&status, &hotkey);
+                        }
                     }
                 })
                 .detach();
@@ -1204,7 +1214,7 @@ fn append_log(message: &str) {
                 }
             }
         }
-        let _ = writeln!(file, "{message}");
+        let _ = writeln!(file, "{} {message}", config::local_hms());
     }
 }
 
