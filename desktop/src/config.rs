@@ -64,6 +64,8 @@ pub struct AppConfig {
     pub auto_paste: bool,
     /// Drop "um", "uh", and similar sounds from transcripts.
     pub remove_fillers: bool,
+    /// Look for a new release at start, every hour, and when the panel opens.
+    pub check_updates: bool,
     pub hotkey: String,
     pub model_dir: Option<PathBuf>,
     pub model_id: String,
@@ -74,6 +76,7 @@ impl Default for AppConfig {
         Self {
             auto_paste: true,
             remove_fillers: true,
+            check_updates: true,
             hotkey: "Ctrl+;".to_string(),
             model_dir: None,
             model_id: voice_stt_desktop::stt::DEFAULT_MODEL_ID.to_string(),

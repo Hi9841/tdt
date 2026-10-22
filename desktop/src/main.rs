@@ -154,6 +154,7 @@ fn main() {
     }
     let auto_paste = config.auto_paste;
     let remove_fillers_state = Arc::new(AtomicBool::new(config.remove_fillers));
+    update::set_auto_checks(config.check_updates);
     let hotkey_binding = HotkeyBinding::parse(&config.hotkey).unwrap_or_else(|| {
         eprintln!(
             "Could not parse the configured hotkey '{}'; using the default.",
