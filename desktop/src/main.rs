@@ -141,7 +141,8 @@ fn main() {
         })
     };
     if !preview::is_active() {
-        autostart::refresh_if_enabled();
+        // Task Scheduler calls are slow enough to delay the first window.
+        std::thread::spawn(autostart::refresh_if_enabled);
         update::remove_downloaded_setups();
     }
 

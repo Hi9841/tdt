@@ -1,26 +1,41 @@
 //! Per-user "start with Windows".
 //!
-//! Task Manager's Startup list is filled from the user Startup folder and the
-//! HKCU Run key. The toggle writes a Startup-folder shortcut (working
-//! directory set to the exe folder) and enables the matching StartupApproved
-//! value so Windows does not keep a leftover Disabled state. If the shortcut
-//! cannot be created, it falls back to the Run key. Never both, so logon
-//! does not launch TDT twice.
+//! The toggle registers a Task Scheduler task that starts TDT when this user
+//! signs in. Explorer starts Run-key and Startup-folder apps one at a time
+//! and waits for each, so it can reach TDT minutes after sign-in; the task
+//! does not wait in that queue.
+//!
+//! If the task cannot be registered, the toggle writes a Startup-folder
+//! shortcut (working directory set to the exe folder), then the HKCU Run key,
+//! and enables the matching StartupApproved value so Windows does not keep a
+//! leftover Disabled state. Only one of the three exists at a time, so logon
+//! does not launch TDT twice. TDT 0.4.2 and older used only the shortcut and
+//! the Run key; the first start of a newer TDT moves them to the task.
 
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-use windows::core::{Interface, HSTRING, PCWSTR};
-use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, TRUE};
+use windows::core::{Interface, BSTR, HSTRING, PCWSTR, PWSTR, VARIANT};
+use windows::Win32::Foundation::{
+    CloseHandle, LocalFree, E_FAIL, ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, HANDLE, HLOCAL, TRUE,
+};
+use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
+use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
 use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, IPersistFile, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
+    CoCreateInstance, CoInitializeEx, CoUninitialize, IPersistFile, CLSCTX_INPROC_SERVER,
+    COINIT_APARTMENTTHREADED,
 };
 use windows::Win32::System::Registry::{
     RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
     HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_BINARY, REG_OPTION_NON_VOLATILE,
     REG_SZ,
 };
+use windows::Win32::System::TaskScheduler::{
+    IExecAction, ITaskFolder, ITaskService, TaskScheduler, TASK_CREATE_OR_UPDATE,
+    TASK_LOGON_INTERACTIVE_TOKEN,
+};
+use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows::Win32::UI::Shell::{
     IShellLinkW, SHChangeNotify, ShellLink, SHCNE_CREATE, SHCNE_DELETE, SHCNE_UPDATEDIR,
     SHCNF_PATHW,
@@ -33,11 +48,20 @@ const APPROVED_FOLDER: &str =
     "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\StartupFolder";
 const VALUE_NAME: &str = "TDT";
 const SHORTCUT_NAME: &str = "TDT.lnk";
+/// Task names are machine-wide, so each user gets their own task.
+const TASK_PREFIX: &str = "TDT Startup ";
 /// Windows 8+ enabled blob: 0x02, then 11 zero bytes.
 const APPROVED_ENABLED: [u8; 12] = [0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
 
-/// True when TDT will launch at sign-in and Task Manager does not have it Disabled.
+/// True when TDT will launch at sign-in and the user has not disabled it.
 pub fn is_enabled() -> bool {
+    match read_task() {
+        Some(task) => task.enabled,
+        None => legacy_enabled(),
+    }
+}
+
+fn legacy_enabled() -> bool {
     let shortcut = shortcut_path();
     if !shortcut.as_os_str().is_empty()
         && shortcut.exists()
@@ -48,64 +72,30 @@ pub fn is_enabled() -> bool {
     read_value_exists(RUN_SUBKEY, VALUE_NAME) && !is_approved_disabled(APPROVED_RUN, VALUE_NAME)
 }
 
-/// Keep the Startup shortcut aimed at this TDT.exe after an update or move.
+/// Keep startup aimed at this TDT.exe after an update or move, and move an
+/// older shortcut or Run value to the task.
 pub fn refresh_if_enabled() {
-    if !is_enabled() {
-        return;
-    }
     let Ok(exe) = current_tdt_exe() else {
         return;
     };
     if !is_tdt_exe_name(&exe) {
         return;
     }
-    let shortcut = shortcut_path();
-    if shortcut.as_os_str().is_empty() {
-        return;
+    let needs_update = match read_task() {
+        Some(task) => task.enabled && !same_path(&task.exe, &exe),
+        // An older shortcut or Run value moves to the task. If the task still
+        // cannot be registered, this rewrites the fallback, which is cheap.
+        None => legacy_enabled(),
+    };
+    if needs_update {
+        let _ = enable_startup();
     }
-    let unchanged = shortcut_target(&shortcut)
-        .is_some_and(|target| target.eq_ignore_ascii_case(&exe.to_string_lossy()));
-    if unchanged {
-        return;
-    }
-    let _ = enable_startup();
 }
 
-fn shortcut_target(path: &Path) -> Option<String> {
-    if !path.exists() {
-        return None;
-    }
-    let path = path.to_path_buf();
-    std::thread::spawn(move || {
-        if unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.is_err() {
-            return None;
-        }
-        let target = unsafe {
-            let link: IShellLinkW =
-                CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).ok()?;
-            let persist: IPersistFile = link.cast().ok()?;
-            persist
-                .Load(
-                    &HSTRING::from(path.to_string_lossy().as_ref()),
-                    windows::Win32::System::Com::STGM_READ,
-                )
-                .ok()?;
-            let mut buffer = [0u16; 260];
-            link.GetPath(
-                &mut buffer,
-                std::ptr::null_mut(),
-                windows::Win32::UI::Shell::SLGP_RAWPATH.0 as u32,
-            )
-            .ok()?;
-            let len = buffer.iter().position(|&c| c == 0).unwrap_or(buffer.len());
-            Some(String::from_utf16_lossy(&buffer[..len]))
-        };
-        unsafe { windows::Win32::System::Com::CoUninitialize() };
-        target
-    })
-    .join()
-    .ok()
-    .flatten()
+fn same_path(stored: &str, exe: &Path) -> bool {
+    stored
+        .trim_matches('"')
+        .eq_ignore_ascii_case(&exe.to_string_lossy())
 }
 
 fn is_tdt_exe_name(path: &Path) -> bool {
@@ -125,13 +115,37 @@ pub fn set_enabled(enable: bool) -> Result<(), String> {
 
 fn enable_startup() -> Result<(), String> {
     let exe = current_tdt_exe()?;
+    match register_task(&exe) {
+        Ok(()) => {
+            // A leftover shortcut would only start a second TDT, which quits
+            // at once because one already runs, so this is best effort.
+            let _ = remove_legacy();
+            Ok(())
+        }
+        Err(task_error) => {
+            enable_legacy(&exe).map_err(|legacy_error| format!("{task_error}. {legacy_error}"))
+        }
+    }
+}
+
+fn disable_startup() -> Result<(), String> {
+    let task = delete_task();
+    let legacy = remove_legacy();
+    match (task, legacy) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(task_error), Err(legacy_error)) => Err(format!("{task_error}. {legacy_error}")),
+    }
+}
+
+fn enable_legacy(exe: &Path) -> Result<(), String> {
     let lnk = shortcut_path();
     // A claimed-successful write that left no file must fall back to the Run
     // key, not silently report enabled.
     let shortcut_result = if lnk.as_os_str().is_empty() {
         Err("Could not find the Startup folder.".into())
     } else {
-        write_shortcut(&exe, &lnk).and_then(|_| {
+        write_shortcut(exe, &lnk).and_then(|_| {
             if lnk.is_file() {
                 Ok(())
             } else {
@@ -156,7 +170,7 @@ fn enable_startup() -> Result<(), String> {
             if !lnk.as_os_str().is_empty() {
                 let _ = remove_shortcut(&lnk);
             }
-            match write_run_key(&exe) {
+            match write_run_key(exe) {
                 Ok(()) => {
                     write_approved(APPROVED_RUN, VALUE_NAME)?;
                     Ok(())
@@ -167,7 +181,7 @@ fn enable_startup() -> Result<(), String> {
     }
 }
 
-fn disable_startup() -> Result<(), String> {
+fn remove_legacy() -> Result<(), String> {
     let mut errors = Vec::new();
     let shortcut = shortcut_path();
     if !shortcut.as_os_str().is_empty() {
@@ -188,6 +202,149 @@ fn disable_startup() -> Result<(), String> {
         Ok(())
     } else {
         Err(errors.join(". "))
+    }
+}
+
+struct StartupTask {
+    enabled: bool,
+    exe: String,
+}
+
+fn task_name() -> Result<String, String> {
+    current_user_sid()
+        .map(|sid| format!("{TASK_PREFIX}{sid}"))
+        .ok_or_else(|| "Could not read the Windows user for the startup task.".into())
+}
+
+/// Runs `work` against the Task Scheduler root folder on a fresh COM thread.
+fn with_task_folder<T: Send + 'static>(
+    work: impl FnOnce(&ITaskFolder) -> windows::core::Result<T> + Send + 'static,
+) -> windows::core::Result<T> {
+    std::thread::spawn(move || unsafe {
+        CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
+        let result = (|| {
+            let service: ITaskService =
+                CoCreateInstance(&TaskScheduler, None, CLSCTX_INPROC_SERVER)?;
+            let none = VARIANT::default();
+            service.Connect(&none, &none, &none, &none)?;
+            work(&service.GetFolder(&BSTR::from("\\"))?)
+        })();
+        CoUninitialize();
+        result
+    })
+    .join()
+    .unwrap_or_else(|_| Err(E_FAIL.into()))
+}
+
+/// None when this user has no startup task.
+fn read_task() -> Option<StartupTask> {
+    let name = task_name().ok()?;
+    with_task_folder(move |folder| unsafe {
+        let task = folder.GetTask(&BSTR::from(name))?;
+        let action: IExecAction = task.Definition()?.Actions()?.get_Item(1)?.cast()?;
+        let mut exe = BSTR::new();
+        action.Path(&mut exe)?;
+        Ok(StartupTask {
+            enabled: task.Enabled()?.as_bool(),
+            exe: exe.to_string(),
+        })
+    })
+    .ok()
+}
+
+fn register_task(exe: &Path) -> Result<(), String> {
+    let name = task_name()?;
+    let sid = current_user_sid().unwrap_or_default();
+    let workdir = exe.parent().unwrap_or(exe);
+    // InteractiveToken runs TDT in the user's desktop session without a
+    // stored password. Priority 4 keeps normal CPU and I/O priority; the
+    // default 7 runs below normal. The time limit PT0S means no limit.
+    let xml = format!(
+        r#"<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo><Description>Starts TDT when you sign in.</Description></RegistrationInfo>
+  <Triggers><LogonTrigger><UserId>{sid}</UserId></LogonTrigger></Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>{sid}</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>4</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>{}</Command>
+      <WorkingDirectory>{}</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>"#,
+        xml_text(&exe.to_string_lossy()),
+        xml_text(&workdir.to_string_lossy()),
+    );
+    with_task_folder(move |folder| unsafe {
+        let none = VARIANT::default();
+        folder
+            .RegisterTask(
+                &BSTR::from(name),
+                &BSTR::from(xml),
+                TASK_CREATE_OR_UPDATE.0,
+                &none,
+                &none,
+                TASK_LOGON_INTERACTIVE_TOKEN,
+                &none,
+            )
+            .map(|_| ())
+    })
+    .map_err(|error| format!("Could not register the startup task: {error}"))
+}
+
+fn delete_task() -> Result<(), String> {
+    let name = task_name()?;
+    with_task_folder(move |folder| unsafe {
+        match folder.DeleteTask(&BSTR::from(name), 0) {
+            Err(error) if error.code() == ERROR_FILE_NOT_FOUND.to_hresult() => Ok(()),
+            other => other,
+        }
+    })
+    .map_err(|error| format!("Could not remove the startup task: {error}"))
+}
+
+fn xml_text(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// The user's SID, such as S-1-5-21-...-1001. The task trigger and principal
+/// need it, and it makes the task name unique on a shared computer.
+fn current_user_sid() -> Option<String> {
+    unsafe {
+        let mut token = HANDLE::default();
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).ok()?;
+        let mut buffer = [0u64; 32];
+        let mut len = 0u32;
+        let read = GetTokenInformation(
+            token,
+            TokenUser,
+            Some(buffer.as_mut_ptr().cast()),
+            std::mem::size_of_val(&buffer) as u32,
+            &mut len,
+        );
+        let _ = CloseHandle(token);
+        read.ok()?;
+        let user = &*(buffer.as_ptr() as *const TOKEN_USER);
+        let mut text = PWSTR::null();
+        ConvertSidToStringSidW(user.User.Sid, &mut text).ok()?;
+        let sid = text.to_string().ok();
+        let _ = LocalFree(HLOCAL(text.0.cast()));
+        sid
     }
 }
 
@@ -289,7 +446,7 @@ fn write_shortcut_sta(exe: &Path, path: &Path) -> Result<(), String> {
         }
         Ok(())
     })();
-    unsafe { windows::Win32::System::Com::CoUninitialize() };
+    unsafe { CoUninitialize() };
     result?;
     notify_path(path, SHCNE_CREATE);
     Ok(())

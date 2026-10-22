@@ -1,6 +1,6 @@
 [package]
 name = "tdt-setup"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 license = "PolyForm-Noncommercial-1.0.0"
 publish = false
@@ -19,6 +19,7 @@ sha2 = "0.10"
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_Security_Authorization",
     "Win32_System_Com",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Registry",

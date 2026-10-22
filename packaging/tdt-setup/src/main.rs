@@ -40,6 +40,8 @@ const APPROVED_RUN: &str =
     r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run";
 const APPROVED_FOLDER: &str =
     r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder";
+/// TDT's startup task is this prefix plus the user's SID.
+const TASK_PREFIX: &str = "TDT Startup ";
 /// The single-instance mutex that a running TDT.exe holds.
 const INSTANCE_MUTEX: PCWSTR = w!("Local\\TDT-TalkDontType");
 /// Files that older TDT versions left in the install folder.
@@ -158,6 +160,12 @@ fn uninstall(silent: bool) -> Result<(), String> {
     }
     unsafe {
         let _ = RegDeleteTreeW(HKEY_CURRENT_USER, &HSTRING::from(UNINSTALL_KEY));
+    }
+    if let Some(sid) = current_user_sid() {
+        let _ = Command::new("schtasks.exe")
+            .args(["/Delete", "/F", "/TN", &format!("{TASK_PREFIX}{sid}")])
+            .creation_flags(CREATE_NO_WINDOW)
+            .status();
     }
 
     let me = std::env::current_exe().ok();
@@ -442,6 +450,36 @@ fn known_folder(id: &GUID) -> Result<PathBuf, String> {
         windows::Win32::System::Com::CoTaskMemFree(Some(path.as_ptr() as *const _));
         text.map(PathBuf::from)
             .map_err(|_| "Could not read a Windows folder path".to_string())
+    }
+}
+
+/// The user's SID, such as S-1-5-21-...-1001. TDT names its task with it.
+fn current_user_sid() -> Option<String> {
+    use windows::core::PWSTR;
+    use windows::Win32::Foundation::{LocalFree, HANDLE, HLOCAL};
+    use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    unsafe {
+        let mut token = HANDLE::default();
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).ok()?;
+        let mut buffer = [0u64; 32];
+        let mut len = 0u32;
+        let read = GetTokenInformation(
+            token,
+            TokenUser,
+            Some(buffer.as_mut_ptr().cast()),
+            std::mem::size_of_val(&buffer) as u32,
+            &mut len,
+        );
+        let _ = CloseHandle(token);
+        read.ok()?;
+        let user = &*(buffer.as_ptr() as *const TOKEN_USER);
+        let mut text = PWSTR::null();
+        ConvertSidToStringSidW(user.User.Sid, &mut text).ok()?;
+        let sid = text.to_string().ok();
+        let _ = LocalFree(HLOCAL(text.0.cast()));
+        sid
     }
 }
 
