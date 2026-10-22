@@ -186,7 +186,7 @@ fn main() {
         std::thread::spawn(prewarm);
         match AudioRecorder::new() {
             Ok(recorder) => {
-                append_log(&format!("Microphone: {}", recorder.device_name()));
+                append_log(&format!("Microphone: {}", recorder.describe()));
                 (Some(recorder), None)
             }
             Err(error) => (
@@ -437,6 +437,7 @@ fn main() {
                             let _ = this.update(cx, |view, cx| {
                                 match opened {
                                     Some(Ok(recorder)) => {
+                                        append_log(&format!("Microphone: {}", recorder.describe()));
                                         *rec.borrow_mut() = Some(recorder);
                                         view.status = HudStatus::Idle;
                                         view.recovery_message = None;
@@ -618,20 +619,15 @@ fn main() {
                                             });
                                             continue;
                                         }
-                                        let reopen = {
-                                            let borrowed = rec.borrow();
-                                            borrowed.as_ref().is_some_and(|recorder| {
-                                                recorder.needs_reopen()
-                                                    || recorder.take_error().is_some()
-                                            })
-                                        };
-                                        if rec.borrow().is_none() || reopen {
+                                        let reopen = rec.borrow().as_ref().and_then(AudioRecorder::reopen_reason);
+                                        if rec.borrow().is_none() || reopen.is_some() {
                                             *rec.borrow_mut() = None;
                                             match AudioRecorder::new() {
                                                 Ok(recorder) => {
+                                                    let reason = reopen.map(|reason| format!(", opened again: {reason}")).unwrap_or_default();
                                                     append_log(&format!(
-                                                        "Microphone: {}",
-                                                        recorder.device_name()
+                                                        "Microphone: {}{reason}",
+                                                        recorder.describe()
                                                     ));
                                                     *rec.borrow_mut() = Some(recorder);
                                                 }

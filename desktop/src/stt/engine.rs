@@ -190,29 +190,51 @@ impl SttEngine {
 const SPEECH_FRAME_SAMPLES: usize = 400;
 /// A syllable at this level ticks the wave and still comes back empty.
 const VISIBLE_FRAME_RMS: f32 = 0.0015;
+/// Speech frames are 15 dB or more over the noise floor of the same take.
+/// Steady noise and hum stay near their floor at any level.
+const SPEECH_OVER_FLOOR: f32 = 5.6;
+/// 200 ms of speech frames in the take. A single click is not a phrase.
+const MIN_SPEECH_FRAMES: usize = 8;
+/// 150 ms of speech frames in one run, as in a voiced syllable. Key clicks
+/// are shorter, even fast typing.
+const MIN_VOICED_RUN: usize = 6;
 const BOOST_TARGET_RMS: f32 = 0.05;
 const BOOST_MAX_GAIN: f32 = 24.0;
 
-/// Amplify a take whose bars are visible but whose level is too low for Parakeet.
-/// `None` for silence, a short blip, or audio that is already loud enough.
+/// Amplify a take whose speech is visible but too quiet for Parakeet.
+/// `None` for silence, steady noise or hum, clicks, a short blip, or audio
+/// that is already loud enough. Amplified noise makes the model write words
+/// that nobody said, so the take must show speech over its own noise floor.
 pub(crate) fn boost_quiet_speech(samples: &[f32]) -> Option<Vec<f32>> {
-    let mut audible = Vec::new();
-    for frame in samples.chunks(SPEECH_FRAME_SAMPLES) {
-        if frame.len() < SPEECH_FRAME_SAMPLES / 2 {
-            continue;
-        }
-        let level = frame_rms(frame);
-        if level >= VISIBLE_FRAME_RMS {
-            audible.push(level);
-        }
-    }
-    // 200 ms of audible frames. A single click is not a phrase.
-    const MIN_AUDIBLE_FRAMES: usize = 8;
-    if audible.len() < MIN_AUDIBLE_FRAMES {
+    let levels: Vec<f32> = samples
+        .as_chunks::<SPEECH_FRAME_SAMPLES>()
+        .0
+        .iter()
+        .map(|frame| frame_rms(frame))
+        .collect();
+    if levels.len() < MIN_SPEECH_FRAMES {
         return None;
     }
-    audible.sort_by(f32::total_cmp);
-    let level = audible[(audible.len() * 3) / 4];
+    let mut sorted = levels.clone();
+    sorted.sort_by(f32::total_cmp);
+    let floor = sorted[sorted.len() / 10];
+    let speech_min = (floor * SPEECH_OVER_FLOOR).max(VISIBLE_FRAME_RMS);
+    let mut speech = Vec::new();
+    let (mut run, mut longest_run) = (0, 0);
+    for level in levels {
+        if level >= speech_min {
+            speech.push(level);
+            run += 1;
+            longest_run = longest_run.max(run);
+        } else {
+            run = 0;
+        }
+    }
+    if speech.len() < MIN_SPEECH_FRAMES || longest_run < MIN_VOICED_RUN {
+        return None;
+    }
+    speech.sort_by(f32::total_cmp);
+    let level = speech[(speech.len() * 3) / 4];
     if !level.is_finite() || level >= BOOST_TARGET_RMS {
         return None;
     }

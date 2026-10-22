@@ -4,8 +4,8 @@ use parking_lot::{Condvar, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use voice_stt_desktop::resample::{Resampler, TARGET_SAMPLE_RATE};
 
-pub const TARGET_SAMPLE_RATE: u32 = 16000;
 pub const MAX_RECORDING_SECONDS: usize = 120;
 /// A live WASAPI stream delivers buffers even in silence. Longer than this
 /// with no callback means the endpoint went away.
@@ -21,7 +21,14 @@ pub struct AudioRecorder {
     samples_ready: Arc<Condvar>,
     captured: Arc<AtomicUsize>,
     envelope: Arc<Mutex<SpeechEnvelope>>,
+    /// Set by `start`. The capture callback then drops the resampler state of
+    /// the previous take.
+    new_take: Arc<AtomicBool>,
     device_name: String,
+    /// The Windows default input when this stream opened.
+    default_name: Option<String>,
+    /// Device rate, channels, and sample format, for the log.
+    format: String,
     opened_ms: u64,
     last_callback_ms: Arc<AtomicU64>,
     paused: AtomicBool,
@@ -41,10 +48,11 @@ pub struct CaptureHandle {
 impl AudioRecorder {
     pub fn new() -> Result<Self, String> {
         let host = cpal::default_host();
-        let names = ordered_input_names(&host)?;
+        let default_name = default_input_name(&host);
+        let names = ordered_input_names(&host, default_name.as_deref())?;
         let mut last_error = "No microphone found. Connect a microphone and try again.".to_string();
         for name in names {
-            match open_named(&host, &name) {
+            match open_named(&host, &name, default_name.clone()) {
                 Ok(recorder) => return Ok(recorder),
                 Err(error) => last_error = error,
             }
@@ -61,10 +69,37 @@ struct CaptureParts {
     samples_ready: Arc<Condvar>,
     captured: Arc<AtomicUsize>,
     envelope: Arc<Mutex<SpeechEnvelope>>,
+    new_take: Arc<AtomicBool>,
     last_callback_ms: Arc<AtomicU64>,
 }
 
-fn open_named(host: &cpal::Host, device_name: &str) -> Result<AudioRecorder, String> {
+/// Device audio to 16 kHz mono. The capture callback owns it, so the
+/// resampler keeps its state from one packet to the next.
+struct Converter {
+    channels: usize,
+    sample_rate: u32,
+    resampler: Option<Resampler>,
+    mono: Vec<f32>,
+    output: Vec<f32>,
+}
+
+impl Converter {
+    fn new(channels: usize, sample_rate: u32) -> Self {
+        Self {
+            channels,
+            sample_rate,
+            resampler: Resampler::new(sample_rate),
+            mono: Vec::new(),
+            output: Vec::new(),
+        }
+    }
+}
+
+fn open_named(
+    host: &cpal::Host,
+    device_name: &str,
+    default_name: Option<String>,
+) -> Result<AudioRecorder, String> {
     let device = find_input(host, device_name)
         .ok_or_else(|| format!("Microphone {device_name} disappeared"))?;
     let supported_config = device
@@ -81,6 +116,7 @@ fn open_named(host: &cpal::Host, device_name: &str) -> Result<AudioRecorder, Str
         samples_ready: Arc::new(Condvar::new()),
         captured: Arc::new(AtomicUsize::new(0)),
         envelope: Arc::new(Mutex::new(SpeechEnvelope::default())),
+        new_take: Arc::new(AtomicBool::new(false)),
         last_callback_ms: Arc::new(AtomicU64::new(0)),
     };
 
@@ -96,8 +132,7 @@ fn open_named(host: &cpal::Host, device_name: &str) -> Result<AudioRecorder, Str
         &device,
         &config,
         sample_format,
-        channels,
-        input_sample_rate,
+        Converter::new(channels, input_sample_rate),
         parts.clone(),
         error_cb,
     )?;
@@ -106,7 +141,8 @@ fn open_named(host: &cpal::Host, device_name: &str) -> Result<AudioRecorder, Str
         .play()
         .map_err(|e| format!("Failed to start input stream: {e}"))?;
 
-    eprintln!("Microphone open: {device_name}");
+    let format = format!("{input_sample_rate} Hz, {channels} ch, {sample_format}");
+    eprintln!("Microphone open: {device_name} ({format})");
 
     Ok(AudioRecorder {
         is_recording: parts.is_recording,
@@ -116,7 +152,10 @@ fn open_named(host: &cpal::Host, device_name: &str) -> Result<AudioRecorder, Str
         samples_ready: parts.samples_ready,
         captured: parts.captured,
         envelope: parts.envelope,
+        new_take: parts.new_take,
         device_name: device_name.to_string(),
+        default_name,
+        format,
         opened_ms: now_ms(),
         last_callback_ms: parts.last_callback_ms,
         paused: AtomicBool::new(false),
@@ -125,8 +164,40 @@ fn open_named(host: &cpal::Host, device_name: &str) -> Result<AudioRecorder, Str
 }
 
 impl AudioRecorder {
-    pub fn device_name(&self) -> &str {
-        &self.device_name
+    /// The device and its format, and the Windows default when it is another device.
+    pub fn describe(&self) -> String {
+        let mut text = format!("{} ({})", self.device_name, self.format);
+        match &self.default_name {
+            Some(default) if *default != self.device_name => {
+                text.push_str(&format!(
+                    "; the Windows default {default} could not be used"
+                ));
+            }
+            None => text.push_str("; Windows has no default microphone"),
+            Some(_) => {}
+        }
+        text
+    }
+
+    /// Why the next take must open the microphone again, or `None` when this
+    /// stream is still the right one. Reads the Windows default each time, so
+    /// a USB microphone that is plugged in, unplugged, or chosen in Settings
+    /// is used from the next take.
+    pub fn reopen_reason(&self) -> Option<String> {
+        if let Some(error) = self.take_error() {
+            return Some(error);
+        }
+        if self.needs_reopen() {
+            return Some("the stream stopped".to_string());
+        }
+        let default_name = default_input_name(&cpal::default_host());
+        if default_name != self.default_name {
+            return Some(format!(
+                "the Windows default changed to {}",
+                default_name.as_deref().unwrap_or("none")
+            ));
+        }
+        None
     }
 
     /// Park the input stream while idle so the microphone (and its Windows
@@ -151,7 +222,7 @@ impl AudioRecorder {
     /// True when the capture callback has stopped. The next recording should
     /// open the microphone again instead of writing into a dead stream.
     /// A deliberately parked stream is healthy, not stale.
-    pub fn needs_reopen(&self) -> bool {
+    fn needs_reopen(&self) -> bool {
         if self.paused.load(Ordering::SeqCst) {
             return false;
         }
@@ -162,28 +233,28 @@ impl AudioRecorder {
         )
     }
 
-    fn process_samples_f32(data: &[f32], channels: usize, sample_rate: u32, parts: &CaptureParts) {
-        if data.is_empty() {
+    fn process_samples_f32(data: &[f32], converter: &mut Converter, parts: &CaptureParts) {
+        let channels = converter.channels;
+        converter.mono.clear();
+        converter.mono.extend(
+            data.chunks_exact(channels)
+                .map(|frame| frame.iter().sum::<f32>() / channels as f32),
+        );
+        if converter.mono.is_empty() {
             return;
         }
+        parts
+            .envelope
+            .lock()
+            .push(&converter.mono, converter.sample_rate);
 
-        // Downmix to mono
-        let mut mono: Vec<f32> = Vec::with_capacity(data.len() / channels);
-        for chunk in data.chunks_exact(channels) {
-            let sum: f32 = chunk.iter().sum();
-            mono.push(sum / channels as f32);
-        }
-
-        if mono.is_empty() {
-            return;
-        }
-        parts.envelope.lock().push(&mono, sample_rate);
-
-        // Resample to 16,000 Hz if necessary
-        let resampled = if sample_rate != TARGET_SAMPLE_RATE && sample_rate > 0 {
-            Self::resample_linear(&mono, sample_rate, TARGET_SAMPLE_RATE)
-        } else {
-            mono
+        let resampled = match converter.resampler.as_mut() {
+            Some(resampler) => {
+                converter.output.clear();
+                resampler.process(&converter.mono, &mut converter.output);
+                &converter.output
+            }
+            None => &converter.mono,
         };
 
         let mut recorded = parts.buffer.lock();
@@ -207,28 +278,6 @@ impl AudioRecorder {
         parts.samples_ready.notify_one();
     }
 
-    fn resample_linear(input: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
-        if input.is_empty() {
-            return Vec::new();
-        }
-        let ratio = from_rate as f64 / to_rate as f64;
-        let out_len = ((input.len() as f64) / ratio).floor() as usize;
-        let mut output = Vec::with_capacity(out_len);
-
-        for i in 0..out_len {
-            let src_idx = i as f64 * ratio;
-            let idx_floor = src_idx.floor() as usize;
-            let frac = (src_idx - idx_floor as f64) as f32;
-
-            let s0 = input[idx_floor.min(input.len() - 1)];
-            let s1 = input[(idx_floor + 1).min(input.len() - 1)];
-
-            output.push(s0 + frac * (s1 - s0));
-        }
-
-        output
-    }
-
     pub fn start(&self) {
         {
             let mut recorded = self.buffer.lock();
@@ -236,7 +285,10 @@ impl AudioRecorder {
             self.captured.store(0, Ordering::SeqCst);
         }
         *self.envelope.lock() = SpeechEnvelope::default();
-        clear_session_signals(&self.last_error, &self.at_limit);
+        // A pending stream error stays: when the resume just before this
+        // failed, the UI loop must see it and open the microphone again.
+        self.at_limit.store(false, Ordering::SeqCst);
+        self.new_take.store(true, Ordering::SeqCst);
         self.is_recording.store(true, Ordering::SeqCst);
     }
 
@@ -351,11 +403,6 @@ fn take_pending_error(last_error: &Mutex<Option<String>>) -> Option<String> {
     last_error.lock().take()
 }
 
-fn clear_session_signals(last_error: &Mutex<Option<String>>, at_limit: &AtomicBool) {
-    *last_error.lock() = None;
-    at_limit.store(false, Ordering::SeqCst);
-}
-
 fn stream_error_callback(
     last_error: Arc<Mutex<Option<String>>>,
     is_recording: Arc<AtomicBool>,
@@ -368,16 +415,21 @@ fn stream_error_callback(
     }
 }
 
-fn ordered_input_names(host: &cpal::Host) -> Result<Vec<String>, String> {
+fn default_input_name(host: &cpal::Host) -> Option<String> {
+    host.default_input_device()
+        .and_then(|device| device.name().ok())
+}
+
+fn ordered_input_names(
+    host: &cpal::Host,
+    default_name: Option<&str>,
+) -> Result<Vec<String>, String> {
     let available = host
         .input_devices()
         .map_err(|error| format!("Could not list microphones: {error}"))?
         .filter_map(|device| device.name().ok())
         .collect::<Vec<_>>();
-    let default_name = host
-        .default_input_device()
-        .and_then(|device| device.name().ok());
-    let names = preferred_input_names(default_name.as_deref(), &available);
+    let names = preferred_input_names(default_name, &available);
     if names.is_empty() {
         Err("No microphone found. Connect a microphone and try again.".to_string())
     } else {
@@ -451,10 +503,15 @@ fn note_callback(last_callback_ms: &AtomicU64) {
     last_callback_ms.store(now_ms().max(1), Ordering::Relaxed);
 }
 
-fn ingest(samples: &[f32], channels: usize, sample_rate: u32, parts: &CaptureParts) {
+fn ingest(samples: &[f32], converter: &mut Converter, parts: &CaptureParts) {
     note_callback(&parts.last_callback_ms);
     if parts.is_recording.load(Ordering::Relaxed) {
-        AudioRecorder::process_samples_f32(samples, channels, sample_rate, parts);
+        if parts.new_take.swap(false, Ordering::SeqCst) {
+            if let Some(resampler) = converter.resampler.as_mut() {
+                resampler.reset();
+            }
+        }
+        AudioRecorder::process_samples_f32(samples, converter, parts);
     } else {
         *parts.envelope.lock() = SpeechEnvelope::default();
     }
@@ -464,8 +521,7 @@ fn build_stream(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
     sample_format: cpal::SampleFormat,
-    channels: usize,
-    sample_rate: u32,
+    mut converter: Converter,
     parts: CaptureParts,
     on_error: impl FnMut(cpal::StreamError) + Send + 'static,
 ) -> Result<cpal::Stream, String> {
@@ -475,7 +531,7 @@ fn build_stream(
             .build_input_stream(
                 config,
                 move |data: &[f32], _| {
-                    ingest(data, channels, sample_rate, &parts);
+                    ingest(data, &mut converter, &parts);
                 },
                 on_error,
                 None,
@@ -489,7 +545,7 @@ fn build_stream(
                         .iter()
                         .map(|sample| *sample as f32 / i16::MAX as f32)
                         .collect::<Vec<_>>();
-                    ingest(&samples, channels, sample_rate, &parts);
+                    ingest(&samples, &mut converter, &parts);
                 },
                 on_error,
                 None,
@@ -503,7 +559,7 @@ fn build_stream(
                         .iter()
                         .map(|sample| *sample as f32 / i32::MAX as f32)
                         .collect::<Vec<_>>();
-                    ingest(&samples, channels, sample_rate, &parts);
+                    ingest(&samples, &mut converter, &parts);
                 },
                 on_error,
                 None,
@@ -517,7 +573,7 @@ fn build_stream(
                         .iter()
                         .map(|sample| (*sample as f32 / u16::MAX as f32) * 2.0 - 1.0)
                         .collect::<Vec<_>>();
-                    ingest(&samples, channels, sample_rate, &parts);
+                    ingest(&samples, &mut converter, &parts);
                 },
                 on_error,
                 None,

@@ -1,15 +1,18 @@
 //! Speech benchmark: latency after release and word error rate.
 //!
-//! `cargo run --release --bin bench-asr -- [--dir PATH] [--realtime] [--repeat N] [--native]`
+//! `cargo run --release --bin bench-asr -- [--dir PATH] [--realtime] [--repeat N] [--native] [--whole]`
 //!
 //! Each `clip.wav` may have a `clip.txt` reference transcript next to it.
 //! `--realtime` feeds audio at speaking pace, so latency is the wait a user
 //! has after the key is released. Without it, all audio arrives at once.
 //! `--native` runs TDT's Rust engine on each whole clip instead of the app path.
+//! `--whole` keeps the quiet after the last word. Noise-only and quiet-speech
+//! clips are under the trim level, so the trim would cut them to 150 ms.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use trit::{BiasWeights, Trit};
+use voice_stt_desktop::resample::Resampler;
 use voice_stt_desktop::stt::models::{find_dir, ModelSpec, CATALOG};
 use voice_stt_desktop::stt::{LiveAudio, SttEngine};
 
@@ -35,6 +38,7 @@ struct Options {
     dir: PathBuf,
     realtime: bool,
     native: bool,
+    whole: bool,
     repeat: usize,
 }
 
@@ -46,6 +50,7 @@ fn parse_options() -> Options {
         ),
         realtime: false,
         native: false,
+        whole: false,
         repeat: 1,
     };
     let mut args = std::env::args().skip(1);
@@ -54,6 +59,7 @@ fn parse_options() -> Options {
             "--dir" => options.dir = args.next().map(PathBuf::from).unwrap_or(options.dir),
             "--realtime" => options.realtime = true,
             "--native" => options.native = true,
+            "--whole" => options.whole = true,
             "--repeat" => {
                 options.repeat = args
                     .next()
@@ -67,23 +73,23 @@ fn parse_options() -> Options {
     options
 }
 
-fn load_clips(dir: &Path) -> Vec<Clip> {
+fn load_clips(dir: &Path, whole: bool) -> Vec<Clip> {
     // Recursive: nested bench folders hold grouped clips and must not be
     // silently skipped.
     let mut clips = Vec::new();
-    load_clips_into(dir, &mut clips);
+    load_clips_into(dir, whole, &mut clips);
     clips.sort_by(|a, b| a.name.cmp(&b.name));
     clips
 }
 
-fn load_clips_into(dir: &Path, clips: &mut Vec<Clip>) {
+fn load_clips_into(dir: &Path, whole: bool, clips: &mut Vec<Clip>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            load_clips_into(&path, clips);
+            load_clips_into(&path, whole, clips);
             continue;
         }
         if path.extension().and_then(|s| s.to_str()) != Some("wav") {
@@ -95,7 +101,9 @@ fn load_clips_into(dir: &Path, clips: &mut Vec<Clip>) {
             .to_string_lossy()
             .to_string();
         if let Some(mut samples) = pcm16_wav(&path) {
-            trim_trailing_quiet(&mut samples);
+            if !whole {
+                trim_trailing_quiet(&mut samples);
+            }
             let duration_secs = samples.len() as f32 / 16000.0;
             let reference = std::fs::read_to_string(path.with_extension("txt")).ok();
             clips.push(Clip {
@@ -341,7 +349,7 @@ fn whole_clips(
 
 fn main() {
     let options = parse_options();
-    let clips = load_clips(&options.dir);
+    let clips = load_clips(&options.dir, options.whole);
     if clips.is_empty() {
         println!("No wav clips found in {}", options.dir.display());
         return;
@@ -361,7 +369,8 @@ fn main() {
     }
 }
 
-/// 16 kHz PCM16 WAV as mono f32; None for any other format.
+/// PCM16 WAV as 16 kHz mono f32; None for any other format. Other rates go
+/// through the app's capture resampler in 10 ms packets, as from a microphone.
 fn pcm16_wav(path: &Path) -> Option<Vec<f32>> {
     let bytes = std::fs::read(path).ok()?;
     if bytes.len() < 44 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
@@ -389,7 +398,7 @@ fn pcm16_wav(path: &Path) -> Option<Vec<f32>> {
         offset = body + size + (size % 2);
     }
     let data = data?;
-    if bits != 16 || channels == 0 || rate != 16_000 {
+    if bits != 16 || channels == 0 || rate == 0 {
         return None;
     }
     let width = channels as usize;
@@ -402,5 +411,12 @@ fn pcm16_wav(path: &Path) -> Option<Vec<f32>> {
         }
         mono.push(sum / width as f32);
     }
-    Some(mono)
+    let Some(mut resampler) = Resampler::new(rate) else {
+        return Some(mono);
+    };
+    let mut converted = Vec::new();
+    for packet in mono.chunks((rate / 100) as usize) {
+        resampler.process(packet, &mut converted);
+    }
+    Some(converted)
 }
