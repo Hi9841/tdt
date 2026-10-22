@@ -102,14 +102,21 @@ pub fn parse_name(name: &str) -> Option<Spec> {
 }
 
 pub fn fixture_stats(count: usize) -> AppStats {
-    let long = "This is a longer transcript that runs past the four lines the latest row shows. It keeps going so the preview needs the expand control, and the expanded state shows every line of the saved text instead of a clipped summary.";
+    // Real dictations, so captures of the panel show TDT in use. The first
+    // runs past the four lines the latest row shows, for the expand control.
+    const TEXTS: [&str; 8] = [
+        "Hi Sam, thanks for the notes from today. I moved the design review to Thursday at 3 PM so the whole team can join. Can you send the updated mockups before then? I also put the open questions about the onboarding flow in the shared doc, so we can go through them first.",
+        "Restart the Kubernetes pod, then check the PostgreSQL logs.",
+        "Remind me to book the flight to Berlin before Friday.",
+        "The build passes now. I will merge the pull request after lunch.",
+        "Order more coffee for the office, the dark roast.",
+        "Move the standup to 9:30 tomorrow.",
+        "Send the invoice to Dana and copy the finance team.",
+        "Call the dentist on Monday morning.",
+    ];
     let history = (0..count)
         .map(|index| HistoryItem {
-            text: if index == 0 {
-                long.to_string()
-            } else {
-                format!("Short transcript {index}: ready when you are")
-            },
+            text: TEXTS[index % TEXTS.len()].to_string(),
             latency_ms: 90 + (index as u64) * 15,
             timestamp: format!(
                 "2026-10-06 12:{:02}:{:02}",
@@ -131,7 +138,7 @@ pub fn update_phase(spec: &Spec) -> Option<UpdatePhase> {
     Some(match spec {
         Spec::PanelSettingsUpdateChecking => UpdatePhase::Checking,
         Spec::PanelSettingsUpdateUpToDate => UpdatePhase::UpToDate,
-        Spec::PanelSettingsUpdateAvailable => UpdatePhase::Available(Release::preview("0.3.0")),
+        Spec::PanelSettingsUpdateAvailable => UpdatePhase::Available(Release::preview("0.4.1")),
         Spec::PanelSettingsUpdateDownloading => UpdatePhase::Downloading {
             done: 12_000_000,
             total: 28_000_000,

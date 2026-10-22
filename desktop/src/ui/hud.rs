@@ -610,7 +610,7 @@ impl HudView {
             }
             PreviewSpec::BubbleSuccess { pasted } => {
                 self.status = HudStatus::Success {
-                    text: "this is a sample transcript".into(),
+                    text: "Restart the Kubernetes pod, then check the PostgreSQL logs.".into(),
                     auto_pasted: pasted,
                     latency_ms: 182,
                     finished_at: Instant::now(),

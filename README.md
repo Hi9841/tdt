@@ -20,7 +20,7 @@
 </p>
 
 <p align="center">
-  <img src="docs/images/how-it-works.svg" alt="Press Ctrl+;, speak, Trit transcribes on your CPU, the text appears in your app" width="760">
+  <img src="docs/images/app/usage-example.png" alt="Hold Ctrl+; and speak; Trit transcribes on your computer; the text is typed into your app and the pill shows Pasted" width="920">
 </p>
 
 ## Why TDT
@@ -57,9 +57,22 @@ and your dictionary.
 | Change the shortcut | Settings > **Shortcut** > **Change**, then press the new keys. |
 | Open Settings | Click the tray icon. |
 
-The floating pill shows the recording state. The tray icon shows the same
-state; hover over it to see the latest transcript. **History** keeps the full
-text of your recent dictations.
+The floating pill at the bottom of the screen shows the state:
+
+| Ready | Listening | Transcribing | Pasted |
+|:---:|:---:|:---:|:---:|
+| <img src="docs/images/app/pill-idle.png" alt="The pill, ready" height="19"> | <img src="docs/images/app/pill-listening.png" alt="The pill while you speak, with the sound level" height="33"> | <img src="docs/images/app/pill-transcribing.png" alt="The pill while Trit transcribes" height="22"> | <img src="docs/images/app/pill-pasted.png" alt="The pill after the text is typed, with the time Trit took" height="49"> |
+
+The tray icon shows the same state; hover over it to see the latest
+transcript. Click the tray icon to open the panel. **Stats**
+keeps the full text of your recent dictations, with a copy button for each.
+**Settings** has every option.
+
+<p align="center">
+  <img src="docs/images/app/panel-history.png" alt="The Stats tab: dictations, words, recorded time, and the recent transcripts" width="400">
+  &nbsp;
+  <img src="docs/images/app/panel-settings.png" alt="The Settings tab: shortcut, auto-paste, filler words, model, dictionary, startup, and updates" width="400">
+</p>
 
 With **auto-paste** on (the default), TDT types the text into the window that
 had focus. TDT also copies the text to the clipboard. A recording can be up to
@@ -163,7 +176,7 @@ and attaches it with `SHA256SUMS.txt`. TDT 0.2.32 and older need
 | `trit/` | Trit, the speech engine: a Rust crate, a CLI, a C ABI, and Python, C#, and Node bindings. |
 | `models/` | The model downloader. |
 | `packaging/` | `TDT-Setup.exe` (install, update, uninstall) and its build script. |
-| `docs/` | The engine comparison and the README images. |
+| `docs/` | The engine comparison and the README images. `docs/images/capture.py` captures the app pictures again. |
 | `site/` | The TDT website. |
 
 ## License

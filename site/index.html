@@ -36,25 +36,27 @@
     </div>
   </section>
   <section class="preview" id="project_preview" aria-labelledby="preview-title" tabindex="-1">
-    <header class="preview-heading"><p class="eyebrow">On Windows</p><h2 id="preview-title">Press a key. Speak your words.<br><em>Review the text.</em></h2><p class="illustration-label" data-reveal="fade" data-duration="480">Windows workflow illustration</p></header>
+    <header class="preview-heading"><p class="eyebrow">On Windows</p><h2 id="preview-title">Press a key. Speak your words.<br><em>Review the text.</em></h2><p class="illustration-label" data-reveal="fade" data-duration="480">Captured from TDT 0.4.0</p></header>
+    <figure class="app-usage content" data-reveal="rise" data-duration="620"><img src="assets/tdt-page/app/usage-example.png" width="920" height="400" loading="lazy" alt="Hold Ctrl+; and speak. Trit transcribes on your computer. The text is typed where your cursor is, and the pill shows Pasted."></figure>
     <div class="workflow-grid content">
       <article class="workflow-card">
         <div class="workflow-visual"><div data-reveal="slide" data-duration="680">
-          <p class="panel-label">Prepare</p><h3>Prepare for dictation</h3>
-          <dl><div><dt>Shortcut</dt><dd><kbd>Ctrl+;</kbd></dd></div><div><dt>Speech model</dt><dd>Parakeet Redux</dd></div></dl>
-          <p class="setup-instruction">Download a speech model in TDT Settings.</p><p class="panel-note">The initial download needs internet access.</p>
-          <div class="paste-note"><strong>Optional auto-paste</strong><p>Enable it in TDT to insert recognized text into the focused Windows app.</p></div>
+          <p class="panel-label">The pill</p><h3>It shows every state</h3>
+          <ul class="pill-states">
+            <li><img src="assets/tdt-page/app/pill-idle.png" width="36" height="19" alt=""><span>Ready</span></li>
+            <li><img src="assets/tdt-page/app/pill-listening.png" width="84" height="33" alt=""><span>Listening, with the sound level</span></li>
+            <li><img src="assets/tdt-page/app/pill-transcribing.png" width="42" height="22" alt=""><span>Transcribing</span></li>
+            <li><img src="assets/tdt-page/app/pill-pasted.png" width="312" height="49" alt=""><span>Pasted, with the time it took</span></li>
+          </ul>
         </div></div>
         <div class="workflow-caption"><h3>Record.</h3><p>Press <kbd>Ctrl+;</kbd> to start and press again to stop. Or hold the shortcut and release it when you finish.</p></div>
       </article>
       <article class="workflow-card">
-        <div class="workflow-visual"><div data-reveal="slide" data-duration="680" data-delay="80">
-          <p class="panel-label">Transcribe &amp; copy</p><h3>From recording to text</h3>
-          <div class="transcription-step"><h4>Transcribe</h4><p>TDT processes the recording on your computer.</p></div>
-          <div class="transcription-step"><h4>Copy</h4><p>The recognized text is copied to your clipboard.</p></div>
-          <p class="example"><span>Example text</span>Please send the revised notes tomorrow.</p>
+        <div class="workflow-visual"><div class="panel-shots" data-reveal="slide" data-duration="680" data-delay="80">
+          <img src="assets/tdt-page/app/panel-history.png" width="408" height="628" loading="lazy" alt="The Stats tab: dictations, words, recorded time, and the recent transcripts.">
+          <img src="assets/tdt-page/app/panel-settings.png" width="408" height="628" loading="lazy" alt="The Settings tab: shortcut, auto-paste, filler words, model, dictionary, startup, and updates.">
         </div></div>
-        <div class="workflow-caption"><h3>Review and use.</h3><p>Paste the copied text where you need it and review it.</p></div>
+        <div class="workflow-caption"><h3>Review and use.</h3><p>Auto-paste types the text into the app you use, and TDT copies it too. The Stats tab keeps your recent dictations. Settings has every option.</p></div>
       </article>
     </div>
   </section>
