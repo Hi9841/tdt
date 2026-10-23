@@ -25,9 +25,9 @@ Desktop.ini
 # Working plans of agents
 .plan/
 
-# OpLoop: the pristine baseline and built libraries (rebuilt from the patches)
+# OpLoop: the pristine baseline and the A/B libraries, built locally
 oploop/baseline/
-oploop/results/*.dll
+oploop/results/
 
 # Skills installed by the local skill tool
 .agents/

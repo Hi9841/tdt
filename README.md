@@ -108,14 +108,13 @@ when the audio supports it, so "the mayor" stays "the mayor" when Maor is in
 the dictionary.
 
 On the test sentences with developer terms, the dictionary removes about
-half of the errors (from 34 to 18). On sentences with names and product
+half of the errors (from 34 to 17). On sentences with names and product
 names, it writes 27 of 37 names correctly; without it, 11. On 400
 recordings of ordinary speech (LibriSpeech), it changes 2 transcripts and
 adds no error.
 
 TDT writes English only. It never writes word pieces that only other
-languages use. When most words of a dictation are not English, TDT
-transcribes it again with a preference for English words.
+languages use.
 
 ## Benchmarks
 
