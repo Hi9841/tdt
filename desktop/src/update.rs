@@ -50,7 +50,8 @@ pub struct Release {
     pub version: String,
     url: String,
     size: u64,
-    sha256: Option<String>,
+    /// Lowercase hex. A release without one is never offered.
+    sha256: String,
 }
 
 impl Release {
@@ -60,7 +61,7 @@ impl Release {
             version: version.into(),
             url: String::new(),
             size: 7_900_000,
-            sha256: None,
+            sha256: String::new(),
         }
     }
 }
@@ -213,13 +214,21 @@ fn latest_release() -> Result<Option<Release>, String> {
     let Some(asset) = release.assets.into_iter().find(|a| a.name == ASSET) else {
         return Ok(None);
     };
+    // No digest, no install: size and the MZ header prove nothing.
+    let Some(sha256) = asset
+        .digest
+        .as_deref()
+        .and_then(|d| d.strip_prefix("sha256:"))
+        .filter(|hex| hex.len() == 64)
+        .map(str::to_ascii_lowercase)
+    else {
+        return Err("GitHub did not send the update's checksum. Try again later.".into());
+    };
     Ok(Some(Release {
         version: version.to_string(),
         url: asset.browser_download_url,
         size: asset.size,
-        sha256: asset
-            .digest
-            .and_then(|d| d.strip_prefix("sha256:").map(str::to_ascii_lowercase)),
+        sha256,
     }))
 }
 
@@ -255,11 +264,7 @@ fn download(release: &Release, mut on_progress: impl FnMut(u64)) -> Result<PathB
     let hash = format!("{:x}", hasher.finalize());
     let problem = if done != release.size {
         Some("The download is incomplete. Try again.")
-    } else if release
-        .sha256
-        .as_ref()
-        .is_some_and(|expected| *expected != hash)
-    {
+    } else if release.sha256 != hash {
         Some("The download failed its integrity check. Try again.")
     } else if &head != b"MZ" {
         Some("The download is not a Windows program.")

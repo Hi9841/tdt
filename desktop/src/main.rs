@@ -75,8 +75,9 @@ fn deliver_transcript(
     // Text reaches the user first; the history write is not on the latency path.
     // A failed copy still lands in History so the transcript is not lost.
     if !result.text.trim().is_empty() {
-        let mut stats = AppStats::load();
-        stats.record_and_save(&result.text, result.duration_secs, result.latency_ms);
+        AppStats::update(|stats| {
+            stats.record(&result.text, result.duration_secs, result.latency_ms)
+        });
     }
     let (auto_pasted, notice) = match delivered {
         Ok(DeliveryOutcome::NoSpeech) => {
@@ -678,7 +679,8 @@ fn main() {
                                                         if discard_worker.load(Ordering::SeqCst) {
                                                             return;
                                                         }
-                                                        let _ = events.send(InternalEvent::TranscribeError(format!("Could not load the speech model. Choose another model in Settings. {error}")));
+                                                        // The engine's errors are written for the user.
+                                                        let _ = events.send(InternalEvent::TranscribeError(error));
                                                     }
                                                 }
                                             });

@@ -1,6 +1,6 @@
 [package]
 name = "voice-stt-desktop"
-version = "0.4.10"
+version = "0.4.11"
 edition = "2021"
 description = "TDT (Talk Don't Type), native offline speech-to-text built with Rust and GPUI, with its own Parakeet speech engine"
 license = "PolyForm-Noncommercial-1.0.0"
@@ -9,7 +9,7 @@ homepage = "https://github.com/Hi9841/tdt"
 repository = "https://github.com/Hi9841/tdt"
 documentation = "https://github.com/Hi9841/tdt#readme"
 authors = ["Hi9841"]
-keywords = ["speech-to-text", "dictation", "sensevoice", "offline"]
+keywords = ["speech-to-text", "dictation", "parakeet", "offline"]
 categories = ["accessibility", "multimedia::audio", "os::windows-apis"]
 
 [lib]

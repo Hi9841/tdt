@@ -184,15 +184,16 @@ impl AppStats {
         }
     }
 
-    /// Record a transcript and persist the result.
-    pub fn record_and_save(&mut self, text: &str, duration_secs: f32, latency_ms: u64) {
-        self.record(text, duration_secs, latency_ms);
-        let _ = self.save();
-    }
-
-    pub fn clear_history(&mut self) {
-        self.history.clear();
-        let _ = self.save();
+    /// Loads stats.json, applies `change`, and saves it, as one step. The
+    /// transcribe thread records and the UI thread clears History: without
+    /// the lock, one save could undo the other.
+    pub fn update(change: impl FnOnce(&mut Self)) -> Self {
+        static FILE: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+        let _file = FILE.lock();
+        let mut stats = Self::load();
+        change(&mut stats);
+        let _ = stats.save();
+        stats
     }
 
     pub fn save(&self) -> Result<(), std::io::Error> {

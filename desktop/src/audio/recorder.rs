@@ -320,7 +320,7 @@ impl AudioRecorder {
 
 impl CaptureHandle {
     pub fn drain(&self) -> Vec<f32> {
-        drain_samples(&self.is_recording, &self.buffer, &self.captured)
+        drain_samples(&self.is_recording, &self.buffer)
     }
 
     /// Same end state as AudioRecorder::stop: is_recording false,
@@ -353,16 +353,13 @@ impl CaptureHandle {
     }
 }
 
-fn drain_samples(
-    is_recording: &AtomicBool,
-    buffer: &Mutex<Vec<f32>>,
-    captured: &AtomicUsize,
-) -> Vec<f32> {
+/// Takes the samples so far. `captured` keeps counting the whole take, so
+/// the 2-minute limit still fires while the pump drains.
+fn drain_samples(is_recording: &AtomicBool, buffer: &Mutex<Vec<f32>>) -> Vec<f32> {
     let mut recorded = buffer.lock();
     if !is_recording.load(Ordering::SeqCst) {
         return Vec::new();
     }
-    captured.store(0, Ordering::SeqCst);
     std::mem::take(&mut *recorded)
 }
 

@@ -104,7 +104,9 @@ impl SttEngine {
     ) -> Result<LiveTranscript, String> {
         // A release waiting from the last dictation must not run during this one.
         DICTATIONS.fetch_add(1, Ordering::Relaxed);
-        self.prepare()?;
+        self.prepare().map_err(|error| {
+            format!("Could not load the speech model. Choose another model in Settings. {error}")
+        })?;
         self.refresh_dictionary();
         let mut stopped_at = None;
         let mut captured: Vec<f32> = Vec::new();
@@ -137,7 +139,10 @@ impl SttEngine {
                 Err(RecvTimeoutError::Timeout) => {
                     // A stalled producer must not hang transcription forever.
                     if last_any.elapsed() > Duration::from_secs(120) {
-                        return Err("Audio capture stalled; transcription aborted.".to_string());
+                        return Err(
+                            "The microphone stopped sending audio. Check the input device and try again."
+                                .to_string(),
+                        );
                     }
                 }
                 Err(RecvTimeoutError::Disconnected) => break,

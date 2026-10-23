@@ -11,8 +11,12 @@ WER uses the Whisper English normalizer, as the Open ASR Leaderboard does.
 --engine native: TDT's Rust engine on each whole clip (default).
 --engine app: the app's own path (pause cuts and the dictionary file).
 Speed is total audio time divided by total transcription time.
+With --engine native and no TDT_DICTIONARY, the run exits 1 when a set has
+more errors than engine-budget.json allows (the budgets have no dictionary).
 """
 
+import json
+import os
 import re
 import subprocess
 import sys
@@ -23,6 +27,12 @@ from whisper_normalizer.english import EnglishTextNormalizer
 DESKTOP = Path(__file__).resolve().parents[1]
 LINE = re.compile(r'^\[([\d.]+)s\] (\S+)\.wav -> ([\d.]+) ms[^:]*: "(.*)"$')
 FLAGS = {"native": ["--native"], "app": []}
+BUDGET = json.loads((DESKTOP / "bench" / "engine-budget.json").read_text(encoding="utf-8"))
+BUDGET_KEYS = {
+    "clean": "accuracy/librispeech-clean-200-errors",
+    "other": "accuracy/librispeech-other-200-errors",
+    "tech": "accuracy/tech-errors",
+}
 NORMALIZE = EnglishTextNormalizer()
 
 
@@ -78,6 +88,7 @@ def main() -> None:
     if engine not in FLAGS or len(args) < 2:
         sys.exit(__doc__)
     exe, sets = args[0], args[1:]
+    over = []
     for name in sets:
         rows = score(exe, name, engine)
         errors, total = sum(r[0] for r in rows), sum(r[1] for r in rows)
@@ -89,6 +100,13 @@ def main() -> None:
               f"{len(rows)} clips, median {median} ms, {rtfx:.0f}x realtime)")
         for err, _, clip, ref, hyp, *_ in sorted(rows, reverse=True)[:show]:
             print(f"  {err:2d} {clip}\n     ref: {ref}\n     hyp: {hyp}")
+        key = BUDGET_KEYS.get(name)
+        if engine == "native" and key and not os.environ.get("TDT_DICTIONARY"):
+            limit = BUDGET[key]["value"]
+            if errors > limit:
+                over.append(f"{name}: {errors} errors, budget {limit}")
+    if over:
+        sys.exit("Over engine-budget.json: " + "; ".join(over))
 
 
 if __name__ == "__main__":

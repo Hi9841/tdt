@@ -1103,7 +1103,7 @@ impl HudView {
         if preview::is_active() {
             self.stats.history.clear();
         } else {
-            self.stats.clear_history();
+            self.stats = AppStats::update(|stats| stats.history.clear());
         }
         self.expanded_history_key = None;
         self.copied_key = None;

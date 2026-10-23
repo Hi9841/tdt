@@ -257,8 +257,17 @@ impl HotkeyListener {
                 },
                 receiver,
             )),
-            Ok(Err(error)) => Err(error),
-            Err(_) => Err("Could not install the keyboard hook. Restart TDT.".to_string()),
+            failed => {
+                // A hook that installs after the timeout must not keep
+                // swallowing the shortcut for a listener that is gone, and a
+                // later start must not find the old sender.
+                drop(Self { running });
+                *SENDER.lock() = None;
+                Err(match failed {
+                    Ok(Err(error)) => error,
+                    _ => "Could not install the keyboard hook. Restart TDT.".to_string(),
+                })
+            }
         }
     }
 
@@ -378,7 +387,8 @@ unsafe extern "system" fn hotkey_hook_proc(
 
         // Ignore synthetic keys: auto-paste types text with SendInput, and that
         // text must never start a recording or be mistaken for a new shortcut.
-        if kbd.flags & LLKHF_INJECTED == LLKHF_INJECTED {
+        // With no listener left (a failed start), every key passes on.
+        if kbd.flags & LLKHF_INJECTED == LLKHF_INJECTED || SENDER.lock().is_none() {
             return CallNextHookEx(
                 HHOOK(HOOK_PTR.load(Ordering::Relaxed)),
                 code,
