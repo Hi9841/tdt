@@ -69,6 +69,8 @@ pub struct AppConfig {
     pub hotkey: String,
     pub model_dir: Option<PathBuf>,
     pub model_id: String,
+    /// Keep each take's audio and text in `%LOCALAPPDATA%\TDT\takes` for testing.
+    pub save_takes: bool,
 }
 
 impl Default for AppConfig {
@@ -80,6 +82,7 @@ impl Default for AppConfig {
             hotkey: "Ctrl+;".to_string(),
             model_dir: None,
             model_id: voice_stt_desktop::stt::DEFAULT_MODEL_ID.to_string(),
+            save_takes: false,
         }
     }
 }

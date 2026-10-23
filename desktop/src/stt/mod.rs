@@ -3,6 +3,7 @@ pub mod engine;
 pub mod fillers;
 pub mod models;
 pub mod segment;
+pub mod takes;
 
 pub use engine::{LiveAudio, LiveTranscript, SttEngine};
 pub use fillers::remove_fillers;

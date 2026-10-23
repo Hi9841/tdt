@@ -14,7 +14,7 @@ use crate::ui::window_util::{client_animations_enabled, set_pill_hit_rect, set_w
 use crate::update::{self, UpdatePhase};
 use ely_gpui_component::buttons::{ButtonVariant, IconButton, SegmentedControl};
 use ely_gpui_component::feedback::{Alert, InlineMessage};
-use ely_gpui_component::forms::{Choice, ChoiceChips, Switch};
+use ely_gpui_component::forms::Switch;
 use ely_gpui_component::layout::ScrollArea;
 use ely_gpui_component::primitives::{FocusScope, Icon, IconName, Severity};
 use ely_gpui_component::theme::{ActiveTheme, ControlSize, IconSize};
@@ -29,6 +29,8 @@ use voice_stt_desktop::stt::{models, DownloadPhase, EngineSlot, SttEngine, CATAL
 /// Compact actions leave seven pixels above and below inside the overlay.
 const SETTINGS_SURFACE_HEIGHT: f32 = 28.0;
 const WAVE_BARS: usize = VIS_BARS;
+/// Width of the Settings scrollbar lane, taken from the panel padding.
+const SCROLL_GUTTER: f32 = 8.0;
 /// Two clamped lines at 12px in this panel hold about this many characters.
 const HISTORY_EXPAND_CHARS: usize = 88;
 /// The latest row clamps four lines at 14px, so it holds about twice as much.
@@ -415,6 +417,7 @@ pub struct HudView {
     pub auto_paste_enabled: bool,
     remove_fillers_enabled: bool,
     remove_fillers_state: Arc<AtomicBool>,
+    save_takes_enabled: bool,
     autostart_enabled: bool,
     autostart_error: Option<String>,
     auto_updates_enabled: bool,
@@ -503,6 +506,7 @@ impl HudView {
             auto_paste_enabled,
             remove_fillers_enabled: remove_fillers_state.load(Ordering::Relaxed),
             remove_fillers_state,
+            save_takes_enabled: voice_stt_desktop::stt::takes::saving(),
             autostart_enabled: crate::autostart::is_enabled(),
             autostart_error: None,
             auto_updates_enabled: config.check_updates,
@@ -1036,6 +1040,17 @@ impl HudView {
         self.remove_fillers_state.store(on, Ordering::Relaxed);
     }
 
+    fn set_save_takes(&mut self, on: bool) {
+        self.save_takes_enabled = on;
+        if preview::is_active() {
+            return;
+        }
+        let mut cfg = AppConfig::load();
+        cfg.save_takes = on;
+        let _ = cfg.save();
+        voice_stt_desktop::stt::takes::set_saving(on);
+    }
+
     fn set_auto_updates(&mut self, on: bool) {
         self.auto_updates_enabled = on;
         if preview::is_active() {
@@ -1552,24 +1567,30 @@ impl HudView {
             SettingsTab::Stats => "panel_tab_stats",
             SettingsTab::Settings => "panel_tab_settings",
         };
+        // No fixed width: the body stretches across the panel, and the
+        // Settings gutter below widens it into the padding.
         let faded_content = div()
             .id("stats_settings_body")
             .flex()
             .flex_col()
             .flex_1()
-            .w_full()
             .min_h(px(0.0));
         let faded_content = if self.active_tab == SettingsTab::Stats {
-            faded_content.overflow_hidden().child(content)
+            faded_content.w_full().overflow_hidden().child(content)
         } else {
-            faded_content.overflow_hidden().child(
-                ScrollArea::new("settings_scroll")
-                    .shadows()
-                    .flex_1()
-                    .w_full()
-                    .min_h(px(0.0))
-                    .child(content),
-            )
+            // The scrollbar runs in a gutter in the panel padding, beside the
+            // cards and not over their edge.
+            faded_content
+                .overflow_hidden()
+                .mr(px(-SCROLL_GUTTER))
+                .child(
+                    ScrollArea::new("settings_scroll")
+                        .shadows()
+                        .flex_1()
+                        .w_full()
+                        .min_h(px(0.0))
+                        .child(div().pr(px(SCROLL_GUTTER)).child(content)),
+                )
         };
         let faded_content = if client_animations_enabled() {
             faded_content
@@ -2027,7 +2048,7 @@ impl HudView {
         let hotkey_sub = if capturing {
             "Press the new shortcut. Esc cancels.".to_string()
         } else {
-            "Tap to start and stop. Hold to keep recording.".to_string()
+            "Tap to toggle. Hold to talk.".to_string()
         };
         let hotkey_control = div()
             .flex()
@@ -2120,6 +2141,35 @@ impl HudView {
             _ => None,
         };
         let update_row = settings_row("Updates", update_sub, update_btn.into_any_element());
+        let takes_switch = Switch::new("save_takes", self.save_takes_enabled).on_change({
+            let hud = hud.clone();
+            move |on, _, cx| {
+                hud.update(cx, |this, cx| {
+                    if this.save_takes_enabled != on {
+                        this.set_save_takes(on);
+                    }
+                    cx.notify();
+                });
+            }
+        });
+        let takes_row = settings_row(
+            "Save takes for testing",
+            if self.save_takes_enabled {
+                "Audio and text go to LOCALAPPDATA\\TDT\\takes."
+            } else {
+                "Off. Nothing is kept."
+            }
+            .to_string(),
+            takes_switch.into_any_element(),
+        )
+        .on_click(
+            "save_takes_row",
+            cx.listener(|this, _, _, cx| {
+                let on = !this.save_takes_enabled;
+                this.set_save_takes(on);
+                cx.notify();
+            }),
+        );
         let auto_updates_switch =
             Switch::new("auto_updates", self.auto_updates_enabled).on_change({
                 let hud = hud.clone();
@@ -2178,41 +2228,56 @@ impl HudView {
                     .filter(|active| *active != spec.id)
                 {
                     Some(active) => format!(
-                        "Loading {}. {} keeps running until it is ready.",
-                        spec.label,
+                        "Loading. {} runs until it is ready.",
                         models::resolve(active).label
                     ),
-                    None => format!("Loading {}.", spec.label),
+                    None => "Loading.".to_string(),
                 }
             }
-            _ if self.active_model.as_deref() == Some(spec.id) => {
-                format!("{} is active.", spec.label)
-            }
-            _ if installed => "Installed. Not in use yet.".to_string(),
-            _ => format!("Not downloaded. {}", spec.size_label),
+            _ if self.active_model.as_deref() == Some(spec.id) => "Active".to_string(),
+            _ if installed => "Installed, not in use".to_string(),
+            _ => "Not downloaded".to_string(),
         };
-        let selected_model = self.selected_model.clone();
-        let model_chips = ChoiceChips::new(
-            "model",
-            CATALOG
-                .iter()
-                .map(|option| Choice::new(option.id, option.label)),
-        )
-        .selected([selected_model.as_str()])
-        .on_change({
-            let hud = hud.clone();
-            move |values, _, cx| {
-                let Some(id) = values.first().cloned() else {
-                    return;
+        let model_rows: Vec<AnyElement> = CATALOG
+            .iter()
+            .map(|option| {
+                let selected = option.id == spec.id;
+                let status = if selected {
+                    model_sub.clone()
+                } else if self.installed_models.iter().any(|id| id == option.id) {
+                    "Installed".to_string()
+                } else {
+                    "Not downloaded".to_string()
                 };
-                hud.update(cx, |this, cx| {
-                    if this.selected_model != id.as_ref() {
-                        this.select_model(&id);
-                    }
-                    cx.notify();
-                });
-            }
-        });
+                let mark = div()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .size(px(20.0))
+                    .when(selected, |mark| {
+                        mark.child(
+                            Icon::new(IconName::Check)
+                                .size(IconSize::Sm)
+                                .color(theme::accent()),
+                        )
+                    });
+                controls::line_row(
+                    option.label,
+                    format!("{} · {status}", option.size_label),
+                    mark,
+                )
+                .on_click(
+                    option.id,
+                    cx.listener(move |this, _, _, cx| {
+                        if this.selected_model != option.id {
+                            this.select_model(option.id);
+                        }
+                        cx.notify();
+                    }),
+                )
+                .into_any_element()
+            })
+            .collect();
         let download_action = match model_phase {
             DownloadPhase::Downloading {
                 id, done, total, ..
@@ -2292,28 +2357,27 @@ impl HudView {
                 controls::section("Dictation")
                     .child(hotkey_row)
                     .child(auto_paste_row)
-                    .child(fillers_row),
+                    .child(fillers_row)
+                    .child(dictionary_row)
+                    .when_some(self.dictionary_error.clone(), |card, error| {
+                        card.note(inset(
+                            InlineMessage::new(Severity::Danger, error).into_any_element(),
+                        ))
+                    }),
             )
             .child(
-                controls::section("Recognition")
-                    .child(controls::labeled("Model", model_sub))
-                    .child(inset(model_chips.into_any_element()))
+                controls::section("Model")
+                    .children(model_rows)
                     .when_some(running_note, |card, note| {
-                        card.child(inset(
+                        card.note(inset(
                             InlineMessage::new(Severity::Info, note).into_any_element(),
                         ))
                     })
                     .when_some(model_meter, |card, meter| {
-                        card.child(inset(meter.into_any_element()))
+                        card.note(inset(meter.into_any_element()))
                     })
                     .when(show_activate || show_download, |card| {
-                        card.child(inset(model_actions.into_any_element()))
-                    })
-                    .child(dictionary_row)
-                    .when_some(self.dictionary_error.clone(), |card, error| {
-                        card.child(inset(
-                            InlineMessage::new(Severity::Danger, error).into_any_element(),
-                        ))
+                        card.note(inset(model_actions.into_any_element()))
                     }),
             )
             .when_some(self.model_error.clone(), |column, error| {
@@ -2325,8 +2389,9 @@ impl HudView {
                     .child(auto_updates_row)
                     .child(update_row)
                     .when_some(update_meter, |card, meter| {
-                        card.child(inset(meter.into_any_element()))
-                    }),
+                        card.note(inset(meter.into_any_element()))
+                    })
+                    .child(takes_row),
             )
             .when_some(self.autostart_error.clone(), |column, error| {
                 column.child(InlineMessage::new(Severity::Danger, error))

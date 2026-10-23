@@ -1,5 +1,6 @@
 use super::dictionary;
 use super::segment;
+use super::takes;
 use crossbeam_channel::{Receiver, RecvTimeoutError};
 use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
@@ -173,6 +174,9 @@ impl SttEngine {
             }
         }
 
+        if let Err(error) = takes::save(&captured, &text) {
+            eprintln!("Could not save the test take: {error}");
+        }
         let transcript = LiveTranscript {
             text,
             latency_ms: stopped_at.elapsed().as_millis() as u64,

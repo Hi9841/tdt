@@ -41,15 +41,6 @@ pub fn icon_button(id: &'static str, icon: IconName, tip: &'static str) -> IconB
 }
 
 /// One setting on a single line. The control stays on the right in a narrow panel.
-pub fn labeled(title: impl Into<SharedString>, caption: impl Into<SharedString>) -> LineRow {
-    LineRow {
-        title: title.into(),
-        caption: Some(caption.into()),
-        control: None,
-        click: None,
-    }
-}
-
 pub fn line_row(
     title: impl Into<SharedString>,
     caption: impl Into<SharedString>,
@@ -63,7 +54,8 @@ pub fn line_row(
     }
 }
 
-/// A titled group of settings: the title, then the rows on one card.
+/// A titled group of settings: the title, then the rows on one card, with a
+/// hairline between rows.
 pub fn section(title: impl Into<SharedString>) -> Section {
     Section {
         title: title.into(),
@@ -82,12 +74,23 @@ const CARD_PAD: f32 = 4.0;
 #[derive(IntoElement)]
 pub struct Section {
     title: SharedString,
-    children: Vec<AnyElement>,
+    /// Each child, and whether a hairline separates it from the one before.
+    children: Vec<(AnyElement, bool)>,
+}
+
+impl Section {
+    /// Content that belongs to the row above it (a message, a progress
+    /// bar): no hairline between them.
+    pub fn note(mut self, element: impl IntoElement) -> Self {
+        self.children.push((element.into_any_element(), false));
+        self
+    }
 }
 
 impl ParentElement for Section {
     fn extend(&mut self, elements: impl IntoIterator<Item = AnyElement>) {
-        self.children.extend(elements);
+        self.children
+            .extend(elements.into_iter().map(|element| (element, true)));
     }
 }
 
@@ -108,11 +111,24 @@ impl RenderOnce for Section {
                     .flex()
                     .flex_col()
                     .w_full()
-                    .gap(px(2.0))
                     .p(px(CARD_PAD))
                     .rounded(theme::r_section())
-                    .bg(theme::well())
-                    .children(self.children),
+                    .bg(theme::raised())
+                    .border_1()
+                    .border_color(theme::edge())
+                    .children(self.children.into_iter().enumerate().flat_map(
+                        |(index, (element, divided))| {
+                            let hairline = (index > 0 && divided).then(|| {
+                                div()
+                                    .h(px(1.0))
+                                    .mx(px(ROW_PAD_X))
+                                    .my(px(2.0))
+                                    .bg(theme::edge())
+                                    .into_any_element()
+                            });
+                            hairline.into_iter().chain(std::iter::once(element))
+                        },
+                    )),
             )
     }
 }
@@ -238,7 +254,7 @@ impl RenderOnce for LineRow {
             .w_full()
             .gap_3()
             .px(px(ROW_PAD_X))
-            .py(px(6.0))
+            .py(px(8.0))
             .rounded(crate::ui::theme::r_chip())
             .child(
                 div()

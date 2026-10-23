@@ -166,6 +166,7 @@ fn main() {
     let auto_paste = config.auto_paste;
     let remove_fillers_state = Arc::new(AtomicBool::new(config.remove_fillers));
     update::set_auto_checks(config.check_updates);
+    voice_stt_desktop::stt::takes::set_saving(config.save_takes);
     let hotkey_binding = HotkeyBinding::parse(&config.hotkey).unwrap_or_else(|| {
         eprintln!(
             "Could not parse the configured hotkey '{}'; using the default.",
