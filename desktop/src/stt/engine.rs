@@ -74,7 +74,7 @@ impl SttEngine {
         Ok(())
     }
 
-    /// Applies the built-in terms and the user's dictionary file when it changed.
+    /// Applies the user's dictionary file when it changed.
     fn refresh_dictionary(&self) {
         let native = self.native.lock().clone();
         let Some(engine) = native else {

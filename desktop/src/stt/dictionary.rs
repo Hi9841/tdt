@@ -1,13 +1,9 @@
-//! Words and names the engine should spell the user's way: a built-in list
-//! of developer terms plus `%LOCALAPPDATA%\TDT\dictionary.txt`, which the
-//! user edits. The file is read again whenever it changes.
+//! Words and names the engine should spell the user's way: the terms in
+//! `%LOCALAPPDATA%\TDT\dictionary.txt`, which the user edits. TDT ships no
+//! terms of its own. The file is read again whenever it changes.
 
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
-
-/// Common developer names and terms. On by default; measured to change no
-/// transcript of ordinary speech (LibriSpeech test subsets).
-pub const DEVELOPER_TERMS: &str = include_str!("../../assets/dictionary/developer-terms.txt");
 
 const USER_FILE_HEADER: &str = "\
 # TDT dictionary
@@ -45,16 +41,6 @@ pub fn parse(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// The built-in terms followed by the user's, without repeats.
-pub fn merged(user: &str) -> Vec<String> {
-    let mut seen = std::collections::HashSet::new();
-    parse(DEVELOPER_TERMS)
-        .into_iter()
-        .chain(parse(user))
-        .filter(|term| seen.insert(term.clone()))
-        .collect()
-}
-
 /// Remembers the user file's modification time, to reload only after a change.
 #[derive(Default)]
 pub struct Watch {
@@ -62,7 +48,7 @@ pub struct Watch {
 }
 
 impl Watch {
-    /// The merged terms when the file changed since the last call (or on the
+    /// The user's terms when the file changed since the last call (or on the
     /// first call), otherwise `None`. A missing file counts as empty.
     pub fn changed_terms(&mut self, path: Option<&Path>) -> Option<Vec<String>> {
         let modified = path
@@ -75,6 +61,6 @@ impl Watch {
         let text = path
             .and_then(|p| std::fs::read_to_string(p).ok())
             .unwrap_or_default();
-        Some(merged(&text))
+        Some(parse(&text))
     }
 }

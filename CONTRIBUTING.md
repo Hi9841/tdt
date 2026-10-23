@@ -1,7 +1,7 @@
 # Contributing
 
 1. Install Rust stable.
-2. Download the model with `powershell -ExecutionPolicy Bypass -File models/download-models.ps1`.
+2. Download the model with `cargo run --release --bin download-model --manifest-path desktop/Cargo.toml`.
 3. Before opening a change, run:
 
 ```powershell

@@ -6,7 +6,7 @@ packaging/tdt-setup/target/
 dist/
 *.pdb
 
-# Models (download with models/download-models.ps1)
+# Models (download with `cargo run --release --bin download-model`)
 models/*/
 trit/models/
 models/**/*.download

@@ -18,6 +18,15 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - name: No word lists
+        shell: bash
+        # Trit and TDT decode with the model alone (trit/AGENTS.md).
+        run: |
+          if git grep -n 'include_str!' -- trit/src trit/ffi desktop/src \
+            || git ls-files -- trit/src desktop/src desktop/assets | grep -E '\.(txt|json|csv|tsv)$'; then
+            echo "error: a word list ships in the engine or the app; Trit and TDT decode with the model alone"
+            exit 1
+          fi
       - name: Format
         run: cargo fmt --manifest-path desktop/Cargo.toml -- --check
       - name: Build

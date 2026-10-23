@@ -90,9 +90,8 @@ had focus. TDT also copies the text to the clipboard. A recording can be up to
 
 ## Dictionary
 
-TDT spells names and technical terms better when they are in its dictionary.
-A list of about 130 developer terms, for example Kubernetes, PostgreSQL, and
-GitHub, is always active.
+TDT spells names and technical terms better when they are in your dictionary.
+TDT ships no word lists: the dictionary holds only the words you add.
 
 To add your own words:
 
@@ -107,14 +106,11 @@ the words it heard and the term on the same audio. TDT writes the term only
 when the audio supports it, so "the mayor" stays "the mayor" when Maor is in
 the dictionary.
 
-On the test sentences with developer terms, the dictionary removes most
-of the errors (from 34 to 13). On sentences with names and product
-names, it writes 31 of 37 names correctly; without it, 11. On 400
-recordings of ordinary speech (LibriSpeech), it changes 1 transcript and
-adds no error.
+On test sentences with names and product names, with those names in the
+dictionary, TDT writes 31 of 37 names correctly; without them, 11.
 
-TDT writes English only. It never writes word pieces that only other
-languages use.
+TDT writes English only. It never writes word pieces with letters that
+English does not use (accents, Cyrillic, Greek).
 
 ## Benchmarks
 
@@ -157,9 +153,13 @@ for these operations:
 You need Rust stable on Windows.
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\models\download-models.ps1
+cargo run --release --bin download-model --manifest-path .\desktop\Cargo.toml
 cargo run --release --bin TDT --manifest-path .\desktop\Cargo.toml
 ```
+
+`download-model` gets Parakeet Redux the same way Settings does, with a
+SHA-256 check of each file. It needs no PowerShell script. Add
+`-- parakeet-tdt-0.6b-v3` for Parakeet v3.
 
 Checks before a change:
 

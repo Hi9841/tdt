@@ -215,7 +215,7 @@ fn main() {
             Some(Arc::new(SttEngine::new(&dir)))
         } else {
             append_log(&format!(
-                "{} is not downloaded. Open Settings to download it, or run models/download-models.ps1.",
+                "{} is not downloaded. Open Settings to download it.",
                 model_spec.label
             ));
             None

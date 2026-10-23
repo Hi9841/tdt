@@ -9,9 +9,6 @@ licenses remain applicable to those components.
 - TDT speech engine: TDT's own Rust implementation of the Parakeet TDT
   network. Its structure follows the Hugging Face Transformers Parakeet
   implementation (Apache-2.0, https://github.com/huggingface/transformers).
-- wordfreq (https://github.com/rspeer/wordfreq): its word frequencies chose
-  the tokenizer pieces in `trit/src/text/foreign-pieces.txt`. The file holds
-  pieces of the Parakeet v3 tokenizer, not wordfreq data.
 - GPUI, CPAL, and Rust crates: each crate's license is recorded in Cargo's
   lockfile and upstream package metadata. See `desktop/Cargo.toml` and
   https://crates.io/

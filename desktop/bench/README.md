@@ -51,13 +51,9 @@ $bench = "target/release/bench-asr.exe"
 
 # 3. Score each engine.
 uv run bench/accuracy.py $bench clean other tech tts16 --engine native
-$env:TDT_DICTIONARY = "assets/dictionary/developer-terms.txt"
-uv run bench/accuracy.py $bench clean other tech tts16 --engine native
-Remove-Item Env:TDT_DICTIONARY
 
 # 4. The dictionary on names, and on words that only sound like them.
 uv run bench/terms.py $bench bench/names-terms.txt names names-neg --show
-uv run bench/terms.py $bench assets/dictionary/developer-terms.txt tech clean other
 ```
 
 For the v0.2.25 column, check out tag `v0.2.25`, build the bench, and run the

@@ -1,6 +1,6 @@
 [package]
 name = "voice-stt-desktop"
-version = "0.4.6"
+version = "0.4.7"
 edition = "2021"
 description = "TDT (Talk Don't Type), native offline speech-to-text built with Rust and GPUI, with its own Parakeet speech engine"
 license = "PolyForm-Noncommercial-1.0.0"
@@ -23,6 +23,10 @@ path = "src/main.rs"
 [[bin]]
 name = "bench-asr"
 path = "src/bin/bench_asr.rs"
+
+[[bin]]
+name = "download-model"
+path = "src/bin/download_model.rs"
 
 [dependencies]
 # Ely pins this Zed revision. A crates.io gpui would be a different type universe.

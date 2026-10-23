@@ -7,9 +7,9 @@
     "updated": "2026-10-21",
     "value": 172
   },
-  "accuracy/tech-errors-with-dev-terms": {
+  "accuracy/tech-errors": {
     "updated": "2026-10-23",
-    "value": 13
+    "value": 34
   },
   "engine/word-errors": {
     "updated": "2026-10-20",
