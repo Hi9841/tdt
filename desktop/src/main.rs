@@ -717,7 +717,9 @@ fn main() {
                                             if !rest.is_empty() {
                                                 let _ = pump_tx.send(LiveAudio::Chunk(rest));
                                             }
-                                            let _ = pump_tx.send(LiveAudio::Finish(Instant::now()));
+                                            // Latency counts from the key release, the wait the user feels.
+                                            let released = pump_tail.lock().released_at().unwrap_or_else(Instant::now);
+                                            let _ = pump_tx.send(LiveAudio::Finish(released));
                                             pump_done.store(true, Ordering::SeqCst);
                                         });
                                         session = Some(LiveTake {

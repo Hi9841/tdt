@@ -34,7 +34,8 @@ fn release_when_idle() {
 /// Audio captured while the user is still holding the hotkey.
 pub enum LiveAudio {
     Chunk(Vec<f32>),
-    /// `Instant` is the moment recording stopped. Latency is measured from here.
+    /// `Instant` is the moment the key came up (or recording stopped).
+    /// Latency is measured from here, so it includes the speech tail.
     Finish(Instant),
 }
 
