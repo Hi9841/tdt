@@ -297,16 +297,12 @@ fn bench_native(clips: &[Clip], options: &Options) {
                 };
             }
         }
-        // TDT_TERMS: "prior,distance" for the sound check of Parakeet TDT.
-        if let Ok(spec) = std::env::var("TDT_TERMS") {
-            let values: Vec<f32> = spec
-                .split(',')
-                .filter_map(|v| v.trim().parse().ok())
-                .collect();
-            if let [prior, distance] = values.as_slice() {
-                weights.prior = *prior;
-                weights.distance = *distance;
-            }
+        // TDT_TERMS: the spelling distance of the sound check of Parakeet TDT.
+        if let Some(distance) = std::env::var("TDT_TERMS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+        {
+            weights.distance = distance;
         }
         let skipped = engine.set_dictionary(&terms, weights);
         println!(
