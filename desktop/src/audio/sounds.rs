@@ -40,6 +40,8 @@ pub fn play_sound(effect: SoundEffect) {
         use windows::core::PCWSTR;
         use windows::Win32::Media::Audio::{PlaySoundW, SND_ASYNC, SND_MEMORY, SND_NODEFAULT};
 
+        // SAFETY: `wav_bytes` is `'static`. With SND_MEMORY, PlaySoundW reads the WAV from that address and
+        // never as text, and SND_ASYNC needs it to stay valid, which `'static` guarantees.
         unsafe {
             // SND_ASYNC replaces any in-flight sound: a success chime cuts off
             // the start blip. That overlap is accepted UI behavior, not a bug.

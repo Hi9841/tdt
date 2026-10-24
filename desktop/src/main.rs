@@ -43,7 +43,7 @@ use ui::window_util::{
     position_bubble_on_preferred_monitor, PANEL_HEIGHT, PANEL_WIDTH,
 };
 use ui::{HudStatus, HudView, SystemTray};
-use update::UpdatePhase;
+use update::{CheckKind, UpdatePhase};
 use voice_stt_desktop::stt::{
     models, remove_fillers, EngineSlot, LiveAudio, LiveTranscript, SttEngine,
 };
@@ -489,7 +489,7 @@ fn main() {
                                     });
                                 } else if event.id == tray.updates_item.id() {
                                     let _ = this.update(cx, |view, cx| {
-                                        view.check_for_update(true);
+                                        view.check_for_update(CheckKind::Manual);
                                         view.open_settings(cx);
                                     });
                                 }
@@ -962,7 +962,7 @@ fn main() {
                     std::thread::spawn(move || {
                         std::thread::sleep(Duration::from_secs(8));
                         loop {
-                            update::check(&update_for_boot, false, &update_ping_boot);
+                            update::check(&update_for_boot, CheckKind::Automatic, &update_ping_boot);
                             std::thread::sleep(Duration::from_secs(60 * 60));
                         }
                     });
@@ -1012,6 +1012,7 @@ fn main() {
 /// COM release into Explorer did, keeps a windowless TDT alive forever.
 fn exit_now(code: u32) -> ! {
     #[cfg(windows)]
+    // SAFETY: TerminateProcess on this process's own pseudo-handle.
     unsafe {
         use windows::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
         let _ = TerminateProcess(GetCurrentProcess(), code);
@@ -1035,6 +1036,8 @@ struct InstanceGuard {
 #[cfg(windows)]
 impl Drop for InstanceGuard {
     fn drop(&mut self) {
+        // SAFETY: both handles come from `claim_instance` and are closed once, here. The slot is cleared first,
+        // so `take_show_request` cannot use the event after it closes.
         unsafe {
             *show_event_slot().lock() = None;
             let _ = windows::Win32::Foundation::CloseHandle(self.show_event);
@@ -1053,9 +1056,13 @@ fn take_show_request() -> bool {
     {
         use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
         use windows::Win32::System::Threading::WaitForSingleObject;
-        let Some(raw) = *show_event_slot().lock() else {
+        // The lock stays held, so `InstanceGuard::drop` cannot close the event mid-call.
+        let slot = show_event_slot().lock();
+        let Some(raw) = *slot else {
             return false;
         };
+        // SAFETY: the slot holds the event until `InstanceGuard::drop` clears it under this
+        // lock, so the handle is open. A zero timeout only reads the event state.
         unsafe { WaitForSingleObject(HANDLE(raw as _), 0) == WAIT_OBJECT_0 }
     }
     #[cfg(not(windows))]
@@ -1069,6 +1076,7 @@ fn signal_running_instance() {
     {
         use windows::core::w;
         use windows::Win32::System::Threading::{OpenEventW, SetEvent, EVENT_MODIFY_STATE};
+        // SAFETY: the name is a static null-terminated string, and the opened handle is closed after use.
         unsafe {
             if let Ok(handle) = OpenEventW(EVENT_MODIFY_STATE, false, w!("Local\\TDT-ShowOverlay"))
             {
@@ -1092,6 +1100,8 @@ fn low_rights_message() -> Option<String> {
     use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
     const MEDIUM_RID: u32 = 0x2000;
 
+    // SAFETY: `token` is closed after one query. `buf` is 8-byte aligned and sized for the label and its
+    // SID; a short buffer fails the call before the read. The SID pointer stays valid while `buf` lives.
     let rid = unsafe {
         let mut token = HANDLE::default();
         OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).ok()?;
@@ -1133,6 +1143,8 @@ fn claim_instance() -> InstanceClaim {
         use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
         use windows::Win32::System::Threading::{CreateEventW, CreateMutexW};
 
+        // SAFETY: Win32 object calls with static names. Each handle is closed on every failure path or owned
+        // by the returned guard.
         unsafe {
             // CreateMutexW's wrapper does not surface ERROR_ALREADY_EXISTS.
             // Open the existing object first so a second launch cannot start
@@ -1224,6 +1236,7 @@ fn show_error(message: &str) {
     {
         use windows::core::HSTRING;
         use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+        // SAFETY: MessageBoxW gets owned strings that outlive the call.
         unsafe {
             let _ = MessageBoxW(
                 None,

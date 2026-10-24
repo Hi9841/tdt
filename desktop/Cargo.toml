@@ -1,6 +1,6 @@
 [package]
 name = "voice-stt-desktop"
-version = "0.4.11"
+version = "0.4.12"
 edition = "2021"
 description = "TDT (Talk Don't Type), native offline speech-to-text built with Rust and GPUI, with its own Parakeet speech engine"
 license = "PolyForm-Noncommercial-1.0.0"
@@ -70,6 +70,9 @@ windows = { version = "0.58", features = [
 
 [build-dependencies]
 embed-resource = "3.0"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"
 
 [profile.release]
 opt-level = 3

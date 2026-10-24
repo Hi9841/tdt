@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 use windows::core::{Interface, BSTR, HSTRING, PCWSTR, PWSTR, VARIANT};
 use windows::Win32::Foundation::{
     CloseHandle, LocalFree, ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, E_FAIL, HANDLE, HLOCAL, TRUE,
+    WIN32_ERROR,
 };
 use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
 use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
@@ -29,7 +30,7 @@ use windows::Win32::System::Com::{
 use windows::Win32::System::Registry::{
     RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
     HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_BINARY, REG_OPTION_NON_VOLATILE,
-    REG_SZ,
+    REG_SAM_FLAGS, REG_SZ, REG_VALUE_TYPE,
 };
 use windows::Win32::System::TaskScheduler::{
     IExecAction, ITaskFolder, ITaskService, TaskScheduler, TASK_CREATE_OR_UPDATE,
@@ -220,6 +221,8 @@ fn task_name() -> Result<String, String> {
 fn with_task_folder<T: Send + 'static>(
     work: impl FnOnce(&ITaskFolder) -> windows::core::Result<T> + Send + 'static,
 ) -> windows::core::Result<T> {
+    // SAFETY: COM is initialized on this thread before its first use and released after its last,
+    // and no COM pointer leaves the thread.
     std::thread::spawn(move || unsafe {
         CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
         let result = (|| {
@@ -239,6 +242,7 @@ fn with_task_folder<T: Send + 'static>(
 /// None when this user has no startup task.
 fn read_task() -> Option<StartupTask> {
     let name = task_name().ok()?;
+    // SAFETY: COM calls on the task folder that `with_task_folder` gives this closure on its COM thread.
     with_task_folder(move |folder| unsafe {
         let task = folder.GetTask(&BSTR::from(name))?;
         let action: IExecAction = task.Definition()?.Actions()?.get_Item(1)?.cast()?;
@@ -287,6 +291,7 @@ fn register_task(exe: &Path) -> Result<(), String> {
         xml_text(&exe.to_string_lossy()),
         xml_text(&workdir.to_string_lossy()),
     );
+    // SAFETY: COM calls on the task folder that `with_task_folder` gives this closure on its COM thread.
     with_task_folder(move |folder| unsafe {
         let none = VARIANT::default();
         folder
@@ -306,6 +311,7 @@ fn register_task(exe: &Path) -> Result<(), String> {
 
 fn delete_task() -> Result<(), String> {
     let name = task_name()?;
+    // SAFETY: COM calls on the task folder that `with_task_folder` gives this closure on its COM thread.
     with_task_folder(move |folder| unsafe {
         match folder.DeleteTask(&BSTR::from(name), 0) {
             Err(error) if error.code() == ERROR_FILE_NOT_FOUND.to_hresult() => Ok(()),
@@ -325,6 +331,8 @@ fn xml_text(value: &str) -> String {
 /// The user's SID, such as S-1-5-21-...-1001. The task trigger and principal
 /// need it, and it makes the task name unique on a shared computer.
 fn current_user_sid() -> Option<String> {
+    // SAFETY: `token` is closed after one query. `buffer` is 8-byte aligned and sized for TOKEN_USER;
+    // a short buffer fails the call. The SID text is freed with LocalFree.
     unsafe {
         let mut token = HANDLE::default();
         OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).ok()?;
@@ -396,6 +404,7 @@ fn startup_folder() -> PathBuf {
 fn known_startup_folder() -> Option<PathBuf> {
     use windows::Win32::System::Com::CoTaskMemFree;
     use windows::Win32::UI::Shell::{FOLDERID_Startup, SHGetKnownFolderPath, KF_FLAG_DEFAULT};
+    // SAFETY: the shell hands over a string we own. It is copied before CoTaskMemFree releases it.
     unsafe {
         let rendered = SHGetKnownFolderPath(&FOLDERID_Startup, KF_FLAG_DEFAULT, None).ok()?;
         let path = rendered.to_string().ok();
@@ -420,11 +429,14 @@ fn write_shortcut_sta(exe: &Path, path: &Path) -> Result<(), String> {
     let workdir = exe
         .parent()
         .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+    // SAFETY: balanced by CoUninitialize on this same thread below.
     let init = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
     if init.is_err() {
         return Err("Could not initialize COM for the startup shortcut.".into());
     }
     let result: Result<(), String> = (|| {
+        // SAFETY: COM calls on this STA thread, set up by the CoInitializeEx call above. Every string is
+        // alive for the call that takes it.
         unsafe {
             let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)
                 .map_err(|error| format!("Could not create a startup shortcut: {error}"))?;
@@ -446,6 +458,7 @@ fn write_shortcut_sta(exe: &Path, path: &Path) -> Result<(), String> {
         }
         Ok(())
     })();
+    // SAFETY: balances the successful CoInitializeEx above.
     unsafe { CoUninitialize() };
     result?;
     notify_path(path, SHCNE_CREATE);
@@ -464,11 +477,17 @@ fn remove_shortcut(path: &Path) -> Result<(), String> {
 }
 
 fn notify_path(path: &Path, event: windows::Win32::UI::Shell::SHCNE_ID) {
-    let wide = wide(&path.to_string_lossy());
+    let path_text = wide(&path.to_string_lossy());
+    // SAFETY: `path_text` and `folder` are null-terminated and outlive the calls.
     unsafe {
-        SHChangeNotify(event, SHCNF_PATHW, Some(wide.as_ptr() as *const _), None);
+        SHChangeNotify(
+            event,
+            SHCNF_PATHW,
+            Some(path_text.as_ptr() as *const _),
+            None,
+        );
         if let Some(parent) = path.parent() {
-            let folder = wide_owned(&parent.to_string_lossy());
+            let folder = wide(&parent.to_string_lossy());
             SHChangeNotify(
                 SHCNE_UPDATEDIR,
                 SHCNF_PATHW,
@@ -479,161 +498,137 @@ fn notify_path(path: &Path, event: windows::Win32::UI::Shell::SHCNE_ID) {
     }
 }
 
-fn write_run_key(exe: &Path) -> Result<(), String> {
-    let data = startup_command(exe);
-    unsafe {
+/// An open HKCU registry key, closed when dropped.
+struct RegKey(HKEY);
+
+impl RegKey {
+    /// Opens `subkey`, and creates it when it is missing, for writing values.
+    fn create(subkey: &str) -> Result<Self, WIN32_ERROR> {
+        let subkey = wide(subkey);
         let mut key = HKEY::default();
-        let opened = RegCreateKeyExW(
-            HKEY_CURRENT_USER,
-            PCWSTR::from_raw(wide(RUN_SUBKEY).as_ptr()),
-            0,
-            None,
-            REG_OPTION_NON_VOLATILE,
-            KEY_SET_VALUE,
-            None,
-            &mut key,
-            None,
-        );
-        if opened != ERROR_SUCCESS {
-            return Err(format!(
-                "Could not open the Run registry key (error {opened:?})"
-            ));
-        }
-        let written = RegSetValueExW(
-            key,
-            PCWSTR::from_raw(wide(VALUE_NAME).as_ptr()),
-            0,
-            REG_SZ,
-            Some(&data),
-        );
-        let _ = RegCloseKey(key);
-        if written != ERROR_SUCCESS {
-            return Err(format!(
-                "Could not write the Run registry value (error {written:?})"
-            ));
-        }
+        // SAFETY: `subkey` is null-terminated and outlives the call, and `key`
+        // is a valid out pointer for the new handle.
+        let status = unsafe {
+            RegCreateKeyExW(
+                HKEY_CURRENT_USER,
+                PCWSTR(subkey.as_ptr()),
+                0,
+                None,
+                REG_OPTION_NON_VOLATILE,
+                KEY_SET_VALUE,
+                None,
+                &mut key,
+                None,
+            )
+        };
+        check(status).map(|()| Self(key))
     }
-    Ok(())
+
+    /// Opens the existing `subkey` with `access` rights.
+    fn open(subkey: &str, access: REG_SAM_FLAGS) -> Result<Self, WIN32_ERROR> {
+        let subkey = wide(subkey);
+        let mut key = HKEY::default();
+        // SAFETY: `subkey` is null-terminated and outlives the call, and `key`
+        // is a valid out pointer for the new handle.
+        let status = unsafe {
+            RegOpenKeyExW(
+                HKEY_CURRENT_USER,
+                PCWSTR(subkey.as_ptr()),
+                0,
+                access,
+                &mut key,
+            )
+        };
+        check(status).map(|()| Self(key))
+    }
+
+    fn set(&self, value: &str, kind: REG_VALUE_TYPE, data: &[u8]) -> Result<(), WIN32_ERROR> {
+        let value = wide(value);
+        // SAFETY: `self.0` is open, and `value` is null-terminated and outlives the call.
+        check(unsafe { RegSetValueExW(self.0, PCWSTR(value.as_ptr()), 0, kind, Some(data)) })
+    }
+
+    /// The stored size of `value`. With `data`, also copies the first bytes into it.
+    fn query(&self, value: &str, data: Option<&mut [u8]>) -> Result<u32, WIN32_ERROR> {
+        let value = wide(value);
+        let mut len = data.as_deref().map_or(0, |data| data.len() as u32);
+        let buffer = data.map(|data| data.as_mut_ptr());
+        // SAFETY: `self.0` is open, `value` is null-terminated, and `buffer`
+        // (when set) points to at least `len` writable bytes. All outlive the call.
+        let status = unsafe {
+            RegQueryValueExW(
+                self.0,
+                PCWSTR(value.as_ptr()),
+                None,
+                None,
+                buffer,
+                Some(&mut len),
+            )
+        };
+        check(status).map(|()| len)
+    }
+
+    fn delete(&self, value: &str) -> Result<(), WIN32_ERROR> {
+        let value = wide(value);
+        // SAFETY: `self.0` is open, and `value` is null-terminated and outlives the call.
+        check(unsafe { RegDeleteValueW(self.0, PCWSTR(value.as_ptr())) })
+    }
+}
+
+impl Drop for RegKey {
+    fn drop(&mut self) {
+        // SAFETY: the handle came from a successful open or create, and this is its only close.
+        let _ = unsafe { RegCloseKey(self.0) };
+    }
+}
+
+fn check(status: WIN32_ERROR) -> Result<(), WIN32_ERROR> {
+    if status == ERROR_SUCCESS {
+        Ok(())
+    } else {
+        Err(status)
+    }
+}
+
+fn write_run_key(exe: &Path) -> Result<(), String> {
+    let key = RegKey::create(RUN_SUBKEY)
+        .map_err(|error| format!("Could not open the Run registry key (error {error:?})"))?;
+    key.set(VALUE_NAME, REG_SZ, &startup_command(exe))
+        .map_err(|error| format!("Could not write the Run registry value (error {error:?})"))
 }
 
 fn write_approved(subkey: &str, value: &str) -> Result<(), String> {
-    unsafe {
-        let mut key = HKEY::default();
-        let opened = RegCreateKeyExW(
-            HKEY_CURRENT_USER,
-            PCWSTR::from_raw(wide(subkey).as_ptr()),
-            0,
-            None,
-            REG_OPTION_NON_VOLATILE,
-            KEY_SET_VALUE,
-            None,
-            &mut key,
-            None,
-        );
-        if opened != ERROR_SUCCESS {
-            return Err(format!(
-                "Could not open startup approval settings (error {opened:?})"
-            ));
-        }
-        let written = RegSetValueExW(
-            key,
-            PCWSTR::from_raw(wide(value).as_ptr()),
-            0,
-            REG_BINARY,
-            Some(&APPROVED_ENABLED),
-        );
-        let _ = RegCloseKey(key);
-        if written != ERROR_SUCCESS {
-            return Err(format!(
-                "Could not enable TDT in Task Manager startup (error {written:?})"
-            ));
-        }
-    }
-    Ok(())
+    let key = RegKey::create(subkey)
+        .map_err(|error| format!("Could not open startup approval settings (error {error:?})"))?;
+    key.set(value, REG_BINARY, &APPROVED_ENABLED)
+        .map_err(|error| format!("Could not enable TDT in Task Manager startup (error {error:?})"))
 }
 
 fn is_approved_disabled(subkey: &str, value: &str) -> bool {
-    unsafe {
-        let mut key = HKEY::default();
-        if RegOpenKeyExW(
-            HKEY_CURRENT_USER,
-            PCWSTR::from_raw(wide(subkey).as_ptr()),
-            0,
-            KEY_QUERY_VALUE,
-            &mut key,
-        ) != ERROR_SUCCESS
-        {
-            return false;
-        }
-        let mut data = [0u8; 16];
-        let mut data_len = data.len() as u32;
-        let queried = RegQueryValueExW(
-            key,
-            PCWSTR::from_raw(wide(value).as_ptr()),
-            None,
-            None,
-            Some(data.as_mut_ptr()),
-            Some(&mut data_len),
-        );
-        let _ = RegCloseKey(key);
-        queried == ERROR_SUCCESS && data_len >= 12 && data[0] != 0x02
-    }
+    let Ok(key) = RegKey::open(subkey, KEY_QUERY_VALUE) else {
+        return false;
+    };
+    let mut data = [0u8; 16];
+    key.query(value, Some(&mut data))
+        .is_ok_and(|len| len >= 12 && data[0] != 0x02)
 }
 
 fn read_value_exists(subkey: &str, value: &str) -> bool {
-    unsafe {
-        let mut key = HKEY::default();
-        if RegOpenKeyExW(
-            HKEY_CURRENT_USER,
-            PCWSTR::from_raw(wide(subkey).as_ptr()),
-            0,
-            KEY_QUERY_VALUE,
-            &mut key,
-        ) != ERROR_SUCCESS
-        {
-            return false;
-        }
-        let mut data_len = 0u32;
-        let exists = RegQueryValueExW(
-            key,
-            PCWSTR::from_raw(wide(value).as_ptr()),
-            None,
-            None,
-            None,
-            Some(&mut data_len),
-        ) == ERROR_SUCCESS;
-        let _ = RegCloseKey(key);
-        exists
-    }
+    RegKey::open(subkey, KEY_QUERY_VALUE).is_ok_and(|key| key.query(value, None).is_ok())
 }
 
 fn delete_value(subkey: &str, value: &str) -> Result<(), String> {
-    unsafe {
-        let mut key = HKEY::default();
-        let opened = RegOpenKeyExW(
-            HKEY_CURRENT_USER,
-            PCWSTR::from_raw(wide(subkey).as_ptr()),
-            0,
-            KEY_SET_VALUE,
-            &mut key,
-        );
-        if opened == ERROR_FILE_NOT_FOUND {
-            return Ok(());
-        }
-        if opened != ERROR_SUCCESS {
-            return Err(format!(
-                "Could not open startup settings (error {opened:?})"
-            ));
-        }
-        let deleted = RegDeleteValueW(key, PCWSTR::from_raw(wide(value).as_ptr()));
-        let _ = RegCloseKey(key);
-        if deleted == ERROR_SUCCESS || deleted == ERROR_FILE_NOT_FOUND {
-            Ok(())
-        } else {
-            Err(format!(
-                "Could not delete the startup value (error {deleted:?})"
-            ))
-        }
+    let key = match RegKey::open(subkey, KEY_SET_VALUE) {
+        Ok(key) => key,
+        Err(error) if error == ERROR_FILE_NOT_FOUND => return Ok(()),
+        Err(error) => return Err(format!("Could not open startup settings (error {error:?})")),
+    };
+    match key.delete(value) {
+        Ok(()) => Ok(()),
+        Err(error) if error == ERROR_FILE_NOT_FOUND => Ok(()),
+        Err(error) => Err(format!(
+            "Could not delete the startup value (error {error:?})"
+        )),
     }
 }
 
@@ -646,10 +641,6 @@ fn startup_command(exe: &Path) -> Vec<u8> {
 }
 
 fn wide(value: &str) -> Vec<u16> {
-    wide_owned(value)
-}
-
-fn wide_owned(value: &str) -> Vec<u16> {
     OsStr::new(value)
         .encode_wide()
         .chain(std::iter::once(0))

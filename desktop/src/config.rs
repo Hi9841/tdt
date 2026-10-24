@@ -231,6 +231,7 @@ pub(crate) fn local_hms() -> String {
             second: 0,
             millisecond: 0,
         };
+        // SAFETY: `time` is a valid SYSTEMTIME for GetLocalTime to fill.
         unsafe {
             GetLocalTime(&mut time);
         }

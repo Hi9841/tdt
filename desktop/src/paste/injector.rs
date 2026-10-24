@@ -38,6 +38,7 @@ fn has_input_focus(hwnd: windows::Win32::Foundation::HWND) -> bool {
     use windows::Win32::UI::WindowsAndMessaging::{
         GetGUIThreadInfo, GetWindowThreadProcessId, GUITHREADINFO,
     };
+    // SAFETY: `info` has `cbSize` set and outlives the call. a stale handle makes a call fail, not misbehave.
     unsafe {
         let thread = GetWindowThreadProcessId(hwnd, None);
         if thread == 0 {
@@ -180,6 +181,7 @@ impl PasteInjector {
                 use windows::Win32::UI::WindowsAndMessaging::{
                     BringWindowToTop, GetForegroundWindow, SetForegroundWindow,
                 };
+                // SAFETY: foreground calls on the caller's target handle; a stale handle makes a call fail, not misbehave.
                 unsafe {
                     let hwnd = HWND(raw as _);
                     // SetForegroundWindow is frequently denied to background
@@ -249,6 +251,7 @@ impl PasteInjector {
 fn release_physical_modifiers() {
     use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, KEYEVENTF_KEYUP};
 
+    // SAFETY: GetAsyncKeyState takes no pointers.
     let down = modifier_vks_to_release(|vk| unsafe {
         GetAsyncKeyState(i32::from(vk)) as u16 & 0x8000 != 0
     });
@@ -335,6 +338,7 @@ fn send_inputs(
 ) -> Result<(), String> {
     use windows::Win32::UI::Input::KeyboardAndMouse::SendInput;
     for chunk in inputs.chunks(512) {
+        // SAFETY: `chunk` is a valid slice of INPUT, and the size argument is the size of one INPUT.
         let sent = unsafe { SendInput(chunk, std::mem::size_of_val(&chunk[0]) as i32) };
         if sent != chunk.len() as u32 {
             return Err(format!(

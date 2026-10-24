@@ -213,6 +213,8 @@ impl HotkeyListener {
             *guard = Some(sender);
         }
 
+        // SAFETY: this thread installs the hook, runs its message loop, and removes it, as WH_KEYBOARD_LL
+        // requires. `hotkey_hook_proc` has the HOOKPROC signature. `msg` outlives the loop.
         std::thread::spawn(move || unsafe {
             HOOK_THREAD_ID.store(
                 windows::Win32::System::Threading::GetCurrentThreadId(),
@@ -276,6 +278,7 @@ impl HotkeyListener {
         self.running.store(false, Ordering::SeqCst);
         let thread_id = HOOK_THREAD_ID.load(Ordering::SeqCst);
         if thread_id != 0 {
+            // SAFETY: PostThreadMessageW only queues WM_QUIT; a dead thread id makes it fail.
             unsafe {
                 use windows::Win32::UI::WindowsAndMessaging::{PostThreadMessageW, WM_QUIT};
                 let _ = PostThreadMessageW(
@@ -313,6 +316,7 @@ static HOOK_PTR: std::sync::atomic::AtomicPtr<core::ffi::c_void> =
 #[cfg(target_os = "windows")]
 fn key_down(vk: i32) -> bool {
     use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+    // SAFETY: GetAsyncKeyState takes no pointers.
     unsafe { GetAsyncKeyState(vk) as u16 & 0x8000 != 0 }
 }
 

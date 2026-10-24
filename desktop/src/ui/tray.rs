@@ -87,6 +87,7 @@ fn app_icon() -> Result<Icon, String> {
 
 fn tray_icon_px() -> u32 {
     use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSMICON};
+    // SAFETY: GetSystemMetrics takes no pointers.
     let side = unsafe { GetSystemMetrics(SM_CXSMICON) };
     side.max(16) as u32
 }

@@ -101,18 +101,28 @@ pub fn set_auto_checks(on: bool) {
     AUTO_CHECKS.store(on, Ordering::Relaxed);
 }
 
+/// Who asked for an update check.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CheckKind {
+    /// The user pressed "Check for updates".
+    Manual,
+    /// TDT checks by itself, when it starts and when the panel opens.
+    Automatic,
+}
+
 /// Starts one check. The phase changes on the calling thread, so a second
 /// call finds it busy; the network work runs on a new thread. A manual
 /// check always runs and shows its errors. An automatic check runs only when
 /// the last one is `AUTO_CHECK_EVERY` old, and a failure keeps the previous
 /// state.
-pub fn check(cell: &Arc<Mutex<UpdatePhase>>, manual: bool, ping: &Sender<()>) {
+pub fn check(cell: &Arc<Mutex<UpdatePhase>>, kind: CheckKind, ping: &Sender<()>) {
+    let manual = kind == CheckKind::Manual;
     if updates_disabled() || (!manual && !AUTO_CHECKS.load(Ordering::Relaxed)) {
         return;
     }
     let previous = {
         let mut phase = cell.lock();
-        if phase.is_busy() || !claim_check_slot(manual) {
+        if phase.is_busy() || !claim_check_slot(kind) {
             return;
         }
         std::mem::replace(&mut *phase, UpdatePhase::Checking)
@@ -123,7 +133,7 @@ pub fn check(cell: &Arc<Mutex<UpdatePhase>>, manual: bool, ping: &Sender<()>) {
         let next = match latest_release() {
             Ok(Some(release)) => UpdatePhase::Available(release),
             Ok(None) => UpdatePhase::UpToDate,
-            Err(error) if manual => UpdatePhase::Failed(error),
+            Err(error) if kind == CheckKind::Manual => UpdatePhase::Failed(error),
             Err(error) => {
                 eprintln!("TDT: update check failed: {error}");
                 previous
@@ -178,10 +188,10 @@ pub fn install(cell: &Arc<Mutex<UpdatePhase>>, ping: &Sender<()>) {
     });
 }
 
-fn claim_check_slot(manual: bool) -> bool {
+fn claim_check_slot(kind: CheckKind) -> bool {
     static LAST: Mutex<Option<Instant>> = Mutex::new(None);
     let mut last = LAST.lock();
-    if !manual && last.is_some_and(|at| at.elapsed() < AUTO_CHECK_EVERY) {
+    if kind == CheckKind::Automatic && last.is_some_and(|at| at.elapsed() < AUTO_CHECK_EVERY) {
         return false;
     }
     *last = Some(Instant::now());

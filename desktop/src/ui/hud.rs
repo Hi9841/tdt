@@ -11,7 +11,7 @@ use crate::ui::theme::{
     TYPE_META, TYPE_TITLE,
 };
 use crate::ui::window_util::{client_animations_enabled, set_pill_hit_rect, set_window_mode};
-use crate::update::{self, UpdatePhase};
+use crate::update::{self, CheckKind, UpdatePhase};
 use ely_gpui_component::buttons::{ButtonVariant, IconButton, SegmentedControl};
 use ely_gpui_component::feedback::{Alert, InlineMessage};
 use ely_gpui_component::forms::Switch;
@@ -740,11 +740,11 @@ impl HudView {
 
     /// Opening the panel also asks for an automatic check, so a new
     /// version shows up where the user looks for it.
-    pub fn check_for_update(&self, manual: bool) {
+    pub fn check_for_update(&self, kind: CheckKind) {
         if preview::is_active() {
             return;
         }
-        update::check(&self.update, manual, &self.update_ping);
+        update::check(&self.update, kind, &self.update_ping);
     }
 
     fn install_update(&self) {
@@ -802,7 +802,7 @@ impl HudView {
         }
         self.active_tab = SettingsTab::Settings;
         self.panel_needs_focus = true;
-        self.check_for_update(false);
+        self.check_for_update(CheckKind::Automatic);
         let started_at = Instant::now();
         self.panel_motion = Some(PanelMotion::Opening { started_at });
         set_window_mode(true);
@@ -2129,7 +2129,7 @@ impl HudView {
                 let phase = this.update.lock().clone();
                 match phase {
                     UpdatePhase::Available(_) => this.install_update(),
-                    phase if !phase.is_busy() => this.check_for_update(true),
+                    phase if !phase.is_busy() => this.check_for_update(CheckKind::Manual),
                     _ => {}
                 }
                 cx.notify();
