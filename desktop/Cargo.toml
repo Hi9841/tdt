@@ -1,6 +1,6 @@
 [package]
 name = "voice-stt-desktop"
-version = "0.4.13"
+version = "0.4.14"
 edition = "2021"
 description = "TDT (Talk Don't Type), native offline speech-to-text built with Rust and GPUI, with its own Parakeet speech engine"
 license = "PolyForm-Noncommercial-1.0.0"
@@ -39,7 +39,7 @@ arboard = "3.4"
 tray-icon = { version = "0.26", default-features = false }
 crossbeam-channel = "0.5"
 parking_lot = "0.12"
-trit = { git = "https://github.com/Hi9841/trit", tag = "v0.2.0" }
+trit = { git = "https://github.com/Hi9841/trit", tag = "v0.3.0" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 directories = "5.0"

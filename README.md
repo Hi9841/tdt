@@ -136,12 +136,13 @@ commands that reproduce them are in [Trit's bench folder](https://github.com/Hi9
 TDT's own ratchet (the same Parakeet Redux numbers through the app's engine
 path) is in [desktop/bench](desktop/bench/README.md).
 
-Trit also speaks text (text to speech) with the Meta MMS-TTS voice:
-`trit speak "<text>" --out speech.wav`, or `Voice` in Rust, C, Python, C#,
-and Node. The TDT app does not use it yet. With the noise off, Trit gives the
-same audio as Transformers to 76 dB or more on 56 test sentences, and the
-round trip through Parakeet Redux gives 167 word errors against 171 for
-Transformers. The speech-to-text results above did not change: the 440
+Trit also speaks text (text to speech): Kokoro-82M with 28 English voices
+(American and British; it reads numbers, money, times, and symbols), and
+the Meta MMS-TTS voice. Use `trit speak "<text>" --voice bf_emma`, or `Voice`
+in Rust, C, Python, C#, and Node. The TDT app does not use it yet. Spoken by
+Trit and by the `kokoro` package, then transcribed by Parakeet Redux, 56
+test sentences give 70 word errors with Trit and 70 to 71 with the
+reference. The speech-to-text results above did not change: the 440
 LibriSpeech and tech transcripts are the same as in 0.4.12. See
 [Text to speech](https://github.com/Hi9841/trit#text-to-speech).
 
