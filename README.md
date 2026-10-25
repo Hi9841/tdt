@@ -185,7 +185,7 @@ and attaches it with `SHA256SUMS.txt`. TDT 0.2.32 and older need
 | Folder | Contents |
 |---|---|
 | `desktop/` | The Windows app (Rust and GPUI) and the speech benchmark. |
-| `trit/` | Trit, the speech engine: a Rust crate, a CLI, a C ABI, and Python, C#, and Node bindings. |
+| `trit/` | Trit, the speech engine (speech to text, and text to speech): a Rust crate, a CLI, a C ABI, and Python, C#, and Node bindings. |
 | `packaging/` | `TDT-Setup.exe` (install, update, uninstall) and its build script. |
 | `docs/` | The engine comparison and the README images. `docs/images/capture.py` captures the app pictures again. |
 | `site/` | The TDT website. |
