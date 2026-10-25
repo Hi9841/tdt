@@ -12,9 +12,9 @@
 <p align="center">
   <a href="https://github.com/Hi9841/tdt/releases/latest"><b>Download TDT-Setup.exe</b></a>
   ·
-  <a href="trit/README.md">Trit speech engine (STT and TTS)</a>
+  <a href="https://github.com/Hi9841/trit">Trit speech engine (STT and TTS)</a>
   ·
-  <a href="docs/engine-comparison.md">Benchmarks</a>
+  <a href="https://hi9841.github.io/trit/benchmarks/">Benchmarks</a>
   ·
   <a href="#license">License</a>
 </p>
@@ -27,7 +27,7 @@
 
 - **Private.** TDT records and transcribes on your computer. It uses the
   network only to download a model and to look for updates.
-- **Fast.** TDT's own speech engine, [Trit](trit/README.md), is written in
+- **Fast.** TDT's own speech engine, [Trit](https://github.com/Hi9841/trit), is written in
   Rust. The default model loads in about 0.2 seconds and stays in memory, so a
   recording never waits for it.
 - **Accurate.** The default model, Parakeet Redux, has 1.58-bit ternary
@@ -120,19 +120,21 @@ clips: LibriSpeech test-clean (200), test-other (200), developer terms (40),
 and everyday dictation (16). AMD Ryzen 9 7950X3D, Windows 11.
 
 <p align="center">
-  <img src="docs/images/errors.svg" alt="Word errors on 456 clips: Trit against the most accurate other runtime, per model" width="760">
+  <img src="https://raw.githubusercontent.com/Hi9841/trit/main/docs/images/errors.svg" alt="Word errors on 456 clips: Trit against the most accurate other runtime, per model" width="760">
 </p>
 
 <p align="center">
-  <img src="docs/images/speed.svg" alt="Median time per clip: Trit against the fastest other runtime, per model" width="760">
+  <img src="https://raw.githubusercontent.com/Hi9841/trit/main/docs/images/speed.svg" alt="Median time per clip: Trit against the fastest other runtime, per model" width="760">
 </p>
 
 For each model, Trit makes the fewest errors or ties for the fewest, and it
 has the shortest time per clip. The runtimes are faster-whisper, whisper.cpp,
 ONNX Runtime, sherpa-onnx, Transformers, OpenAI Whisper, and Photon. The full
 tables, memory use, the text cleanup model, and the method are in
-[docs/engine-comparison.md](docs/engine-comparison.md). The commands that
-reproduce them are in [desktop/bench](desktop/bench/README.md).
+[Trit's engine comparison](https://github.com/Hi9841/trit/blob/main/docs/engine-comparison.md). The
+commands that reproduce them are in [Trit's bench folder](https://github.com/Hi9841/trit/tree/main/bench).
+TDT's own ratchet (the same Parakeet Redux numbers through the app's engine
+path) is in [desktop/bench](desktop/bench/README.md).
 
 Trit also speaks text (text to speech) with the Meta MMS-TTS voice:
 `trit speak "<text>" --out speech.wav`, or `Voice` in Rust, C, Python, C#,
@@ -141,7 +143,7 @@ same audio as Transformers to 76 dB or more on 56 test sentences, and the
 round trip through Parakeet Redux gives 167 word errors against 171 for
 Transformers. The speech-to-text results above did not change: the 440
 LibriSpeech and tech transcripts are the same as in 0.4.12. See
-[Text to speech](trit/README.md#text-to-speech).
+[Text to speech](https://github.com/Hi9841/trit#text-to-speech).
 
 ## Updates
 
@@ -194,10 +196,18 @@ and attaches it with `SHA256SUMS.txt`. TDT 0.2.32 and older need
 | Folder | Contents |
 |---|---|
 | `desktop/` | The Windows app (Rust and GPUI) and the speech benchmark. |
-| `trit/` | Trit, the speech engine (speech to text, and text to speech): a Rust crate, a CLI, a C ABI, and Python, C#, and Node bindings. |
 | `packaging/` | `TDT-Setup.exe` (install, update, uninstall) and its build script. |
-| `docs/` | The engine comparison and the README images. `docs/images/capture.py` captures the app pictures again. |
+| `docs/` | The README images. `docs/images/capture.py` captures the app pictures again. |
 | `site/` | The TDT website. |
+
+Trit, the speech engine (speech to text and text to speech), has its own
+repository: [Hi9841/trit](https://github.com/Hi9841/trit), with its website at
+<https://hi9841.github.io/trit/>. TDT uses a tagged version of it
+(`desktop/Cargo.toml`). To build TDT with a local Trit checkout:
+
+```powershell
+cargo build --release --manifest-path .\desktop\Cargo.toml --config "patch.'https://github.com/Hi9841/trit'.trit.path='..\trit'"
+```
 
 ## License
 

@@ -61,49 +61,15 @@ For the v0.2.25 column, check out tag `v0.2.25`, build the bench, and run the
 `--engine app` scores the app's own path, which also cuts long recordings at
 pauses and reads the user's dictionary file.
 
-## Same model on other runtimes
+## Engine benchmarks
 
-`runtimes.py` runs each model on every runtime that supports it, on the same
-clips and with the same scorer: Trit and Photon for Parakeet Redux; ONNX
-Runtime and sherpa-onnx for Parakeet TDT; faster-whisper, whisper.cpp,
-Transformers and OpenAI Whisper for Whisper; Transformers and sherpa-onnx for
-Moonshine. Each engine runs in its own process and its own uv environment.
-
-```powershell
-cargo build --release -p trit-ffi --manifest-path ../trit/Cargo.toml   # Trit for Python
-uv run --no-project --python 3.12 python bench/runtimes.py --list      # engines and models
-uv run --no-project --python 3.12 python bench/runtimes.py parakeet-redux whisper-turbo
-uv run --no-project --python 3.12 python bench/runtimes.py all         # about 2 hours
-python bench/runtimes_report.py                                        # ../docs/engine-comparison.html
-```
-
-Results append to `target/runtimes/results.jsonl` (the last line of each
-engine wins), and each engine's transcripts go next to it. The committed run
-is [runtimes-results.jsonl](runtimes-results.jsonl). GPU engines need an
-NVIDIA GPU with CUDA 12.
-
-## Text to speech
-
-`tts.py` checks Trit's voice (MMS-TTS) against Transformers `VitsModel`. Both
-runtimes speak the 56 sentences of `corpus.txt` and `tech-corpus.txt` with
-the same token ids, and Trit transcribes both sets of clips with Parakeet
-Redux. A defect in Trit's engine shows up as a different waveform (noise off)
-or as extra word errors.
-
-```powershell
-cargo build --release --manifest-path ../trit/Cargo.toml   # copy trit.exe out of the repo folder first
-uv run --no-project --python 3.12 --with torch --with transformers --with numpy --with scipy --with whisper-normalizer --index https://download.pytorch.org/whl/cpu --index-strategy unsafe-best-match python bench/tts.py <trit.exe> <mms-tts-eng dir> <parakeet-redux dir>
-```
-
-Last run (2026-10-25, Trit 0.2.0):
-
-| Noise | Transformers errors | Trit errors |
-|---|---:|---:|
-| Off | 171 | 167 |
-| On, seeds 0, 1, 2 | 553 | 536 |
-
-With the noise off, every clip has the length of the reference, at 76.1 dB
-SNR or more (median 83.1 dB). The words are 859 per run.
+The engine benchmarks are in the Trit repository, in
+[bench/](https://github.com/Hi9841/trit/tree/main/bench): the same model on every CPU runtime
+(`runtimes.py`), the S1-mini cleanup comparison, the memory check, and the
+text-to-speech check against Transformers (`tts.py`). The report is
+[docs/engine-comparison.md](https://github.com/Hi9841/trit/blob/main/docs/engine-comparison.md).
+This folder keeps the checks of the app: the ratchet, the dictionary, and
+the accent set.
 
 ## Scripts
 
@@ -113,11 +79,3 @@ SNR or more (median 83.1 dB). The words are 859 per run.
 | `accent.py` | Speaks corpora with non-English Piper voices (the `accent` set) |
 | `accuracy.py` | Errors and speed of the TDT model through `bench-asr` (the ratchet in `engine-budget.json`) |
 | `librispeech.py` | Writes the 200 LibriSpeech clips per set as 16 kHz WAV and text |
-| `runtimes.py` | The same model on every runtime (above) |
-| `cleanup_runtimes.py` | S1-mini on Trit, Transformers, and llama.cpp, scored the same way |
-| `runtimes_table.py` | Errors per model and runtime from `target/runtimes/results.jsonl`, as text |
-| `wer_rule.py` | Exits 1 when Trit's default makes more errors than another runtime on a model |
-| `runtimes_report.py` | Writes `docs/engine-comparison.{md,html}` and `benchmarks.json` for the site |
-| `readme_charts.py` | Draws the README charts in `docs/images/` from `benchmarks.json` |
-| `memory.py` | Memory and speed of one Trit model over N clips |
-| `tts.py` | Trit's voice against Transformers: waveforms with the noise off, and round-trip word errors through Parakeet Redux |

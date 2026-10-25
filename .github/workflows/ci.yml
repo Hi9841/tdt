@@ -20,11 +20,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: No word lists
         shell: bash
-        # Trit and TDT decode with the model alone (trit/AGENTS.md).
+        # TDT decodes with the model alone; Trit (Hi9841/trit) guards its own code.
         run: |
-          if git grep -n 'include_str!' -- trit/src trit/ffi desktop/src \
-            || git ls-files -- trit/src desktop/src desktop/assets | grep -E '\.(txt|json|csv|tsv)$'; then
-            echo "error: a word list ships in the engine or the app; Trit and TDT decode with the model alone"
+          if git grep -n 'include_str!' -- desktop/src \
+            || git ls-files -- desktop/src desktop/assets | grep -E '\.(txt|json|csv|tsv)$'; then
+            echo "error: a word list ships in the app; TDT decodes with the model alone"
             exit 1
           fi
       - name: Format
@@ -33,12 +33,6 @@ jobs:
         run: cargo build --locked --manifest-path desktop/Cargo.toml
       - name: Clippy
         run: cargo clippy --locked --manifest-path desktop/Cargo.toml --all-targets --all-features -- -D warnings
-      - name: Trit engine
-        run: |
-          cargo fmt --manifest-path trit/Cargo.toml --all -- --check
-          cargo build --locked --release --manifest-path trit/Cargo.toml --workspace
-          cargo clippy --locked --manifest-path trit/Cargo.toml --workspace --all-targets -- -D warnings
-          trit/target/release/trit.exe skill --check trit/skill/SKILL.md
       - name: Installer stub
         run: |
           cargo fmt --manifest-path packaging/tdt-setup/Cargo.toml -- --check

@@ -1,14 +1,11 @@
 # Build
 desktop/target/
-trit/target/
-trit/bindings/node/node_modules/
 packaging/tdt-setup/target/
 dist/
 *.pdb
 
 # Models (download with `cargo run --release --bin download-model`)
 models/*/
-trit/models/
 models/**/*.download
 
 # Logs
@@ -24,10 +21,6 @@ Desktop.ini
 
 # Working plans of agents
 .plan/
-
-# OpLoop: the pristine baseline and the A/B libraries, built locally
-oploop/baseline/
-oploop/results/
 
 # Skills installed by the local skill tool
 .agents/
