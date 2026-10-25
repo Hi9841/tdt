@@ -82,6 +82,29 @@ engine wins), and each engine's transcripts go next to it. The committed run
 is [runtimes-results.jsonl](runtimes-results.jsonl). GPU engines need an
 NVIDIA GPU with CUDA 12.
 
+## Text to speech
+
+`tts.py` checks Trit's voice (MMS-TTS) against Transformers `VitsModel`. Both
+runtimes speak the 56 sentences of `corpus.txt` and `tech-corpus.txt` with
+the same token ids, and Trit transcribes both sets of clips with Parakeet
+Redux. A defect in Trit's engine shows up as a different waveform (noise off)
+or as extra word errors.
+
+```powershell
+cargo build --release --manifest-path ../trit/Cargo.toml   # copy trit.exe out of the repo folder first
+uv run --no-project --python 3.12 --with torch --with transformers --with numpy --with scipy --with whisper-normalizer --index https://download.pytorch.org/whl/cpu --index-strategy unsafe-best-match python bench/tts.py <trit.exe> <mms-tts-eng dir> <parakeet-redux dir>
+```
+
+Last run (2026-10-25, Trit 0.2.0):
+
+| Noise | Transformers errors | Trit errors |
+|---|---:|---:|
+| Off | 171 | 167 |
+| On, seeds 0, 1, 2 | 553 | 536 |
+
+With the noise off, every clip has the length of the reference, at 76.1 dB
+SNR or more (median 83.1 dB). The words are 859 per run.
+
 ## Scripts
 
 | Script | What it does |
@@ -97,3 +120,4 @@ NVIDIA GPU with CUDA 12.
 | `runtimes_report.py` | Writes `docs/engine-comparison.{md,html}` and `benchmarks.json` for the site |
 | `readme_charts.py` | Draws the README charts in `docs/images/` from `benchmarks.json` |
 | `memory.py` | Memory and speed of one Trit model over N clips |
+| `tts.py` | Trit's voice against Transformers: waveforms with the noise off, and round-trip word errors through Parakeet Redux |

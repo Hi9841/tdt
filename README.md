@@ -12,7 +12,7 @@
 <p align="center">
   <a href="https://github.com/Hi9841/tdt/releases/latest"><b>Download TDT-Setup.exe</b></a>
   ·
-  <a href="trit/README.md">Trit speech engine</a>
+  <a href="trit/README.md">Trit speech engine (STT and TTS)</a>
   ·
   <a href="docs/engine-comparison.md">Benchmarks</a>
   ·
@@ -133,6 +133,15 @@ ONNX Runtime, sherpa-onnx, Transformers, OpenAI Whisper, and Photon. The full
 tables, memory use, the text cleanup model, and the method are in
 [docs/engine-comparison.md](docs/engine-comparison.md). The commands that
 reproduce them are in [desktop/bench](desktop/bench/README.md).
+
+Trit also speaks text (text to speech) with the Meta MMS-TTS voice:
+`trit speak "<text>" --out speech.wav`, or `Voice` in Rust, C, Python, C#,
+and Node. The TDT app does not use it yet. With the noise off, Trit gives the
+same audio as Transformers to 76 dB or more on 56 test sentences, and the
+round trip through Parakeet Redux gives 167 word errors against 171 for
+Transformers. The speech-to-text results above did not change: the 440
+LibriSpeech and tech transcripts are the same as in 0.4.12. See
+[Text to speech](trit/README.md#text-to-speech).
 
 ## Updates
 
