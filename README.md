@@ -78,6 +78,16 @@ With **auto-paste** on (the default), TDT types the text into the window that
 had focus. TDT also copies the text to the clipboard. A recording can be up to
 120 seconds long.
 
+If the text does not appear in the app, press Ctrl+V. The pill tells you why
+TDT did not type it:
+
+- You pressed a key or a mouse button while TDT was finishing.
+- The app runs as administrator. Windows does not let TDT type into it.
+- TDT could not go back to the app.
+
+TDT writes one line about each dictation to `%LOCALAPPDATA%\TDT\tdt.log`: the
+app and the result, never the text.
+
 ## Settings
 
 | Setting | What it does |

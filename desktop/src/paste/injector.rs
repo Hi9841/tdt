@@ -28,7 +28,52 @@ pub enum DeliveryOutcome {
     NoSpeech,
     Copied,
     Pasted,
-    CopiedFallback(String),
+    CopiedFallback(NotTyped),
+}
+
+/// Why the text is on the clipboard but not in the app.
+#[derive(Debug, PartialEq)]
+pub enum NotTyped {
+    /// A key or mouse button went down while TDT was finishing.
+    UserTyped,
+    /// The app runs as administrator. Windows drops TDT's keys and reports no error.
+    Elevated,
+    /// The app is gone, or Windows did not give it the focus.
+    NoFocus(&'static str),
+    /// Windows refused some of the key events.
+    Partial(String),
+}
+
+impl NotTyped {
+    /// What the pill tells the user.
+    pub fn notice(&self) -> &'static str {
+        match self {
+            Self::UserTyped => {
+                "You typed while TDT was finishing. The final text is on the clipboard."
+            }
+            Self::Elevated => {
+                "This app runs as administrator, so Windows does not let TDT type into it. \
+                 Press Ctrl+V to paste the text."
+            }
+            Self::NoFocus(_) => {
+                "TDT could not go back to the app. Click in the app and press Ctrl+V to paste the text."
+            }
+            Self::Partial(_) => {
+                "Copied. Could not insert all text. Check the destination before pasting with Ctrl+V."
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for NotTyped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UserTyped => f.write_str("the user typed"),
+            Self::Elevated => f.write_str("the app runs as administrator"),
+            Self::NoFocus(detail) => f.write_str(detail),
+            Self::Partial(detail) => f.write_str(detail),
+        }
+    }
 }
 
 /// True once the window's input focus is live, meaning synthesized keystrokes
@@ -70,7 +115,7 @@ fn deliver_with(
     text: &str,
     should_paste: bool,
     copy: impl FnOnce(&str) -> Result<(), String>,
-    insert: impl FnOnce(&str) -> Result<(), String>,
+    insert: impl FnOnce(&str) -> Result<(), NotTyped>,
 ) -> Result<DeliveryOutcome, String> {
     if text.trim().is_empty() {
         return Ok(DeliveryOutcome::NoSpeech);
@@ -155,22 +200,19 @@ impl PasteInjector {
         }
         if user_typed {
             self.copy_to_clipboard(final_text.trim())?;
-            return Ok(DeliveryOutcome::CopiedFallback(
-                "You typed while TDT was finishing. The final text is on the clipboard."
-                    .to_string(),
-            ));
+            return Ok(DeliveryOutcome::CopiedFallback(NotTyped::UserTyped));
         }
         self.deliver(final_text, should_paste, target_hwnd)
     }
 
-    fn insert_text(&self, text: &str, target_hwnd: Option<isize>) -> Result<(), String> {
+    fn insert_text(&self, text: &str, target_hwnd: Option<isize>) -> Result<(), NotTyped> {
         self.prepare_target(target_hwnd)?;
         self.type_prepared(text)
     }
 
-    fn prepare_target(&self, target_hwnd: Option<isize>) -> Result<(), String> {
+    fn prepare_target(&self, target_hwnd: Option<isize>) -> Result<(), NotTyped> {
         if target_hwnd.is_none_or(|handle| handle == 0) {
-            return Err("The destination app is no longer available.".into());
+            return Err(NotTyped::NoFocus("no target window"));
         }
 
         // Bring the original target back to the foreground.
@@ -181,6 +223,11 @@ impl PasteInjector {
                 use windows::Win32::UI::WindowsAndMessaging::{
                     BringWindowToTop, GetForegroundWindow, SetForegroundWindow,
                 };
+                // Windows would drop the keys and report success, so do not
+                // claim a paste that cannot happen.
+                if super::Target::of(raw).blocks_input() {
+                    return Err(NotTyped::Elevated);
+                }
                 // SAFETY: foreground calls on the caller's target handle; a stale handle makes a call fail, not misbehave.
                 unsafe {
                     let hwnd = HWND(raw as _);
@@ -199,16 +246,11 @@ impl PasteInjector {
                         thread::sleep(Duration::from_millis(15));
                     }
                     if !focused {
-                        if !foreground_allowed {
-                            return Err(
-                                "Windows would not give TDT the focus (background app). Focus the target app and the transcript stays on the clipboard for Ctrl+V"
-                                    .to_string(),
-                            );
-                        }
-                        return Err(
-                            "Could not restore the target application focus; text remains on the clipboard"
-                                .to_string(),
-                        );
+                        return Err(NotTyped::NoFocus(if foreground_allowed {
+                            "the window did not come to the front"
+                        } else {
+                            "Windows refused the focus"
+                        }));
                     }
 
                     // Wait for the window to be able to accept text, rather
@@ -231,12 +273,12 @@ impl PasteInjector {
         Ok(())
     }
 
-    fn type_prepared(&self, text: &str) -> Result<(), String> {
+    fn type_prepared(&self, text: &str) -> Result<(), NotTyped> {
         // Inject Unicode text directly. A synthetic Ctrl+V is interpreted as an image
         // paste by some apps, even when CF_UNICODETEXT is present.
         #[cfg(target_os = "windows")]
         {
-            type_text_windows(text)?;
+            type_text_windows(text).map_err(NotTyped::Partial)?;
         }
         #[cfg(not(target_os = "windows"))]
         {

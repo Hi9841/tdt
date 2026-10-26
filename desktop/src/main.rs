@@ -7,6 +7,7 @@ mod audio;
 mod autostart;
 mod config;
 mod hotkey;
+mod integrity;
 mod paste;
 mod ui;
 mod update;
@@ -21,11 +22,11 @@ use config::{AppConfig, AppStats};
 use ely_gpui_component::Assets;
 use gpui::*;
 use hotkey::{
-    current_binding, input_appeared, input_mask, is_modifier_vk, note_user_typed,
-    poll_capture_timeout, set_binding, user_typed, HotkeyAction, HotkeyBinding, HotkeyListener,
+    current_binding, input_appeared, input_held, input_mask, note_user_typed, poll_capture_timeout,
+    reset_user_typed, set_binding, user_typed, HotkeyAction, HotkeyBinding, HotkeyListener,
 };
 use parking_lot::Mutex;
-use paste::{DeliveryOutcome, PasteInjector};
+use paste::{DeliveryOutcome, NotTyped, PasteInjector};
 use std::cell::RefCell;
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -66,12 +67,13 @@ fn deliver_transcript(
     should_paste: bool,
     clean_fillers: bool,
     target: Option<isize>,
-    user_typed: bool,
+    typed_key: Option<u16>,
 ) {
     if clean_fillers {
         result.text = remove_fillers(&result.text);
     }
-    let delivered = injector.apply_final(&result.text, should_paste, target, user_typed);
+    let delivered = injector.apply_final(&result.text, should_paste, target, typed_key.is_some());
+    log_delivery(&delivered, target, typed_key);
     // Text reaches the user first; the history write is not on the latency path.
     // A failed copy still lands in History so the transcript is not lost.
     if !result.text.trim().is_empty() {
@@ -86,15 +88,7 @@ fn deliver_transcript(
         }
         Ok(DeliveryOutcome::Copied) => (false, None),
         Ok(DeliveryOutcome::Pasted) => (true, None),
-        Ok(DeliveryOutcome::CopiedFallback(reason)) => (
-            false,
-            Some(if reason.starts_with("You typed") {
-                reason
-            } else {
-                "Copied. Could not insert all text. Check the destination before pasting with Ctrl+V."
-                    .to_string()
-            }),
-        ),
+        Ok(DeliveryOutcome::CopiedFallback(reason)) => (false, Some(reason.notice().to_string())),
         Err(error) => {
             let _ = tx.send(InternalEvent::TranscribeError(format!(
                 "Could not copy text. Open History to copy the saved transcript. {error}"
@@ -108,6 +102,31 @@ fn deliver_transcript(
         notice,
         latency_ms: result.latency_ms,
     });
+}
+
+/// One line per dictation, so a paste that did not arrive can be explained
+/// from the log. It names the app, never the text.
+fn log_delivery(
+    delivered: &Result<DeliveryOutcome, String>,
+    target: Option<isize>,
+    typed_key: Option<u16>,
+) {
+    let result = match delivered {
+        Ok(DeliveryOutcome::NoSpeech) => return,
+        Ok(DeliveryOutcome::Pasted) => "typed".to_string(),
+        Ok(DeliveryOutcome::Copied) => "copied (auto-paste is off)".to_string(),
+        Ok(DeliveryOutcome::CopiedFallback(NotTyped::UserTyped)) => format!(
+            "copied, not typed: key 0x{:02X} went down while TDT was finishing",
+            typed_key.unwrap_or(0)
+        ),
+        Ok(DeliveryOutcome::CopiedFallback(reason)) => format!("copied, not typed: {reason}"),
+        Err(error) => format!("not copied: {error}"),
+    };
+    let app = target.filter(|&raw| raw != 0).map_or_else(
+        || "no window".to_string(),
+        |raw| paste::Target::of(raw).to_string(),
+    );
+    append_log(&format!("Delivery: {result}. App: {app}."));
 }
 
 fn main() {
@@ -546,6 +565,10 @@ fn main() {
                             .update(cx, |view, _| std::mem::take(&mut view.click_dictation))
                             .unwrap_or(false);
                         if clicked && !is_recording_state && !is_processing_state {
+                            // The hook clears this when the shortcut goes down. A
+                            // click must clear it too, or a key typed before the
+                            // click stops the paste.
+                            reset_user_typed();
                             actions.push(HotkeyAction::PressStarted);
                             actions.push(HotkeyAction::Toggled);
                         }
@@ -572,6 +595,11 @@ fn main() {
                         };
                         let mut stop_now = false;
                         if is_recording_state && (at_limit || stop_requested) {
+                            if stop_requested {
+                                // As a stop press of the shortcut does: only keys
+                                // typed after the stop keep the text off the app.
+                                reset_user_typed();
+                            }
                             limit_notice = at_limit;
                             stop_now = true;
                         }
@@ -766,13 +794,8 @@ fn main() {
                                         let tail_open = session.as_ref().is_some_and(|live| live.baseline.is_some());
                                         if !tail_open {
                                             let baseline = input_mask();
-                                            let typing = baseline.iter().enumerate().any(|(vk, down)| {
-                                                *down
-                                                    && !is_modifier_vk(vk as u16)
-                                                    && vk as u16 != current_binding().vk
-                                            });
-                                            if typing {
-                                                note_user_typed();
+                                            if let Some(vk) = input_held(current_binding().vk) {
+                                                note_user_typed(vk);
                                                 stop_now = true;
                                             } else if let Some(live) = session.as_mut() {
                                                 live.tail.lock().mark_release();
@@ -790,8 +813,8 @@ fn main() {
 
                         if is_recording_state {
                             if let Some(baseline) = session.as_ref().and_then(|live| live.baseline.as_ref()) {
-                                if input_appeared(baseline) {
-                                    note_user_typed();
+                                if let Some(vk) = input_appeared(baseline) {
+                                    note_user_typed(vk);
                                     stop_now = true;
                                 }
                             }
@@ -1092,34 +1115,7 @@ fn signal_running_instance() {
 /// cannot read keys from, or paste into, normal apps.
 #[cfg(windows)]
 fn low_rights_message() -> Option<String> {
-    use windows::Win32::Foundation::{CloseHandle, HANDLE};
-    use windows::Win32::Security::{
-        GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TokenIntegrityLevel,
-        TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
-    };
-    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-    const MEDIUM_RID: u32 = 0x2000;
-
-    // SAFETY: `token` is closed after one query. `buf` is 8-byte aligned and sized for the label and its
-    // SID; a short buffer fails the call before the read. The SID pointer stays valid while `buf` lives.
-    let rid = unsafe {
-        let mut token = HANDLE::default();
-        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).ok()?;
-        let mut buf = [0u64; 16];
-        let mut len = 0u32;
-        let read = GetTokenInformation(
-            token,
-            TokenIntegrityLevel,
-            Some(buf.as_mut_ptr().cast()),
-            std::mem::size_of_val(&buf) as u32,
-            &mut len,
-        );
-        let _ = CloseHandle(token);
-        read.ok()?;
-        let sid = (*(buf.as_ptr() as *const TOKEN_MANDATORY_LABEL)).Label.Sid;
-        *GetSidSubAuthority(sid, u32::from(*GetSidSubAuthorityCount(sid)) - 1)
-    };
-    if rid >= MEDIUM_RID {
+    if integrity::own()? >= integrity::MEDIUM {
         return None;
     }
     let exe = std::env::current_exe().ok()?;

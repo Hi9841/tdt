@@ -1,6 +1,6 @@
 use crossbeam_channel::{Receiver, Sender};
 use parking_lot::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -153,27 +153,37 @@ fn send_action(action: HotkeyAction) {
     }
 }
 
-static USER_TYPED: AtomicBool = AtomicBool::new(false);
+/// The key that last counted as typing, for the delivery log. 0 is none.
+static TYPED_KEY: AtomicU16 = AtomicU16::new(0);
 
-/// The next dictation starts clean. Called when the shortcut key goes down.
+/// Forget earlier keys. Called when the shortcut goes down, and when a click
+/// starts or stops a dictation.
 pub fn reset_user_typed() {
-    USER_TYPED.store(false, Ordering::SeqCst);
+    TYPED_KEY.store(0, Ordering::SeqCst);
 }
 
 /// A physical non-modifier key arrived, or a key was already down at release.
-pub fn note_user_typed() {
-    USER_TYPED.store(true, Ordering::SeqCst);
+pub fn note_user_typed(vk: u16) {
+    TYPED_KEY.store(vk.max(1), Ordering::SeqCst);
 }
 
-pub fn user_typed() -> bool {
-    USER_TYPED.load(Ordering::SeqCst)
+/// The key the user pressed since the dictation started, if any.
+pub fn user_typed() -> Option<u16> {
+    Some(TYPED_KEY.load(Ordering::SeqCst)).filter(|&vk| vk != 0)
 }
 
 /// Mouse buttons are 0x01 through 0x06. The shortcut key and modifiers are not typing.
 pub fn note_physical_key(vk: u16, binding_vk: u16) {
     if vk > 0x06 && !is_modifier_vk(vk) && vk != binding_vk {
-        note_user_typed();
+        note_user_typed(vk);
     }
+}
+
+/// Keys the hook saw go down and not up. Injected keys are not here.
+static PHYSICAL_DOWN: [AtomicBool; 256] = [const { AtomicBool::new(false) }; 256];
+
+fn is_mouse_vk(vk: u16) -> bool {
+    matches!(vk, 0x01 | 0x02 | 0x04 | 0x05 | 0x06)
 }
 
 fn finish_press() {
@@ -333,10 +343,23 @@ pub fn input_mask() -> [bool; 256] {
 /// A key or button that was up when `baseline` was taken and is down now.
 /// Modifiers are ignored so the shortcut's Ctrl can stay held.
 #[cfg(target_os = "windows")]
-pub fn input_appeared(baseline: &[bool; 256]) -> bool {
+pub fn input_appeared(baseline: &[bool; 256]) -> Option<u16> {
     let now = input_mask();
-    now.iter().enumerate().any(|(vk, down)| {
-        *down && !baseline.get(vk).copied().unwrap_or(false) && !is_modifier_vk(vk as u16)
+    (0..now.len())
+        .find(|&vk| now[vk] && !baseline[vk] && !is_modifier_vk(vk as u16))
+        .map(|vk| vk as u16)
+}
+
+/// A key or mouse button, other than the shortcut, that is down now.
+///
+/// A keyboard key counts only when the hook saw it go down. Some laptop
+/// drivers report a key as down that never goes up, and that key would stop
+/// every paste.
+#[cfg(target_os = "windows")]
+pub fn input_held(binding_vk: u16) -> Option<u16> {
+    (1..=255u16).find(|&vk| {
+        let real = is_mouse_vk(vk) || PHYSICAL_DOWN[usize::from(vk)].load(Ordering::SeqCst);
+        real && !is_modifier_vk(vk) && vk != binding_vk && key_down(i32::from(vk))
     })
 }
 
@@ -399,6 +422,9 @@ unsafe extern "system" fn hotkey_hook_proc(
                 wparam,
                 lparam,
             );
+        }
+        if is_down || is_up {
+            PHYSICAL_DOWN[(kbd.vkCode & 0xFF) as usize].store(is_down, Ordering::SeqCst);
         }
 
         if CAPTURE.load(Ordering::SeqCst) {
