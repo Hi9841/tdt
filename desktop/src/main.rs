@@ -427,6 +427,9 @@ fn main() {
                     let mut recording_session = 0u64;
                     let mut limit_notice = false;
                     let mut no_speech_at: Option<Instant> = None;
+                    // A microphone that failed during the take, for the
+                    // notice after its text.
+                    let mut microphone_lost: Option<String> = None;
                     let mut session: Option<LiveTake> = None;
 
                     loop {
@@ -582,16 +585,20 @@ fn main() {
                             actions.push(HotkeyAction::PressStarted);
                             actions.push(HotkeyAction::Toggled);
                         }
+                        let mut stop_now = false;
                         let stream_error = rec.borrow().as_ref().and_then(AudioRecorder::take_error);
                         if let Some(error) = stream_error {
-                            if let Some(live) = session.take() {
-                                live.discard.store(true, Ordering::SeqCst);
-                                live.halt.store(true, Ordering::SeqCst);
-                            }
+                            // The next press opens the microphone again.
                             *rec.borrow_mut() = None;
-                            is_recording_state = false;
-                            is_processing_state = false;
-                            let _ = this.update(cx, |view, cx| { view.set_error(error); cx.notify(); });
+                            if is_recording_state || is_processing_state {
+                                // The audio before the failure is already with
+                                // the engine: finish the take, then say why it
+                                // ended.
+                                stop_now = is_recording_state;
+                                microphone_lost = Some(error);
+                            } else {
+                                let _ = this.update(cx, |view, cx| { view.set_error(error); cx.notify(); });
+                            }
                         }
                         let hit_limit = is_recording_state
                             && session.as_ref().is_some_and(|live| live.hit_limit.load(Ordering::SeqCst));
@@ -603,7 +610,6 @@ fn main() {
                         } else {
                             false
                         };
-                        let mut stop_now = false;
                         if is_recording_state && (at_limit || stop_requested) {
                             if stop_requested {
                                 // As a stop press of the shortcut does: only keys
@@ -882,6 +888,7 @@ fn main() {
                                     let word_count = text.split_whitespace().count();
                                     println!("Transcription completed ({word_count} words, latency: {latency_ms}ms)");
                                     let finished_at = Instant::now();
+                                    let notice = notice.or(microphone_lost.take());
                                     let _ = this.update(cx, |view, cx| {
                                         view.stats = AppStats::load();
                                         view.recovery_message = notice;
@@ -896,6 +903,7 @@ fn main() {
                                 }
                                 InternalEvent::TranscribeError(err) => {
                                     is_processing_state = false;
+                                    microphone_lost = None;
                                     if is_recording_state {
                                         if let Some(live) = session.as_mut() {
                                             live.halt.store(true, Ordering::SeqCst);
@@ -912,6 +920,10 @@ fn main() {
                                 }
                                 InternalEvent::NoSpeech => {
                                     is_processing_state = false;
+                                    if let Some(error) = microphone_lost.take() {
+                                        let _ = this.update(cx, |view, cx| { view.set_error(error); cx.notify(); });
+                                        continue;
+                                    }
                                     no_speech_at = Some(Instant::now());
                                     let _ = this.update(cx, |view, cx| {
                                         view.status = HudStatus::NoSpeech;
