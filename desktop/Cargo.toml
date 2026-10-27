@@ -38,6 +38,8 @@ arboard = "3.4"
 # Linux AppIndicator pulls an old glib stack that cannot share a lockfile with Zed's GPUI.
 tray-icon = { version = "0.26", default-features = false }
 crossbeam-channel = "0.5"
+# The hotkey channel: the UI loop awaits it, so a key press wakes the loop at once.
+async-channel = "2.5"
 parking_lot = "0.12"
 trit = { git = "https://github.com/Hi9841/trit", tag = "v0.3.1" }
 serde = { version = "1.0", features = ["derive"] }

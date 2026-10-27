@@ -6663,6 +6663,7 @@ name = "voice-stt-desktop"
 version = "0.4.16"
 dependencies = [
  "arboard",
+ "async-channel",
  "cpal",
  "crossbeam-channel",
  "directories",

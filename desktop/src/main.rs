@@ -269,13 +269,13 @@ fn main() {
     let hotkey_error;
     if preview::is_active() {
         _hotkey_guard = None;
-        hotkey_rx = crossbeam_channel::never();
+        hotkey_rx = None;
         hotkey_error = None;
     } else {
         match HotkeyListener::start() {
             Ok((guard, rx)) => {
                 _hotkey_guard = Some(guard);
-                hotkey_rx = rx;
+                hotkey_rx = Some(rx);
                 // The hook installs fine at low integrity but never sees keys
                 // typed into normal apps, so say why instead of failing silently.
                 hotkey_error = low_rights_message();
@@ -286,7 +286,7 @@ fn main() {
             Err(error) => {
                 append_log(&format!("Hotkey hook failed: {error}"));
                 _hotkey_guard = None;
-                hotkey_rx = crossbeam_channel::never();
+                hotkey_rx = None;
                 hotkey_error = Some(error);
             }
         }
@@ -435,9 +435,21 @@ fn main() {
                         } else {
                             Duration::from_millis(75)
                         };
-                        cx.background_executor()
-                            .timer(poll_interval)
-                            .await;
+                        // A shortcut press or release ends the wait at once:
+                        // the poll would add up to 75 ms before the microphone
+                        // starts, and up to 25 ms before the release is seen.
+                        let woke = match &hotkey_rx {
+                            Some(rx) => rx
+                                .recv()
+                                .with_timeout(poll_interval, cx.background_executor())
+                                .await
+                                .ok()
+                                .and_then(Result::ok),
+                            None => {
+                                cx.background_executor().timer(poll_interval).await;
+                                None
+                            }
+                        };
                         follow_current_virtual_desktop();
                         lock_overlay_chrome();
                         ensure_overlay_topmost();
@@ -554,10 +566,10 @@ fn main() {
                         }
 
                         // 2. Process Hotkey Events
-                        if preview::is_active() {
-                            while hotkey_rx.try_recv().is_ok() {}
-                        }
-                        let mut actions: Vec<_> = hotkey_rx.try_iter().collect();
+                        let mut actions: Vec<_> = woke
+                            .into_iter()
+                            .chain(std::iter::from_fn(|| hotkey_rx.as_ref()?.try_recv().ok()))
+                            .collect();
                         // A click on the resting pill is a tap of the shortcut.
                         let clicked = this
                             .update(cx, |view, _| std::mem::take(&mut view.click_dictation))
@@ -674,9 +686,10 @@ fn main() {
                                                 }
                                             }
                                         }
+                                        // Capture first: the buffer holds the audio until the pump below drains it.
+                                        if let Some(recorder) = rec.borrow().as_ref() { recorder.resume_input(); recorder.start(); }
                                         *target_hwnd.lock() = ui::window_util::dictation_target_window();
                                         let _ = this.update(cx, |view, cx| view.close_stats_settings(cx));
-                                        if let Some(recorder) = rec.borrow().as_ref() { recorder.resume_input(); recorder.start(); }
                                         let Some(handle) = rec.borrow().as_ref().map(|recorder| recorder.handle()) else {
                                             continue;
                                         };

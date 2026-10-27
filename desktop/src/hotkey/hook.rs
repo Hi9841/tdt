@@ -1,4 +1,4 @@
-use crossbeam_channel::{Receiver, Sender};
+use async_channel::{Receiver, Sender};
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::Arc;
@@ -149,7 +149,9 @@ fn capture_expired() -> bool {
 
 fn send_action(action: HotkeyAction) {
     if let Some(ref sender) = *SENDER.lock() {
-        let _ = sender.send(action);
+        // Unbounded, so this never waits inside the hook. The receiving
+        // loop wakes at once instead of at its next poll.
+        let _ = sender.try_send(action);
     }
 }
 
@@ -211,7 +213,7 @@ impl HotkeyListener {
             WH_KEYBOARD_LL,
         };
 
-        let (sender, receiver) = crossbeam_channel::unbounded();
+        let (sender, receiver) = async_channel::unbounded();
         let (ready_tx, ready_rx) = crossbeam_channel::bounded(1);
         let running = Arc::new(AtomicBool::new(true));
         let running_thread = Arc::clone(&running);
@@ -303,7 +305,7 @@ impl HotkeyListener {
 
     #[cfg(not(target_os = "windows"))]
     pub fn start() -> Result<(Self, Receiver<HotkeyAction>), String> {
-        let (_sender, receiver) = crossbeam_channel::unbounded();
+        let (_sender, receiver) = async_channel::unbounded();
         let running = Arc::new(AtomicBool::new(true));
         Ok((Self { running }, receiver))
     }
