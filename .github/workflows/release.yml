@@ -14,9 +14,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # The runner has no model and no clip sets, so the accuracy ratchet
+      # runs only in the local release build (packaging/build-installer.ps1).
       - name: Build TDT-Setup.exe
         shell: pwsh
-        run: ./packaging/build-installer.ps1 -Version "${{ github.ref_name }}"
+        run: ./packaging/build-installer.ps1 -Version "${{ github.ref_name }}" -SkipAccuracy
       # TDT-Setup.exe is the release. SHA256SUMS.txt only lets TDT 0.2.32
       # and older find it; drop it when those versions are gone.
       - name: Publish GitHub release

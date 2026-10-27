@@ -419,7 +419,8 @@ pub struct HudView {
     remove_fillers_state: Arc<AtomicBool>,
     save_takes_enabled: bool,
     autostart_enabled: bool,
-    autostart_error: Option<String>,
+    /// A failed startup change or settings save, shown under the settings.
+    pub settings_error: Option<String>,
     auto_updates_enabled: bool,
     pub hotkey_label: String,
     pub wave_peaks: [f32; WAVE_BARS],
@@ -508,7 +509,7 @@ impl HudView {
             remove_fillers_state,
             save_takes_enabled: voice_stt_desktop::stt::takes::saving(),
             autostart_enabled: crate::autostart::is_enabled(),
-            autostart_error: None,
+            settings_error: None,
             auto_updates_enabled: config.check_updates,
             hotkey_label,
             wave_peaks: [0.0; WAVE_BARS],
@@ -576,7 +577,7 @@ impl HudView {
         self.auto_paste_enabled = true;
         self.remove_fillers_enabled = true;
         self.autostart_enabled = false;
-        self.autostart_error = None;
+        self.settings_error = None;
         self.auto_updates_enabled = true;
 
         self.selected_model = models::DEFAULT_MODEL_ID.into();
@@ -703,7 +704,7 @@ impl HudView {
                 self.autostart_enabled = true;
             }
             PreviewSpec::PanelSettingsStartupError => {
-                self.autostart_error = Some(
+                self.settings_error = Some(
                     "Could not change startup. Check Windows startup permissions and try again."
                         .into(),
                 );
@@ -1018,48 +1019,69 @@ impl HudView {
         });
     }
 
-    fn toggle_auto_paste(&mut self) {
-        self.auto_paste_enabled = !self.auto_paste_enabled;
+    pub fn toggle_auto_paste(&mut self) {
+        let on = !self.auto_paste_enabled;
         if preview::is_active() {
+            self.auto_paste_enabled = on;
             return;
         }
-        let mut cfg = AppConfig::load();
-        cfg.auto_paste = self.auto_paste_enabled;
-        let _ = cfg.save();
-        *self.auto_paste_state.lock() = self.auto_paste_enabled;
+        if self.save_setting(|cfg| cfg.auto_paste = on) {
+            self.auto_paste_enabled = on;
+            *self.auto_paste_state.lock() = on;
+        }
     }
 
     fn set_remove_fillers(&mut self, on: bool) {
-        self.remove_fillers_enabled = on;
         if preview::is_active() {
+            self.remove_fillers_enabled = on;
             return;
         }
-        let mut cfg = AppConfig::load();
-        cfg.remove_fillers = on;
-        let _ = cfg.save();
-        self.remove_fillers_state.store(on, Ordering::Relaxed);
+        if self.save_setting(|cfg| cfg.remove_fillers = on) {
+            self.remove_fillers_enabled = on;
+            self.remove_fillers_state.store(on, Ordering::Relaxed);
+        }
     }
 
     fn set_save_takes(&mut self, on: bool) {
-        self.save_takes_enabled = on;
         if preview::is_active() {
+            self.save_takes_enabled = on;
             return;
         }
-        let mut cfg = AppConfig::load();
-        cfg.save_takes = on;
-        let _ = cfg.save();
-        voice_stt_desktop::stt::takes::set_saving(on);
+        if self.save_setting(|cfg| cfg.save_takes = on) {
+            self.save_takes_enabled = on;
+            voice_stt_desktop::stt::takes::set_saving(on);
+        }
     }
 
     fn set_auto_updates(&mut self, on: bool) {
-        self.auto_updates_enabled = on;
         if preview::is_active() {
+            self.auto_updates_enabled = on;
             return;
         }
+        if self.save_setting(|cfg| cfg.check_updates = on) {
+            self.auto_updates_enabled = on;
+            update::set_auto_checks(on);
+        }
+    }
+
+    /// Loads the config, applies `change`, and saves it. A failed save
+    /// shows an error under the settings and returns false, so the switch
+    /// keeps the value that is on disk.
+    fn save_setting(&mut self, change: impl FnOnce(&mut AppConfig)) -> bool {
         let mut cfg = AppConfig::load();
-        cfg.check_updates = on;
-        let _ = cfg.save();
-        update::set_auto_checks(on);
+        change(&mut cfg);
+        match cfg.save() {
+            Ok(()) => {
+                self.settings_error = None;
+                true
+            }
+            Err(error) => {
+                eprintln!("Could not save the settings: {error}");
+                self.settings_error =
+                    Some(format!("Could not save the setting. Try again. {error}"));
+                false
+            }
+        }
     }
 
     fn toggle_autostart(&mut self) {
@@ -1071,12 +1093,12 @@ impl HudView {
         match crate::autostart::set_enabled(enabled) {
             Ok(()) => {
                 self.autostart_enabled = enabled;
-                self.autostart_error = None;
+                self.settings_error = None;
             }
             Err(error) => {
                 eprintln!("{error}");
                 self.autostart_enabled = crate::autostart::is_enabled();
-                self.autostart_error = Some(
+                self.settings_error = Some(
                     "Could not change startup. Check Windows startup permissions and try again."
                         .into(),
                 );
@@ -2393,7 +2415,7 @@ impl HudView {
                     })
                     .child(takes_row),
             )
-            .when_some(self.autostart_error.clone(), |column, error| {
+            .when_some(self.settings_error.clone(), |column, error| {
                 column.child(InlineMessage::new(Severity::Danger, error))
             })
             .into_any_element()

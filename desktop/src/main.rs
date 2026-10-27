@@ -179,7 +179,9 @@ fn main() {
     let resolved_id = models::resolve(&config.model_id).id.to_string();
     if !preview::is_active() && resolved_id != config.model_id {
         config.model_id = resolved_id;
-        let _ = config.save();
+        if let Err(error) = config.save() {
+            eprintln!("Could not save the model id: {error}");
+        }
     } else {
         config.model_id = resolved_id;
     }
@@ -195,7 +197,9 @@ fn main() {
         let binding = HotkeyBinding::default();
         config.hotkey = binding.display();
         if !preview::is_active() {
-            let _ = config.save();
+            if let Err(error) = config.save() {
+                eprintln!("Could not save the default shortcut: {error}");
+            }
         }
         binding
     });
@@ -484,16 +488,10 @@ fn main() {
                                     });
                                     quitting = true;
                                 } else if event.id == tray.auto_paste_item.id() {
-                                    let mut flag = auto_paste_flag.lock();
-                                    *flag = !*flag;
-                                    let current = *flag;
-                                    if !preview::is_active() {
-                                        let mut cfg = AppConfig::load();
-                                        cfg.auto_paste = current;
-                                        let _ = cfg.save();
-                                    }
+                                    // The same switch as in Settings: it changes
+                                    // only when the setting is saved.
                                     let _ = this.update(cx, |view, cx| {
-                                        view.auto_paste_enabled = current;
+                                        view.toggle_auto_paste();
                                         cx.notify();
                                     });
                                 } else if event.id == tray.settings_item.id() {
@@ -613,7 +611,7 @@ fn main() {
                                     set_binding(binding);
                                     let mut cfg = AppConfig::load();
                                     cfg.hotkey = label.clone();
-                                    let _ = cfg.save();
+                                    let saved = cfg.save();
                                     if let Some(ref tray) = tray {
                                         let _ = tray
                                             .tray_icon
@@ -622,6 +620,12 @@ fn main() {
                                     let _ = this.update(cx, |view, cx| {
                                         view.hotkey_label = label;
                                         view.hotkey_capturing = false;
+                                        view.settings_error = saved.err().map(|error| {
+                                            eprintln!("Could not save the shortcut: {error}");
+                                            format!(
+                                                "The shortcut works now, but TDT could not save it. Set it again. {error}"
+                                            )
+                                        });
                                         cx.notify();
                                     });
                                 }

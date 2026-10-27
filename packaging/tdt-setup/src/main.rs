@@ -56,6 +56,15 @@ const STALE_FILES: &[&str] = &[
     "photon_worker.py",
     "photon-python.txt",
 ];
+/// Files that setup writes. `replace_file` moves a locked one aside as
+/// `<name>.old-<pid>`; TDT 0.2 updates used `TDT.exe.old-<8 hex digits>`.
+const INSTALLED_FILES: &[&str] = &[
+    "TDT.exe",
+    "uninstall.exe",
+    "LICENSE",
+    "NOTICE",
+    "THIRD_PARTY_NOTICES.md",
+];
 /// User data in the install folder that uninstall keeps.
 const USER_DATA: &[&str] = &["models", "dictionary.txt"];
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -95,29 +104,33 @@ fn main() {
 fn install(stub: &[u8], app: App, no_launch: bool) -> Result<(), String> {
     log(&format!("Installing TDT {}", app.version));
     let dir = install_dir()?;
-    close_tdt()?;
+    close_tdt(&dir)?;
     fs::create_dir_all(&dir).map_err(|e| format!("Could not create {}: {e}", dir.display()))?;
     remove_stale_files(&dir);
 
     let exe = dir.join("TDT.exe");
     replace_file(&exe, &app.exe)?;
-    replace_file(&dir.join("uninstall.exe"), stub)?;
-    for (name, bytes) in [
-        ("LICENSE", &include_bytes!("../../../LICENSE")[..]),
-        ("NOTICE", &include_bytes!("../../../NOTICE")[..]),
-        (
-            "THIRD_PARTY_NOTICES.md",
-            &include_bytes!("../../../THIRD_PARTY_NOTICES.md")[..],
-        ),
-    ] {
-        replace_file(&dir.join(name), bytes)?;
-    }
-
-    let programs = known_folder(&FOLDERID_Programs)?.join("TDT");
-    fs::create_dir_all(&programs)
-        .map_err(|e| format!("Could not create the Start menu folder: {e}"))?;
-    write_shortcut(&exe, &programs.join("TDT.lnk"))?;
-    register(&dir, &app.version, app.exe.len())?;
+    // Each step replaces what it writes, so a second run of setup completes
+    // an install that stopped here.
+    let finish = || -> Result<(), String> {
+        replace_file(&dir.join("uninstall.exe"), stub)?;
+        for (name, bytes) in [
+            ("LICENSE", &include_bytes!("../../../LICENSE")[..]),
+            ("NOTICE", &include_bytes!("../../../NOTICE")[..]),
+            (
+                "THIRD_PARTY_NOTICES.md",
+                &include_bytes!("../../../THIRD_PARTY_NOTICES.md")[..],
+            ),
+        ] {
+            replace_file(&dir.join(name), bytes)?;
+        }
+        let programs = known_folder(&FOLDERID_Programs)?.join("TDT");
+        fs::create_dir_all(&programs)
+            .map_err(|e| format!("Could not create the Start menu folder: {e}"))?;
+        write_shortcut(&exe, &programs.join("TDT.lnk"))?;
+        register(&dir, &app.version, app.exe.len())
+    };
+    finish().map_err(|error| format!("{error} TDT is only partly installed. Run setup again."))?;
     log(&format!(
         "Installed TDT {} to {}",
         app.version,
@@ -135,7 +148,7 @@ fn install(stub: &[u8], app: App, no_launch: bool) -> Result<(), String> {
 
 fn uninstall(silent: bool) -> Result<(), String> {
     let dir = install_dir()?;
-    close_tdt()?;
+    close_tdt(&dir)?;
 
     if let Ok(programs) = known_folder(&FOLDERID_Programs) {
         let _ = fs::remove_dir_all(programs.join("TDT"));
@@ -245,7 +258,7 @@ fn read_payload() -> Result<Payload, String> {
 
 /// Waits for a running TDT to quit, then ends it. The in-app updater quits
 /// by itself right after it starts setup.
-fn close_tdt() -> Result<(), String> {
+fn close_tdt(dir: &Path) -> Result<(), String> {
     let running = || unsafe {
         match OpenMutexW(
             SYNCHRONIZATION_ACCESS_RIGHTS(0x0010_0000),
@@ -268,7 +281,7 @@ fn close_tdt() -> Result<(), String> {
         }
     };
     wait(Duration::from_secs(5));
-    end_tdt_processes();
+    end_tdt_processes(dir);
     wait(Duration::from_secs(5));
     if running() {
         return Err(
@@ -279,17 +292,23 @@ fn close_tdt() -> Result<(), String> {
     Ok(())
 }
 
-/// Ends every TDT.exe that is left. TDT 0.4.0 and older can hang while they
-/// exit, with or without the mutex, and still lock TDT.exe. taskkill skips a
-/// process that is exiting, so each one ends directly.
-fn end_tdt_processes() {
+/// Ends every TDT.exe that is left in `dir`. TDT 0.4.0 and older can hang
+/// while they exit, with or without the mutex, and still lock TDT.exe.
+/// taskkill skips a process that is exiting, so each one ends directly. A
+/// TDT.exe in another folder (a second copy, another program with that
+/// name) is not touched.
+fn end_tdt_processes(dir: &Path) {
+    use windows::core::PWSTR;
     use windows::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
         TH32CS_SNAPPROCESS,
     };
     use windows::Win32::System::Threading::{
-        OpenProcess, TerminateProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+        OpenProcess, QueryFullProcessImageNameW, TerminateProcess, WaitForSingleObject,
+        PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+        PROCESS_TERMINATE,
     };
+    let ours = dir.join("TDT.exe").to_string_lossy().to_lowercase();
     unsafe {
         let Ok(snapshot) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
             return;
@@ -304,13 +323,25 @@ fn end_tdt_processes() {
             let name = String::from_utf16_lossy(&entry.szExeFile[..len]);
             if name.eq_ignore_ascii_case("TDT.exe") {
                 if let Ok(process) = OpenProcess(
-                    PROCESS_TERMINATE | PROCESS_SYNCHRONIZE,
+                    PROCESS_TERMINATE | PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
                     false,
                     entry.th32ProcessID,
                 ) {
-                    log(&format!("Ending TDT ({})", entry.th32ProcessID));
-                    if TerminateProcess(process, 1).is_ok() {
-                        let _ = WaitForSingleObject(process, 5000);
+                    let mut path = [0u16; 1024];
+                    let mut size = path.len() as u32;
+                    let image = QueryFullProcessImageNameW(
+                        process,
+                        PROCESS_NAME_WIN32,
+                        PWSTR(path.as_mut_ptr()),
+                        &mut size,
+                    )
+                    .ok()
+                    .map(|()| String::from_utf16_lossy(&path[..size as usize]).to_lowercase());
+                    if image.as_deref() == Some(ours.as_str()) {
+                        log(&format!("Ending TDT ({})", entry.th32ProcessID));
+                        if TerminateProcess(process, 1).is_ok() {
+                            let _ = WaitForSingleObject(process, 5000);
+                        }
                     }
                     let _ = CloseHandle(process);
                 }
@@ -338,10 +369,20 @@ fn remove_stale_files(dir: &Path) {
     };
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
-        if name.contains(".old") || STALE_FILES.contains(&name.as_str()) {
+        if moved_aside(&name) || STALE_FILES.contains(&name.as_str()) {
             let _ = fs::remove_file(entry.path());
         }
     }
+}
+
+/// `<one of INSTALLED_FILES>.old-<letters or digits>`: a file that setup or
+/// an older update moved aside. Other names that hold ".old" stay.
+fn moved_aside(name: &str) -> bool {
+    name.rsplit_once(".old-").is_some_and(|(file, id)| {
+        INSTALLED_FILES.iter().any(|f| f.eq_ignore_ascii_case(file))
+            && !id.is_empty()
+            && id.chars().all(|c| c.is_ascii_alphanumeric())
+    })
 }
 
 fn register(dir: &Path, version: &str, exe_len: usize) -> Result<(), String> {

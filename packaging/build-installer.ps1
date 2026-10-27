@@ -5,7 +5,10 @@
 [CmdletBinding()]
 param(
     # The release tag. The build stops when it does not match desktop/Cargo.toml.
-    [string]$Version = ""
+    [string]$Version = "",
+    # Skips the accuracy ratchet. Only for a computer without the model and
+    # the clip sets (the GitHub release workflow).
+    [switch]$SkipAccuracy
 )
 
 $ErrorActionPreference = "Stop"
@@ -21,6 +24,32 @@ if ($Version -and $Version.TrimStart("vV") -ne $CargoVersion) {
 }
 if ([Text.Encoding]::ASCII.GetByteCount($CargoVersion) -gt 16) {
     throw "Version $CargoVersion is longer than 16 bytes"
+}
+
+# The ratchet: the engine must not write more errors than
+# desktop/bench/engine-budget.json allows (without a dictionary).
+if ($SkipAccuracy) {
+    Write-Warning "Accuracy ratchet skipped: this build is not checked against engine-budget.json."
+} else {
+    foreach ($set in @("clean", "other", "tech")) {
+        if (-not (Test-Path (Join-Path $Desktop "target\accuracy\$set"))) {
+            throw "No clip set target\accuracy\$set. Make it (desktop/bench/README.md), or pass -SkipAccuracy."
+        }
+    }
+    Write-Host "Checking accuracy against engine-budget.json..."
+    & cargo build --release --locked --manifest-path (Join-Path $Desktop "Cargo.toml") --bin bench-asr
+    if ($LASTEXITCODE -ne 0) { throw "bench-asr build failed" }
+    $bench = Join-Path $Desktop "target\release\bench-asr.exe"
+    Push-Location $Desktop
+    $dictionary = $env:TDT_DICTIONARY
+    try {
+        Remove-Item Env:TDT_DICTIONARY -ErrorAction SilentlyContinue
+        & uv run bench/accuracy.py $bench clean other tech --engine native
+        if ($LASTEXITCODE -ne 0) { throw "Accuracy ratchet failed: a set is over engine-budget.json" }
+    } finally {
+        if ($dictionary) { $env:TDT_DICTIONARY = $dictionary }
+        Pop-Location
+    }
 }
 
 Write-Host "Building TDT $CargoVersion..."

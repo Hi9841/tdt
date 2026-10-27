@@ -54,12 +54,16 @@ pub fn pause_cut(samples: &[f32], start: usize) -> Option<usize> {
 
 /// Join the text of the parts. A cut can fall inside a sentence: the model
 /// then ends the first part with a period and starts the next part in
-/// lowercase. That period becomes a comma.
+/// lowercase. That period becomes a comma. The model writes a sentence
+/// start in capitals, so the lowercase start is its own sign that the
+/// sentence goes on. The period of a dotted word ("e.g.", "U.S.", "a.m.")
+/// stays. A short form with one period ("Dr.", "etc.") still gets the
+/// comma: telling it from a word at a sentence end needs a word list.
 pub fn join_parts(parts: &[String]) -> String {
     let mut joined = String::new();
     for part in parts {
         let continues = part.chars().next().is_some_and(char::is_lowercase);
-        if continues && joined.ends_with('.') && !joined.ends_with("..") {
+        if continues && joined.ends_with('.') && !dotted(&joined) {
             joined.pop();
             joined.push(',');
         }
@@ -69,6 +73,14 @@ pub fn join_parts(parts: &[String]) -> String {
         joined.push_str(part);
     }
     joined
+}
+
+/// The last word of `text` holds a period before its final one: "e.g.",
+/// "U.S.", or "..". That final period is not a sentence end.
+fn dotted(text: &str) -> bool {
+    let word = text.rsplit(char::is_whitespace).next().unwrap_or(text);
+    word.strip_suffix('.')
+        .is_some_and(|rest| rest.contains('.'))
 }
 
 fn frame_db(frame: &[f32]) -> f32 {

@@ -114,8 +114,10 @@ After each dictation, TDT looks for words that are spelled close to a term
 ("Perakeet", "trip run time", "wire shark"). The speech model then scores
 the words it heard and the term on the same audio. TDT writes the term only
 when the audio supports it, so "the mayor" stays "the mayor" when Maor is in
-the dictionary. Words with the same letters as a term with inner capitals
-("web socket" for WebSocket) always become the term.
+the dictionary. Words with the same letters as a term sound the same, so
+the audio cannot decide between them. They always become the term when the
+term has inner capitals ("web socket" for WebSocket), or when letters after
+the first differ in case ("PNPM" for pnpm).
 
 On test sentences with names and product names, with those names in the
 dictionary, TDT writes 31 of 37 names correctly; without them, 11.
