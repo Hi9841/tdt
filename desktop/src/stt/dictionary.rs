@@ -33,8 +33,11 @@ pub fn ensure_user_file() -> Result<PathBuf, String> {
 }
 
 /// Terms from dictionary text: one per line, blank lines and `#` comments skipped.
+/// A leading byte order mark, which Windows editors can add, is not part of the first term.
 pub fn parse(text: &str) -> Vec<String> {
-    text.lines()
+    text.strip_prefix('\u{feff}')
+        .unwrap_or(text)
+        .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .map(str::to_string)

@@ -108,7 +108,8 @@ To add your own words:
 1. Open Settings and find **Dictionary**.
 2. Select **Edit**. TDT opens `%LOCALAPPDATA%\TDT\dictionary.txt`.
 3. Write one word or name on each line, spelled the way you want it.
-4. Save the file. The next dictation uses it.
+4. Save the file. The next dictation uses it. A file that your editor saved
+   with a byte order mark works too.
 
 After each dictation, TDT looks for words that are spelled close to a term
 ("Perakeet", "trip run time", "wire shark"). The speech model then scores
