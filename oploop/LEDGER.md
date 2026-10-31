@@ -73,3 +73,91 @@ the order of the calls. The GUI was not started.
 - A short hangover of the open microphone after a take (a few seconds before
   `pause_input`) would remove the device start from a quick next press. It keeps
   the Windows microphone indicator on longer: the owner's decision.
+
+## Session 2026-11-01 (ultra)
+
+Branch `feat/parakeet-ultra` from `origin/main` (0.5.0, Trit tag `v0.4.0`). Goal: TDT is
+the Trit CLI with a GUI. RAM is the model, the time of a take is the CLI time, and the
+new model (Parakeet Ultra) runs well on Trit. Machine: Ryzen 9 7950X3D, RTX 4090,
+Windows 11. Scripts (not in the repo): `%TEMP%\ultra-scripts\` (`cli_bench.py`,
+`ab_engine.py`, `tdt-mem.ps1`, `floor\`, the engine-only probe).
+
+### Journeys
+
+| ID | Journey | Harness |
+|---|---|---|
+| J1 | Engine time of a take: TDT against the CLI | `ab_engine.py 10 <takes> <redux> cli=cli:trit.exe thin=tdt:<bench-asr> fat=tdt:<bench-asr>` (same whole clips, CPU, en) |
+| J2 | Words of the default model | `bench/accuracy.py <bench-asr> clean other tech` (budget 81/172/34) |
+| J3 | Idle RAM of the app with a loaded model | `tdt-mem.ps1` (full app from `%TEMP%`, 30 s idle) against `floor.exe <model> <clip> cpu` (engine only) |
+
+### Floor
+
+| Check | Result |
+|---|---|
+| `cargo fmt --check`, `cargo clippy --all-targets --release -- -D warnings` | clean, before and after |
+| J2 ratchet | 81/172/34, before and after |
+
+### Parakeet Ultra on Trit (CLI, CPU, 456 clips, no dictionary, whole clips)
+
+| Model | Word errors | Median ms (clean) | Peak RAM (clean set) | Disk |
+|---|---:|---:|---:|---:|
+| parakeet-redux | 356 | 32.5 | 549 MB | 178 MB |
+| parakeet-tdt-0.6b-v3 | 262 | 36.4 | 1044 MB | 2.5 GB |
+| parakeet-ultra | 260 | 36.8 | 1043 MB | 1.26 GB |
+
+Ultra loads with no engine change (its `vad_head` is the speech head Redux has too).
+On the GPU it is slower than on the CPU (101 against 59 ms a take) and used three
+times the memory, so TDT keeps it on the CPU (`ModelSpec::gpu`).
+
+### J3 RAM: app against engine only (idle, model loaded, CPU)
+
+| Model | Engine only (private) | TDT (private) | TDT (private working set) | Extra of the app |
+|---|---:|---:|---:|---:|
+| Redux | 496 MB | 505 MB | 335 to 343 MB | +9 MB |
+| Ultra | 900 MB | 909 MB | 815 MB | +9 MB |
+
+The GUI, tray, and microphone cost about 9 MB private. A fresh TDT loads only
+`d3d11.dll` and `dcomp.dll`. The running TDT of the owner had 697 MB private and
+`vulkan-1.dll`, `d3d12.dll`: Use GPU had been on in that session. The engine-only
+probe shows the cause (load on GPU, drop, release, load on CPU): 1177 MB private
+against 496 MB. Fixed in Trit (`gpu::trim` in `release_memory`, `MemoryHints::MemoryUsage`,
+flushed weight uploads): after the drop 390 MB, Redux on the GPU 929 MB (was 1277),
+Ultra GPU load peak 1071 MB working set (was 2143). The rest is the wgpu device and
+the driver; it stays until the process ends.
+
+### U-003 fat LTO, as the Trit CLI is built
+
+- Hypothesis: TDT builds the engine with `lto = "thin"`, the CLI with `lto = "fat"`.
+  Thin LTO costs a few percent of a take.
+- Result (J1, 12 interleaved rounds on a quiet machine, 46 takes): CLI 3107 ms,
+  thin 3129 ms (1.007, p = 0.0002), fat 3129 ms (1.007, p = 0.0005). No speed change.
+  `TDT.exe` 25,352,704 to 23,920,128 bytes (-5.6 %), deterministic.
+- Decision: KEEP for the size. Same profile as Trit.
+
+### J1 text and time against the CLI
+
+- Same text: on the 46 takes, 15 texts differed between the CLI and `bench-asr --native
+  --whole`. Cause (proved with the Python binding on one engine): `bench-asr` reads PCM16
+  as `/ 32767`, `trit::read_wav` as `/ 32768`. With the same samples, 0 of 46 differ.
+  The app itself gets f32 from the microphone, so this is a harness difference only.
+  `bench-asr` keeps `/ 32767` (as `bench/runtimes.py` of Trit): with `/ 32768` the
+  ratchet moves to 81/177/33 by noise alone (other over its budget of 172).
+- Engine sensitivity: a gain change of 0.003 % changes 15 of 46 Redux texts and 5 errors
+  on `other`. Redux quantizes activations to i8, so the rounding grid moves with the gain.
+- Time: TDT 0.5 to 0.6 % slower than the CLI with the same texts (about 0.45 ms a take).
+  H2 (threads on the other CCD of the 7950X3D): rejected, both pinned to CCD0 gave
+  1.006 (p < 0.0001). H3 (`cc` 1.6.0 against 1.9.0 for mimalloc): 1.005, no change,
+  reverted. Stopped after three tries: cause not found, below a user's perception.
+- App path (realtime, pause cuts), 46 takes: Redux 128 errors, p50 64 ms after release;
+  Ultra 79 errors, p50 60 ms. Tech: Redux 44, Ultra 28.
+
+### Not changed (proposals)
+
+- `config.rs` `load_json`: a `config.json` with a byte order mark fails to parse, and
+  TDT runs with defaults (seen when a PowerShell 5.1 script wrote it). The dictionary
+  had the same defect (fixed in 0.4.18).
+- Trit keeps the CPU copy of weights that are on the GPU (short takes, the decoder,
+  and the GPU fallback read it): about 80 MB working set above the CPU on Redux.
+- Parakeet Ultra is not on the Trit website yet (owner: investigate first). Trit int8
+  200 errors, Trit f16/f32 198, Transformers fp32 197 (`bench/runtimes.py`, 3 rounds),
+  so `wer_rule.py` would fail. Raw results in Trit `target/runtimes/results.jsonl`.
