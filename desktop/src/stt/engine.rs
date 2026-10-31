@@ -1,14 +1,13 @@
 use super::dictionary;
-use super::models::ModelSpec;
 use super::segment;
 use super::takes;
 use crossbeam_channel::{Receiver, RecvTimeoutError};
 use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use trit::{BiasWeights, Device, LoadOptions, Trit};
+use trit::{BiasWeights, Trit};
 
 const MAX_CAPTURED_SAMPLES: usize = 120 * 16_000;
 /// After a cut, a remainder shorter than 200 ms is the pause itself, not speech.
@@ -52,14 +51,10 @@ pub struct LiveTranscript {
     pub duration_secs: f32,
 }
 
-/// Speech to text for one installed model, on TDT's own engine. The model
+/// Speech to text for one installed model, on Trit and the CPU. The model
 /// loads on first use.
 pub struct SttEngine {
     model_dir: PathBuf,
-    /// The model runs faster on the GPU (`ModelSpec::gpu`).
-    gpu_faster: bool,
-    /// The user's Use GPU setting.
-    use_gpu: AtomicBool,
     native: Mutex<Option<Arc<Trit>>>,
     /// Held during a load, so a take that starts during the startup load
     /// waits for it instead of loading a second model.
@@ -69,22 +64,12 @@ pub struct SttEngine {
 }
 
 impl SttEngine {
-    pub fn new(spec: &ModelSpec, model_dir: &Path, use_gpu: bool) -> Self {
+    pub fn new(model_dir: &Path) -> Self {
         Self {
             model_dir: model_dir.to_path_buf(),
-            gpu_faster: spec.gpu,
-            use_gpu: AtomicBool::new(use_gpu),
             native: Mutex::new(None),
             loading: Mutex::new(()),
             dictionary: Mutex::new(dictionary::Watch::default()),
-        }
-    }
-
-    /// Drop the loaded model when the choice changes, so the next dictation loads it again.
-    pub fn set_use_gpu(&self, on: bool) {
-        let mut native = self.native.lock();
-        if self.use_gpu.swap(on, Ordering::Relaxed) != on && self.gpu_faster {
-            *native = None;
         }
     }
 
@@ -93,44 +78,13 @@ impl SttEngine {
         if self.native.lock().is_some() {
             return Ok(());
         }
-        // Load outside the lock. A toggle during the load must not publish this model.
-        let use_gpu = self.use_gpu.load(Ordering::Relaxed);
-        let engine = self.load_model(use_gpu && self.gpu_faster)?;
-        let mut native = self.native.lock();
-        if self.use_gpu.load(Ordering::Relaxed) == use_gpu && native.is_none() {
-            *native = Some(Arc::new(engine));
-            // Loading converts weights through buffers that are freed again.
-            trit::release_memory();
-            // A fresh engine has no dictionary yet.
-            *self.dictionary.lock() = dictionary::Watch::default();
-        }
+        let engine = Trit::load(&self.model_dir)?;
+        *self.native.lock() = Some(Arc::new(engine));
+        // Loading converts weights through buffers that are freed again.
+        trit::release_memory();
+        // A fresh engine has no dictionary yet.
+        *self.dictionary.lock() = dictionary::Watch::default();
         Ok(())
-    }
-
-    fn load_model(&self, use_gpu: bool) -> Result<Trit, String> {
-        let device = if use_gpu { Device::Auto } else { Device::Cpu };
-        match Trit::load_with(
-            &self.model_dir,
-            &LoadOptions {
-                device,
-                ..LoadOptions::default()
-            },
-        ) {
-            Ok(engine) => Ok(engine),
-            Err(error) if use_gpu => {
-                eprintln!(
-                    "Could not load the speech model on the GPU. The processor is used instead. {error}"
-                );
-                Trit::load_with(
-                    &self.model_dir,
-                    &LoadOptions {
-                        device: Device::Cpu,
-                        ..LoadOptions::default()
-                    },
-                )
-            }
-            Err(error) => Err(error),
-        }
     }
 
     /// Applies the user's dictionary file when it changed.

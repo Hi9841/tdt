@@ -416,7 +416,6 @@ pub struct HudView {
     pub status: HudStatus,
     pub auto_paste_enabled: bool,
     remove_fillers_enabled: bool,
-    use_gpu_enabled: bool,
     remove_fillers_state: Arc<AtomicBool>,
     save_takes_enabled: bool,
     autostart_enabled: bool,
@@ -507,7 +506,6 @@ impl HudView {
             status: HudStatus::Idle,
             auto_paste_enabled,
             remove_fillers_enabled: remove_fillers_state.load(Ordering::Relaxed),
-            use_gpu_enabled: config.use_gpu,
             remove_fillers_state,
             save_takes_enabled: voice_stt_desktop::stt::takes::saving(),
             autostart_enabled: crate::autostart::is_enabled(),
@@ -578,7 +576,6 @@ impl HudView {
 
         self.auto_paste_enabled = true;
         self.remove_fillers_enabled = true;
-        self.use_gpu_enabled = false;
         self.autostart_enabled = false;
         self.settings_error = None;
         self.auto_updates_enabled = true;
@@ -855,7 +852,6 @@ impl HudView {
                 config.model_id = model.id.clone();
                 match config.save() {
                     Ok(()) => {
-                        model.engine.set_use_gpu(self.use_gpu_enabled);
                         self.stt_engine.set(Some(model.engine));
                         self.active_model = Some(model.id);
                         self.model_error = None;
@@ -907,9 +903,8 @@ impl HudView {
         self.model_error = None;
         let tx = self.model_ready_tx.clone();
         let ping = self.update_ping.clone();
-        let use_gpu = self.use_gpu_enabled;
         std::thread::spawn(move || {
-            let engine = SttEngine::new(spec, &dir, use_gpu);
+            let engine = SttEngine::new(&dir);
             let result = engine
                 .prepare()
                 .map(|()| PreparedModel {
@@ -1044,19 +1039,6 @@ impl HudView {
         if self.save_setting(|cfg| cfg.remove_fillers = on) {
             self.remove_fillers_enabled = on;
             self.remove_fillers_state.store(on, Ordering::Relaxed);
-        }
-    }
-
-    fn set_use_gpu(&mut self, on: bool) {
-        if preview::is_active() {
-            self.use_gpu_enabled = on;
-            return;
-        }
-        if self.save_setting(|cfg| cfg.use_gpu = on) {
-            self.use_gpu_enabled = on;
-            if let Some(engine) = self.stt_engine.get() {
-                engine.set_use_gpu(on);
-            }
         }
     }
 
@@ -2043,32 +2025,6 @@ impl HudView {
             }),
         );
 
-        let use_gpu_switch = Switch::new("use_gpu", self.use_gpu_enabled).on_change({
-            let hud = hud.clone();
-            move |on, _, cx| {
-                hud.update(cx, |this, cx| {
-                    if this.use_gpu_enabled != on {
-                        this.set_use_gpu(on);
-                    }
-                    cx.notify();
-                });
-            }
-        });
-        let use_gpu_row = settings_row(
-            "Use GPU",
-            "Runs Parakeet Redux on the graphics card. Ultra is faster on the processor."
-                .to_string(),
-            use_gpu_switch.into_any_element(),
-        )
-        .on_click(
-            "use_gpu_row",
-            cx.listener(|this, _, _, cx| {
-                let on = !this.use_gpu_enabled;
-                this.set_use_gpu(on);
-                cx.notify();
-            }),
-        );
-
         let startup_switch = Switch::new("start_with_windows", self.autostart_enabled).on_change({
             let hud = hud.clone();
             move |on, _, cx| {
@@ -2424,7 +2380,6 @@ impl HudView {
                     .child(hotkey_row)
                     .child(auto_paste_row)
                     .child(fillers_row)
-                    .child(use_gpu_row)
                     .child(dictionary_row)
                     .when_some(self.dictionary_error.clone(), |card, error| {
                         card.note(inset(

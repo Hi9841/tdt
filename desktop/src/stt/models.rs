@@ -23,8 +23,6 @@ pub struct ModelSpec {
     pub revision: &'static str,
     pub dir_name: &'static str,
     pub files: &'static [ModelFile],
-    /// The GPU runs this model faster than the CPU. Use GPU applies only then.
-    pub gpu: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -110,8 +108,6 @@ pub const CATALOG: &[ModelSpec] = &[
         revision: "main",
         dir_name: REDUX_DIR,
         files: REDUX_FILES,
-        // 36 against 57 ms a take on an RTX 4090 (Trit 0.4.0).
-        gpu: true,
     },
     ModelSpec {
         id: "parakeet-ultra",
@@ -122,8 +118,6 @@ pub const CATALOG: &[ModelSpec] = &[
         revision: "73175eb7aeb0d82f1e2a6b53b3aabc10a90bcd0b",
         dir_name: "parakeet-ultra",
         files: ULTRA_FILES,
-        // 101 against 59 ms a take on an RTX 4090, and three times the memory.
-        gpu: false,
     },
 ];
 
