@@ -20,6 +20,10 @@ pub const HOLD_THRESHOLD: Duration = Duration::from_millis(350);
 /// this long, so a forgotten capture cannot swallow the keyboard.
 pub const CAPTURE_TIMEOUT: Duration = Duration::from_secs(6);
 
+/// Virtual-key codes of the side mouse buttons (XBUTTON1 and XBUTTON2).
+const VK_MOUSE4: u16 = 0x05;
+const VK_MOUSE5: u16 = 0x06;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HotkeyBinding {
     pub ctrl: bool,
@@ -91,7 +95,12 @@ impl HotkeyBinding {
         }
         let has_mod = self.ctrl || self.alt || self.shift || self.win;
         let is_function = (0x70..=0x87).contains(&self.vk);
-        has_mod || is_function
+        has_mod || is_function || self.is_mouse()
+    }
+
+    /// Mouse 4 and Mouse 5, the side buttons. Other mouse buttons stay free.
+    pub fn is_mouse(self) -> bool {
+        matches!(self.vk, VK_MOUSE4 | VK_MOUSE5)
     }
 }
 
@@ -188,6 +197,28 @@ fn is_mouse_vk(vk: u16) -> bool {
     matches!(vk, 0x01 | 0x02 | 0x04 | 0x05 | 0x06)
 }
 
+/// The shortcut went down. Key repeat sends more downs; only the first counts.
+fn start_press() {
+    let mut start_guard = PRESS_START.lock();
+    if start_guard.is_none() {
+        *start_guard = Some(Instant::now());
+        reset_user_typed();
+        send_action(HotkeyAction::PressStarted);
+    }
+}
+
+/// A valid capture replaces the shortcut. An invalid one, such as a lone
+/// letter, ends capture instead of swallowing input until the timeout.
+fn finish_capture(captured: HotkeyBinding) {
+    end_capture();
+    if captured.is_valid() {
+        set_binding(captured);
+        send_action(HotkeyAction::Captured(captured));
+    } else {
+        send_action(HotkeyAction::CaptureCancelled);
+    }
+}
+
 fn finish_press() {
     let Some(start) = PRESS_START.lock().take() else {
         return;
@@ -210,7 +241,7 @@ impl HotkeyListener {
         use windows::Win32::Foundation::{HINSTANCE, HWND};
         use windows::Win32::UI::WindowsAndMessaging::{
             DispatchMessageW, GetMessageW, SetWindowsHookExW, UnhookWindowsHookEx, MSG,
-            WH_KEYBOARD_LL,
+            WH_KEYBOARD_LL, WH_MOUSE_LL,
         };
 
         let (sender, receiver) = async_channel::unbounded();
@@ -225,8 +256,9 @@ impl HotkeyListener {
             *guard = Some(sender);
         }
 
-        // SAFETY: this thread installs the hook, runs its message loop, and removes it, as WH_KEYBOARD_LL
-        // requires. `hotkey_hook_proc` has the HOOKPROC signature. `msg` outlives the loop.
+        // SAFETY: this thread installs the hooks, runs their message loop, and removes them, as
+        // WH_KEYBOARD_LL and WH_MOUSE_LL require. Both procs have the HOOKPROC signature.
+        // `msg` outlives the loop.
         std::thread::spawn(move || unsafe {
             HOOK_THREAD_ID.store(
                 windows::Win32::System::Threading::GetCurrentThreadId(),
@@ -243,12 +275,28 @@ impl HotkeyListener {
             match hook {
                 Ok(h) => {
                     HOOK_PTR.store(h.0, Ordering::SeqCst);
+                    // Without the mouse hook only a mouse shortcut fails,
+                    // so the keyboard shortcut keeps working.
+                    let mouse_hook = SetWindowsHookExW(
+                        WH_MOUSE_LL,
+                        Some(mouse_hook_proc),
+                        HINSTANCE(module.0),
+                        0,
+                    );
+                    match &mouse_hook {
+                        Ok(m) => MOUSE_HOOK_PTR.store(m.0, Ordering::SeqCst),
+                        Err(error) => eprintln!("Could not install the mouse hook. {error}"),
+                    }
                     let _ = ready_tx.send(Ok(()));
                     let mut msg = MSG::default();
                     while running_thread.load(Ordering::Relaxed)
                         && GetMessageW(&mut msg, HWND::default(), 0, 0).as_bool()
                     {
                         let _ = DispatchMessageW(&msg);
+                    }
+                    if let Ok(m) = mouse_hook {
+                        let _ = UnhookWindowsHookEx(m);
+                        MOUSE_HOOK_PTR.store(std::ptr::null_mut(), Ordering::SeqCst);
                     }
                     let _ = UnhookWindowsHookEx(h);
                     HOOK_PTR.store(std::ptr::null_mut(), Ordering::SeqCst);
@@ -326,6 +374,10 @@ static HOOK_PTR: std::sync::atomic::AtomicPtr<core::ffi::c_void> =
     std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 
 #[cfg(target_os = "windows")]
+static MOUSE_HOOK_PTR: std::sync::atomic::AtomicPtr<core::ffi::c_void> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+#[cfg(target_os = "windows")]
 fn key_down(vk: i32) -> bool {
     use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
     // SAFETY: GetAsyncKeyState takes no pointers.
@@ -380,6 +432,18 @@ fn modifiers_down() -> (bool, bool, bool, bool) {
         key_down(VK_SHIFT.0 as i32) || key_down(VK_LSHIFT.0 as i32) || key_down(VK_RSHIFT.0 as i32);
     let win = key_down(VK_LWIN.0 as i32) || key_down(VK_RWIN.0 as i32);
     (ctrl, alt, shift, win)
+}
+
+#[cfg(target_os = "windows")]
+fn binding_with_modifiers(vk: u16) -> HotkeyBinding {
+    let (ctrl, alt, shift, win) = modifiers_down();
+    HotkeyBinding {
+        ctrl,
+        alt,
+        shift,
+        win,
+        vk,
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -439,36 +503,14 @@ unsafe extern "system" fn hotkey_hook_proc(
                 return LRESULT(1);
             } else if !is_modifier_vk(vk) && (is_down || is_up) {
                 if is_down {
-                    let (ctrl, alt, shift, win) = modifiers_down();
-                    let captured = HotkeyBinding {
-                        ctrl,
-                        alt,
-                        shift,
-                        win,
-                        vk,
-                    };
-                    if captured.is_valid() {
-                        set_binding(captured);
-                        end_capture();
-                        send_action(HotkeyAction::Captured(captured));
-                    } else {
-                        // A lone letter is not a valid global hotkey; end
-                        // capture instead of swallowing keys for seconds.
-                        end_capture();
-                        send_action(HotkeyAction::CaptureCancelled);
-                    }
+                    finish_capture(binding_with_modifiers(vk));
                 }
                 return LRESULT(1);
             }
         } else {
             let binding = current_binding();
             if is_down && vk == binding.vk && modifiers_match(binding) {
-                let mut start_guard = PRESS_START.lock();
-                if start_guard.is_none() {
-                    *start_guard = Some(Instant::now());
-                    reset_user_typed();
-                    send_action(HotkeyAction::PressStarted);
-                }
+                start_press();
                 return LRESULT(1);
             }
             if is_down {
@@ -495,6 +537,75 @@ unsafe extern "system" fn hotkey_hook_proc(
     )
 }
 
+/// Side buttons whose down event TDT swallowed. Their up event is swallowed
+/// too, so an app never gets a lone up and goes Back or Forward.
+#[cfg(target_os = "windows")]
+static MOUSE_SWALLOWED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Only Mouse 4 and Mouse 5 events are read. All other mouse events pass on
+/// at once, because this hook runs for each mouse move on the system.
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn mouse_hook_proc(
+    code: i32,
+    wparam: windows::Win32::Foundation::WPARAM,
+    lparam: windows::Win32::Foundation::LPARAM,
+) -> windows::Win32::Foundation::LRESULT {
+    use windows::Win32::Foundation::LRESULT;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CallNextHookEx, HHOOK, LLMHF_INJECTED, MSLLHOOKSTRUCT, WM_XBUTTONDOWN, WM_XBUTTONUP,
+    };
+
+    let msg = wparam.0 as u32;
+    if code >= 0 && (msg == WM_XBUTTONDOWN || msg == WM_XBUTTONUP) {
+        let info = *(lparam.0 as *const MSLLHOOKSTRUCT);
+        let vk = match info.mouseData >> 16 {
+            1 => Some(VK_MOUSE4),
+            2 => Some(VK_MOUSE5),
+            _ => None,
+        };
+        let injected = info.flags & LLMHF_INJECTED == LLMHF_INJECTED;
+        if let Some(vk) = vk.filter(|_| !injected && SENDER.lock().is_some()) {
+            if handle_mouse_button(vk, msg == WM_XBUTTONDOWN) {
+                return LRESULT(1);
+            }
+        }
+    }
+    CallNextHookEx(
+        HHOOK(MOUSE_HOOK_PTR.load(Ordering::Relaxed)),
+        code,
+        wparam,
+        lparam,
+    )
+}
+
+/// Returns true when TDT keeps the event from other apps.
+#[cfg(target_os = "windows")]
+fn handle_mouse_button(vk: u16, is_down: bool) -> bool {
+    let bit = 1u8 << (vk - VK_MOUSE4);
+    if !is_down {
+        if current_binding().vk == vk {
+            finish_press();
+        }
+        return MOUSE_SWALLOWED.fetch_and(!bit, Ordering::SeqCst) & bit != 0;
+    }
+    if CAPTURE.load(Ordering::SeqCst) {
+        if capture_expired() {
+            end_capture();
+            send_action(HotkeyAction::CaptureCancelled);
+            return false;
+        }
+        finish_capture(binding_with_modifiers(vk));
+    } else {
+        let binding = current_binding();
+        if vk != binding.vk || !modifiers_match(binding) {
+            return false;
+        }
+        start_press();
+    }
+    MOUSE_SWALLOWED.fetch_or(bit, Ordering::SeqCst);
+    true
+}
+
 pub fn is_modifier_vk(vk: u16) -> bool {
     matches!(
         vk,
@@ -503,8 +614,10 @@ pub fn is_modifier_vk(vk: u16) -> bool {
 }
 
 fn parse_vk(token: &str) -> Option<u16> {
-    let lower = token.trim().to_ascii_lowercase();
+    let lower = token.trim().to_ascii_lowercase().replace(' ', "");
     match lower.as_str() {
+        "mouse4" | "xbutton1" => Some(VK_MOUSE4),
+        "mouse5" | "xbutton2" => Some(VK_MOUSE5),
         ";" | "semicolon" => Some(0xBA),
         "=" | "plus" | "equal" => Some(0xBB),
         "," | "comma" => Some(0xBC),
@@ -540,6 +653,8 @@ fn parse_vk(token: &str) -> Option<u16> {
 
 fn vk_label(vk: u16) -> String {
     match vk {
+        VK_MOUSE4 => "Mouse 4".into(),
+        VK_MOUSE5 => "Mouse 5".into(),
         0x08 => "Backspace".into(),
         0x09 => "Tab".into(),
         0x0D => "Enter".into(),

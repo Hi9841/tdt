@@ -54,7 +54,7 @@ and your dictionary.
 |---|---|
 | Start and stop a recording | Tap `Ctrl + ;` once to start and once to stop. |
 | Record while you hold the key | Hold `Ctrl + ;`, speak, and release. |
-| Change the shortcut | Settings > **Shortcut** > **Change**, then press the new keys. |
+| Change the shortcut | Settings > **Shortcut** > **Change**, then press the new keys, or Mouse 4 or Mouse 5 alone. |
 | Open Settings | Click the tray icon. |
 
 The floating pill at the bottom of the screen shows the state:

@@ -2068,7 +2068,7 @@ impl HudView {
 
         let capturing = self.hotkey_capturing;
         let hotkey_sub = if capturing {
-            "Press the new shortcut. Esc cancels.".to_string()
+            "Press the new keys, Mouse 4, or Mouse 5. Esc cancels.".to_string()
         } else {
             "Tap to toggle. Hold to talk.".to_string()
         };
