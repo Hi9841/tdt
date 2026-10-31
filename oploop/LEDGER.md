@@ -161,3 +161,9 @@ the driver; it stays until the process ends.
 - Parakeet Ultra is not on the Trit website yet (owner: investigate first). Trit int8
   200 errors, Trit f16/f32 198, Transformers fp32 197 (`bench/runtimes.py`, 3 rounds),
   so `wer_rule.py` would fail. Raw results in Trit `target/runtimes/results.jsonl`.
+
+### U-004 no GPU in TDT (owner's decision)
+
+- The Use GPU option, its config field, and the GPU load path are removed; Trit is
+  built without `gpu`. `TDT.exe` 23,920,128 -> 18,489,856 bytes, `bench-asr.exe`
+  7,556,096 -> 2,063,872. Ratchet on 0.6.0 (Trit v0.4.1): 81/172/34.

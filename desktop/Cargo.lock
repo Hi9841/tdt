@@ -2270,7 +2270,7 @@ dependencies = [
  "log",
  "presser",
  "thiserror 2.0.21",
- "windows 0.62.0",
+ "windows 0.54.0",
 ]
 
 [[package]]
@@ -2785,7 +2785,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.62.2",
+ "windows-core 0.58.0",
 ]
 
 [[package]]
@@ -6053,7 +6053,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -6392,8 +6392,8 @@ dependencies = [
 
 [[package]]
 name = "trit"
-version = "0.4.0"
-source = "git+https://github.com/Hi9841/trit?tag=v0.4.0#6eeb943e42323c48420211869d497580183b2fba"
+version = "0.4.1"
+source = "git+https://github.com/Hi9841/trit?tag=v0.4.1#a5aec6883cbb74a428fc33d0f04ea8212e8df6e9"
 dependencies = [
  "libmimalloc-sys",
  "mimalloc",
@@ -6660,7 +6660,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "voice-stt-desktop"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "arboard",
  "async-channel",
