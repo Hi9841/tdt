@@ -237,7 +237,7 @@ fn main() {
                 model_spec.label,
                 dir.display()
             ));
-            Some(Arc::new(SttEngine::new(&dir, config.use_gpu)))
+            Some(Arc::new(SttEngine::new(model_spec, &dir, config.use_gpu)))
         } else {
             append_log(&format!(
                 "{} is not downloaded. Open Settings to download it.",

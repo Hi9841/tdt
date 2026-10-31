@@ -909,7 +909,7 @@ impl HudView {
         let ping = self.update_ping.clone();
         let use_gpu = self.use_gpu_enabled;
         std::thread::spawn(move || {
-            let engine = SttEngine::new(&dir, use_gpu);
+            let engine = SttEngine::new(spec, &dir, use_gpu);
             let result = engine
                 .prepare()
                 .map(|()| PreparedModel {
@@ -2056,7 +2056,7 @@ impl HudView {
         });
         let use_gpu_row = settings_row(
             "Use GPU",
-            "Runs speech on the graphics card. Falls back to the processor if it fails."
+            "Runs Parakeet Redux on the graphics card. Ultra is faster on the processor."
                 .to_string(),
             use_gpu_switch.into_any_element(),
         )

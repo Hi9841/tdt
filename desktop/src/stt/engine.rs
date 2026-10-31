@@ -1,4 +1,5 @@
 use super::dictionary;
+use super::models::ModelSpec;
 use super::segment;
 use super::takes;
 use crossbeam_channel::{Receiver, RecvTimeoutError};
@@ -55,6 +56,9 @@ pub struct LiveTranscript {
 /// loads on first use.
 pub struct SttEngine {
     model_dir: PathBuf,
+    /// The model runs faster on the GPU (`ModelSpec::gpu`).
+    gpu_faster: bool,
+    /// The user's Use GPU setting.
     use_gpu: AtomicBool,
     native: Mutex<Option<Arc<Trit>>>,
     /// Held during a load, so a take that starts during the startup load
@@ -65,9 +69,10 @@ pub struct SttEngine {
 }
 
 impl SttEngine {
-    pub fn new(model_dir: &Path, use_gpu: bool) -> Self {
+    pub fn new(spec: &ModelSpec, model_dir: &Path, use_gpu: bool) -> Self {
         Self {
             model_dir: model_dir.to_path_buf(),
+            gpu_faster: spec.gpu,
             use_gpu: AtomicBool::new(use_gpu),
             native: Mutex::new(None),
             loading: Mutex::new(()),
@@ -78,7 +83,7 @@ impl SttEngine {
     /// Drop the loaded model when the choice changes, so the next dictation loads it again.
     pub fn set_use_gpu(&self, on: bool) {
         let mut native = self.native.lock();
-        if self.use_gpu.swap(on, Ordering::Relaxed) != on {
+        if self.use_gpu.swap(on, Ordering::Relaxed) != on && self.gpu_faster {
             *native = None;
         }
     }
@@ -90,7 +95,7 @@ impl SttEngine {
         }
         // Load outside the lock. A toggle during the load must not publish this model.
         let use_gpu = self.use_gpu.load(Ordering::Relaxed);
-        let engine = self.load_model(use_gpu)?;
+        let engine = self.load_model(use_gpu && self.gpu_faster)?;
         let mut native = self.native.lock();
         if self.use_gpu.load(Ordering::Relaxed) == use_gpu && native.is_none() {
             *native = Some(Arc::new(engine));

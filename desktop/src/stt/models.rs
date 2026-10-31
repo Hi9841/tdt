@@ -23,6 +23,8 @@ pub struct ModelSpec {
     pub revision: &'static str,
     pub dir_name: &'static str,
     pub files: &'static [ModelFile],
+    /// The GPU runs this model faster than the CPU. Use GPU applies only then.
+    pub gpu: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -79,17 +81,18 @@ const REDUX_FILES: &[ModelFile] = &[
     },
 ];
 
-/// NVIDIA Parakeet TDT 0.6B v3 as published for Transformers: 207 errors
-/// against Redux's 293 on the 456 English test clips, at about the same
-/// speed with int8; 2.5 GB on disk and about 0.8 GB in memory.
-const V3_FILES: &[ModelFile] = &[
+/// Moondream Parakeet Ultra: Parakeet TDT 0.6B v3 trained further, in f16.
+/// On the 456 English test clips (Trit CLI, CPU) it has 260 word errors,
+/// v3 262 and Redux 356, at about the same speed as Redux with int8;
+/// 1.3 GB on disk (v3: 2.5 GB) and about 0.9 GB in memory.
+const ULTRA_FILES: &[ModelFile] = &[
     ModelFile {
         name: "config.json",
         sha256: "E747B85E1BDFD300C8B8AC63BAC8DD5221F8FE9BC275B48D06C735FCD6971B6E",
     },
     ModelFile {
         name: "model.safetensors",
-        sha256: "3A2026366188C8C68598EDBBFF92F8D11590A08E0AE2E6775544E7B07D6A5E11",
+        sha256: "C9608F36D0AB956C14BFCC525479B0746B3B42A56F6949EC85C14EB7466717DC",
     },
     ModelFile {
         name: "tokenizer.json",
@@ -107,16 +110,20 @@ pub const CATALOG: &[ModelSpec] = &[
         revision: "main",
         dir_name: REDUX_DIR,
         files: REDUX_FILES,
+        // 36 against 57 ms a take on an RTX 4090 (Trit 0.4.0).
+        gpu: true,
     },
     ModelSpec {
-        id: "parakeet-tdt-0.6b-v3",
-        label: "Parakeet v3",
-        size_label: "2.5 GB",
-        size_bytes: 2_509_472_233,
-        hf_repo: "nvidia/parakeet-tdt-0.6b-v3",
-        revision: "541d1f99c6b0c3cd0b11a95167540bb8edefd82b",
-        dir_name: "parakeet-tdt-0.6b-v3",
-        files: V3_FILES,
+        id: "parakeet-ultra",
+        label: "Parakeet Ultra",
+        size_label: "1.3 GB",
+        size_bytes: 1_256_514_499,
+        hf_repo: "moondream/parakeet-ultra",
+        revision: "73175eb7aeb0d82f1e2a6b53b3aabc10a90bcd0b",
+        dir_name: "parakeet-ultra",
+        files: ULTRA_FILES,
+        // 101 against 59 ms a take on an RTX 4090, and three times the memory.
+        gpu: false,
     },
 ];
 
@@ -126,7 +133,7 @@ pub fn by_id(id: &str) -> Option<&'static ModelSpec> {
     CATALOG.iter().find(|spec| spec.id == id.trim())
 }
 
-/// Retired ids (INT8, Q8, Whisper, Moonshine, SenseVoice) resolve to Parakeet Redux.
+/// Retired ids (INT8, Q8, Whisper, Moonshine, SenseVoice, Parakeet v3) resolve to Parakeet Redux.
 pub fn resolve(id: &str) -> &'static ModelSpec {
     by_id(id).unwrap_or(DEFAULT)
 }

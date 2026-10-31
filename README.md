@@ -92,9 +92,9 @@ app and the result, never the text.
 
 | Setting | What it does |
 |---|---|
-| Model | **Parakeet Redux** (178 MB, the default) or **Parakeet v3** (2.5 GB). |
+| Model | **Parakeet Redux** (178 MB, the default) or **Parakeet Ultra** (1.3 GB). Ultra makes about a third fewer errors on real dictation and uses about 0.5 GB more memory. |
 | Remove filler words | Removes "um", "uh", "erm", and "hmm", and the commas around them. Words that can carry meaning, such as "like", stay. On by default. |
-| Use GPU | Runs speech on the graphics card through Trit. Off by default. If the graphics card fails, TDT uses the processor. |
+| Use GPU | Runs Parakeet Redux on the graphics card through Trit. Off by default. Parakeet Ultra always runs on the processor: there it is faster and uses less memory. If the graphics card fails, TDT uses the processor. |
 | Dictionary | Names and terms that TDT must spell your way. See [Dictionary](#dictionary). |
 | Start with Windows | Opens TDT when you sign in. |
 | Check for updates automatically | Looks for a new release at start, every hour, and when Settings opens. Turn it off to check only when you select **Check for updates**. |
@@ -186,7 +186,7 @@ cargo run --release --bin TDT --manifest-path .\desktop\Cargo.toml
 
 `download-model` gets Parakeet Redux the same way Settings does, with a
 SHA-256 check of each file. It needs no PowerShell script. Add
-`-- parakeet-tdt-0.6b-v3` for Parakeet v3.
+`-- parakeet-ultra` for Parakeet Ultra.
 
 Checks before a change:
 
