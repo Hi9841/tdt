@@ -66,6 +66,8 @@ pub struct AppConfig {
     pub remove_fillers: bool,
     /// Look for a new release at start, every hour, and when the panel opens.
     pub check_updates: bool,
+    /// Run speech on the graphics card. Off keeps the processor.
+    pub use_gpu: bool,
     pub hotkey: String,
     pub model_dir: Option<PathBuf>,
     pub model_id: String,
@@ -79,6 +81,7 @@ impl Default for AppConfig {
             auto_paste: true,
             remove_fillers: true,
             check_updates: true,
+            use_gpu: false,
             hotkey: "Ctrl+;".to_string(),
             model_dir: None,
             model_id: voice_stt_desktop::stt::DEFAULT_MODEL_ID.to_string(),

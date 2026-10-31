@@ -94,6 +94,7 @@ app and the result, never the text.
 |---|---|
 | Model | **Parakeet Redux** (178 MB, the default) or **Parakeet v3** (2.5 GB). |
 | Remove filler words | Removes "um", "uh", "erm", and "hmm", and the commas around them. Words that can carry meaning, such as "like", stay. On by default. |
+| Use GPU | Runs speech on the graphics card through Trit. Off by default. If the graphics card fails, TDT uses the processor. |
 | Dictionary | Names and terms that TDT must spell your way. See [Dictionary](#dictionary). |
 | Start with Windows | Opens TDT when you sign in. |
 | Check for updates automatically | Looks for a new release at start, every hour, and when Settings opens. Turn it off to check only when you select **Check for updates**. |

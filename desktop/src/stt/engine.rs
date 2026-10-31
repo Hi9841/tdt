@@ -4,14 +4,19 @@ use super::takes;
 use crossbeam_channel::{Receiver, RecvTimeoutError};
 use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use trit::{BiasWeights, Trit};
+use trit::{BiasWeights, Device, LoadOptions, Trit};
 
 const MAX_CAPTURED_SAMPLES: usize = 120 * 16_000;
 /// After a cut, a remainder shorter than 200 ms is the pause itself, not speech.
 const MIN_REMAINDER_SAMPLES: usize = 3_200;
+/// The first second of a take runs through the model once while the user
+/// still talks, and its text is dropped. After a long idle the first run
+/// pays for weights the system paged out and cores that slept; this moves
+/// that cost out of the wait after the release.
+const PRIME_SAMPLES: usize = 16_000;
 
 /// Dictation starts and ends so far; a release waits for this to stay the same.
 static DICTATIONS: AtomicU64 = AtomicU64::new(0);
@@ -50,30 +55,77 @@ pub struct LiveTranscript {
 /// loads on first use.
 pub struct SttEngine {
     model_dir: PathBuf,
+    use_gpu: AtomicBool,
     native: Mutex<Option<Arc<Trit>>>,
+    /// Held during a load, so a take that starts during the startup load
+    /// waits for it instead of loading a second model.
+    loading: Mutex<()>,
     /// The dictionary file as last applied to the engine.
     dictionary: Mutex<dictionary::Watch>,
 }
 
 impl SttEngine {
-    pub fn new(model_dir: &Path) -> Self {
+    pub fn new(model_dir: &Path, use_gpu: bool) -> Self {
         Self {
             model_dir: model_dir.to_path_buf(),
+            use_gpu: AtomicBool::new(use_gpu),
             native: Mutex::new(None),
+            loading: Mutex::new(()),
             dictionary: Mutex::new(dictionary::Watch::default()),
         }
     }
 
-    pub fn prepare(&self) -> Result<(), String> {
+    /// Drop the loaded model when the choice changes, so the next dictation loads it again.
+    pub fn set_use_gpu(&self, on: bool) {
         let mut native = self.native.lock();
-        if native.is_none() {
-            *native = Some(Arc::new(Trit::load(&self.model_dir)?));
+        if self.use_gpu.swap(on, Ordering::Relaxed) != on {
+            *native = None;
+        }
+    }
+
+    pub fn prepare(&self) -> Result<(), String> {
+        let _loading = self.loading.lock();
+        if self.native.lock().is_some() {
+            return Ok(());
+        }
+        // Load outside the lock. A toggle during the load must not publish this model.
+        let use_gpu = self.use_gpu.load(Ordering::Relaxed);
+        let engine = self.load_model(use_gpu)?;
+        let mut native = self.native.lock();
+        if self.use_gpu.load(Ordering::Relaxed) == use_gpu && native.is_none() {
+            *native = Some(Arc::new(engine));
             // Loading converts weights through buffers that are freed again.
             trit::release_memory();
             // A fresh engine has no dictionary yet.
             *self.dictionary.lock() = dictionary::Watch::default();
         }
         Ok(())
+    }
+
+    fn load_model(&self, use_gpu: bool) -> Result<Trit, String> {
+        let device = if use_gpu { Device::Auto } else { Device::Cpu };
+        match Trit::load_with(
+            &self.model_dir,
+            &LoadOptions {
+                device,
+                ..LoadOptions::default()
+            },
+        ) {
+            Ok(engine) => Ok(engine),
+            Err(error) if use_gpu => {
+                eprintln!(
+                    "Could not load the speech model on the GPU. The processor is used instead. {error}"
+                );
+                Trit::load_with(
+                    &self.model_dir,
+                    &LoadOptions {
+                        device: Device::Cpu,
+                        ..LoadOptions::default()
+                    },
+                )
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Applies the user's dictionary file when it changed.
@@ -114,6 +166,7 @@ impl SttEngine {
         let mut committed = 0;
         let mut parts: Vec<String> = Vec::new();
         let mut last_any = Instant::now();
+        let mut primed = false;
 
         loop {
             match rx.recv_timeout(Duration::from_millis(20)) {
@@ -121,6 +174,10 @@ impl SttEngine {
                     last_any = Instant::now();
                     if captured.len() < MAX_CAPTURED_SAMPLES {
                         captured.extend_from_slice(&samples);
+                        if !primed && captured.len() >= PRIME_SAMPLES {
+                            primed = true;
+                            self.transcribe_samples(&captured[..PRIME_SAMPLES])?;
+                        }
                         // Transcribe finished sentences while the user still
                         // talks. New chunks wait in the channel meanwhile.
                         if let Some(cut) = segment::pause_cut(&captured, committed) {
