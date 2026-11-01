@@ -7,8 +7,12 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HotkeyAction {
     PressStarted,
-    HoldReleased,
-    Toggled,
+    /// A hold came up. The `Instant` is the key-up: a hold asks the take to
+    /// stop when the user lets go.
+    HoldReleased(Instant),
+    /// A short tap. The `Instant` is the key-down: a tap that stops a take
+    /// asks to stop when the user presses it, not when the key comes up.
+    Toggled(Instant),
     Captured(HotkeyBinding),
     CaptureCancelled,
 }
@@ -129,7 +133,7 @@ pub fn current_binding() -> HotkeyBinding {
 pub fn begin_capture() {
     // A press was possibly still active; never leave the app thinking it is.
     if PRESS_START.lock().take().is_some() {
-        send_action(HotkeyAction::HoldReleased);
+        send_action(HotkeyAction::HoldReleased(Instant::now()));
     }
     *CAPTURE_START.lock() = Some(Instant::now());
     CAPTURE.store(true, Ordering::SeqCst);
@@ -224,9 +228,9 @@ fn finish_press() {
         return;
     };
     let action = if start.elapsed() > HOLD_THRESHOLD {
-        HotkeyAction::HoldReleased
+        HotkeyAction::HoldReleased(Instant::now())
     } else {
-        HotkeyAction::Toggled
+        HotkeyAction::Toggled(start)
     };
     send_action(action);
 }

@@ -46,7 +46,7 @@ use ui::window_util::{
 use ui::{HudStatus, HudView, SystemTray};
 use update::{CheckKind, UpdatePhase};
 use voice_stt_desktop::stt::{
-    models, remove_fillers, EngineSlot, LiveAudio, LiveTranscript, SttEngine,
+    models, remove_fillers, EngineSlot, Latency, LiveAudio, LiveTranscript, StopTimes, SttEngine,
 };
 
 enum InternalEvent {
@@ -73,12 +73,13 @@ fn deliver_transcript(
         result.text = remove_fillers(&result.text);
     }
     let delivered = injector.apply_final(&result.text, should_paste, target, typed_key.is_some());
-    log_delivery(&delivered, target, typed_key);
+    let latency = result.latency(Instant::now());
+    log_delivery(&delivered, target, typed_key, latency);
     // Text reaches the user first; the history write is not on the latency path.
     // A failed copy still lands in History so the transcript is not lost.
     if !result.text.trim().is_empty() {
         AppStats::update(|stats| {
-            stats.record(&result.text, result.duration_secs, result.latency_ms)
+            stats.record(&result.text, result.duration_secs, latency.total_ms())
         });
     }
     let (auto_pasted, notice) = match delivered {
@@ -100,16 +101,17 @@ fn deliver_transcript(
         text: result.text,
         auto_pasted,
         notice,
-        latency_ms: result.latency_ms,
+        latency_ms: latency.total_ms(),
     });
 }
 
-/// One line per dictation, so a paste that did not arrive can be explained
-/// from the log. It names the app, never the text.
+/// One line per dictation, so a paste that did not arrive or a slow take can
+/// be explained from the log. It names the app, never the text.
 fn log_delivery(
     delivered: &Result<DeliveryOutcome, String>,
     target: Option<isize>,
     typed_key: Option<u16>,
+    latency: Latency,
 ) {
     let result = match delivered {
         Ok(DeliveryOutcome::NoSpeech) => return,
@@ -126,7 +128,9 @@ fn log_delivery(
         || "no window".to_string(),
         |raw| paste::Target::of(raw).to_string(),
     );
-    append_log(&format!("Delivery: {result}. App: {app}."));
+    append_log(&format!(
+        "Delivery: {result}. App: {app}. Latency: {latency}."
+    ));
 }
 
 fn main() {
@@ -586,7 +590,7 @@ fn main() {
                             // click stops the paste.
                             reset_user_typed();
                             actions.push(HotkeyAction::PressStarted);
-                            actions.push(HotkeyAction::Toggled);
+                            actions.push(HotkeyAction::Toggled(Instant::now()));
                         }
                         let mut stop_now = false;
                         let stream_error = rec.borrow().as_ref().and_then(AudioRecorder::take_error);
@@ -774,9 +778,10 @@ fn main() {
                                             if !rest.is_empty() {
                                                 let _ = pump_tx.send(LiveAudio::Chunk(rest));
                                             }
-                                            // Latency counts from the key release, the wait the user feels.
-                                            let released = pump_tail.lock().released_at().unwrap_or_else(Instant::now);
-                                            let _ = pump_tx.send(LiveAudio::Finish(released));
+                                            // Latency counts from the stop request, the wait the user feels.
+                                            let closed = Instant::now();
+                                            let asked = pump_tail.lock().asked_at().unwrap_or(closed);
+                                            let _ = pump_tx.send(LiveAudio::Finish(StopTimes { asked, closed }));
                                             pump_done.store(true, Ordering::SeqCst);
                                         });
                                         session = Some(LiveTake {
@@ -804,10 +809,10 @@ fn main() {
                                         });
                                     }
                                 }
-                                HotkeyAction::HoldReleased | HotkeyAction::Toggled => {
+                                HotkeyAction::HoldReleased(asked) | HotkeyAction::Toggled(asked) => {
                                     // A hold always stops; a tap only stops a session it
                                     // started, otherwise it has just started one.
-                                    let should_stop = if matches!(action, HotkeyAction::Toggled)
+                                    let should_stop = if matches!(action, HotkeyAction::Toggled(_))
                                     {
                                         let stop = recording_before_press;
                                         recording_before_press = false;
@@ -824,7 +829,7 @@ fn main() {
                                                 note_user_typed(vk);
                                                 stop_now = true;
                                             } else if let Some(live) = session.as_mut() {
-                                                live.tail.lock().mark_release();
+                                                live.tail.lock().mark_release(asked);
                                                 live.released_at = Some(Instant::now());
                                                 live.release.store(true, Ordering::SeqCst);
                                                 live.baseline = Some(baseline);

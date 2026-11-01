@@ -31,6 +31,7 @@ pub struct SpeechTail {
     samples: usize,
     release_sample: Option<usize>,
     release_at: Option<std::time::Instant>,
+    asked_at: Option<std::time::Instant>,
     noise_cache: Option<(usize, f32)>,
 }
 
@@ -44,16 +45,20 @@ impl SpeechTail {
         }
     }
 
-    pub fn mark_release(&mut self) {
+    /// `asked` is when the user asked the take to stop. It can be earlier
+    /// than this call: a tap asks when the key goes down. The tail cap counts
+    /// from this call, so a long tap does not shorten the tail.
+    pub fn mark_release(&mut self, asked: std::time::Instant) {
         if self.release_sample.is_none() {
             self.release_sample = Some(self.samples);
             self.release_at = Some(std::time::Instant::now());
+            self.asked_at = Some(asked);
         }
     }
 
-    /// When the shortcut came up.
-    pub fn released_at(&self) -> Option<std::time::Instant> {
-        self.release_at
+    /// When the user asked the take to stop. The latency starts here.
+    pub fn asked_at(&self) -> Option<std::time::Instant> {
+        self.asked_at
     }
 
     /// Audio captured since the shortcut came up.

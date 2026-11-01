@@ -40,15 +40,78 @@ fn release_when_idle() {
 /// Audio captured while the user is still holding the hotkey.
 pub enum LiveAudio {
     Chunk(Vec<f32>),
-    /// `Instant` is the moment the key came up (or recording stopped).
-    /// Latency is measured from here, so it includes the speech tail.
-    Finish(Instant),
+    Finish(StopTimes),
+}
+
+/// The end of a take's recording.
+#[derive(Clone, Copy, Debug)]
+pub struct StopTimes {
+    /// The user asked the take to stop: a hold came up, a stopping tap went
+    /// down, or TDT stopped the take itself. The latency starts here.
+    pub asked: Instant,
+    /// The microphone closed, after the last word ended.
+    pub closed: Instant,
+}
+
+impl StopTimes {
+    /// A stop with no wait for the last word.
+    pub fn now() -> Self {
+        let now = Instant::now();
+        Self {
+            asked: now,
+            closed: now,
+        }
+    }
 }
 
 pub struct LiveTranscript {
     pub text: String,
-    pub latency_ms: u64,
     pub duration_secs: f32,
+    pub stop: StopTimes,
+    /// The model's text was ready.
+    pub transcribed: Instant,
+}
+
+impl LiveTranscript {
+    /// The wait from the stop request until `delivered`, in its parts.
+    pub fn latency(&self, delivered: Instant) -> Latency {
+        Latency {
+            last_word: self.stop.closed.saturating_duration_since(self.stop.asked),
+            model: self.transcribed.saturating_duration_since(self.stop.closed),
+            delivery: delivered.saturating_duration_since(self.transcribed),
+        }
+    }
+}
+
+/// The wait the user feels after a take, from the stop request until the
+/// text is in the app.
+#[derive(Clone, Copy, Debug)]
+pub struct Latency {
+    /// The microphone stayed open for the end of the last word.
+    pub last_word: Duration,
+    /// The model finished the speech not yet transcribed.
+    pub model: Duration,
+    /// Filler removal, the clipboard, focus, and typing.
+    pub delivery: Duration,
+}
+
+impl Latency {
+    pub fn total_ms(&self) -> u64 {
+        (self.last_word + self.model + self.delivery).as_millis() as u64
+    }
+}
+
+impl std::fmt::Display for Latency {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} ms (last word {}, model {}, delivery {})",
+            self.total_ms(),
+            self.last_word.as_millis(),
+            self.model.as_millis(),
+            self.delivery.as_millis()
+        )
+    }
 }
 
 /// Speech to text for one installed model, on Trit and the CPU. The model
@@ -133,7 +196,7 @@ impl SttEngine {
             format!("Could not load the speech model. Choose another model in Settings. {error}")
         })?;
         self.refresh_dictionary();
-        let mut stopped_at = None;
+        let mut stop = None;
         let mut captured: Vec<f32> = Vec::new();
         // Speech before `committed` is already text in `parts`.
         let mut committed = 0;
@@ -162,8 +225,8 @@ impl SttEngine {
                         }
                     }
                 }
-                Ok(LiveAudio::Finish(at)) => {
-                    stopped_at = Some(at);
+                Ok(LiveAudio::Finish(times)) => {
+                    stop = Some(times);
                     break;
                 }
                 Err(RecvTimeoutError::Timeout) => {
@@ -179,7 +242,7 @@ impl SttEngine {
             }
         }
 
-        let stopped_at = stopped_at.unwrap_or_else(Instant::now);
+        let stop = stop.unwrap_or_else(StopTimes::now);
         // Duration actually fed to the model, not the full take when the
         // capture cap truncated it.
         let duration_secs = captured.len() as f32 / 16000.0;
@@ -187,8 +250,9 @@ impl SttEngine {
         if captured.is_empty() {
             return Ok(LiveTranscript {
                 text: String::new(),
-                latency_ms: stopped_at.elapsed().as_millis() as u64,
                 duration_secs,
+                stop,
+                transcribed: Instant::now(),
             });
         }
 
@@ -209,16 +273,23 @@ impl SttEngine {
             }
         }
 
-        if let Err(error) = takes::save(&captured, &text) {
-            eprintln!("Could not save the test take: {error}");
+        let transcribed = Instant::now();
+        // The disk write must not delay the text.
+        if takes::saving() {
+            let saved_text = text.clone();
+            std::thread::spawn(move || {
+                if let Err(error) = takes::save(&captured, &saved_text) {
+                    eprintln!("Could not save the test take: {error}");
+                }
+            });
         }
-        let transcript = LiveTranscript {
-            text,
-            latency_ms: stopped_at.elapsed().as_millis() as u64,
-            duration_secs,
-        };
         release_when_idle();
-        Ok(transcript)
+        Ok(LiveTranscript {
+            text,
+            duration_secs,
+            stop,
+            transcribed,
+        })
     }
 
     pub fn release(&self) {

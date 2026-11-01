@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use trit::{BiasWeights, Trit};
 use voice_stt_desktop::resample::Resampler;
 use voice_stt_desktop::stt::models::{find_dir, ModelSpec, CATALOG};
-use voice_stt_desktop::stt::{LiveAudio, SttEngine};
+use voice_stt_desktop::stt::{LiveAudio, StopTimes, SttEngine};
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -175,7 +175,7 @@ fn feed(clip: &Clip, realtime: bool) -> crossbeam_channel::Receiver<LiveAudio> {
             }
             let _ = tx.send(LiveAudio::Chunk(chunk.to_vec()));
         }
-        let _ = tx.send(LiveAudio::Finish(Instant::now()));
+        let _ = tx.send(LiveAudio::Finish(StopTimes::now()));
     });
     rx
 }
@@ -204,7 +204,8 @@ fn bench_model(spec: &ModelSpec, clips: &[Clip], options: &Options) {
             let rx = feed(clip, options.realtime);
             match engine.transcribe_live_reporting(&rx) {
                 Ok(res) => {
-                    latencies.push(res.latency_ms);
+                    let latency_ms = res.latency(res.transcribed).total_ms();
+                    latencies.push(latency_ms);
                     let mut wer_note = String::new();
                     if let Some(reference) = &clip.reference {
                         format_errors += word_errors(&raw_words(reference), &raw_words(&res.text));
@@ -218,7 +219,7 @@ fn bench_model(spec: &ModelSpec, clips: &[Clip], options: &Options) {
                         "[{:.2}s] {} -> {} ms{}: {:?}",
                         clip.duration_secs,
                         clip.name,
-                        res.latency_ms,
+                        latency_ms,
                         wer_note,
                         res.text.trim()
                     );
