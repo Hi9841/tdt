@@ -12,7 +12,7 @@
 <p align="center">
   <a href="https://github.com/Hi9841/tdt/releases/latest"><b>Download TDT-Setup.exe</b></a>
   ·
-  <a href="https://github.com/Hi9841/trit">Trit speech engine (STT and TTS)</a>
+  <a href="https://github.com/Hi9841/trit">Trit speech engine</a>
   ·
   <a href="https://hi9841.github.io/trit/benchmarks/">Benchmarks</a>
   ·
@@ -20,56 +20,53 @@
 </p>
 
 <p align="center">
-  <img src="docs/images/app/usage-example.png" alt="Hold Ctrl+; and speak; Trit transcribes on your computer; the text is typed into your app and the pill shows Pasted" width="920">
+  <img src="docs/images/architecture.png" alt="TDT architecture: the hotkey starts the recorder, Trit transcribes the audio, cleanup applies the dictionary, and auto-paste types the text into your app. The network is used only for the model download and updates." width="920">
 </p>
 
 ## Why TDT
 
 - **Private.** TDT records and transcribes on your computer. It uses the
   network only to download a model and to look for updates.
-- **Fast.** TDT's own speech engine, [Trit](https://github.com/Hi9841/trit), is written in
-  Rust. The default model loads in about 0.2 seconds and stays in memory, so a
-  recording never waits for it. TDT keeps the model's converted weights in a
-  file next to the model and maps it, so they count as file memory that
-  Windows can reclaim, not as TDT's private memory.
-- **Accurate.** The default model, Parakeet Redux, has 1.58-bit ternary
-  weights and is only 178 MB. On 456 test clips it makes fewer errors than the
-  same model on any other runtime that we tested.
+- **Fast.** [Trit](https://github.com/Hi9841/trit), TDT's own speech engine,
+  is written in Rust. The model loads in about 0.2 seconds and stays in
+  memory, so a recording never waits for it.
+- **Accurate.** The default model, Parakeet Redux (178 MB, 1.58-bit ternary
+  weights), makes fewer errors on 456 test clips than the same model on any
+  other runtime that we tested.
 - **Small.** TDT-Setup.exe is about 8 MB. It needs no admin rights and no
   Python.
 
 ## Install
 
 1. Download `TDT-Setup.exe` from the
-   [latest release](https://github.com/Hi9841/tdt/releases/latest).
-2. Run it. Setup installs TDT for the current user in `%LOCALAPPDATA%\TDT`,
-   adds a Start menu shortcut, and opens the app.
-3. Open Settings and download **Parakeet Redux** (178 MB). The model stays on
-   disk. At the first load, TDT adds its converted weights to the model folder
-   (`.trit`, 293 MB for Redux, 725 MB for Ultra).
+   [latest release](https://github.com/Hi9841/tdt/releases/latest) and run it.
+   Setup installs TDT for the current user and opens it.
+2. Open Settings and download **Parakeet Redux** (178 MB).
 
-To uninstall, use Windows Settings > Apps. Uninstall keeps your speech models
-and your dictionary.
+To uninstall, use Windows Settings > Apps. Your models and your dictionary
+stay.
 
 ## Use
+
+<p align="center">
+  <img src="docs/images/app/usage-example.png" alt="Hold Ctrl+; and speak; Trit transcribes on your computer; the text is typed into your app and the pill shows Pasted" width="920">
+</p>
 
 | Action | How |
 |---|---|
 | Start and stop a recording | Tap `Ctrl + ;` once to start and once to stop. |
 | Record while you hold the key | Hold `Ctrl + ;`, speak, and release. |
-| Change the shortcut | Settings > **Shortcut** > **Change**, then press the new keys or a side mouse button (Mouse 4 or Mouse 5). |
-| Open Settings | Click the tray icon. |
+| Change the shortcut | Settings > **Shortcut** > **Change**, then press the new keys or a side mouse button. |
+| Open Stats and Settings | Click the tray icon. |
 
-The floating pill at the bottom of the screen shows the state:
+TDT types the text into the window that had focus and copies it to the
+clipboard. A recording can be up to 120 seconds long. If the text does not
+appear, press Ctrl+V; the pill tells you why. For example, Windows does not
+let TDT type into an app that runs as administrator.
 
 | Ready | Listening | Transcribing | Pasted |
 |:---:|:---:|:---:|:---:|
 | <img src="docs/images/app/pill-idle.png" alt="The pill, ready" height="19"> | <img src="docs/images/app/pill-listening.png" alt="The pill while you speak, with the sound level" height="33"> | <img src="docs/images/app/pill-transcribing.png" alt="The pill while Trit transcribes" height="22"> | <img src="docs/images/app/pill-pasted.png" alt="The pill after the text is typed, with the time Trit took" height="49"> |
-
-The tray icon shows the same state; hover over it to see the latest
-transcript. Click the tray icon to open the panel. **Stats**
-keeps the full text of your recent dictations, with a copy button for each.
-**Settings** has every option.
 
 <p align="center">
   <img src="docs/images/app/panel-history.png" alt="The Stats tab: dictations, words, recorded time, and the recent transcripts" width="400">
@@ -77,63 +74,31 @@ keeps the full text of your recent dictations, with a copy button for each.
   <img src="docs/images/app/panel-settings.png" alt="The Settings tab: shortcut, auto-paste, filler words, model, dictionary, startup, and updates" width="400">
 </p>
 
-With **auto-paste** on (the default), TDT types the text into the window that
-had focus. TDT also copies the text to the clipboard. A recording can be up to
-120 seconds long.
-
-If the text does not appear in the app, press Ctrl+V. The pill tells you why
-TDT did not type it:
-
-- You pressed a key or a mouse button while TDT was finishing.
-- The app runs as administrator. Windows does not let TDT type into it.
-- TDT could not go back to the app.
-
-TDT writes one line about each dictation to `%LOCALAPPDATA%\TDT\tdt.log`: the
-app and the result, never the text.
-
 ## Settings
 
 | Setting | What it does |
 |---|---|
-| Model | **Parakeet Redux** (178 MB, the default) or **Parakeet Ultra** (1.3 GB). Ultra makes about a third fewer errors on real dictation and uses about 0.45 GB more memory. A change shows a loading bar until the new model is ready; the previous model runs until then. |
-| Remove filler words | Removes "um", "uh", "erm", and "hmm", and the commas around them. Words that can carry meaning, such as "like", stay. On by default. |
+| Model | **Parakeet Redux** (178 MB, the default) or **Parakeet Ultra** (1.3 GB). Ultra makes about a third fewer errors on real dictation and uses about 0.45 GB more memory. |
+| Remove filler words | Removes "um", "uh", "erm", and "hmm". Words that can carry meaning, such as "like", stay. On by default. |
 | Dictionary | Names and terms that TDT must spell your way. See [Dictionary](#dictionary). |
 | Start with Windows | Opens TDT when you sign in. |
-| Check for updates automatically | Looks for a new release at start, every hour, and when Settings opens. Turn it off to check only when you select **Check for updates**. |
+| Check for updates automatically | Looks for a new release at start and every hour. **Update now** downloads the new setup from GitHub, checks its SHA-256 digest, and installs it. |
 
 ## Dictionary
 
-TDT spells names and technical terms better when they are in your dictionary.
-TDT ships no word lists: the dictionary holds only the words you add.
+Select **Edit** next to **Dictionary** in Settings. TDT opens
+`%LOCALAPPDATA%\TDT\dictionary.txt`. Write one word or name on each line,
+spelled the way you want it, and save. The next dictation uses it.
 
-To add your own words:
-
-1. Open Settings and find **Dictionary**.
-2. Select **Edit**. TDT opens `%LOCALAPPDATA%\TDT\dictionary.txt`.
-3. Write one word or name on each line, spelled the way you want it.
-4. Save the file. The next dictation uses it. A file that your editor saved
-   with a byte order mark works too.
-
-After each dictation, TDT looks for words that are spelled close to a term
-("Perakeet", "trip run time", "wire shark"). The speech model then scores
-the words it heard and the term on the same audio. TDT writes the term only
-when the audio supports it, so "the mayor" stays "the mayor" when Maor is in
-the dictionary. Words with the same letters as a term sound the same, so
-the audio cannot decide between them. They always become the term when the
-term has inner capitals ("web socket" for WebSocket), or when letters after
-the first differ in case ("PNPM" for pnpm).
-
-On test sentences with names and product names, with those names in the
-dictionary, TDT writes 31 of 37 names correctly; without them, 11.
-
-TDT writes English only. It never writes word pieces with letters that
-English does not use (accents, Cyrillic, Greek).
+TDT replaces words that are spelled close to a term ("Perakeet", "wire
+shark") only when the audio supports the term, so "the mayor" stays "the
+mayor" when Maor is in the dictionary. With the names in the dictionary, TDT
+writes 31 of 37 names in our test sentences correctly; without them, 11.
 
 ## Benchmarks
 
 The same models on Trit and on the other CPU runtimes, with the same 456
-clips: LibriSpeech test-clean (200), test-other (200), developer terms (40),
-and everyday dictation (16). AMD Ryzen 9 7950X3D, Windows 11.
+clips. AMD Ryzen 9 7950X3D, Windows 11.
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/Hi9841/trit/main/docs/images/errors.svg" alt="Word errors on 456 clips: Trit against the most accurate other runtime, per model" width="760">
@@ -144,38 +109,8 @@ and everyday dictation (16). AMD Ryzen 9 7950X3D, Windows 11.
 </p>
 
 For each model, Trit makes the fewest errors or ties for the fewest, and it
-has the shortest time per clip. The runtimes are faster-whisper, whisper.cpp,
-ONNX Runtime, sherpa-onnx, Transformers, OpenAI Whisper, and Photon. The full
-tables, memory use, the text cleanup model, and the method are in
-[Trit's engine comparison](https://github.com/Hi9841/trit/blob/main/docs/engine-comparison.md). The
-commands that reproduce them are in [Trit's bench folder](https://github.com/Hi9841/trit/tree/main/bench).
-TDT's own ratchet (the same Parakeet Redux numbers through the app's engine
-path) is in [desktop/bench](desktop/bench/README.md).
-
-Trit also speaks text (text to speech): Kokoro-82M with 28 English voices
-(American and British; it reads numbers, money, times, and symbols), and
-the Meta MMS-TTS voice. Use `trit speak "<text>" --voice bf_emma`, or `Voice`
-in Rust, C, Python, C#, and Node. The TDT app does not use it yet. Spoken by
-Trit and by the `kokoro` package, then transcribed by Parakeet Redux, 56
-test sentences give 70 word errors with Trit and 70 to 71 with the
-reference. The speech-to-text results above did not change: the 440
-LibriSpeech and tech transcripts are the same as in 0.4.12. See
-[Text to speech](https://github.com/Hi9841/trit#text-to-speech).
-
-## Updates
-
-When a newer version is available, Settings shows **Update now**. One click
-downloads `TDT-Setup.exe` from GitHub, verifies its size and its SHA-256
-digest, and runs it silently. Setup replaces TDT.exe and opens the new
-version. Your speech models and settings stay.
-
-## Privacy
-
-Recording and transcription stay on your computer. TDT uses the network only
-for these operations:
-
-- The model download that you start in Settings.
-- The update check. It connects only to GitHub.
+has the shortest time per clip. The full tables and the method are in
+[Trit's engine comparison](https://github.com/Hi9841/trit/blob/main/docs/engine-comparison.md).
 
 ## Build from source
 
@@ -186,57 +121,8 @@ cargo run --release --bin download-model --manifest-path .\desktop\Cargo.toml
 cargo run --release --bin TDT --manifest-path .\desktop\Cargo.toml
 ```
 
-`download-model` gets Parakeet Redux the same way Settings does, with a
-SHA-256 check of each file. It needs no PowerShell script. Add
-`-- parakeet-ultra` for Parakeet Ultra.
-
-Checks before a change:
-
-```powershell
-cargo fmt --manifest-path .\desktop\Cargo.toml -- --check
-cargo clippy --manifest-path .\desktop\Cargo.toml --all-targets --all-features -- -D warnings
-```
-
-To build `dist\TDT-Setup.exe`:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\packaging\build-installer.ps1
-```
-
-To publish a release, set the version in `desktop/Cargo.toml` and push a
-matching tag, such as `v0.4.0`. The `Release` workflow builds `TDT-Setup.exe`
-and attaches it with `SHA256SUMS.txt`. TDT 0.2.32 and older need
-`SHA256SUMS.txt` to find the update.
-
-## How it works
-
-A press of the shortcut starts the recorder. Trit transcribes the audio with
-the model file that TDT maps into memory. Cleanup removes filler words and
-applies your dictionary. Auto-paste types the text into the window that has
-focus. TDT connects to the internet only to download a model from Hugging
-Face and to get updates from GitHub.
-
-<p align="center">
-  <img src="docs/images/architecture.png" alt="TDT architecture: the hotkey starts the recorder, Trit transcribes the audio, cleanup applies the dictionary, and auto-paste types the text into your app. The network is used only for the model download and updates." width="920">
-</p>
-
-## Repository layout
-
-| Folder | Contents |
-|---|---|
-| `desktop/` | The Windows app (Rust and GPUI) and the speech benchmark. |
-| `packaging/` | `TDT-Setup.exe` (install, update, uninstall) and its build script. |
-| `docs/` | The README images. `docs/images/capture.py` captures the app pictures again. |
-| `site/` | The TDT website. |
-
-Trit, the speech engine (speech to text and text to speech), has its own
-repository: [Hi9841/trit](https://github.com/Hi9841/trit), with its website at
-<https://hi9841.github.io/trit/>. TDT uses a tagged version of it
-(`desktop/Cargo.toml`). To build TDT with a local Trit checkout:
-
-```powershell
-cargo build --release --manifest-path .\desktop\Cargo.toml --config "patch.'https://github.com/Hi9841/trit'.trit.path='..\trit'"
-```
+The checks, the installer build, the release steps, and the layout of the
+repository are in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
