@@ -208,6 +208,18 @@ matching tag, such as `v0.4.0`. The `Release` workflow builds `TDT-Setup.exe`
 and attaches it with `SHA256SUMS.txt`. TDT 0.2.32 and older need
 `SHA256SUMS.txt` to find the update.
 
+## How it works
+
+A press of the shortcut starts the recorder. Trit transcribes the audio with
+the model file that TDT maps into memory. Cleanup removes filler words and
+applies your dictionary. Auto-paste types the text into the window that has
+focus. TDT connects to the internet only to download a model from Hugging
+Face and to get updates from GitHub.
+
+<p align="center">
+  <img src="docs/images/architecture.png" alt="TDT architecture: the hotkey starts the recorder, Trit transcribes the audio, cleanup applies the dictionary, and auto-paste types the text into your app. The network is used only for the model download and updates." width="920">
+</p>
+
 ## Repository layout
 
 | Folder | Contents |
