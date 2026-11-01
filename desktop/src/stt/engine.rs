@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use trit::{BiasWeights, Trit};
+use trit::{BiasWeights, LoadOptions, Trit};
 
 const MAX_CAPTURED_SAMPLES: usize = 120 * 16_000;
 /// After a cut, a remainder shorter than 200 ms is the pause itself, not speech.
@@ -74,11 +74,25 @@ impl SttEngine {
     }
 
     pub fn prepare(&self) -> Result<(), String> {
+        self.prepare_reporting(None)
+    }
+
+    /// `prepare`; `progress` gets the fraction loaded, from 0 to 1.
+    pub fn prepare_reporting(
+        &self,
+        progress: Option<Arc<dyn Fn(f32) + Send + Sync>>,
+    ) -> Result<(), String> {
         let _loading = self.loading.lock();
         if self.native.lock().is_some() {
             return Ok(());
         }
-        let engine = Trit::load(&self.model_dir)?;
+        // The cache maps the converted weights from a file next to the
+        // model, so they count as file memory, not TDT's private memory.
+        let options = LoadOptions {
+            cache: true,
+            ..LoadOptions::default()
+        };
+        let engine = Trit::load_reporting(&self.model_dir, &options, progress)?;
         *self.native.lock() = Some(Arc::new(engine));
         // Loading converts weights through buffers that are freed again.
         trit::release_memory();

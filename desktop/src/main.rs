@@ -464,8 +464,11 @@ fn main() {
                         }
                         while update_ping_rx.try_recv().is_ok() {}
                         let retry = this
-                            .update(cx, |view, _| {
+                            .update(cx, |view, cx| {
                                 view.take_ready_model();
+                                if view.model_load_moved() {
+                                    cx.notify();
+                                }
                                 std::mem::take(&mut view.retry_microphone)
                             })
                             .unwrap_or(false);

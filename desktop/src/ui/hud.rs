@@ -21,7 +21,7 @@ use ely_gpui_component::theme::{ActiveTheme, ControlSize, IconSize};
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use parking_lot::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use voice_stt_desktop::stt::{models, DownloadPhase, EngineSlot, SttEngine, CATALOG};
@@ -407,6 +407,9 @@ impl PanelMotion {
     }
 }
 
+/// The model that the model-change previews switch to.
+const PREVIEW_OTHER_MODEL: &str = "parakeet-ultra";
+
 struct PreparedModel {
     id: String,
     engine: Arc<SttEngine>,
@@ -460,6 +463,12 @@ pub struct HudView {
     installed_models: Vec<String>,
     model_dir: Option<std::path::PathBuf>,
     model_loading: Option<String>,
+    /// Thousandths of the model load in progress, written by the load thread.
+    model_progress: Arc<AtomicU32>,
+    /// The value of `model_progress` that the last frame drew.
+    model_progress_drawn: u32,
+    /// The model that the last load made active, for the "ready" note.
+    model_ready_note: Option<&'static str>,
     prepared_model: Option<PreparedModel>,
     model_ready_tx: crossbeam_channel::Sender<Result<PreparedModel, String>>,
     model_ready_rx: crossbeam_channel::Receiver<Result<PreparedModel, String>>,
@@ -551,6 +560,9 @@ impl HudView {
             installed_models,
             model_dir: config.model_dir,
             model_loading: None,
+            model_progress: Arc::new(AtomicU32::new(0)),
+            model_progress_drawn: 0,
+            model_ready_note: None,
             prepared_model: None,
             model_ready_tx,
             model_ready_rx,
@@ -659,6 +671,18 @@ impl HudView {
             PreviewSpec::PanelModelFailed => {
                 self.selected_model = models::DEFAULT.id.to_string();
                 *self.model_phase.lock() = DownloadPhase::Failed { id: self.selected_model.clone(), message: format!("Download failed. Check your connection and try again. {} is still active.", models::DEFAULT.label) };
+            }
+            PreviewSpec::PanelModelLoading => {
+                self.installed_models.push(PREVIEW_OTHER_MODEL.into());
+                self.selected_model = PREVIEW_OTHER_MODEL.into();
+                self.model_loading = Some(PREVIEW_OTHER_MODEL.into());
+                self.model_progress.store(450, Ordering::Relaxed);
+            }
+            PreviewSpec::PanelModelReady => {
+                self.installed_models.push(PREVIEW_OTHER_MODEL.into());
+                self.selected_model = PREVIEW_OTHER_MODEL.into();
+                self.active_model = Some(PREVIEW_OTHER_MODEL.into());
+                self.model_ready_note = Some(models::resolve(PREVIEW_OTHER_MODEL).label);
             }
             PreviewSpec::PanelRecovery => self.set_error("Microphone disconnected. Connect a microphone, check Windows microphone access, then choose Retry microphone.".into()),
             PreviewSpec::PanelClearHistory => {
@@ -824,6 +848,17 @@ impl HudView {
         self.copied_at = Some(Instant::now());
     }
 
+    /// Whether the model load moved since the last frame, so the bar needs one.
+    pub fn model_load_moved(&mut self) -> bool {
+        if self.model_loading.is_none() {
+            return false;
+        }
+        let now = self.model_progress.load(Ordering::Relaxed);
+        let moved = now != self.model_progress_drawn;
+        self.model_progress_drawn = now;
+        moved
+    }
+
     fn model_busy(&self) -> bool {
         matches!(
             self.status,
@@ -853,6 +888,9 @@ impl HudView {
                 match config.save() {
                     Ok(()) => {
                         self.stt_engine.set(Some(model.engine));
+                        // The previous engine is gone now: give its memory back.
+                        std::thread::spawn(trit::release_memory);
+                        self.model_ready_note = Some(models::resolve(&model.id).label);
                         self.active_model = Some(model.id);
                         self.model_error = None;
                         self.recovery_message = None;
@@ -901,12 +939,19 @@ impl HudView {
         };
         self.model_loading = Some(id.into());
         self.model_error = None;
+        self.model_ready_note = None;
+        self.model_progress.store(0, Ordering::Relaxed);
+        self.model_progress_drawn = 0;
         let tx = self.model_ready_tx.clone();
         let ping = self.update_ping.clone();
+        let progress = Arc::clone(&self.model_progress);
         std::thread::spawn(move || {
             let engine = SttEngine::new(&dir);
+            let report: Arc<dyn Fn(f32) + Send + Sync> = Arc::new(move |fraction: f32| {
+                progress.store((fraction * 1000.0) as u32, Ordering::Relaxed);
+            });
             let result = engine
-                .prepare()
+                .prepare_reporting(Some(report))
                 .map(|()| PreparedModel {
                     id: spec.id.into(),
                     engine: Arc::new(engine),
@@ -930,6 +975,7 @@ impl HudView {
         }
         let spec = models::resolve(id);
         self.selected_model = spec.id.to_string();
+        self.model_ready_note = None;
         if self.active_model.as_deref() == Some(id) {
             self.model_error = None;
             return;
@@ -2244,16 +2290,17 @@ impl HudView {
             ),
             DownloadPhase::Failed { id, message } if id == spec.id => message.clone(),
             _ if self.model_loading.as_deref() == Some(spec.id) => {
+                let percent = self.model_progress.load(Ordering::Relaxed) / 10;
                 match self
                     .active_model
                     .as_deref()
                     .filter(|active| *active != spec.id)
                 {
                     Some(active) => format!(
-                        "Loading. {} runs until it is ready.",
+                        "Loading, {percent}%. {} runs until it is ready.",
                         models::resolve(active).label
                     ),
-                    None => "Loading.".to_string(),
+                    None => format!("Loading, {percent}%."),
                 }
             }
             _ if self.active_model.as_deref() == Some(spec.id) => "Active".to_string(),
@@ -2318,8 +2365,17 @@ impl HudView {
             DownloadPhase::Downloading {
                 id, done, total, ..
             } if id == spec.id => Some(controls::progress_bar("model_progress", *done, *total)),
+            _ if self.model_loading.as_deref() == Some(spec.id) => Some(controls::progress_bar(
+                "model_load",
+                u64::from(self.model_progress.load(Ordering::Relaxed)),
+                1000,
+            )),
             _ => None,
         };
+        let ready_note = self
+            .model_ready_note
+            .filter(|_| self.active_model.as_deref() == Some(spec.id))
+            .map(|label| format!("{label} is loaded and ready."));
         drop(model_guard);
         let running_note = if self.model_loading.as_deref() != Some(spec.id) {
             self.active_model
@@ -2397,6 +2453,11 @@ impl HudView {
                     })
                     .when_some(model_meter, |card, meter| {
                         card.note(inset(meter.into_any_element()))
+                    })
+                    .when_some(ready_note, |card, note| {
+                        card.note(inset(
+                            InlineMessage::new(Severity::Success, note).into_any_element(),
+                        ))
                     })
                     .when(show_activate || show_download, |card| {
                         card.note(inset(model_actions.into_any_element()))

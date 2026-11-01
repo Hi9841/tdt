@@ -29,7 +29,9 @@
   network only to download a model and to look for updates.
 - **Fast.** TDT's own speech engine, [Trit](https://github.com/Hi9841/trit), is written in
   Rust. The default model loads in about 0.2 seconds and stays in memory, so a
-  recording never waits for it.
+  recording never waits for it. TDT keeps the model's converted weights in a
+  file next to the model and maps it, so they count as file memory that
+  Windows can reclaim, not as TDT's private memory.
 - **Accurate.** The default model, Parakeet Redux, has 1.58-bit ternary
   weights and is only 178 MB. On 456 test clips it makes fewer errors than the
   same model on any other runtime that we tested.
@@ -43,7 +45,8 @@
 2. Run it. Setup installs TDT for the current user in `%LOCALAPPDATA%\TDT`,
    adds a Start menu shortcut, and opens the app.
 3. Open Settings and download **Parakeet Redux** (178 MB). The model stays on
-   disk.
+   disk. At the first load, TDT adds its converted weights to the model folder
+   (`.trit`, 293 MB for Redux, 725 MB for Ultra).
 
 To uninstall, use Windows Settings > Apps. Uninstall keeps your speech models
 and your dictionary.
@@ -92,7 +95,7 @@ app and the result, never the text.
 
 | Setting | What it does |
 |---|---|
-| Model | **Parakeet Redux** (178 MB, the default) or **Parakeet Ultra** (1.3 GB). Ultra makes about a third fewer errors on real dictation and uses about 0.5 GB more memory. |
+| Model | **Parakeet Redux** (178 MB, the default) or **Parakeet Ultra** (1.3 GB). Ultra makes about a third fewer errors on real dictation and uses about 0.45 GB more memory. A change shows a loading bar until the new model is ready; the previous model runs until then. |
 | Remove filler words | Removes "um", "uh", "erm", and "hmm", and the commas around them. Words that can carry meaning, such as "like", stay. On by default. |
 | Dictionary | Names and terms that TDT must spell your way. See [Dictionary](#dictionary). |
 | Start with Windows | Opens TDT when you sign in. |
