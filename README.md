@@ -64,9 +64,14 @@ clipboard. A recording can be up to 120 seconds long. If the text does not
 appear, press Ctrl+V; the pill tells you why. For example, Windows does not
 let TDT type into an app that runs as administrator.
 
+The time on the pill and in History is the wait you feel: from the moment you
+ask to stop (you release a hold, or press the key for a tap) until the text is
+in your app. `%LOCALAPPDATA%\TDT\tdt.log` splits each wait into three parts:
+the end of your last word, the model, and the delivery.
+
 | Ready | Listening | Transcribing | Pasted |
 |:---:|:---:|:---:|:---:|
-| <img src="docs/images/app/pill-idle.png" alt="The pill, ready" height="19"> | <img src="docs/images/app/pill-listening.png" alt="The pill while you speak, with the sound level" height="33"> | <img src="docs/images/app/pill-transcribing.png" alt="The pill while Trit transcribes" height="22"> | <img src="docs/images/app/pill-pasted.png" alt="The pill after the text is typed, with the time Trit took" height="49"> |
+| <img src="docs/images/app/pill-idle.png" alt="The pill, ready" height="19"> | <img src="docs/images/app/pill-listening.png" alt="The pill while you speak, with the sound level" height="33"> | <img src="docs/images/app/pill-transcribing.png" alt="The pill while Trit transcribes" height="22"> | <img src="docs/images/app/pill-pasted.png" alt="The pill after the text is typed, with the time from the stop to the text" height="49"> |
 
 <p align="center">
   <img src="docs/images/app/panel-history.png" alt="The Stats tab: dictations, words, recorded time, and the recent transcripts" width="400">
