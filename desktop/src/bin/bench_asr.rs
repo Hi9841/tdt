@@ -188,7 +188,7 @@ fn bench_model(spec: &ModelSpec, clips: &[Clip], options: &Options) {
     };
 
     let t0 = Instant::now();
-    let engine = SttEngine::new(&model_dir);
+    let engine = SttEngine::new(&model_dir, spec.precision);
     if let Err(e) = engine.prepare() {
         println!("Failed to prepare engine: {e}");
         return;

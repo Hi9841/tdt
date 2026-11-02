@@ -83,7 +83,7 @@ the end of your last word, the model, and the delivery.
 
 | Setting | What it does |
 |---|---|
-| Model | **Parakeet Redux** (178 MB, the default) or **Parakeet Ultra** (1.3 GB). Ultra makes about a third fewer errors on real dictation and uses about 0.45 GB more memory. |
+| Model | **Parakeet Redux** (178 MB, the default) or **Parakeet Unified English** (731 MB). On 456 English test clips Unified makes 177 word errors, Redux 301, at about the same speed. |
 | Remove filler words | Removes "um", "uh", "erm", and "hmm". Words that can carry meaning, such as "like", stay. On by default. |
 | Dictionary | Names and terms that TDT must spell your way. See [Dictionary](#dictionary). |
 | Start with Windows | Opens TDT when you sign in. |

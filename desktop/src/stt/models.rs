@@ -23,6 +23,9 @@ pub struct ModelSpec {
     pub revision: &'static str,
     pub dir_name: &'static str,
     pub files: &'static [ModelFile],
+    /// How Trit holds the weights: the fastest choice that keeps the
+    /// model's accuracy (see the model's notes).
+    pub precision: trit::Precision,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -79,24 +82,18 @@ const REDUX_FILES: &[ModelFile] = &[
     },
 ];
 
-/// Moondream Parakeet Ultra: Parakeet TDT 0.6B v3 trained further, in f16.
-/// On the 456 English test clips (Trit CLI, CPU) it has 260 word errors,
-/// v3 262 and Redux 356, at about the same speed as Redux with int8;
-/// 1.3 GB on disk (v3: 2.5 GB) and about 0.9 GB in memory.
-const ULTRA_FILES: &[ModelFile] = &[
-    ModelFile {
-        name: "config.json",
-        sha256: "E747B85E1BDFD300C8B8AC63BAC8DD5221F8FE9BC275B48D06C735FCD6971B6E",
-    },
-    ModelFile {
-        name: "model.safetensors",
-        sha256: "C9608F36D0AB956C14BFCC525479B0746B3B42A56F6949EC85C14EB7466717DC",
-    },
-    ModelFile {
-        name: "tokenizer.json",
-        sha256: "BD321B096832A3F270BD3B2A88823957920F1A5C5ADA71114A26EA729D0CBE91",
-    },
-];
+/// NVIDIA Parakeet Unified English 0.6B (RNNT) in ggml's Q8_0, the file
+/// that Hex ships (handy-computer, pinned below). Trit reads the GGUF file
+/// and holds it as int8: on the 456 English test clips (Trit, CPU) 177 word
+/// errors (Ultra 205, Redux 301) at 40 ms a clip (Ultra 36 ms); with the
+/// stored Q8_0 kernel 178 errors at 52 ms. 731 MB on disk. No word comes out
+/// of silence or noise. It replaces Parakeet Ultra.
+pub const UNIFIED_ID: &str = "parakeet-unified-en";
+
+const UNIFIED_FILES: &[ModelFile] = &[ModelFile {
+    name: "parakeet-unified-en-0.6b-Q8_0.gguf",
+    sha256: "4B50B6DD862BF6E346929AAF4F5EAACEC003BFA3F56462D6C874B41EF2F38795",
+}];
 
 pub const CATALOG: &[ModelSpec] = &[
     ModelSpec {
@@ -108,18 +105,27 @@ pub const CATALOG: &[ModelSpec] = &[
         revision: "main",
         dir_name: REDUX_DIR,
         files: REDUX_FILES,
+        precision: trit::Precision::Auto,
     },
     ModelSpec {
-        id: "parakeet-ultra",
-        label: "Parakeet Ultra",
-        size_label: "1.3 GB",
-        size_bytes: 1_256_514_499,
-        hf_repo: "moondream/parakeet-ultra",
-        revision: "73175eb7aeb0d82f1e2a6b53b3aabc10a90bcd0b",
-        dir_name: "parakeet-ultra",
-        files: ULTRA_FILES,
+        id: UNIFIED_ID,
+        label: "Parakeet Unified English",
+        size_label: "731 MB",
+        size_bytes: 731_357_568,
+        hf_repo: "handy-computer/parakeet-unified-en-0.6b-gguf",
+        revision: "7e948f21b7bdbac698d3318db9d350f1096f3b6c",
+        // Not the name of the retired ONNX folders, which hold a config.json.
+        dir_name: "parakeet-unified-en-gguf",
+        files: UNIFIED_FILES,
+        // Auto would run the stored Q8_0; Trit's own int8 is faster (40 ms
+        // against 52 ms a clip) with one error fewer on the test clips.
+        precision: trit::Precision::Int8,
     },
 ];
+
+/// Ids of models TDT no longer offers, and the model that replaces each.
+/// Any other unknown id resolves to `DEFAULT`.
+const REPLACED: &[(&str, &str)] = &[("parakeet-ultra", UNIFIED_ID)];
 
 pub const DEFAULT: &ModelSpec = &CATALOG[0];
 
@@ -127,9 +133,18 @@ pub fn by_id(id: &str) -> Option<&'static ModelSpec> {
     CATALOG.iter().find(|spec| spec.id == id.trim())
 }
 
-/// Retired ids (INT8, Q8, Whisper, Moonshine, SenseVoice, Parakeet v3) resolve to Parakeet Redux.
+/// A known id, else its replacement (Parakeet Ultra: Unified English), else
+/// Parakeet Redux (the retired INT8, Q8, Whisper, Moonshine, SenseVoice, and
+/// Parakeet v3 ids).
 pub fn resolve(id: &str) -> &'static ModelSpec {
-    by_id(id).unwrap_or(DEFAULT)
+    by_id(id)
+        .or_else(|| {
+            REPLACED
+                .iter()
+                .find(|(old, _)| *old == id.trim())
+                .and_then(|(_, new)| by_id(new))
+        })
+        .unwrap_or(DEFAULT)
 }
 
 impl ModelSpec {

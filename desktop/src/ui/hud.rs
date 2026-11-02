@@ -408,7 +408,7 @@ impl PanelMotion {
 }
 
 /// The model that the model-change previews switch to.
-const PREVIEW_OTHER_MODEL: &str = "parakeet-ultra";
+const PREVIEW_OTHER_MODEL: &str = models::UNIFIED_ID;
 
 struct PreparedModel {
     id: String,
@@ -945,8 +945,9 @@ impl HudView {
         let tx = self.model_ready_tx.clone();
         let ping = self.update_ping.clone();
         let progress = Arc::clone(&self.model_progress);
+        let precision = spec.precision;
         std::thread::spawn(move || {
-            let engine = SttEngine::new(&dir);
+            let engine = SttEngine::new(&dir, precision);
             let report: Arc<dyn Fn(f32) + Send + Sync> = Arc::new(move |fraction: f32| {
                 progress.store((fraction * 1000.0) as u32, Ordering::Relaxed);
             });

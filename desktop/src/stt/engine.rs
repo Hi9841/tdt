@@ -118,6 +118,8 @@ impl std::fmt::Display for Latency {
 /// loads on first use.
 pub struct SttEngine {
     model_dir: PathBuf,
+    /// How Trit holds this model's weights (`ModelSpec::precision`).
+    precision: trit::Precision,
     native: Mutex<Option<Arc<Trit>>>,
     /// Held during a load, so a take that starts during the startup load
     /// waits for it instead of loading a second model.
@@ -127,9 +129,10 @@ pub struct SttEngine {
 }
 
 impl SttEngine {
-    pub fn new(model_dir: &Path) -> Self {
+    pub fn new(model_dir: &Path, precision: trit::Precision) -> Self {
         Self {
             model_dir: model_dir.to_path_buf(),
+            precision,
             native: Mutex::new(None),
             loading: Mutex::new(()),
             dictionary: Mutex::new(dictionary::Watch::default()),
@@ -153,6 +156,7 @@ impl SttEngine {
         // model, so they count as file memory, not TDT's private memory.
         let options = LoadOptions {
             cache: true,
+            precision: self.precision,
             ..LoadOptions::default()
         };
         let engine = Trit::load_reporting(&self.model_dir, &options, progress)?;
