@@ -297,52 +297,95 @@ pub fn download(
     Ok(())
 }
 
+/// A try that failed and added no bytes. This many in sequence stop the download.
+const DOWNLOAD_TRIES: u32 = 3;
+
 fn download_file(
     url: &str,
     dest: &Path,
     expected_sha: &str,
     on_chunk: &mut dyn FnMut(u64),
 ) -> Result<(), String> {
-    let mut last_error = String::new();
-    for attempt in 0..3 {
-        match download_file_once(url, dest, expected_sha, &mut *on_chunk) {
-            Ok(()) => return Ok(()),
-            Err(error) => {
-                last_error = error;
-                eprintln!(
-                    "Model download attempt {} failed: {last_error}",
-                    attempt + 1
-                );
-                std::thread::sleep(std::time::Duration::from_millis(500 * (attempt as u64 + 1)));
-            }
-        }
-    }
-    Err(last_error)
-}
-
-fn download_file_once(
-    url: &str,
-    dest: &Path,
-    expected_sha: &str,
-    on_chunk: &mut dyn FnMut(u64),
-) -> Result<(), String> {
-    let tmp = dest.with_file_name(format!(
+    let partial = dest.with_file_name(format!(
         "{}.download",
         dest.file_name().unwrap_or_default().to_string_lossy()
     ));
-    if tmp.exists() {
-        let _ = fs::remove_file(&tmp);
+    // The bytes of this file that `on_chunk` has had.
+    let mut reported = 0u64;
+    let mut failed = 0;
+    loop {
+        let before = file_len(&partial);
+        let error =
+            match download_file_once(url, dest, &partial, expected_sha, &mut reported, on_chunk) {
+                Ok(()) => return Ok(()),
+                Err(error) => error,
+            };
+        eprintln!("Model download try failed: {error}");
+        // A try that added bytes is progress: the next one continues from there.
+        failed = if file_len(&partial) > before {
+            0
+        } else {
+            failed + 1
+        };
+        if failed >= DOWNLOAD_TRIES {
+            return Err(error);
+        }
+        std::thread::sleep(Duration::from_millis(500 * u64::from(failed + 1)));
     }
+}
 
-    let response = model_download_agent()
+/// One request. It continues the partial file of an earlier try when the
+/// server agrees, and starts at zero when not. A partial file with other
+/// content fails the checksum, and the next try then starts at zero.
+fn download_file_once(
+    url: &str,
+    dest: &Path,
+    partial: &Path,
+    expected_sha: &str,
+    reported: &mut u64,
+    on_chunk: &mut dyn FnMut(u64),
+) -> Result<(), String> {
+    let have = file_len(partial);
+    let mut request = model_download_agent()
         .get(url)
-        .set("Accept", "application/octet-stream")
-        .call()
-        .map_err(|error| format!("Download failed: {error}"))?;
+        .set("Accept", "application/octet-stream");
+    if have > 0 {
+        request = request.set("Range", &format!("bytes={have}-"));
+    }
+    let response = match request.call() {
+        Ok(response) => response,
+        // The partial file is as long as the file, or longer.
+        Err(ureq::Error::Status(416, _)) => {
+            let _ = fs::remove_file(partial);
+            return Err("Download failed: the server could not continue the file".to_string());
+        }
+        Err(error) => return Err(format!("Download failed: {error}")),
+    };
+    let continues = have > 0
+        && response.status() == 206
+        && response
+            .header("Content-Range")
+            .is_some_and(|range| range.trim().starts_with(&format!("bytes {have}-")));
 
-    let mut file =
-        File::create(&tmp).map_err(|error| format!("Could not write model file: {error}"))?;
     let mut hasher = Sha256::new();
+    let mut written = 0u64;
+    let mut file = if continues {
+        hash_file_into(partial, &mut hasher)?;
+        written = have;
+        fs::OpenOptions::new().append(true).open(partial)
+    } else {
+        File::create(partial)
+    }
+    .map_err(|error| format!("Could not write model file: {error}"))?;
+    // After a start at zero, the bytes of the earlier try are not reported again.
+    let mut report = |written: u64, reported: &mut u64| {
+        if written > *reported {
+            on_chunk(written - *reported);
+            *reported = written;
+        }
+    };
+    report(written, &mut *reported);
+
     let mut reader = response.into_reader();
     let mut buf = [0u8; 64 * 1024];
     loop {
@@ -355,13 +398,14 @@ fn download_file_once(
         hasher.update(&buf[..read]);
         file.write_all(&buf[..read])
             .map_err(|error| format!("Could not write model file: {error}"))?;
-        on_chunk(read as u64);
+        written += read as u64;
+        report(written, &mut *reported);
     }
     drop(file);
 
     let actual = format!("{:X}", hasher.finalize());
     if !expected_sha.is_empty() && !actual.eq_ignore_ascii_case(expected_sha) {
-        let _ = fs::remove_file(&tmp);
+        let _ = fs::remove_file(partial);
         return Err(format!(
             "SHA256 mismatch for {}",
             dest.file_name().unwrap_or_default().to_string_lossy()
@@ -371,24 +415,28 @@ fn download_file_once(
     if dest.exists() {
         let _ = fs::remove_file(dest);
     }
-    fs::rename(&tmp, dest).map_err(|error| format!("Could not finalize model file: {error}"))?;
+    fs::rename(partial, dest).map_err(|error| format!("Could not finalize model file: {error}"))?;
     Ok(())
 }
 
-fn file_sha256(path: &Path) -> Result<String, String> {
+fn hash_file_into(path: &Path, hasher: &mut Sha256) -> Result<(), String> {
     let mut file =
         File::open(path).map_err(|error| format!("Could not read model file: {error}"))?;
-    let mut hasher = Sha256::new();
     let mut buf = [0u8; 64 * 1024];
     loop {
         let read = file
             .read(&mut buf)
             .map_err(|error| format!("Could not read model file: {error}"))?;
         if read == 0 {
-            break;
+            return Ok(());
         }
         hasher.update(&buf[..read]);
     }
+}
+
+fn file_sha256(path: &Path) -> Result<String, String> {
+    let mut hasher = Sha256::new();
+    hash_file_into(path, &mut hasher)?;
     Ok(format!("{:X}", hasher.finalize()))
 }
 
@@ -396,13 +444,14 @@ fn file_len(path: &Path) -> u64 {
     fs::metadata(path).map_or(0, |meta| meta.len())
 }
 
-/// Shared long-read HTTP agent: model downloads and update downloads both need
-/// a generous read timeout for large files.
+/// The HTTP agent for model downloads. The read limit is for one read, not
+/// for the file: a connection that gives no bytes for this long fails, and
+/// the next try continues the file.
 #[doc(hidden)]
 pub fn download_agent(user_agent: &str) -> ureq::Agent {
     ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(20))
-        .timeout_read(Duration::from_secs(7200))
+        .timeout_read(Duration::from_secs(60))
         .timeout_write(Duration::from_secs(60))
         .user_agent(user_agent)
         .build()

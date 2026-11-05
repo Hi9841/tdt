@@ -17,13 +17,18 @@ mod update;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use audio::{play_sound, prewarm, AudioRecorder, SoundEffect, SpeechTail, MAX_TAIL, VIS_BARS};
+use audio::recorder::CaptureHandle;
+use audio::{
+    play_sound, prewarm, watch_default_input, AudioRecorder, SoundEffect, SpeechTail, MAX_TAIL,
+    VIS_BARS,
+};
 use config::{AppConfig, AppStats};
 use ely_gpui_component::Assets;
 use gpui::*;
 use hotkey::{
     current_binding, input_appeared, input_held, input_mask, note_user_typed, poll_capture_timeout,
-    reset_user_typed, set_binding, user_typed, HotkeyAction, HotkeyBinding, HotkeyListener,
+    poll_missed_release, reset_user_typed, set_binding, user_typed, wake_loop, HotkeyAction,
+    HotkeyBinding, HotkeyListener,
 };
 use parking_lot::Mutex;
 use paste::{DeliveryOutcome, DeliverySteps, NotTyped, PasteInjector};
@@ -80,7 +85,9 @@ fn deliver_transcript(
         typed_key.is_some(),
         &mut steps,
     );
-    let latency = result.latency(Instant::now());
+    // The wait of the user ends when the text is in the app. The copy to the
+    // clipboard comes after that.
+    let latency = result.latency(steps.typed_at.unwrap_or_else(Instant::now));
     log_delivery(&delivered, target, typed_key, latency, &result, steps);
     // Text reaches the user first; the history write is not on the latency path.
     // A failed copy still lands in History so the transcript is not lost.
@@ -96,6 +103,10 @@ fn deliver_transcript(
         }
         Ok(DeliveryOutcome::Copied) => (false, None),
         Ok(DeliveryOutcome::Pasted) => (true, None),
+        Ok(DeliveryOutcome::PastedNotCopied(_)) => (
+            true,
+            Some("TDT typed the text, but could not copy it to the clipboard.".to_string()),
+        ),
         Ok(DeliveryOutcome::CopiedFallback(reason)) => (false, Some(reason.notice().to_string())),
         Err(error) => {
             let _ = tx.send(InternalEvent::TranscribeError(format!(
@@ -141,6 +152,7 @@ fn log_delivery(
     let result = match delivered {
         Ok(DeliveryOutcome::NoSpeech) => return,
         Ok(DeliveryOutcome::Pasted) => "typed".to_string(),
+        Ok(DeliveryOutcome::PastedNotCopied(error)) => format!("typed, not copied: {error}"),
         Ok(DeliveryOutcome::Copied) => "copied (auto-paste is off)".to_string(),
         Ok(DeliveryOutcome::CopiedFallback(NotTyped::UserTyped)) => format!(
             "copied, not typed: key 0x{:02X} went down while TDT was finishing",
@@ -211,6 +223,14 @@ fn main() {
     } else {
         AppConfig::load()
     };
+    // A damaged settings file: say so on the pill, and write the defaults so
+    // the next load is clean. `load` kept a copy of the old file.
+    let config_error = config::take_reset_notice();
+    if config_error.is_some() {
+        if let Err(error) = config.save() {
+            append_log(&format!("Could not save the default settings: {error}"));
+        }
+    }
     // Persist the exact resolved internal model id so app restarts reopen the
     // same STT backend (and migrate retired ids forward).
     let resolved_id = models::resolve(&config.model_id).id.to_string();
@@ -249,6 +269,7 @@ fn main() {
         (None, None)
     } else {
         std::thread::spawn(prewarm);
+        watch_default_input();
         match AudioRecorder::new() {
             Ok(recorder) => {
                 append_log(&format!("Microphone: {}", recorder.describe()));
@@ -349,6 +370,24 @@ fn main() {
             }
         } };
 
+        // The idle tick of the UI loop is slow, so a tray click wakes it.
+        let (menu_tx, menu_rx) = crossbeam_channel::unbounded::<MenuEvent>();
+        MenuEvent::set_event_handler(Some(move |event| {
+            let _ = menu_tx.send(event);
+            wake_loop();
+        }));
+        let (tray_tx, tray_rx) = crossbeam_channel::unbounded::<TrayIconEvent>();
+        TrayIconEvent::set_event_handler(Some(move |event| {
+            // The pointer over the icon gives events that the loop does not use.
+            if matches!(
+                event,
+                TrayIconEvent::Click { .. } | TrayIconEvent::DoubleClick { .. }
+            ) {
+                let _ = tray_tx.send(event);
+                wake_loop();
+            }
+        }));
+
         let window_options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(Bounds {
                 origin: Point::new(px(700.0), px(860.0)),
@@ -407,18 +446,22 @@ fn main() {
                 overlay = find_app_hwnd();
                 attempts += 1;
             }
-            let Some(hwnd) = overlay else {
-                return;
-            };
+            if let Some(hwnd) = overlay {
+                ui::window_util::apply_overlay_window_style(hwnd);
+                ui::window_util::keep_pill_from_activating(hwnd);
+                ui::window_util::show_overlay_window(hwnd);
 
-            ui::window_util::apply_overlay_window_style(hwnd);
-            ui::window_util::keep_pill_from_activating(hwnd);
-            ui::window_util::show_overlay_window(hwnd);
-
-            position_bubble_on_preferred_monitor(hwnd);
-            follow_current_virtual_desktop();
-            // Strips caption and resize handles and snaps the pill back to size.
-            lock_overlay_chrome();
+                position_bubble_on_preferred_monitor(hwnd);
+                // Strips caption and resize handles and snaps the pill back to size.
+                lock_overlay_chrome();
+            }
+            // The pill follows the user to another virtual desktop. The check
+            // is a COM call into Explorer, so it runs here: a slow Explorer
+            // must not hold the UI loop.
+            loop {
+                follow_current_virtual_desktop();
+                std::thread::sleep(Duration::from_millis(400));
+            }
         });
 
         match cx.open_window(window_options, move |window, cx| {
@@ -457,6 +500,8 @@ fn main() {
                         discard: Arc<AtomicBool>,
                         baseline: Option<[bool; 256]>,
                         released_at: Option<Instant>,
+                        /// Wakes the pump at the release and at the stop.
+                        handle: CaptureHandle,
                     }
                     let mut is_recording_state = false;
                     let mut is_processing_state = false;
@@ -468,15 +513,26 @@ fn main() {
                     // notice after its text.
                     let mut microphone_lost: Option<String> = None;
                     let mut session: Option<LiveTake> = None;
+                    // The view has nothing that changes with time.
+                    let mut at_rest = false;
+                    // A stream that gave no audio: the take starts again one
+                    // time, with the microphone opened again.
+                    let mut restart_take = false;
+                    let mut reopened_in_take = false;
+                    let mut late_start = false;
 
                     loop {
                         let poll_interval = if is_recording_state || is_processing_state {
                             Duration::from_millis(25)
+                        } else if at_rest && hotkey_rx.is_some() {
+                            // Nothing moves, and the shortcut, the pill, and
+                            // the tray wake the loop.
+                            Duration::from_millis(250)
                         } else {
                             Duration::from_millis(75)
                         };
                         // A shortcut press or release ends the wait at once:
-                        // the poll would add up to 75 ms before the microphone
+                        // the poll would add its time before the microphone
                         // starts, and up to 25 ms before the release is seen.
                         let woke = match &hotkey_rx {
                             Some(rx) => rx
@@ -490,10 +546,10 @@ fn main() {
                                 None
                             }
                         };
-                        follow_current_virtual_desktop();
                         lock_overlay_chrome();
                         ensure_overlay_topmost();
                         poll_capture_timeout();
+                        poll_missed_release();
                         if take_show_request() {
                             let _ = this.update(cx, |view, cx| {
                                 view.open_settings(cx);
@@ -535,7 +591,7 @@ fn main() {
                         // 1. Process Menu Events from tray. Drain every queued
                         // event so quick tray clicks are never dropped.
                         let mut quitting = false;
-                        while let Ok(event) = MenuEvent::receiver().try_recv() {
+                        while let Ok(event) = menu_rx.try_recv() {
                             if let Some(ref tray) = tray {
                                 if event.id == tray.quit_item.id() {
                                     let _ = this.update(cx, |_, cx| {
@@ -573,7 +629,7 @@ fn main() {
                             let _ = this.update(cx, |_, cx| cx.quit());
                             quitting = true;
                         }
-                        while let Ok(event) = TrayIconEvent::receiver().try_recv() {
+                        while let Ok(event) = tray_rx.try_recv() {
                             match event {
                                 TrayIconEvent::Click {
                                     button: MouseButton::Left,
@@ -626,11 +682,42 @@ fn main() {
                             actions.push(HotkeyAction::Toggled(Instant::now()));
                         }
                         let mut stop_now = false;
-                        let stream_error = rec.borrow().as_ref().and_then(AudioRecorder::take_error);
+                        let stream_error = rec.borrow().as_ref().and_then(|recorder| {
+                            recorder.take_error().or_else(|| {
+                                (is_recording_state && recorder.stalled()).then(|| {
+                                    "The microphone stopped during the recording. Check the input device and try again.".to_string()
+                                })
+                            })
+                        });
                         if let Some(error) = stream_error {
+                            let silent = rec
+                                .borrow()
+                                .as_ref()
+                                .is_some_and(|recorder| recorder.captured_samples() == 0);
+                            let held = session.as_ref().is_some_and(|live| {
+                                !live.release.load(Ordering::SeqCst)
+                                    && !live.done.load(Ordering::SeqCst)
+                            });
                             // The next press opens the microphone again.
                             *rec.borrow_mut() = None;
-                            if is_recording_state || is_processing_state {
+                            if is_recording_state && silent && held && !reopened_in_take {
+                                // The stream gave no audio in this take, as it
+                                // can after the PC wakes. The user still talks,
+                                // so open the microphone again in this press.
+                                append_log(&format!(
+                                    "The microphone gave no audio. TDT opens it again in the same take. {error}"
+                                ));
+                                if let Some(live) = session.take() {
+                                    live.discard.store(true, Ordering::SeqCst);
+                                    live.halt.store(true, Ordering::SeqCst);
+                                    live.handle.wake();
+                                }
+                                is_recording_state = false;
+                                reopened_in_take = true;
+                                restart_take = true;
+                                late_start = true;
+                                actions.insert(0, HotkeyAction::PressStarted);
+                            } else if is_recording_state || is_processing_state {
                                 // The audio before the failure is already with
                                 // the engine: finish the take, then say why it
                                 // ended.
@@ -706,6 +793,11 @@ fn main() {
                                         .as_ref()
                                         .is_some_and(|live| !live.done.load(Ordering::SeqCst));
                                     if !is_recording_state && !is_processing_state && !pump_busy {
+                                        let restarted = std::mem::take(&mut restart_take);
+                                        if !restarted {
+                                            reopened_in_take = false;
+                                            late_start = false;
+                                        }
                                         if stt.get().is_none() {
                                             let _ = this.update(cx, |view, cx| {
                                                 view.set_error("Download a speech model in Settings before recording.".into());
@@ -714,7 +806,12 @@ fn main() {
                                             });
                                             continue;
                                         }
-                                        let reopen = rec.borrow().as_ref().and_then(AudioRecorder::reopen_reason);
+                                        // A stream that does not start again is opened again too.
+                                        let reopen = rec.borrow().as_ref().and_then(|recorder| {
+                                            recorder
+                                                .reopen_reason()
+                                                .or_else(|| recorder.resume_input().err())
+                                        });
                                         if rec.borrow().is_none() || reopen.is_some() {
                                             *rec.borrow_mut() = None;
                                             match AudioRecorder::new() {
@@ -733,7 +830,7 @@ fn main() {
                                             }
                                         }
                                         // Capture first: the buffer holds the audio until the pump below drains it.
-                                        if let Some(recorder) = rec.borrow().as_ref() { recorder.resume_input(); recorder.start(); }
+                                        if let Some(recorder) = rec.borrow().as_ref() { recorder.start(); }
                                         *target_hwnd.lock() = ui::window_util::dictation_target_window();
                                         let _ = this.update(cx, |view, cx| view.close_stats_settings(cx));
                                         let Some(handle) = rec.borrow().as_ref().map(|recorder| recorder.handle()) else {
@@ -779,6 +876,7 @@ fn main() {
                                         } else {
                                             drop(rx);
                                         }
+                                        let take_handle = handle.clone();
                                         let pump_tx = tx.clone();
                                         let pump_tail = Arc::clone(&tail);
                                         let pump_release = Arc::clone(&release);
@@ -828,8 +926,11 @@ fn main() {
                                             discard,
                                             baseline: None,
                                             released_at: None,
+                                            handle: take_handle,
                                         });
-                                        play_sound(SoundEffect::StartListening);
+                                        if !restarted {
+                                            play_sound(SoundEffect::StartListening);
+                                        }
                                         is_recording_state = true;
                                         no_speech_at = None;
                                         let started_at = Instant::now();
@@ -844,6 +945,7 @@ fn main() {
                                         });
                                     }
                                 }
+                                HotkeyAction::Wake => {}
                                 HotkeyAction::HoldReleased(asked) | HotkeyAction::Toggled(asked) => {
                                     // A hold always stops; a tap only stops a session it
                                     // started, otherwise it has just started one.
@@ -867,6 +969,8 @@ fn main() {
                                                 live.tail.lock().mark_release(asked);
                                                 live.released_at = Some(Instant::now());
                                                 live.release.store(true, Ordering::SeqCst);
+                                                // A user who was quiet stops now, not at the next audio buffer.
+                                                live.handle.wake();
                                                 live.baseline = Some(baseline);
                                             } else {
                                                 stop_now = true;
@@ -900,6 +1004,7 @@ fn main() {
                         if stop_now && is_recording_state {
                             if let Some(live) = session.as_mut() {
                                 live.halt.store(true, Ordering::SeqCst);
+                                live.handle.wake();
                                 live.baseline = None;
                             }
                             is_recording_state = false;
@@ -931,7 +1036,11 @@ fn main() {
                                     let word_count = text.split_whitespace().count();
                                     println!("Transcription completed ({word_count} words, latency: {latency_ms}ms)");
                                     let finished_at = Instant::now();
-                                    let notice = notice.or(microphone_lost.take());
+                                    let notice = notice.or(microphone_lost.take()).or_else(|| {
+                                        std::mem::take(&mut late_start).then(|| {
+                                            "The microphone started late, so the first words can be missing.".to_string()
+                                        })
+                                    });
                                     let _ = this.update(cx, |view, cx| {
                                         view.stats = AppStats::load();
                                         view.recovery_message = notice;
@@ -947,9 +1056,11 @@ fn main() {
                                 InternalEvent::TranscribeError(err) => {
                                     is_processing_state = false;
                                     microphone_lost = None;
+                                    late_start = false;
                                     if is_recording_state {
                                         if let Some(live) = session.as_mut() {
                                             live.halt.store(true, Ordering::SeqCst);
+                                            live.handle.wake();
                                             live.baseline = None;
                                         }
                                         is_recording_state = false;
@@ -963,6 +1074,7 @@ fn main() {
                                 }
                                 InternalEvent::NoSpeech => {
                                     is_processing_state = false;
+                                    late_start = false;
                                     if let Some(error) = microphone_lost.take() {
                                         let _ = this.update(cx, |view, cx| { view.set_error(error); cx.notify(); });
                                         continue;
@@ -994,7 +1106,7 @@ fn main() {
                             no_speech_at = None;
                         }
 
-                        let tray_state = this.update(cx, |view, cx| {
+                        let view_state = this.update(cx, |view, cx| {
                             if !preview::is_active() {
                                 if let Some(copied_at) = view.copied_at {
                                     if copied_at.elapsed() > Duration::from_millis(1400) {
@@ -1037,15 +1149,19 @@ fn main() {
                                 }
                                 HudStatus::NoSpeech | HudStatus::Error { .. } | HudStatus::Idle => {}
                             }
-                            tray.is_some()
-                                .then(|| (view.status.clone(), view.hotkey_label.clone()))
+                            let tray_state = tray
+                                .is_some()
+                                .then(|| (view.status.clone(), view.hotkey_label.clone()));
+                            (view.at_rest(), tray_state)
                         });
+                        let (rest, tray_state) = view_state.unwrap_or((false, None));
+                        at_rest = rest;
                         // A tooltip change waits on Explorer, and during that wait
                         // Windows delivers tray clicks to the tray window. A right
                         // click opens the tray menu, whose message loop runs GPUI
                         // tasks. Inside an update they would panic ("RefCell
                         // already borrowed"), so update the tray between updates.
-                        if let (Some(tray), Ok(Some((status, hotkey)))) = (tray.as_mut(), tray_state) {
+                        if let (Some(tray), Some((status, hotkey))) = (tray.as_mut(), tray_state) {
                             tray.update(&status, &hotkey);
                         }
                     }
@@ -1072,14 +1188,14 @@ fn main() {
                     update_ping_view,
                     cx,
                 );
-                if let Some(error) = microphone_error {
-                    view.set_error(error);
-                }
-                if let Some(error) = hotkey_error {
+                for error in [config_error, microphone_error, hotkey_error]
+                    .into_iter()
+                    .flatten()
+                {
                     let message = match &view.status {
-                        HudStatus::Error { message: existing, .. }
-                            if !existing.is_empty() && existing != &error =>
-                        {
+                        HudStatus::Error {
+                            message: existing, ..
+                        } if !existing.is_empty() && existing != &error => {
                             format!("{existing} {error}")
                         }
                         _ => error,

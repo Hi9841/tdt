@@ -72,6 +72,15 @@ impl SystemTray {
         if self.stop_item.is_enabled() != recording {
             self.stop_item.set_enabled(recording);
         }
+        // A tooltip change is a call to Explorer, and a slow Explorer holds
+        // the UI loop. During a take the loop must see the release, so the
+        // tooltip changes only when no take runs.
+        if matches!(
+            status,
+            HudStatus::Listening { .. } | HudStatus::Transcribing { .. }
+        ) {
+            return;
+        }
         let tooltip = status_tooltip(status, hotkey);
         if tooltip != self.last_tooltip && self.tray_icon.set_tooltip(Some(&tooltip)).is_ok() {
             self.last_tooltip = tooltip;

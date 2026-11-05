@@ -287,3 +287,70 @@ through `safe.cmd`:
   wait.
 
 Not verified: the app itself (hook, microphone, paste) did not run, and no panic was forced.
+
+## Session 2026-11-06 (the 16 app findings of the review)
+
+Baseline `efc2b66` (TDT 0.9.0). The review of 2026-11-05 gave 16 findings in the app, from
+the source only. This session changes the code for each. No change is in the model path.
+
+Stability:
+
+1. Hooks: Windows removes a low-level hook that answers too slowly, with no notice. The hook
+   thread now compares, each 2 s, the time of the last input (`GetLastInputInfo`) with the
+   time of the last hook event. Input more than 1 s newer installs both hooks again. An
+   administrator window in front is no reason (its input reaches no hook of a normal
+   program). For other unseen input (touch, the lock screen) the installs go down to about
+   one each minute, with one log line each hour at most.
+2. Calls into Explorer and COM left the UI loop: a thread reads the Windows default
+   microphone each 2 s (a press compares with that value), and the virtual desktop check has
+   the thread that styles the window at the start. The stream is still opened on the UI
+   thread, only when the device changed.
+3. A press whose key-up did not reach the hook ends when a modifier of the shortcut is up
+   (`GetAsyncKeyState`, in the UI loop). A shortcut with no modifier (F9, Mouse 4) has no such
+   sign and keeps the 2-minute limit.
+4. Keys from other programs can be the shortcut. TDT marks its own key events
+   (`dwExtraInfo`), and the hook passes on only those. Typing by the user is still counted
+   from keyboard keys only.
+5. `SendInput` gets 256 characters for each call, with a pause of 1 ms between calls. A text
+   up to 256 characters has no pause.
+6. A stream that gives no buffer for 3 s during a take ends the take with a notice. The text
+   up to that point is kept.
+7. A model download continues its partial file (`Range`), and a try that added bytes does
+   not count as a failure. One read waits 60 s at most (it was 2 hours).
+8. A damaged `config.json`: a notice on the pill, a line in the log, and the default file
+   written again. The copy of the old file is `config.json.bak`.
+
+Speed:
+
+9. The text goes to the app before the copy to the clipboard. The latency in the log and in
+   History ends when the text is in the app.
+10. A stream that fails at the start of a take, or gives no audio for 3 s, is opened again
+    in the same press, one time. The text then has a notice that the first words can be
+    missing.
+11. The UI loop runs each 250 ms (it was 75 ms) when the pill is at rest and the panel is
+    closed. The shortcut, a click on the pill, and a tray click wake it.
+12. The release and the stop wake the pump. It waited up to 8 ms for the next buffer.
+13. No change: the stop of an old read is in 0.9.0, and a minimum time between reads lost
+    hits in the session of 2026-11-05 (0.45 to 0.32).
+14. The level list of `EndOfSpeech` stays sorted by insertion. It was sorted again for each
+    chunk of audio.
+15. The resampler has fixed weights when the device rate is a whole multiple of 16 kHz
+    (48 kHz). Other rates use the code of before.
+16. The tray tooltip changes only when no take runs.
+
+Checks:
+
+- Items 14 and 15 give the same bits as the code of before, in a scratch program: 16.9 million
+  resampler outputs at 8 device rates, and 91,707 updates of `EndOfSpeech` on 300 takes.
+- Text, `bench-asr` of 0.9.0 against this build, app path, the owner's dictionary on, through
+  `safe.cmd`: `tech` 0 of 40 differ, the 145 saved takes 0, `clean` 0 of 200, `other` 0 of 200,
+  long-clean 0 of 200, long-other 0 of 200. Model time on the long sets, one run each: 80,179
+  to 75,643 ms and 75,782 to 70,703 ms (item 14).
+- At speaking pace (`--whole --realtime`, 46 real takes, one run each): 0 texts differ, mean
+  wait 25.8 against 25.6 ms, p90 104 against 106 ms, 27 takes ready at the release in each.
+- Ratchet 81/172/34. Clippy, format, and the word-list check of CI pass.
+- Item 7 against Hugging Face: a partial file without its last 3 MB ended in 2.0 s with the
+  right SHA-256, and a partial file with wrong content started again and ended right.
+
+Not verified: the app itself did not run, so items 1 to 6, 8 to 12, and 16 have no test. No
+slow app was tried for item 5, and no sleep and wake for item 10.

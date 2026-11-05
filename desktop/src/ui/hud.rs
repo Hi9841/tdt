@@ -848,6 +848,16 @@ impl HudView {
         self.copied_at = Some(Instant::now());
     }
 
+    /// True when nothing on the pill or the panel changes with time. The UI
+    /// loop then runs at its slow tick.
+    pub fn at_rest(&self) -> bool {
+        matches!(self.status, HudStatus::Idle | HudStatus::Error { .. })
+            && self.mode == WindowViewMode::Bubble
+            && self.panel_motion.is_none()
+            && self.copied_at.is_none()
+            && self.model_loading.is_none()
+    }
+
     /// Whether the model load moved since the last frame, so the bar needs one.
     pub fn model_load_moved(&mut self) -> bool {
         if self.model_loading.is_none() {
@@ -1441,6 +1451,8 @@ impl HudView {
             Some(PillAction::Settings) => self.open_settings(cx),
             None => {}
         }
+        // The UI loop reads the request: do not let it wait for its tick.
+        hotkey::wake_loop();
         cx.notify();
     }
 
@@ -1750,6 +1762,7 @@ impl HudView {
                                     .on_click(move |_, _, cx| {
                                         hud.update(cx, |this, cx| {
                                             this.retry_microphone = true;
+                                            hotkey::wake_loop();
                                             cx.notify();
                                         });
                                     }),

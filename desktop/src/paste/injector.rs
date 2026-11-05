@@ -23,12 +23,24 @@ const INPUT_READY_BUDGET: Duration = Duration::from_millis(60);
 /// still caught early, large enough not to spin.
 const INPUT_READY_STEP: Duration = Duration::from_millis(4);
 
+/// The mark on each key event that TDT sends. The keyboard hook passes
+/// these events on, so the typed text cannot start a recording. Events from
+/// other programs (a remap tool, a remote desktop) have another mark.
+pub const OWN_INPUT: usize = 0x5444_5401;
+
+/// Characters in one `SendInput` call. A short pause follows each call but
+/// the last, so the app can read its input before more comes.
+const TYPED_AT_ONCE: usize = 256;
+const PAUSE_BETWEEN_CALLS: Duration = Duration::from_millis(1);
+
 /// Where the delivery time went, for the log.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DeliverySteps {
     pub copy: Duration,
     pub focus: Duration,
     pub typing: Duration,
+    /// When the text was in the app. The wait of the user ends here.
+    pub typed_at: Option<Instant>,
 }
 
 impl std::fmt::Display for DeliverySteps {
@@ -48,6 +60,8 @@ pub enum DeliveryOutcome {
     NoSpeech,
     Copied,
     Pasted,
+    /// The text is in the app, but the clipboard did not take it.
+    PastedNotCopied(String),
     CopiedFallback(NotTyped),
 }
 
@@ -140,14 +154,20 @@ fn deliver_with(
     if text.trim().is_empty() {
         return Ok(DeliveryOutcome::NoSpeech);
     }
-    copy(text)?;
     if !should_paste {
+        copy(text)?;
         return Ok(DeliveryOutcome::Copied);
     }
-    Ok(match insert(text) {
-        Ok(()) => DeliveryOutcome::Pasted,
-        Err(error) => DeliveryOutcome::CopiedFallback(error),
-    })
+    // The app gets the text first. A clipboard manager can hold the copy for
+    // a time, and the user does not wait for the clipboard.
+    let typed = insert(text);
+    let copied = copy(text);
+    match (typed, copied) {
+        (Ok(()), Ok(())) => Ok(DeliveryOutcome::Pasted),
+        (Ok(()), Err(error)) => Ok(DeliveryOutcome::PastedNotCopied(error)),
+        (Err(reason), Ok(())) => Ok(DeliveryOutcome::CopiedFallback(reason)),
+        (Err(_), Err(error)) => Err(error),
+    }
 }
 
 #[derive(Clone)]
@@ -202,6 +222,7 @@ impl PasteInjector {
             copy,
             focus,
             typing,
+            typed_at,
         } = steps;
         deliver_with(
             text,
@@ -212,7 +233,13 @@ impl PasteInjector {
                 *copy = started.elapsed();
                 copied
             },
-            |text| self.insert_text(text, target_hwnd, focus, typing),
+            |text| {
+                let typed = self.insert_text(text, target_hwnd, focus, typing);
+                if typed.is_ok() {
+                    *typed_at = Some(Instant::now());
+                }
+                typed
+            },
         )
     }
 
@@ -402,7 +429,7 @@ fn keyboard_input(
                 wScan: scan_code,
                 dwFlags: flags,
                 time: 0,
-                dwExtraInfo: 0,
+                dwExtraInfo: OWN_INPUT,
             },
         },
     }
@@ -423,7 +450,11 @@ fn send_inputs(
     inputs: &[windows::Win32::UI::Input::KeyboardAndMouse::INPUT],
 ) -> Result<(), String> {
     use windows::Win32::UI::Input::KeyboardAndMouse::SendInput;
-    for chunk in inputs.chunks(512) {
+    // Each character is a key down and a key up.
+    for (index, chunk) in inputs.chunks(2 * TYPED_AT_ONCE).enumerate() {
+        if index > 0 {
+            thread::sleep(PAUSE_BETWEEN_CALLS);
+        }
         // SAFETY: `chunk` is a valid slice of INPUT, and the size argument is the size of one INPUT.
         let sent = unsafe { SendInput(chunk, std::mem::size_of_val(&chunk[0]) as i32) };
         if sent != chunk.len() as u32 {

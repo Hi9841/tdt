@@ -971,19 +971,12 @@ pub fn set_window_mode(is_expanded: bool) {
     }
 }
 
+/// Moves the pill to the virtual desktop that the user looks at. The check
+/// is a COM call into Explorer: call it from a thread that can wait, not
+/// from the UI loop.
 pub fn follow_current_virtual_desktop() {
     #[cfg(target_os = "windows")]
     {
-        use std::time::{Duration, Instant};
-        static LAST: parking_lot::Mutex<Option<Instant>> = parking_lot::Mutex::new(None);
-        {
-            let mut last = LAST.lock();
-            if last.is_some_and(|t| t.elapsed() < Duration::from_millis(400)) {
-                return;
-            }
-            *last = Some(Instant::now());
-        }
-
         let Some(hwnd) = find_app_hwnd() else {
             return;
         };

@@ -44,6 +44,9 @@ const OPENING_FRAMES: usize = 8;
 #[derive(Default)]
 pub struct EndOfSpeech {
     levels: Vec<f32>,
+    /// `levels` in rising order. A sort of the whole take for each chunk of
+    /// audio would grow with the take.
+    sorted: Vec<f32>,
     /// The frame after the last speech.
     speech_end: usize,
 }
@@ -53,8 +56,14 @@ impl EndOfSpeech {
     pub fn update(&mut self, samples: &[f32]) {
         let first = self.levels.len();
         let (frames, _) = samples[first * FRAME_SAMPLES..].as_chunks::<FRAME_SAMPLES>();
-        self.levels
-            .extend(frames.iter().map(|frame| frame_db(frame)));
+        for frame in frames {
+            let level = frame_db(frame);
+            let place = self
+                .sorted
+                .partition_point(|other| other.total_cmp(&level).is_le());
+            self.sorted.insert(place, level);
+            self.levels.push(level);
+        }
         if self.levels.len() < MIN_FRAMES {
             return;
         }
@@ -71,9 +80,7 @@ impl EndOfSpeech {
     /// before the user talks. A short take with no pause has no quiet frames,
     /// and its quietest frames are soft speech.
     fn room_noise(&self) -> f32 {
-        let mut sorted = self.levels.clone();
-        sorted.sort_by(f32::total_cmp);
-        let quietest = sorted[sorted.len() / 20];
+        let quietest = self.sorted[self.sorted.len() / 20];
         let mut opening = self.levels[..OPENING_FRAMES].to_vec();
         opening.sort_by(f32::total_cmp);
         quietest.min(opening[OPENING_FRAMES / 2])

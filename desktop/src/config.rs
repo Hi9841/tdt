@@ -24,24 +24,41 @@ fn config_dir() -> Option<PathBuf> {
     new
 }
 
-fn load_json<T: serde::de::DeserializeOwned>(path: &std::path::Path) -> Result<Option<T>, ()> {
+/// The file as a value, or `None` when there is no file. A file that TDT
+/// cannot read is an error: the log has the cause, and a copy of a damaged
+/// file is at the path that the error gives.
+fn load_json<T: serde::de::DeserializeOwned>(
+    path: &std::path::Path,
+) -> Result<Option<T>, std::path::PathBuf> {
     if !path.exists() {
         return Ok(None);
     }
-    let content = fs::read_to_string(path).map_err(|_| ())?;
+    let backup = path.with_extension("json.bak");
+    let content = fs::read_to_string(path).map_err(|error| {
+        crate::append_log(&format!("Could not read {}: {error}", path.display()));
+        backup.clone()
+    })?;
     match serde_json::from_str(&content) {
         Ok(value) => Ok(Some(value)),
         Err(error) => {
-            let backup = path.with_extension("json.bak");
             let _ = fs::copy(path, &backup);
-            eprintln!(
-                "TDT: could not parse {} ({error}); backed up to {}",
+            crate::append_log(&format!(
+                "Could not parse {} ({error}). A copy is at {}.",
                 path.display(),
                 backup.display()
-            );
-            Err(())
+            ));
+            Err(backup)
         }
     }
+}
+
+/// Set when `config.json` was damaged and the settings went back to the
+/// defaults. The pill shows it one time.
+static RESET_NOTICE: parking_lot::Mutex<Option<String>> = parking_lot::Mutex::new(None);
+
+/// The notice of a settings reset, one time.
+pub fn take_reset_notice() -> Option<String> {
+    RESET_NOTICE.lock().take()
 }
 
 fn write_json_atomic<T: Serialize>(
@@ -102,7 +119,14 @@ impl AppConfig {
                 config
             }
             Ok(None) => Self::default(),
-            Err(()) => Self::default(),
+            Err(backup) => {
+                *RESET_NOTICE.lock() = Some(format!(
+                    "TDT could not read its settings file and uses the default settings. \
+                     A copy of the old file is at {}.",
+                    backup.display()
+                ));
+                Self::default()
+            }
         }
     }
 

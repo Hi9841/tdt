@@ -12,6 +12,26 @@ pub const MAX_RECORDING_SECONDS: usize = 120;
 const STALE_CALLBACK_MS: u64 = 1_500;
 /// First buffer should arrive quickly. Longer means the open did not stick.
 const STALE_OPEN_MS: u64 = 800;
+/// During a take, this long with no buffer means the stream stopped. The
+/// limit is long because a Bluetooth microphone can start slowly.
+const STALLED_TAKE_MS: u64 = 3_000;
+/// The time between two reads of the Windows default microphone.
+const DEFAULT_INPUT_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The Windows default microphone, as the watch thread last read it. The
+/// outer `None` means no read yet. The read is a COM call that can wait on
+/// the Windows audio service, so a press of the shortcut does not make it.
+static DEFAULT_INPUT: Mutex<Option<Option<String>>> = Mutex::new(None);
+
+/// Starts the thread that keeps `DEFAULT_INPUT` current. A microphone that
+/// becomes the default is used from the next take, 2 seconds later at most.
+pub fn watch_default_input() {
+    std::thread::spawn(|| loop {
+        let name = default_input_name(&cpal::default_host());
+        *DEFAULT_INPUT.lock() = Some(name);
+        std::thread::sleep(DEFAULT_INPUT_POLL);
+    });
+}
 
 pub struct AudioRecorder {
     is_recording: Arc<AtomicBool>,
@@ -43,6 +63,8 @@ pub struct CaptureHandle {
     samples_ready: Arc<Condvar>,
     envelope: Arc<Mutex<SpeechEnvelope>>,
     captured: Arc<AtomicUsize>,
+    /// Set by `wake`: `wait_for_audio` returns with no audio.
+    woken: Arc<AtomicBool>,
 }
 
 impl AudioRecorder {
@@ -53,7 +75,11 @@ impl AudioRecorder {
         let mut last_error = "No microphone found. Connect a microphone and try again.".to_string();
         for name in names {
             match open_named(&host, &name, default_name.clone()) {
-                Ok(recorder) => return Ok(recorder),
+                Ok(recorder) => {
+                    // This read is newer than the last one of the watch thread.
+                    *DEFAULT_INPUT.lock() = Some(default_name);
+                    return Ok(recorder);
+                }
                 Err(error) => last_error = error,
             }
         }
@@ -180,9 +206,9 @@ impl AudioRecorder {
     }
 
     /// Why the next take must open the microphone again, or `None` when this
-    /// stream is still the right one. Reads the Windows default each time, so
-    /// a USB microphone that is plugged in, unplugged, or chosen in Settings
-    /// is used from the next take.
+    /// stream is still the right one. Compares with the Windows default that
+    /// the watch thread read, so a USB microphone that is plugged in,
+    /// unplugged, or chosen in Settings is used from the next take.
     pub fn reopen_reason(&self) -> Option<String> {
         if let Some(error) = self.take_error() {
             return Some(error);
@@ -190,7 +216,7 @@ impl AudioRecorder {
         if self.needs_reopen() {
             return Some("the stream stopped".to_string());
         }
-        let default_name = default_input_name(&cpal::default_host());
+        let default_name = DEFAULT_INPUT.lock().clone()?;
         if default_name != self.default_name {
             return Some(format!(
                 "the Windows default changed to {}",
@@ -210,13 +236,31 @@ impl AudioRecorder {
     }
 
     /// Resume a parked stream. Refreshes the callback clock so a long idle
-    /// does not look like a dead device.
-    pub fn resume_input(&self) {
+    /// does not look like a dead device. An error means that the stream is
+    /// gone: open the microphone again.
+    pub fn resume_input(&self) -> Result<(), String> {
         if !self.paused.swap(false, Ordering::SeqCst) {
-            return;
+            return Ok(());
         }
-        let _ = self._stream.play();
         note_callback(&self.last_callback_ms);
+        self._stream
+            .play()
+            .map_err(|error| format!("the stream did not start again: {error}"))
+    }
+
+    /// True when a take records and the stream gave no buffer for a long
+    /// time. A live stream gives buffers in silence too.
+    pub fn stalled(&self) -> bool {
+        if self.paused.load(Ordering::SeqCst) {
+            return false;
+        }
+        let last = nonzero(self.last_callback_ms.load(Ordering::Relaxed)).unwrap_or(self.opened_ms);
+        now_ms().saturating_sub(last) > STALLED_TAKE_MS
+    }
+
+    /// The samples of this take so far.
+    pub fn captured_samples(&self) -> usize {
+        self.captured.load(Ordering::SeqCst)
     }
 
     /// True when the capture callback has stopped. The next recording should
@@ -302,6 +346,7 @@ impl AudioRecorder {
             samples_ready: Arc::clone(&self.samples_ready),
             envelope: Arc::clone(&self.envelope),
             captured: Arc::clone(&self.captured),
+            woken: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -338,12 +383,21 @@ impl CaptureHandle {
         self.at_limit.load(Ordering::Relaxed)
     }
 
-    /// Block until new samples arrive or `timeout`. Must not miss a wakeup:
-    /// the condvar waits on the same mutex as the sample buffer.
+    /// Ends a `wait_for_audio` now. The release of the shortcut and the stop
+    /// of a take must not wait for the next buffer or for the timeout.
+    pub fn wake(&self) {
+        let _guard = self.buffer.lock();
+        self.woken.store(true, Ordering::SeqCst);
+        self.samples_ready.notify_all();
+    }
+
+    /// Block until new samples arrive, `wake` is called, or `timeout`. Must
+    /// not miss a wakeup: the condvar waits on the same mutex as the sample
+    /// buffer, and `wake` sets its flag under that mutex.
     pub fn wait_for_audio(&self, timeout: std::time::Duration) {
         let mut guard = self.buffer.lock();
         let start = std::time::Instant::now();
-        while guard.is_empty() {
+        while guard.is_empty() && !self.woken.swap(false, Ordering::SeqCst) {
             let remaining = timeout.saturating_sub(start.elapsed());
             if remaining.is_zero() {
                 break;

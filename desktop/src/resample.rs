@@ -24,6 +24,10 @@ pub struct Resampler {
     half: usize,
     /// Kernel at `1 / TABLE_STEPS` input samples from `-half` to `+half`.
     table: Vec<f32>,
+    /// The weights of one output, when all outputs have the same ones. That
+    /// is so when the device rate is a whole multiple of 16 kHz (48 kHz):
+    /// each output is then centered on an input sample.
+    taps: Option<Vec<f32>>,
     /// Input that later outputs still need.
     history: Vec<f32>,
     /// Position of the next output in `history`.
@@ -51,9 +55,17 @@ impl Resampler {
             step,
             half,
             table,
+            taps: None,
             history: Vec::new(),
             next: 0.0,
         };
+        if step.fract() == 0.0 {
+            // `next` is then always a whole number, so the distance from an
+            // output to input `offset` of its window is the same each time.
+            let center = (half - 1) as f64;
+            let taps = (0..2 * half).map(|offset| resampler.weight(center - offset as f64));
+            resampler.taps = Some(taps.collect());
+        }
         resampler.reset();
         Some(resampler)
     }
@@ -73,10 +85,21 @@ impl Resampler {
         while self.next + half < self.history.len() as f64 {
             let center = self.next.floor() as usize;
             let first = center + 1 - self.half;
+            let window = &self.history[first..=center + self.half];
             let mut sum = 0.0f32;
-            for (offset, sample) in self.history[first..=center + self.half].iter().enumerate() {
-                let distance = self.next - (first + offset) as f64;
-                sum += sample * self.weight(distance);
+            match &self.taps {
+                // The same products in the same order as below.
+                Some(taps) => {
+                    for (sample, weight) in window.iter().zip(taps) {
+                        sum += sample * weight;
+                    }
+                }
+                None => {
+                    for (offset, sample) in window.iter().enumerate() {
+                        let distance = self.next - (first + offset) as f64;
+                        sum += sample * self.weight(distance);
+                    }
+                }
             }
             output.push(sum);
             self.next += self.step;
