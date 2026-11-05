@@ -37,7 +37,7 @@ const READ_AFTER_QUIET_FRAMES: usize = 20;
 /// as speech: a word after the read must not be lost.
 const SPEECH_OVER_NOISE_DB: f32 = 6.0;
 /// The room noise needs some audio to measure.
-const MIN_FRAMES: usize = 150;
+const MIN_FRAMES: usize = 60;
 const OPENING_FRAMES: usize = 8;
 
 /// Finds where the speech of a take ended, while the take grows.
