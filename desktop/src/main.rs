@@ -170,6 +170,11 @@ fn main() {
             "{msg}\n{}",
             std::backtrace::Backtrace::force_capture()
         ));
+        // The engine call catches this panic: the take ends with an error on
+        // the pill, and the app stays open.
+        if voice_stt_desktop::stt::panic_in_engine_call() {
+            return;
+        }
         // MessageBox runs a message loop. On the UI thread that loop would run
         // GPUI tasks while the panicked update still holds the app, and a
         // second panic there aborts before the user sees the dialog. So the

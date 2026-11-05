@@ -6392,8 +6392,8 @@ dependencies = [
 
 [[package]]
 name = "trit"
-version = "0.8.0"
-source = "git+https://github.com/Hi9841/trit?rev=2352bce0f1e15f78c5374bea494eb6d381a8bf01#2352bce0f1e15f78c5374bea494eb6d381a8bf01"
+version = "0.9.0"
+source = "git+https://github.com/Hi9841/trit?rev=178b4cc07c1f99a41128b5965e97fe9a7a6f5c28#178b4cc07c1f99a41128b5965e97fe9a7a6f5c28"
 dependencies = [
  "libc",
  "libmimalloc-sys",
@@ -6661,7 +6661,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "voice-stt-desktop"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "arboard",
  "async-channel",

@@ -260,3 +260,30 @@ no-speech clips, the ratchet.
    last read finished less than a fixed amount of speech ago could cut it without a lost hit.
 3. Trit: greedy decoding that can return nothing (Trit ledger) needs a fix that does not
    invent words from noise.
+
+## Session 2026-11-05 (review fixes, TDT 0.9.0)
+
+Baseline `30cbc23` (Trit `2352bce`). The change: Trit 0.9.0 (`178b4cc`), the read in the quiet
+on its own thread with a `trit::Cancel`, and an engine panic that fails one take.
+
+- Quiet read: the capture loop reads new audio during the read. New speech or a full window
+  stops a read that is old. Each end of speech gets one read at the same audio as before, so
+  the text does not depend on the CPU.
+- Engine panic: each engine call has a `catch_unwind`. The panic hook writes the log and
+  returns for a panic on the thread of the call or on a `trit-speech-` thread during a call.
+  The take ends with an error on the pill, and the app stays open.
+
+Gate, `bench-asr` of the baseline against the change, app path, the owner's dictionary on,
+through `safe.cmd`:
+
+- Text, all audio at once: the 145 saved takes 0 differ, `clean` 0 of 200, `other` 0 of 200,
+  `tech` 0 of 40, long-clean 0 of 200, long-other 0 of 200.
+- At speaking pace (`--whole --realtime`, 46 real takes, one run each): 0 texts differ. Wait:
+  mean 25.5 against 26.2 ms, p90 103 against 108 ms, max 166 against 165 ms, 27 takes ready
+  at the release in each build. Level.
+- Ratchet 81/172/34.
+- With all audio at once, the model time falls (takes 28,091 to 8,435 ms, long-clean 207,979
+  to 81,602 ms), because an old read stops. This is less work during a take, not a shorter
+  wait.
+
+Not verified: the app itself (hook, microphone, paste) did not run, and no panic was forced.

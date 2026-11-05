@@ -3,11 +3,13 @@ use super::segment;
 use super::takes;
 use crossbeam_channel::{Receiver, RecvTimeoutError};
 use parking_lot::Mutex;
+use std::cell::Cell;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use trit::{BiasWeights, LoadOptions, Trit};
+use trit::{BiasWeights, Cancel, LoadOptions, Trit};
 
 const MAX_CAPTURED_SAMPLES: usize = 120 * 16_000;
 /// The first second of a take runs through the model once while the user
@@ -33,6 +35,148 @@ fn release_when_idle() {
             trit::release_memory();
         }
     });
+}
+
+/// Engine calls that run now; each has a `catch_unwind` around it.
+static ENGINE_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+thread_local! {
+    /// This thread is inside an engine call.
+    static IN_ENGINE_CALL: Cell<bool> = const { Cell::new(false) };
+}
+
+/// True for a panic that an engine call catches: on the thread of the call,
+/// or on a Trit team thread while a call runs (the team gives its panic to
+/// the call). Such a panic costs one take, not the app. A panic of a team
+/// thread during a model load has no such call around it.
+pub fn panic_in_engine_call() -> bool {
+    let team_thread = || {
+        let thread = std::thread::current();
+        let name = thread.name().unwrap_or_default();
+        name.starts_with("trit-speech-") && ENGINE_CALLS.load(Ordering::Relaxed) > 0
+    };
+    IN_ENGINE_CALL.get() || team_thread()
+}
+
+/// The result of `call`, or the error for the pill when the engine panics.
+fn engine_call<T>(call: impl FnOnce() -> T) -> Result<T, String> {
+    IN_ENGINE_CALL.set(true);
+    ENGINE_CALLS.fetch_add(1, Ordering::Relaxed);
+    let result = catch_unwind(AssertUnwindSafe(call));
+    ENGINE_CALLS.fetch_sub(1, Ordering::Relaxed);
+    IN_ENGINE_CALL.set(false);
+    result.map_err(|_| "The speech engine failed on this take. Try again.".to_string())
+}
+
+/// TDT is English only (0.3.1): the decoder never writes other languages.
+/// `cancel` stops the read; the text is then empty.
+fn read_options(cancel: Option<&Cancel>) -> trit::Options {
+    trit::Options {
+        cancel: cancel.cloned(),
+        ..trit::Options::language("en")
+    }
+}
+
+fn transcribe_samples(
+    engine: &Trit,
+    samples: &[f32],
+    cancel: Option<&Cancel>,
+) -> Result<String, String> {
+    let options = read_options(cancel);
+    engine_call(|| engine.transcribe_with(samples, &options))
+}
+
+/// `text` with the window `samples` added, or `None` when the two do not
+/// join. `start` is 0 for the first window, which has nothing to join.
+fn add_window(
+    engine: &Trit,
+    text: &str,
+    samples: &[f32],
+    start: usize,
+    cancel: Option<&Cancel>,
+) -> Result<Option<String>, String> {
+    let part = transcribe_samples(engine, samples, cancel)?;
+    Ok(if start == 0 {
+        Some(part)
+    } else {
+        segment::merge(text, &part)
+    })
+}
+
+/// The text of the whole take, from the windows so far and the speech
+/// from `window` on, and the samples that the model read for it.
+fn read_rest(
+    engine: &Trit,
+    text: &Option<String>,
+    captured: &[f32],
+    window: usize,
+    cancel: Option<&Cancel>,
+) -> Result<(String, usize), String> {
+    let joined = match text {
+        Some(done) => add_window(engine, done, &captured[window..], window, cancel)?,
+        None => None,
+    };
+    Ok(match joined {
+        Some(text) => (text, captured.len() - window),
+        None => (
+            transcribe_samples(engine, captured, cancel)?,
+            captured.len(),
+        ),
+    })
+}
+
+/// A read of the take in the quiet after the speech, on its own thread: new
+/// audio must reach the capture loop during the read, so the loop can stop a
+/// read that new speech made useless. Dropping the read stops it.
+struct QuietRead {
+    /// The frame where the speech ended.
+    end: usize,
+    /// The window at the start of the read.
+    window: usize,
+    cancel: Cancel,
+    result: Receiver<Result<String, String>>,
+}
+
+impl QuietRead {
+    fn start(
+        engine: &Arc<Trit>,
+        text: &Option<String>,
+        captured: &[f32],
+        window: usize,
+        end: usize,
+    ) -> Self {
+        let (done, result) = crossbeam_channel::bounded(1);
+        let cancel = Cancel::new();
+        let flag = cancel.clone();
+        let (engine, text, samples) = (Arc::clone(engine), text.clone(), captured.to_vec());
+        std::thread::spawn(move || {
+            let read = read_rest(&engine, &text, &samples, window, Some(&flag));
+            let _ = done.send(read.map(|(text, _)| text));
+        });
+        Self {
+            end,
+            window,
+            cancel,
+            result,
+        }
+    }
+
+    /// The text is the text of the take: no speech came after the read, and
+    /// no window ended.
+    fn is_current(&self, end: usize, window: usize) -> bool {
+        self.end == end && self.window == window
+    }
+
+    /// Waits for the text; `None` when the read died.
+    fn wait(self) -> Option<Result<String, String>> {
+        self.result.recv().ok()
+    }
+}
+
+impl Drop for QuietRead {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
 }
 
 /// Audio captured while the user is still holding the hotkey.
@@ -184,47 +328,6 @@ impl SttEngine {
         }
     }
 
-    fn transcribe_samples(&self, samples: &[f32]) -> Result<String, String> {
-        let native = self.native.lock().clone();
-        let engine = native.ok_or("The speech model is not loaded.")?;
-        // TDT is English only (0.3.1): the decoder never writes other languages.
-        Ok(engine.transcribe_with(samples, &trit::Options::language("en")))
-    }
-
-    /// `text` with the window `samples` added, or `None` when the two do not
-    /// join. `start` is 0 for the first window, which has nothing to join.
-    fn add_window(
-        &self,
-        text: &str,
-        samples: &[f32],
-        start: usize,
-    ) -> Result<Option<String>, String> {
-        let part = self.transcribe_samples(samples)?;
-        Ok(if start == 0 {
-            Some(part)
-        } else {
-            segment::merge(text, &part)
-        })
-    }
-
-    /// The text of the whole take, from the windows so far and the speech
-    /// from `window` on, and the samples that the model read for it.
-    fn read_rest(
-        &self,
-        text: &Option<String>,
-        captured: &[f32],
-        window: usize,
-    ) -> Result<(String, usize), String> {
-        let joined = match text {
-            Some(done) => self.add_window(done, &captured[window..], window)?,
-            None => None,
-        };
-        Ok(match joined {
-            Some(text) => (text, captured.len() - window),
-            None => (self.transcribe_samples(captured)?, captured.len()),
-        })
-    }
-
     pub fn transcribe_live_reporting(
         &self,
         rx: &Receiver<LiveAudio>,
@@ -235,6 +338,8 @@ impl SttEngine {
             format!("Could not load the speech model. Choose another model in Settings. {error}")
         })?;
         self.refresh_dictionary();
+        let native = self.native.lock().clone();
+        let engine = native.ok_or("The speech model is not loaded.")?;
         let mut stop = None;
         let mut captured: Vec<f32> = Vec::new();
         // The windows so far are in `text`, `None` once two did not join; the
@@ -244,9 +349,11 @@ impl SttEngine {
         let mut last_any = Instant::now();
         let mut primed = false;
         let mut speech = segment::EndOfSpeech::default();
-        // The text read during the quiet after the speech that ended at this
-        // frame, with `window` at that time.
-        let mut ready: Option<(usize, usize, String)> = None;
+        // The read of the quiet after the last speech, while its text can
+        // still be the text of the take.
+        let mut quiet: Option<QuietRead> = None;
+        // Each end of speech gets one read, at the same audio on every CPU.
+        let mut read_end = None;
 
         loop {
             match rx.recv_timeout(Duration::from_millis(20)) {
@@ -256,7 +363,7 @@ impl SttEngine {
                         captured.extend_from_slice(&samples);
                         if !primed && captured.len() >= PRIME_SAMPLES {
                             primed = true;
-                            self.transcribe_samples(&captured[..PRIME_SAMPLES])?;
+                            transcribe_samples(&engine, &captured[..PRIME_SAMPLES], None)?;
                         }
                         // Read full windows while the user still talks. New
                         // chunks wait in the channel meanwhile.
@@ -264,15 +371,24 @@ impl SttEngine {
                             let Some(done) = &text else {
                                 break;
                             };
+                            // The next window makes the read old.
+                            quiet = None;
                             let end = window + segment::WINDOW_SAMPLES;
-                            text = self.add_window(done, &captured[window..end], window)?;
+                            text = add_window(&engine, done, &captured[window..end], window, None)?;
                             window = end - segment::OVERLAP_SAMPLES;
                         }
                         speech.update(&captured);
+                        if quiet
+                            .as_ref()
+                            .is_some_and(|read| !read.is_current(speech.speech_end(), window))
+                        {
+                            quiet = None;
+                        }
                         if let Some(end) = speech.quiet_after() {
-                            if ready.as_ref().is_none_or(|(read, ..)| *read != end) {
-                                let (read, _) = self.read_rest(&text, &captured, window)?;
-                                ready = Some((end, window, read));
+                            if read_end != Some(end) {
+                                read_end = Some(end);
+                                quiet =
+                                    Some(QuietRead::start(&engine, &text, &captured, window, end));
                             }
                         }
                     }
@@ -309,18 +425,17 @@ impl SttEngine {
             });
         }
 
-        let (mut text, last_part) = match ready {
-            // No speech came after the read: the text is done.
-            Some((end, read_from, read)) if end == speech.speech_end() && read_from == window => {
-                (read, 0)
-            }
-            _ => self.read_rest(&text, &captured, window)?,
+        // A release waits only for a read of the final text: a read that new
+        // speech or a window made old has stopped.
+        let (mut text, last_part) = match quiet.and_then(QuietRead::wait) {
+            Some(read) => (read?, 0),
+            None => read_rest(&engine, &text, &captured, window, None)?,
         };
         let last_part_secs = last_part as f32 / 16000.0;
 
         if text.is_empty() {
             if let Some(boosted) = boost_quiet_speech(&captured) {
-                if let Ok(boosted_text) = self.transcribe_samples(&boosted) {
+                if let Ok(boosted_text) = transcribe_samples(&engine, &boosted, None) {
                     text = boosted_text;
                 }
             }
