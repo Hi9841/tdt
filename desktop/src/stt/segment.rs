@@ -27,6 +27,74 @@ const SKIP_COST: i32 = 1;
 /// words than this, a window lost speech, or the overlap is a pause.
 const MIN_MATCHED_WORDS: usize = 8;
 
+/// 10 ms at 16 kHz.
+const FRAME_SAMPLES: usize = 160;
+/// Users stop talking before they release the key: the median take ends in
+/// 375 ms of quiet. After this much quiet the model reads the take, so the
+/// text is ready when the key comes up.
+const READ_AFTER_QUIET_FRAMES: usize = 20;
+/// A frame this far over the room noise is speech. A soft word ending counts
+/// as speech: a word after the read must not be lost.
+const SPEECH_OVER_NOISE_DB: f32 = 6.0;
+/// The room noise needs some audio to measure.
+const MIN_FRAMES: usize = 150;
+const OPENING_FRAMES: usize = 8;
+
+/// Finds where the speech of a take ended, while the take grows.
+#[derive(Default)]
+pub struct EndOfSpeech {
+    levels: Vec<f32>,
+    /// The frame after the last speech.
+    speech_end: usize,
+}
+
+impl EndOfSpeech {
+    /// `samples` is the whole take so far.
+    pub fn update(&mut self, samples: &[f32]) {
+        let first = self.levels.len();
+        let (frames, _) = samples[first * FRAME_SAMPLES..].as_chunks::<FRAME_SAMPLES>();
+        self.levels
+            .extend(frames.iter().map(|frame| frame_db(frame)));
+        if self.levels.len() < MIN_FRAMES {
+            return;
+        }
+        let speech = self.room_noise() + SPEECH_OVER_NOISE_DB;
+        if let Some(last) = self.levels[first..]
+            .iter()
+            .rposition(|level| *level >= speech)
+        {
+            self.speech_end = first + last + 1;
+        }
+    }
+
+    /// The lower of the quietest frames of the take and the first 80 ms,
+    /// before the user talks. A short take with no pause has no quiet frames,
+    /// and its quietest frames are soft speech.
+    fn room_noise(&self) -> f32 {
+        let mut sorted = self.levels.clone();
+        sorted.sort_by(f32::total_cmp);
+        let quietest = sorted[sorted.len() / 20];
+        let mut opening = self.levels[..OPENING_FRAMES].to_vec();
+        opening.sort_by(f32::total_cmp);
+        quietest.min(opening[OPENING_FRAMES / 2])
+    }
+
+    /// The frame where the last speech ended, once enough quiet follows it.
+    pub fn quiet_after(&self) -> Option<usize> {
+        let quiet = self.levels.len() - self.speech_end;
+        (self.speech_end > 0 && quiet >= READ_AFTER_QUIET_FRAMES).then_some(self.speech_end)
+    }
+
+    pub fn speech_end(&self) -> usize {
+        self.speech_end
+    }
+}
+
+fn frame_db(frame: &[f32]) -> f32 {
+    let power = frame.iter().map(|sample| sample * sample).sum::<f32>() / frame.len() as f32;
+    10.0 * (power + 1e-12).log10()
+}
+
 /// `next` is the text of the window after `text`. Keeps `text` up to the
 /// middle of the words that both hold, and `next` from there on. `None` when
 /// the two do not clearly hold the same speech. A window with no text next to

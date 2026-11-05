@@ -207,6 +207,24 @@ impl SttEngine {
         })
     }
 
+    /// The text of the whole take, from the windows so far and the speech
+    /// from `window` on, and the samples that the model read for it.
+    fn read_rest(
+        &self,
+        text: &Option<String>,
+        captured: &[f32],
+        window: usize,
+    ) -> Result<(String, usize), String> {
+        let joined = match text {
+            Some(done) => self.add_window(done, &captured[window..], window)?,
+            None => None,
+        };
+        Ok(match joined {
+            Some(text) => (text, captured.len() - window),
+            None => (self.transcribe_samples(captured)?, captured.len()),
+        })
+    }
+
     pub fn transcribe_live_reporting(
         &self,
         rx: &Receiver<LiveAudio>,
@@ -225,6 +243,10 @@ impl SttEngine {
         let mut text = Some(String::new());
         let mut last_any = Instant::now();
         let mut primed = false;
+        let mut speech = segment::EndOfSpeech::default();
+        // The text read during the quiet after the speech that ended at this
+        // frame, with `window` at that time.
+        let mut ready: Option<(usize, usize, String)> = None;
 
         loop {
             match rx.recv_timeout(Duration::from_millis(20)) {
@@ -245,6 +267,13 @@ impl SttEngine {
                             let end = window + segment::WINDOW_SAMPLES;
                             text = self.add_window(done, &captured[window..end], window)?;
                             window = end - segment::OVERLAP_SAMPLES;
+                        }
+                        speech.update(&captured);
+                        if let Some(end) = speech.quiet_after() {
+                            if ready.as_ref().is_none_or(|(read, ..)| *read != end) {
+                                let (read, _) = self.read_rest(&text, &captured, window)?;
+                                ready = Some((end, window, read));
+                            }
                         }
                     }
                 }
@@ -280,17 +309,12 @@ impl SttEngine {
             });
         }
 
-        let mut last_part = captured.len() - window;
-        let joined = match &text {
-            Some(done) => self.add_window(done, &captured[window..], window)?,
-            None => None,
-        };
-        let mut text = match joined {
-            Some(text) => text,
-            None => {
-                last_part = captured.len();
-                self.transcribe_samples(&captured)?
+        let (mut text, last_part) = match ready {
+            // No speech came after the read: the text is done.
+            Some((end, read_from, read)) if end == speech.speech_end() && read_from == window => {
+                (read, 0)
             }
+            _ => self.read_rest(&text, &captured, window)?,
         };
         let last_part_secs = last_part as f32 / 16000.0;
 
