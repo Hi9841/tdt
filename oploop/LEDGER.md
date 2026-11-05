@@ -206,3 +206,57 @@ speed gives way, on every CPU.
 - `bench-asr --gap` waits before each clip; its summary counts `whole_runs`.
 - Slow CPUs are stand-ins: fewer threads and `TRIT_ISA=avx2` on the 7950X3D. No real laptop,
   hybrid CPU, or all-core load was measured. The app itself did not run.
+
+## Session 2026-11-05 (OpLoop: the wait after the stop, quality gate first)
+
+Baseline `8e5274d`. Journey: model part of the wait on 36 of the owner's real takes (every
+4th by length, 0.6 to 45 s, real endings), `bench-asr --dir <takes> --whole --realtime`.
+An A/A run repeats within 0.1 ms on the mean and 1 ms at p90.
+Gate: the long set of the session above, `clean`, `other`, `tech`, `tts16`, the 143 takes, 50
+no-speech clips, the ratchet.
+
+### H1 read the take in the quiet before the release: KEPT (`f465b84`)
+
+- Hypothesis: the median take ends in 375 ms of quiet before the key comes up, and the model
+  starts only after it. Reading after 200 ms of quiet should make the wait about 0 for most
+  takes. If speech resumes, the read is dropped.
+- First try lost words: "[hello hello hello hello hello no] -> []". In a short take with no
+  pause the 5th percentile is soft speech. The room noise now also takes the first 80 ms.
+- Result, quiet: mean 52 to 16 ms, p50 35 to 14 ms, p90 127 to 66 ms, max 158 to 90 ms. Loaded:
+  mean 50 to 17 ms. Gate: long set -1 / +3 against the build before, takes 317.
+- Cost: 2.7 reads per take, 3.8 times the speech of one run, while the user talks. A limit on
+  reads (a quarter of the take apart) lost too many hits (0.45 to 0.32): not added.
+
+### H2 read takes from 0.6 s, not 1.5 s: KEPT (`610fb1b`)
+
+- Result: p50 13 to 0 ms, mean 14.9 to 13.5 ms, 17 to 20 of 36 takes ready. Gate unchanged.
+
+### H3 read after 150 ms of quiet, not 200 ms: REVERTED
+
+- Result: 21 of 36 takes ready, mean inside the noise, takes 317 to 321 errors, one take at
+  125 ms. No gain, and a worse text.
+
+### Final, `610fb1b`
+
+| Setup | Before: mean, p90, max | Now: mean, p90, max |
+|---|---|---|
+| Quiet | 53, 136, 166 | 16, 66, 103 |
+| CCD0 fully loaded | 50, 124, 163 | 23, 97, 132 |
+| 2 threads | 160, 423, 524 | 77, 237, 336 |
+| 4 threads, AVX2 | 200, 510, 700 | 107, 338, 464 |
+
+- Text: long set +11 / +6 against one whole run (inside the noise), the same 3 runs of 4 or
+  more words as before the loop. 2 threads give the same totals. 36 takes at speaking pace:
+  0 texts differ under load and on 2 threads, 1 differs on the AVX2 path.
+- Redux long set 661 + 1156 (old 678 + 1301). No-speech clips stay empty. Ratchet 81/172/34.
+- The loaded run overlapped about 1 minute of a scoring script. A real take can end sooner
+  than its saved audio: the app was not run.
+
+### Next hypotheses
+
+1. Delivery: 20 to 30 % of the wait at p50 on long texts. The new log line gives copy, focus,
+   and typing per take; typing after a copy off the critical path needs that data first.
+2. Reads of mid-take pauses are 3.8 times the work of one run. Skipping a read when the
+   last read finished less than a fixed amount of speech ago could cut it without a lost hit.
+3. Trit: greedy decoding that can return nothing (Trit ledger) needs a fix that does not
+   invent words from noise.
