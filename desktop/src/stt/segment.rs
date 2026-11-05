@@ -1,89 +1,118 @@
-//! Finds pauses where a take can be cut, so finished speech is transcribed
-//! while the user still talks and only the last part waits for the release.
+//! A take longer than one window runs through the model in overlapping
+//! windows while the user still talks, so only the last window waits for the
+//! release. Quality comes first, on every machine: the windows do not depend
+//! on the speed of the CPU, so the same speech gives the same text.
+//!
+//! A window is a fast path that must prove itself. The model can drop speech
+//! near the edge of a window, so two windows share `OVERLAP_SAMPLES` of speech,
+//! and `merge` joins their text in the middle of the shared words, far from
+//! both edges. When they do not clearly hold the same words, there is no join:
+//! the whole take runs once after the release. That take waits longer and
+//! loses nothing.
+//!
+//! On 400 long LibriSpeech takes, against one run of the whole take: 16 s
+//! windows with 4 s shared added 106 errors to 1,228, 24 s with 8 s added 46,
+//! and 30 s with 8 s added 15, inside the noise.
 
-/// 10 ms at 16 kHz.
-const FRAME: usize = 160;
-/// A pause this long is a sentence break in normal speech, not a breath
-/// inside a phrase. Shorter cuts change the punctuation the model chooses.
-const MIN_PAUSE_FRAMES: usize = 50;
-/// The model needs some context. Shorter parts wait for the next pause.
-pub const MIN_SEGMENT_SAMPLES: usize = 3 * 16_000;
-/// A frame this far under the loud speech of the part is a pause.
-const QUIET_BELOW_SPEECH_DB: f32 = 25.0;
-/// A part whose loud frames are under this level has no speech to cut.
-const MIN_SPEECH_DB: f32 = -45.0;
+/// The model reads this much speech per run. A take up to this long is one
+/// run, the same as without windows.
+pub const WINDOW_SAMPLES: usize = 30 * 16_000;
+/// Speech that two windows share.
+pub const OVERLAP_SAMPLES: usize = 8 * 16_000;
+/// Words of each text that can hold the shared speech: 8 words a second.
+const SHARED_WORDS: usize = 64;
+const MATCH_SCORE: i32 = 2;
+const SKIP_COST: i32 = 1;
+/// Normal speech puts about 20 words in the shared speech. With fewer equal
+/// words than this, a window lost speech, or the overlap is a pause.
+const MIN_MATCHED_WORDS: usize = 8;
 
-/// The sample index where `samples[start..]` can be cut, or `None`.
-///
-/// The cut is in the middle of the first long pause that leaves at least
-/// `MIN_SEGMENT_SAMPLES` before it, so both parts keep some silence.
-pub fn pause_cut(samples: &[f32], start: usize) -> Option<usize> {
-    let part = samples.get(start..)?;
-    if part.len() < MIN_SEGMENT_SAMPLES {
+/// `next` is the text of the window after `text`. Keeps `text` up to the
+/// middle of the words that both hold, and `next` from there on. `None` when
+/// the two do not clearly hold the same speech. A window with no text next to
+/// one with text is such a case: the model can write nothing for clear speech.
+pub fn merge(text: &str, next: &str) -> Option<String> {
+    if text.is_empty() && next.is_empty() {
+        return Some(String::new());
+    }
+    let first: Vec<&str> = text.split_whitespace().collect();
+    let second: Vec<&str> = next.split_whitespace().collect();
+    let tail = first.len().saturating_sub(SHARED_WORDS);
+    let head = second.len().min(SHARED_WORDS);
+    let matched = shared_words(&first[tail..], &second[..head]);
+    if matched.len() < MIN_MATCHED_WORDS {
         return None;
     }
-    let levels: Vec<f32> = part
-        .as_chunks::<FRAME>()
-        .0
-        .iter()
-        .map(|frame| frame_db(frame))
-        .collect();
-    let mut sorted = levels.clone();
-    sorted.sort_by(f32::total_cmp);
-    let speech_db = sorted[(sorted.len() * 9) / 10];
-    if speech_db < MIN_SPEECH_DB {
-        return None;
+    let (kept, from) = matched[matched.len() / 2];
+    let words = first[..tail + kept].iter().chain(&second[from..]);
+    Some(words.copied().collect::<Vec<_>>().join(" "))
+}
+
+/// The best line-up of the end of `first` with the start of `second`, as
+/// the index pairs of equal words. The text before the line-up and after it
+/// costs nothing; inside it, each skipped or different word costs. So a word
+/// that repeats far away cannot pull the two texts together and lose the
+/// speech between.
+fn shared_words(first: &[&str], second: &[&str]) -> Vec<(usize, usize)> {
+    #[derive(Clone, Copy)]
+    enum Step {
+        Both,
+        First,
+        Second,
     }
-    let quiet_db = speech_db - QUIET_BELOW_SPEECH_DB;
-    let mut run_start = None;
-    for (index, level) in levels.iter().enumerate() {
-        if *level < quiet_db {
-            let first = *run_start.get_or_insert(index);
-            if index + 1 - first >= MIN_PAUSE_FRAMES {
-                let middle = (first + index).div_ceil(2) * FRAME;
-                if middle >= MIN_SEGMENT_SAMPLES {
-                    return Some(start + middle);
+    let first: Vec<String> = first.iter().map(|word| plain(word)).collect();
+    let second: Vec<String> = second.iter().map(|word| plain(word)).collect();
+    let width = second.len() + 1;
+    let mut score = vec![0i32; (first.len() + 1) * width];
+    let mut step = vec![Step::Both; (first.len() + 1) * width];
+    for j in 1..width {
+        score[j] = score[j - 1] - SKIP_COST;
+        step[j] = Step::Second;
+    }
+    for i in 1..=first.len() {
+        // `score[i * width]` stays 0: the line-up can start at any word of `first`.
+        step[i * width] = Step::First;
+        for j in 1..width {
+            let same = first[i - 1] == second[j - 1];
+            let both = score[(i - 1) * width + j - 1] + if same { MATCH_SCORE } else { -SKIP_COST };
+            let skip_first = score[(i - 1) * width + j] - SKIP_COST;
+            let skip_second = score[i * width + j - 1] - SKIP_COST;
+            let cell = i * width + j;
+            (score[cell], step[cell]) = if both >= skip_first && both >= skip_second {
+                (both, Step::Both)
+            } else if skip_first >= skip_second {
+                (skip_first, Step::First)
+            } else {
+                (skip_second, Step::Second)
+            };
+        }
+    }
+    // The line-up ends with the last word of `first`, at any word of `second`.
+    let last = first.len() * width;
+    let mut j = (0..width).max_by_key(|j| score[last + j]).unwrap_or(0);
+    let mut i = first.len();
+    let mut pairs = Vec::new();
+    while i > 0 && j > 0 {
+        match step[i * width + j] {
+            Step::Both => {
+                i -= 1;
+                j -= 1;
+                if first[i] == second[j] {
+                    pairs.push((i, j));
                 }
             }
-        } else {
-            run_start = None;
+            Step::First => i -= 1,
+            Step::Second => j -= 1,
         }
     }
-    None
+    pairs.reverse();
+    pairs
 }
 
-/// Join the text of the parts. A cut can fall inside a sentence: the model
-/// then ends the first part with a period and starts the next part in
-/// lowercase. That period becomes a comma. The model writes a sentence
-/// start in capitals, so the lowercase start is its own sign that the
-/// sentence goes on. The period of a dotted word ("e.g.", "U.S.", "a.m.")
-/// stays. A short form with one period ("Dr.", "etc.") still gets the
-/// comma: telling it from a word at a sentence end needs a word list.
-pub fn join_parts(parts: &[String]) -> String {
-    let mut joined = String::new();
-    for part in parts {
-        let continues = part.chars().next().is_some_and(char::is_lowercase);
-        if continues && joined.ends_with('.') && !dotted(&joined) {
-            joined.pop();
-            joined.push(',');
-        }
-        if !joined.is_empty() {
-            joined.push(' ');
-        }
-        joined.push_str(part);
-    }
-    joined
-}
-
-/// The last word of `text` holds a period before its final one: "e.g.",
-/// "U.S.", or "..". That final period is not a sentence end.
-fn dotted(text: &str) -> bool {
-    let word = text.rsplit(char::is_whitespace).next().unwrap_or(text);
-    word.strip_suffix('.')
-        .is_some_and(|rest| rest.contains('.'))
-}
-
-fn frame_db(frame: &[f32]) -> f32 {
-    let power = frame.iter().map(|sample| sample * sample).sum::<f32>() / frame.len() as f32;
-    10.0 * (power + 1e-12).log10()
+/// A word without its case and punctuation.
+fn plain(word: &str) -> String {
+    word.chars()
+        .filter(|character| character.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
 }

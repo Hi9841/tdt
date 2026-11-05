@@ -264,6 +264,9 @@ impl HotkeyListener {
         // WH_KEYBOARD_LL and WH_MOUSE_LL require. Both procs have the HOOKPROC signature.
         // `msg` outlives the loop.
         std::thread::spawn(move || unsafe {
+            // Each key event of every app waits for this thread, and so does
+            // each character TDT types.
+            crate::raise_thread();
             HOOK_THREAD_ID.store(
                 windows::Win32::System::Threading::GetCurrentThreadId(),
                 Ordering::SeqCst,

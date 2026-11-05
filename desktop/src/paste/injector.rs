@@ -2,7 +2,7 @@ use arboard::Clipboard;
 use parking_lot::Mutex;
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Modifier virtual keys to release before Unicode injection. Order is stable.
 const MODIFIER_VKS: [u16; 11] = [
@@ -22,6 +22,26 @@ const INPUT_READY_BUDGET: Duration = Duration::from_millis(60);
 /// Granularity of the readiness poll. Small enough that a late-ready window is
 /// still caught early, large enough not to spin.
 const INPUT_READY_STEP: Duration = Duration::from_millis(4);
+
+/// Where the delivery time went, for the log.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DeliverySteps {
+    pub copy: Duration,
+    pub focus: Duration,
+    pub typing: Duration,
+}
+
+impl std::fmt::Display for DeliverySteps {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "copy {}, focus {}, typing {}",
+            self.copy.as_millis(),
+            self.focus.as_millis(),
+            self.typing.as_millis()
+        )
+    }
+}
 
 #[derive(Debug, PartialEq)]
 pub enum DeliveryOutcome {
@@ -101,7 +121,7 @@ fn has_input_focus(hwnd: windows::Win32::Foundation::HWND) -> bool {
 
 #[cfg(target_os = "windows")]
 fn wait_for_input_focus(hwnd: windows::Win32::Foundation::HWND) -> Duration {
-    let started = std::time::Instant::now();
+    let started = Instant::now();
     while started.elapsed() < INPUT_READY_BUDGET {
         if has_input_focus(hwnd) {
             break;
@@ -176,12 +196,23 @@ impl PasteInjector {
         text: &str,
         should_paste: bool,
         target_hwnd: Option<isize>,
+        steps: &mut DeliverySteps,
     ) -> Result<DeliveryOutcome, String> {
+        let DeliverySteps {
+            copy,
+            focus,
+            typing,
+        } = steps;
         deliver_with(
             text,
             should_paste,
-            |text| self.copy_to_clipboard(text),
-            |text| self.insert_text(text, target_hwnd),
+            |text| {
+                let started = Instant::now();
+                let copied = self.copy_to_clipboard(text);
+                *copy = started.elapsed();
+                copied
+            },
+            |text| self.insert_text(text, target_hwnd, focus, typing),
         )
     }
 
@@ -194,6 +225,7 @@ impl PasteInjector {
         should_paste: bool,
         target_hwnd: Option<isize>,
         user_typed: bool,
+        steps: &mut DeliverySteps,
     ) -> Result<DeliveryOutcome, String> {
         if final_text.trim().is_empty() {
             return Ok(DeliveryOutcome::NoSpeech);
@@ -202,12 +234,24 @@ impl PasteInjector {
             self.copy_to_clipboard(final_text.trim())?;
             return Ok(DeliveryOutcome::CopiedFallback(NotTyped::UserTyped));
         }
-        self.deliver(final_text, should_paste, target_hwnd)
+        self.deliver(final_text, should_paste, target_hwnd, steps)
     }
 
-    fn insert_text(&self, text: &str, target_hwnd: Option<isize>) -> Result<(), NotTyped> {
-        self.prepare_target(target_hwnd)?;
-        self.type_prepared(text)
+    fn insert_text(
+        &self,
+        text: &str,
+        target_hwnd: Option<isize>,
+        focus: &mut Duration,
+        typing: &mut Duration,
+    ) -> Result<(), NotTyped> {
+        let started = Instant::now();
+        let prepared = self.prepare_target(target_hwnd);
+        *focus = started.elapsed();
+        prepared?;
+        let started = Instant::now();
+        let typed = self.type_prepared(text);
+        *typing = started.elapsed();
+        typed
     }
 
     fn prepare_target(&self, target_hwnd: Option<isize>) -> Result<(), NotTyped> {

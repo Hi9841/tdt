@@ -10,8 +10,6 @@ use std::time::{Duration, Instant};
 use trit::{BiasWeights, LoadOptions, Trit};
 
 const MAX_CAPTURED_SAMPLES: usize = 120 * 16_000;
-/// After a cut, a remainder shorter than 200 ms is the pause itself, not speech.
-const MIN_REMAINDER_SAMPLES: usize = 3_200;
 /// The first second of a take runs through the model once while the user
 /// still talks, and its text is dropped. After a long idle the first run
 /// pays for weights the system paged out and cores that slept; this moves
@@ -67,6 +65,9 @@ impl StopTimes {
 pub struct LiveTranscript {
     pub text: String,
     pub duration_secs: f32,
+    /// The speech the model still had to read after the stop. The model part
+    /// of the latency follows it.
+    pub last_part_secs: f32,
     pub stop: StopTimes,
     /// The model's text was ready.
     pub transcribed: Instant,
@@ -190,6 +191,22 @@ impl SttEngine {
         Ok(engine.transcribe_with(samples, &trit::Options::language("en")))
     }
 
+    /// `text` with the window `samples` added, or `None` when the two do not
+    /// join. `start` is 0 for the first window, which has nothing to join.
+    fn add_window(
+        &self,
+        text: &str,
+        samples: &[f32],
+        start: usize,
+    ) -> Result<Option<String>, String> {
+        let part = self.transcribe_samples(samples)?;
+        Ok(if start == 0 {
+            Some(part)
+        } else {
+            segment::merge(text, &part)
+        })
+    }
+
     pub fn transcribe_live_reporting(
         &self,
         rx: &Receiver<LiveAudio>,
@@ -202,9 +219,10 @@ impl SttEngine {
         self.refresh_dictionary();
         let mut stop = None;
         let mut captured: Vec<f32> = Vec::new();
-        // Speech before `committed` is already text in `parts`.
-        let mut committed = 0;
-        let mut parts: Vec<String> = Vec::new();
+        // The windows so far are in `text`, `None` once two did not join; the
+        // next one starts at `window`.
+        let mut window = 0;
+        let mut text = Some(String::new());
         let mut last_any = Instant::now();
         let mut primed = false;
 
@@ -218,14 +236,15 @@ impl SttEngine {
                             primed = true;
                             self.transcribe_samples(&captured[..PRIME_SAMPLES])?;
                         }
-                        // Transcribe finished sentences while the user still
-                        // talks. New chunks wait in the channel meanwhile.
-                        if let Some(cut) = segment::pause_cut(&captured, committed) {
-                            let text = self.transcribe_samples(&captured[committed..cut])?;
-                            if !text.is_empty() {
-                                parts.push(text);
-                            }
-                            committed = cut;
+                        // Read full windows while the user still talks. New
+                        // chunks wait in the channel meanwhile.
+                        while captured.len() - window >= segment::WINDOW_SAMPLES {
+                            let Some(done) = &text else {
+                                break;
+                            };
+                            let end = window + segment::WINDOW_SAMPLES;
+                            text = self.add_window(done, &captured[window..end], window)?;
+                            window = end - segment::OVERLAP_SAMPLES;
                         }
                     }
                 }
@@ -255,19 +274,25 @@ impl SttEngine {
             return Ok(LiveTranscript {
                 text: String::new(),
                 duration_secs,
+                last_part_secs: 0.0,
                 stop,
                 transcribed: Instant::now(),
             });
         }
 
-        let remainder = &captured[committed..];
-        if parts.is_empty() || remainder.len() >= MIN_REMAINDER_SAMPLES {
-            let text = self.transcribe_samples(remainder)?;
-            if !text.is_empty() {
-                parts.push(text);
+        let mut last_part = captured.len() - window;
+        let joined = match &text {
+            Some(done) => self.add_window(done, &captured[window..], window)?,
+            None => None,
+        };
+        let mut text = match joined {
+            Some(text) => text,
+            None => {
+                last_part = captured.len();
+                self.transcribe_samples(&captured)?
             }
-        }
-        let mut text = segment::join_parts(&parts);
+        };
+        let last_part_secs = last_part as f32 / 16000.0;
 
         if text.is_empty() {
             if let Some(boosted) = boost_quiet_speech(&captured) {
@@ -291,6 +316,7 @@ impl SttEngine {
         Ok(LiveTranscript {
             text,
             duration_secs,
+            last_part_secs,
             stop,
             transcribed,
         })

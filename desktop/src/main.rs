@@ -26,7 +26,7 @@ use hotkey::{
     reset_user_typed, set_binding, user_typed, HotkeyAction, HotkeyBinding, HotkeyListener,
 };
 use parking_lot::Mutex;
-use paste::{DeliveryOutcome, NotTyped, PasteInjector};
+use paste::{DeliveryOutcome, DeliverySteps, NotTyped, PasteInjector};
 use std::cell::RefCell;
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -72,9 +72,16 @@ fn deliver_transcript(
     if clean_fillers {
         result.text = remove_fillers(&result.text);
     }
-    let delivered = injector.apply_final(&result.text, should_paste, target, typed_key.is_some());
+    let mut steps = DeliverySteps::default();
+    let delivered = injector.apply_final(
+        &result.text,
+        should_paste,
+        target,
+        typed_key.is_some(),
+        &mut steps,
+    );
     let latency = result.latency(Instant::now());
-    log_delivery(&delivered, target, typed_key, latency);
+    log_delivery(&delivered, target, typed_key, latency, &result, steps);
     // Text reaches the user first; the history write is not on the latency path.
     // A failed copy still lands in History so the transcript is not lost.
     if !result.text.trim().is_empty() {
@@ -105,6 +112,22 @@ fn deliver_transcript(
     });
 }
 
+/// For a thread between the key and the typed text. These threads sleep
+/// nearly all the time, so the priority costs other programs nothing, and a
+/// CPU load at normal priority no longer stands in front of each step.
+#[cfg(target_os = "windows")]
+pub(crate) fn raise_thread() {
+    use windows::Win32::System::Threading::{
+        GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
+    };
+    // SAFETY: the pseudo handle names the calling thread; the call takes no
+    // pointer. A failed call only leaves the thread at normal priority.
+    let _ = unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) };
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn raise_thread() {}
+
 /// One line per dictation, so a paste that did not arrive or a slow take can
 /// be explained from the log. It names the app, never the text.
 fn log_delivery(
@@ -112,6 +135,8 @@ fn log_delivery(
     target: Option<isize>,
     typed_key: Option<u16>,
     latency: Latency,
+    take: &LiveTranscript,
+    steps: DeliverySteps,
 ) {
     let result = match delivered {
         Ok(DeliveryOutcome::NoSpeech) => return,
@@ -129,7 +154,10 @@ fn log_delivery(
         |raw| paste::Target::of(raw).to_string(),
     );
     append_log(&format!(
-        "Delivery: {result}. App: {app}. Latency: {latency}."
+        "Delivery: {result}. App: {app}. Latency: {latency}. Take {:.1} s, last part {:.1} s, {} characters ({steps}).",
+        take.duration_secs,
+        take.last_part_secs,
+        take.text.chars().count()
     ));
 }
 
@@ -723,6 +751,7 @@ fn main() {
                                             let target_flag = Arc::clone(&target_hwnd);
                                             let discard_worker = Arc::clone(&discard);
                                             std::thread::spawn(move || {
+                                                raise_thread();
                                                 match engine.transcribe_live_reporting(&rx) {
                                                     Ok(result) => {
                                                         if discard_worker.load(Ordering::SeqCst) {
@@ -753,6 +782,7 @@ fn main() {
                                         let pump_limit = Arc::clone(&hit_limit);
                                         drop(tx);
                                         std::thread::spawn(move || {
+                                            raise_thread();
                                             loop {
                                                 if pump_halt.load(Ordering::SeqCst) {
                                                     break;

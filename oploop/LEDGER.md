@@ -167,3 +167,42 @@ the driver; it stays until the process ends.
 - The Use GPU option, its config field, and the GPU load path are removed; Trit is
   built without `gpu`. `TDT.exe` 23,920,128 -> 18,489,856 bytes, `bench-asr.exe`
   7,556,096 -> 2,063,872. Ratchet on 0.6.0 (Trit v0.4.1): 81/172/34.
+
+## Session 2026-11-04 to 05 (stable latency, quality first)
+
+Branch `opt/stability` from `origin/main` (0.8.0). Owner report: the wait changes by 5
+times between takes, and by 4 times under load. Owner rule: quality is the hard gate, and
+speed gives way, on every CPU.
+
+- Cause, take length: on 18 takes matched to the log, the model part is 6 to 8 ms per
+  second of speech. The pause cut fired on 2 of 143 real takes: it asked for a pause 25 dB
+  under speech, and the owner's microphone has a median of 22.8 dB to the room noise.
+  Same audio on a quiet PC stays within about 20 %, and 15 s of idle adds no clear cost.
+- Gate: 400 long takes (`long-clean`, `long-other`: LibriSpeech utterances joined in reading
+  order, 20 to 89 s, 5.6 h, true text), scored with the normalizer of `accuracy.py`, paired
+  per take with a 95 % bootstrap range. The 400 clips of `clean` and `other` hid every loss
+  below: they have few joins. `bench-asr` errors count "gray/grey" and "mr/mister".
+- Rejected, against one run of the whole take (451 + 777 errors): noise-aware pause rule
+  (59 of 143 takes changed, soft word endings look like pauses); 16 s windows with 4 s
+  shared +50 / +56; windows sized by CPU speed (text would depend on the CPU, 2 threads
+  +13 % on the old set); the old pause cut +31 / +88 (on Trit 0.6.0, so not a clean compare);
+  a rescue of empty decodes (see the Trit ledger).
+- Kept: 30 s windows with 8 s shared, the same on every CPU, +12 / +3, inside the noise.
+  `merge` lines up the end of a text with the start of the next, and joins them in the middle
+  of the shared words. Under 8 shared words, or one window with no text, the take runs once
+  whole after the release. At 36 s that path fired on the 2 takes that lost 40+ words: +4,
+  and no run lost. `pause_cut`, `join_parts`, and the bridge are gone.
+- Text, final build: `clean` 66, `other` 117, the same as no windows; `tech` and `tts16` the
+  same; 7 of 143 owner takes changed, 321 errors against their saved text (323 no windows).
+  2 threads give the same totals as 8. Redux long set: old 678 + 1301, new 663 + 1155.
+  50 no-speech clips stay empty on both models. Ratchet 81/172/34.
+- Wait, p50 ms, 2 / 8 / 20 / 46 s takes, final build, 3 rounds. Quiet 22 / 62 / 132 / 162, CCD0
+  fully loaded 20 / 61 / 145 / 213, 4 threads 25 / 94 / 225 / 251, 2 threads 47 / 165 / 374 / 525,
+  4 threads on AVX2 61 / 212 / 513 / 580. Before (4 rounds): quiet 21 / 62 / 157 / 371, loaded
+  26 / 94 / 215 / 589. A take up to 30 s waits as long as its length needs: that is the cost
+  of the quality rule.
+- Also: the log line gives the take length, the last part, the characters, and the delivery
+  split. The hook, pump, and engine threads run above normal priority (not measured).
+- `bench-asr --gap` waits before each clip; its summary counts `whole_runs`.
+- Slow CPUs are stand-ins: fewer threads and `TRIT_ISA=avx2` on the 7950X3D. No real laptop,
+  hybrid CPU, or all-core load was measured. The app itself did not run.

@@ -1,10 +1,12 @@
 //! Speech benchmark: latency after release and word error rate.
 //!
-//! `cargo run --release --bin bench-asr -- [--dir PATH] [--realtime] [--repeat N] [--native] [--whole]`
+//! `cargo run --release --bin bench-asr -- [--dir PATH] [--realtime] [--repeat N] [--gap SECONDS] [--native] [--whole]`
 //!
 //! Each `clip.wav` may have a `clip.txt` reference transcript next to it.
 //! `--realtime` feeds audio at speaking pace, so latency is the wait a user
 //! has after the key is released. Without it, all audio arrives at once.
+//! `--gap` waits this long before each clip. Real takes come after idle time:
+//! the memory goes back to the system after 5 s, and the cores sleep.
 //! `--native` runs TDT's Rust engine on each whole clip instead of the app path.
 //! `--whole` keeps the quiet after the last word. Noise-only and quiet-speech
 //! clips are under the trim level, so the trim would cut them to 150 ms.
@@ -14,6 +16,7 @@ use std::time::{Duration, Instant};
 use trit::{BiasWeights, Trit};
 use voice_stt_desktop::resample::Resampler;
 use voice_stt_desktop::stt::models::{find_dir, ModelSpec, CATALOG};
+use voice_stt_desktop::stt::segment::WINDOW_SAMPLES;
 use voice_stt_desktop::stt::{LiveAudio, StopTimes, SttEngine};
 
 #[global_allocator]
@@ -40,6 +43,7 @@ struct Options {
     native: bool,
     whole: bool,
     repeat: usize,
+    gap: Duration,
 }
 
 fn parse_options() -> Options {
@@ -52,6 +56,7 @@ fn parse_options() -> Options {
         native: false,
         whole: false,
         repeat: 1,
+        gap: Duration::ZERO,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -60,6 +65,10 @@ fn parse_options() -> Options {
             "--realtime" => options.realtime = true,
             "--native" => options.native = true,
             "--whole" => options.whole = true,
+            "--gap" => {
+                let seconds = args.next().and_then(|gap| gap.parse().ok()).unwrap_or(0);
+                options.gap = Duration::from_secs(seconds);
+            }
             "--repeat" => {
                 options.repeat = args
                     .next()
@@ -200,12 +209,17 @@ fn bench_model(spec: &ModelSpec, clips: &[Clip], options: &Options) {
         let mut errors = 0;
         let mut format_errors = 0;
         let mut reference_words = 0;
+        // Takes over one window that fell back to one run of the whole take.
+        let mut whole_runs = 0;
         for clip in clips {
+            std::thread::sleep(options.gap);
             let rx = feed(clip, options.realtime);
             match engine.transcribe_live_reporting(&rx) {
                 Ok(res) => {
                     let latency_ms = res.latency(res.transcribed).total_ms();
                     latencies.push(latency_ms);
+                    let windows = res.duration_secs * 16_000.0 > WINDOW_SAMPLES as f32;
+                    whole_runs += usize::from(windows && res.last_part_secs >= res.duration_secs);
                     let mut wer_note = String::new();
                     if let Some(reference) = &clip.reference {
                         format_errors += word_errors(&raw_words(reference), &raw_words(&res.text));
@@ -236,7 +250,7 @@ fn bench_model(spec: &ModelSpec, clips: &[Clip], options: &Options) {
             100.0 * errors as f64 / reference_words as f64
         };
         println!(
-            "SUMMARY run={run} realtime={} clips={} latency_p50_ms={p50} latency_total_ms={total} wer_pct={wer:.2} errors={errors} format_errors={format_errors} words={reference_words}",
+            "SUMMARY run={run} realtime={} clips={} latency_p50_ms={p50} latency_total_ms={total} wer_pct={wer:.2} errors={errors} format_errors={format_errors} words={reference_words} whole_runs={whole_runs}",
             options.realtime,
             latencies.len()
         );
