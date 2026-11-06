@@ -356,3 +356,22 @@ Not verified: the app itself did not run, so items 1 to 6, 8 to 12, and 16 have 
 slow app was tried for item 5, and no sleep and wake for item 10.
 
 Released as TDT 0.9.1.
+
+## Session 2026-11-06 (a tap stops at the key-down)
+
+Baseline `85a7bd1` (TDT 0.9.1). The owner reported in the real app: a tap to stop is slow,
+a hold is not. The log of two taps: 383 ms and 319 ms, of which 348 ms and 290 ms are the
+wait for the end of the last word. The saved audio of the two takes has 200 ms of quiet,
+then a peak at -32 dB and -29 dB (the click of the key), then 200 to 300 ms of sound above
+the quiet level. The stop of a tap started at the key-up, so the click of the key-down was
+in the audio and the take stayed open until that sound ended. The code is the same in 0.8.0.
+
+Change: a press during a take starts the stop when the key goes down. A press during a take
+can only be the stop of a take that a tap started. The key-up of that press then does
+nothing. The shortcut key is not a typed key in the check after the stop.
+
+Check, by the owner in the real app (fifine USB microphone, Parakeet Unified English): two
+takes after the change, 9 ms and 47 ms, with 0 ms for the last word in each. Clippy and
+format pass. No change is in the speech path.
+
+Not verified: a mouse side button as the shortcut, and a tap while the user still speaks.

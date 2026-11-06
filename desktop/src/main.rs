@@ -503,6 +503,39 @@ fn main() {
                         /// Wakes the pump at the release and at the stop.
                         handle: CaptureHandle,
                     }
+                    /// Starts the end of a take: the microphone stays open
+                    /// only while the last word ends. `shortcut` is the
+                    /// shortcut key when it is down now (a stop at the
+                    /// key-down): it is not a key that the user types.
+                    /// Returns true when the take must stop at once.
+                    fn begin_stop(
+                        session: &mut Option<LiveTake>,
+                        asked: Instant,
+                        shortcut: Option<u16>,
+                    ) -> bool {
+                        if session.as_ref().is_some_and(|live| live.baseline.is_some()) {
+                            // The end of the take started before.
+                            return false;
+                        }
+                        let mut baseline = input_mask();
+                        if let Some(slot) = shortcut.and_then(|vk| baseline.get_mut(usize::from(vk))) {
+                            *slot = true;
+                        }
+                        if let Some(vk) = input_held(current_binding().vk) {
+                            note_user_typed(vk);
+                            return true;
+                        }
+                        let Some(live) = session.as_mut() else {
+                            return true;
+                        };
+                        live.tail.lock().mark_release(asked);
+                        live.released_at = Some(Instant::now());
+                        live.release.store(true, Ordering::SeqCst);
+                        // A user who was quiet stops now, not at the next audio buffer.
+                        live.handle.wake();
+                        live.baseline = Some(baseline);
+                        false
+                    }
                     let mut is_recording_state = false;
                     let mut is_processing_state = false;
                     let mut recording_before_press = false;
@@ -786,6 +819,19 @@ fn main() {
                                     // swallowed press can never stop a session
                                     // it did not start.
                                     recording_before_press = is_recording_state;
+                                    // A press during a take can only be the stop
+                                    // of a take that a tap started. The stop
+                                    // starts when the key goes down. At the
+                                    // key-up, the click of the key is in the
+                                    // audio, and the microphone stays open until
+                                    // that sound ends (about 300 ms).
+                                    if is_recording_state && !stop_now {
+                                        stop_now = begin_stop(
+                                            &mut session,
+                                            Instant::now(),
+                                            Some(current_binding().vk),
+                                        );
+                                    }
                                     // Do not overlap recordings with an in-flight
                                     // transcription. The current recorder and STT
                                     // engine are single-session by design.
@@ -959,23 +1005,7 @@ fn main() {
                                         true
                                     };
                                     if should_stop && is_recording_state && !stop_now {
-                                        let tail_open = session.as_ref().is_some_and(|live| live.baseline.is_some());
-                                        if !tail_open {
-                                            let baseline = input_mask();
-                                            if let Some(vk) = input_held(current_binding().vk) {
-                                                note_user_typed(vk);
-                                                stop_now = true;
-                                            } else if let Some(live) = session.as_mut() {
-                                                live.tail.lock().mark_release(asked);
-                                                live.released_at = Some(Instant::now());
-                                                live.release.store(true, Ordering::SeqCst);
-                                                // A user who was quiet stops now, not at the next audio buffer.
-                                                live.handle.wake();
-                                                live.baseline = Some(baseline);
-                                            } else {
-                                                stop_now = true;
-                                            }
-                                        }
+                                        stop_now = begin_stop(&mut session, asked, None);
                                     }
                                 }
                             }
