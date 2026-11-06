@@ -375,3 +375,5 @@ takes after the change, 9 ms and 47 ms, with 0 ms for the last word in each. Cli
 format pass. No change is in the speech path.
 
 Not verified: a mouse side button as the shortcut, and a tap while the user still speaks.
+
+Released as TDT 0.9.2.
