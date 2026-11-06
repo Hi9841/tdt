@@ -6,7 +6,7 @@ use parking_lot::Mutex;
 use std::cell::Cell;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use trit::{BiasWeights, Cancel, LoadOptions, Trit};
@@ -125,9 +125,36 @@ fn read_rest(
     })
 }
 
+/// A stopped read ends at the next encoder block, in milliseconds. This limit
+/// is for a read that does not end: the take must not wait for it.
+const QUIET_STOP_WAIT: Duration = Duration::from_secs(2);
+
+/// A quiet read runs now. This stays set until the thread of the read ends,
+/// also when the take that started the read has stopped waiting for it.
+static QUIET_READ_RUNS: AtomicBool = AtomicBool::new(false);
+
+/// The right to run the one quiet read. Dropping it gives the right back.
+struct QuietSlot;
+
+impl QuietSlot {
+    /// `None` while another read runs.
+    fn claim() -> Option<Self> {
+        (!QUIET_READ_RUNS.swap(true, Ordering::AcqRel)).then_some(Self)
+    }
+}
+
+impl Drop for QuietSlot {
+    fn drop(&mut self) {
+        QUIET_READ_RUNS.store(false, Ordering::Release);
+    }
+}
+
 /// A read of the take in the quiet after the speech, on its own thread: new
 /// audio must reach the capture loop during the read, so the loop can stop a
-/// read that new speech made useless. Dropping the read stops it.
+/// read that new speech made useless. Dropping the read stops it and waits
+/// for its end, for `QUIET_STOP_WAIT` at most, so the next read does not run
+/// next to it. A read that does not end keeps its `QuietSlot`: no other quiet
+/// read starts, and the take reads after the release.
 struct QuietRead {
     /// The frame where the speech ended.
     end: usize,
@@ -138,27 +165,31 @@ struct QuietRead {
 }
 
 impl QuietRead {
+    /// `None` when a stopped read has not ended yet.
     fn start(
         engine: &Arc<Trit>,
         text: &Option<String>,
         captured: &[f32],
         window: usize,
         end: usize,
-    ) -> Self {
+    ) -> Option<Self> {
+        let slot = QuietSlot::claim()?;
         let (done, result) = crossbeam_channel::bounded(1);
         let cancel = Cancel::new();
         let flag = cancel.clone();
         let (engine, text, samples) = (Arc::clone(engine), text.clone(), captured.to_vec());
         std::thread::spawn(move || {
             let read = read_rest(&engine, &text, &samples, window, Some(&flag));
+            // First the slot: a wait that ends at the send can start a read.
+            drop(slot);
             let _ = done.send(read.map(|(text, _)| text));
         });
-        Self {
+        Some(Self {
             end,
             window,
             cancel,
             result,
-        }
+        })
     }
 
     /// The text is the text of the take: no speech came after the read, and
@@ -176,6 +207,10 @@ impl QuietRead {
 impl Drop for QuietRead {
     fn drop(&mut self) {
         self.cancel.cancel();
+        // After `wait` the channel is empty and closes at once.
+        if let Err(RecvTimeoutError::Timeout) = self.result.recv_timeout(QUIET_STOP_WAIT) {
+            eprintln!("A stopped quiet read did not end in {QUIET_STOP_WAIT:?}");
+        }
     }
 }
 
@@ -340,7 +375,6 @@ impl SttEngine {
         self.refresh_dictionary();
         let native = self.native.lock().clone();
         let engine = native.ok_or("The speech model is not loaded.")?;
-        let mut stop = None;
         let mut captured: Vec<f32> = Vec::new();
         // The windows so far are in `text`, `None` once two did not join; the
         // next one starts at `window`.
@@ -355,12 +389,13 @@ impl SttEngine {
         // Each end of speech gets one read, at the same audio on every CPU.
         let mut read_end = None;
 
-        loop {
+        let stop = loop {
             match rx.recv_timeout(Duration::from_millis(20)) {
                 Ok(LiveAudio::Chunk(samples)) => {
                     last_any = Instant::now();
                     if captured.len() < MAX_CAPTURED_SAMPLES {
-                        captured.extend_from_slice(&samples);
+                        let room = MAX_CAPTURED_SAMPLES - captured.len();
+                        captured.extend_from_slice(&samples[..samples.len().min(room)]);
                         if !primed && captured.len() >= PRIME_SAMPLES {
                             primed = true;
                             transcribe_samples(&engine, &captured[..PRIME_SAMPLES], None)?;
@@ -387,16 +422,14 @@ impl SttEngine {
                         if let Some(end) = speech.quiet_after() {
                             if read_end != Some(end) {
                                 read_end = Some(end);
-                                quiet =
-                                    Some(QuietRead::start(&engine, &text, &captured, window, end));
+                                // The old read ends before the new one starts.
+                                drop(quiet.take());
+                                quiet = QuietRead::start(&engine, &text, &captured, window, end);
                             }
                         }
                     }
                 }
-                Ok(LiveAudio::Finish(times)) => {
-                    stop = Some(times);
-                    break;
-                }
+                Ok(LiveAudio::Finish(times)) => break times,
                 Err(RecvTimeoutError::Timeout) => {
                     // A stalled producer must not hang transcription forever.
                     if last_any.elapsed() > Duration::from_secs(120) {
@@ -406,11 +439,14 @@ impl SttEngine {
                         );
                     }
                 }
-                Err(RecvTimeoutError::Disconnected) => break,
+                // The pump always ends a take with `Finish`, so audio may be
+                // missing: text from a part of the take must not look whole.
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err("The recording stopped too early. Try again.".to_string());
+                }
             }
-        }
+        };
 
-        let stop = stop.unwrap_or_else(StopTimes::now);
         // Duration actually fed to the model, not the full take when the
         // capture cap truncated it.
         let duration_secs = captured.len() as f32 / 16000.0;

@@ -277,13 +277,21 @@ impl AudioRecorder {
         )
     }
 
-    fn process_samples_f32(data: &[f32], converter: &mut Converter, parts: &CaptureParts) {
+    /// Device samples go straight into `converter.mono`, so a packet of any
+    /// sample format needs no buffer of its own.
+    fn process_samples<T: Copy>(
+        data: &[T],
+        to_f32: impl Fn(T) -> f32,
+        converter: &mut Converter,
+        parts: &CaptureParts,
+    ) {
         let channels = converter.channels;
         converter.mono.clear();
-        converter.mono.extend(
-            data.chunks_exact(channels)
-                .map(|frame| frame.iter().sum::<f32>() / channels as f32),
-        );
+        converter
+            .mono
+            .extend(data.chunks_exact(channels).map(|frame| {
+                frame.iter().map(|sample| to_f32(*sample)).sum::<f32>() / channels as f32
+            }));
         if converter.mono.is_empty() {
             return;
         }
@@ -408,13 +416,17 @@ impl CaptureHandle {
 }
 
 /// Takes the samples so far. `captured` keeps counting the whole take, so
-/// the 2-minute limit still fires while the pump drains.
+/// the 2-minute limit still fires while the pump drains. The copy is made
+/// here and `buffer` keeps its memory: after `mem::take`, the next capture
+/// callback would have to allocate.
 fn drain_samples(is_recording: &AtomicBool, buffer: &Mutex<Vec<f32>>) -> Vec<f32> {
     let mut recorded = buffer.lock();
     if !is_recording.load(Ordering::SeqCst) {
         return Vec::new();
     }
-    std::mem::take(&mut *recorded)
+    let samples = recorded.clone();
+    recorded.clear();
+    samples
 }
 
 fn stop_samples(
@@ -554,7 +566,12 @@ fn note_callback(last_callback_ms: &AtomicU64) {
     last_callback_ms.store(now_ms().max(1), Ordering::Relaxed);
 }
 
-fn ingest(samples: &[f32], converter: &mut Converter, parts: &CaptureParts) {
+fn ingest<T: Copy>(
+    samples: &[T],
+    to_f32: impl Fn(T) -> f32,
+    converter: &mut Converter,
+    parts: &CaptureParts,
+) {
     note_callback(&parts.last_callback_ms);
     if parts.is_recording.load(Ordering::Relaxed) {
         if parts.new_take.swap(false, Ordering::SeqCst) {
@@ -562,7 +579,7 @@ fn ingest(samples: &[f32], converter: &mut Converter, parts: &CaptureParts) {
                 resampler.reset();
             }
         }
-        AudioRecorder::process_samples_f32(samples, converter, parts);
+        AudioRecorder::process_samples(samples, to_f32, converter, parts);
     } else {
         *parts.envelope.lock() = SpeechEnvelope::default();
     }
@@ -582,7 +599,7 @@ fn build_stream(
             .build_input_stream(
                 config,
                 move |data: &[f32], _| {
-                    ingest(data, &mut converter, &parts);
+                    ingest(data, |sample| sample, &mut converter, &parts);
                 },
                 on_error,
                 None,
@@ -592,11 +609,8 @@ fn build_stream(
             .build_input_stream(
                 config,
                 move |data: &[i16], _| {
-                    let samples = data
-                        .iter()
-                        .map(|sample| *sample as f32 / i16::MAX as f32)
-                        .collect::<Vec<_>>();
-                    ingest(&samples, &mut converter, &parts);
+                    let to_f32 = |sample: i16| sample as f32 / i16::MAX as f32;
+                    ingest(data, to_f32, &mut converter, &parts);
                 },
                 on_error,
                 None,
@@ -606,11 +620,8 @@ fn build_stream(
             .build_input_stream(
                 config,
                 move |data: &[i32], _| {
-                    let samples = data
-                        .iter()
-                        .map(|sample| *sample as f32 / i32::MAX as f32)
-                        .collect::<Vec<_>>();
-                    ingest(&samples, &mut converter, &parts);
+                    let to_f32 = |sample: i32| sample as f32 / i32::MAX as f32;
+                    ingest(data, to_f32, &mut converter, &parts);
                 },
                 on_error,
                 None,
@@ -620,11 +631,8 @@ fn build_stream(
             .build_input_stream(
                 config,
                 move |data: &[u16], _| {
-                    let samples = data
-                        .iter()
-                        .map(|sample| (*sample as f32 / u16::MAX as f32) * 2.0 - 1.0)
-                        .collect::<Vec<_>>();
-                    ingest(&samples, &mut converter, &parts);
+                    let to_f32 = |sample: u16| (sample as f32 / u16::MAX as f32) * 2.0 - 1.0;
+                    ingest(data, to_f32, &mut converter, &parts);
                 },
                 on_error,
                 None,
