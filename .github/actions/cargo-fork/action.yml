@@ -1,0 +1,34 @@
+name: Cargo fork
+description: Replaces the rustup cargo proxy on a Windows runner with huacnlee/cargo.
+
+# CI pins one release by its checksum. To update, change both values.
+# The checksum is in SHA256SUMS of the release.
+inputs:
+  version:
+    description: Release of huacnlee/cargo
+    default: 0.102.0-9
+  sha256:
+    description: SHA-256 of the x86_64-pc-windows-msvc zip of that release
+    default: 79fce48a68e86857b04c45b77157215da006d0333dc16234891aa10e930bd42c
+
+runs:
+  using: composite
+  steps:
+    - shell: pwsh
+      env:
+        FORK_VERSION: ${{ inputs.version }}
+        FORK_SHA256: ${{ inputs.sha256 }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $asset = "cargo-$env:FORK_VERSION-x86_64-pc-windows-msvc.zip"
+        $zip = Join-Path $env:RUNNER_TEMP $asset
+        Invoke-WebRequest "https://github.com/huacnlee/cargo/releases/download/v$env:FORK_VERSION/$asset" -OutFile $zip
+        if ((Get-FileHash $zip -Algorithm SHA256).Hash -ine $env:FORK_SHA256) { throw "Checksum mismatch for $asset" }
+        $unpacked = Join-Path $env:RUNNER_TEMP 'cargo-fork'
+        Expand-Archive -LiteralPath $zip -DestinationPath $unpacked
+        $proxy = (Get-Command cargo).Source
+        Copy-Item -LiteralPath $proxy -Destination (Join-Path (Split-Path $proxy) 'cargo.rustup.exe')
+        Move-Item -LiteralPath (Join-Path $unpacked 'cargo.exe') -Destination $proxy -Force
+        $version = cargo --version
+        Write-Output $version
+        if ($version -notmatch 'huacnlee/cargo') { throw 'cargo is not the fork' }
