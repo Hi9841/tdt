@@ -13,7 +13,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/cargo-fork
       - uses: Swatinem/rust-cache@v2
+        with:
+          # The fork keeps intermediate files here, not in ./target.
+          cache-directories: ~/.cargo/targets
       # The runner has no model and no clip sets, so the accuracy ratchet
       # runs only in the local release build (packaging/build-installer.ps1).
       - name: Build TDT-Setup.exe
