@@ -354,3 +354,5 @@ Checks:
 
 Not verified: the app itself did not run, so items 1 to 6, 8 to 12, and 16 have no test. No
 slow app was tried for item 5, and no sleep and wake for item 10.
+
+Released as TDT 0.9.1.
