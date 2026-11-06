@@ -61,7 +61,7 @@ const CHIP_PAD: f32 = 9.0;
 const HIT_PAD: f32 = 6.0;
 const TIP_H: f32 = 30.0;
 const TIP_GAP: f32 = 6.0;
-const PILL_MOTION_MS: u64 = 320;
+const PILL_MOTION_MS: u64 = 240;
 /// The pill grows into the panel, and shrinks back faster than it grew.
 const PANEL_IN_MS: u64 = 260;
 const PANEL_OUT_MS: u64 = 180;
@@ -1325,7 +1325,8 @@ impl HudView {
             content
                 .with_animation(
                     state_key,
-                    Animation::new(Duration::from_millis(PILL_MOTION_MS)),
+                    Animation::new(Duration::from_millis(PILL_MOTION_MS))
+                        .with_easing(ease_out_quint()),
                     |element, progress| element.opacity(((progress - 0.35) / 0.65).clamp(0.0, 1.0)),
                 )
                 .into_any_element()
