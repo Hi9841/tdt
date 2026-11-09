@@ -1,6 +1,6 @@
 //! Speech benchmark: latency after release and word error rate.
 //!
-//! `cargo run --release --bin bench-asr -- [--dir PATH] [--realtime] [--repeat N] [--gap SECONDS] [--native] [--whole]`
+//! `cargo run --release --bin bench-asr -- [--dir PATH] [--realtime] [--repeat N] [--gap SECONDS] [--native] [--whole] [--chunk-ms N]`
 //!
 //! Each `clip.wav` may have a `clip.txt` reference transcript next to it.
 //! `--realtime` feeds audio at speaking pace, so latency is the wait a user
@@ -10,6 +10,10 @@
 //! `--native` runs TDT's Rust engine on each whole clip instead of the app path.
 //! `--whole` keeps the quiet after the last word. Noise-only and quiet-speech
 //! clips are under the trim level, so the trim would cut them to 150 ms.
+//! `--chunk-ms` sets the length of the chunks that the app path gets (100 ms
+//! by default). The capture of the app gives one chunk for each device packet
+//! of about 10 ms, and a longer chunk when its thread is late. The text of a
+//! clip must be the same for each chunk length.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -22,8 +26,8 @@ use voice_stt_desktop::stt::{LiveAudio, StopTimes, SttEngine};
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-/// 100 ms at 16 kHz, the size of one capture chunk.
-const CHUNK_SAMPLES: usize = 1600;
+/// The length of one chunk when `--chunk-ms` does not give one.
+const CHUNK_MS: u64 = 100;
 /// The app stops recording after 150 ms of quiet, so a take never ends in
 /// more silence than this. Speech synthesis leaves about 800 ms.
 const KEPT_TRAILING_QUIET: usize = 150 * 16;
@@ -44,6 +48,7 @@ struct Options {
     whole: bool,
     repeat: usize,
     gap: Duration,
+    chunk_ms: u64,
 }
 
 fn parse_options() -> Options {
@@ -57,6 +62,7 @@ fn parse_options() -> Options {
         whole: false,
         repeat: 1,
         gap: Duration::ZERO,
+        chunk_ms: CHUNK_MS,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -68,6 +74,13 @@ fn parse_options() -> Options {
             "--gap" => {
                 let seconds = args.next().and_then(|gap| gap.parse().ok()).unwrap_or(0);
                 options.gap = Duration::from_secs(seconds);
+            }
+            "--chunk-ms" => {
+                options.chunk_ms = args
+                    .next()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(CHUNK_MS)
+                    .max(1);
             }
             "--repeat" => {
                 options.repeat = args
@@ -172,14 +185,15 @@ fn word_errors(reference: &[String], hypothesis: &[String]) -> usize {
     previous[hypothesis.len()]
 }
 
-fn feed(clip: &Clip, realtime: bool) -> crossbeam_channel::Receiver<LiveAudio> {
+fn feed(clip: &Clip, realtime: bool, chunk_ms: u64) -> crossbeam_channel::Receiver<LiveAudio> {
     let (tx, rx) = crossbeam_channel::unbounded();
     let samples = clip.samples.clone();
     std::thread::spawn(move || {
         let started = Instant::now();
-        for (index, chunk) in samples.chunks(CHUNK_SAMPLES).enumerate() {
+        // 16 samples for each millisecond at 16 kHz.
+        for (index, chunk) in samples.chunks(chunk_ms as usize * 16).enumerate() {
             if realtime {
-                let due = started + Duration::from_millis(100 * (index as u64 + 1));
+                let due = started + Duration::from_millis(chunk_ms * (index as u64 + 1));
                 std::thread::sleep(due.saturating_duration_since(Instant::now()));
             }
             let _ = tx.send(LiveAudio::Chunk(chunk.to_vec()));
@@ -213,7 +227,7 @@ fn bench_model(spec: &ModelSpec, clips: &[Clip], options: &Options) {
         let mut whole_runs = 0;
         for clip in clips {
             std::thread::sleep(options.gap);
-            let rx = feed(clip, options.realtime);
+            let rx = feed(clip, options.realtime, options.chunk_ms);
             match engine.transcribe_live_reporting(&rx) {
                 Ok(res) => {
                     let latency_ms = res.latency(res.transcribed).total_ms();
