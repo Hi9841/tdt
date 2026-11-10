@@ -9,7 +9,7 @@ use windows::Win32::Graphics::Dwm::{
 #[cfg(target_os = "windows")]
 use windows::Win32::Graphics::Gdi::{
     ClientToScreen, CreateRectRgn, DeleteObject, EnumDisplayMonitors, GetMonitorInfoW,
-    MonitorFromWindow, SetWindowRgn, HDC, HGDIOBJ, HMONITOR, HRGN, MONITORINFO,
+    MonitorFromPoint, MonitorFromWindow, SetWindowRgn, HDC, HGDIOBJ, HMONITOR, HRGN, MONITORINFO,
     MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTONULL,
 };
 #[cfg(target_os = "windows")]
@@ -22,7 +22,7 @@ use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::Shell::{IVirtualDesktopManager, VirtualDesktopManager};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallWindowProcW, EnumWindows, GetClassNameW, GetClientRect, GetForegroundWindow,
+    CallWindowProcW, EnumWindows, GetClassNameW, GetClientRect, GetCursorPos, GetForegroundWindow,
     GetSystemMetrics, GetWindow, GetWindowLongPtrW, GetWindowLongW, GetWindowRect,
     GetWindowThreadProcessId, IsWindow, IsWindowVisible, IsZoomed, LoadImageW, SendMessageW,
     SetForegroundWindow, SetWindowLongPtrW, SetWindowLongW, SetWindowPos, ShowWindow,
@@ -949,7 +949,8 @@ fn preferred_startup_work_area() -> Option<(i32, i32, i32, i32)> {
             LPARAM(&mut found as *mut Found as isize),
         );
     }
-    found.secondary.or(found.primary)
+    // The main screen: the user works there, so a take on it shows the pill.
+    found.primary.or(found.secondary)
 }
 
 /// Switch between the pill and the open panel. The window keeps its size;
@@ -1025,24 +1026,85 @@ pub fn follow_current_virtual_desktop() {
 
 #[cfg(target_os = "windows")]
 pub fn position_bubble_on_preferred_monitor(hwnd: HWND) {
-    if let Some((left, top, right, bottom)) = preferred_startup_work_area() {
-        let (w, h) = canvas_outer_size(hwnd, (left, top, right, bottom));
-        let scale = window_scale(hwnd);
-        let x = left + ((right - left - w) / 2).max(0);
-        let y =
-            (bottom - h - logical_to_device(70.0, scale)).max(top + logical_to_device(20.0, scale));
-        // SAFETY: SetWindowPos on `hwnd` takes no pointers; a stale handle makes a call fail, not misbehave.
-        unsafe {
-            let _ = SetWindowPos(
-                hwnd,
-                HWND_TOPMOST,
-                x,
-                y,
-                w,
-                h,
-                SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_SHOWWINDOW,
-            );
-            apply_overlay_dwm(hwnd);
+    if let Some(work) = preferred_startup_work_area() {
+        place_at_bottom_center(hwnd, work);
+    }
+}
+
+/// Puts the overlay at the bottom center of the work area `work`, at the
+/// panel's size for it.
+#[cfg(target_os = "windows")]
+fn place_at_bottom_center(hwnd: HWND, (left, top, right, bottom): (i32, i32, i32, i32)) {
+    let (w, h) = canvas_outer_size(hwnd, (left, top, right, bottom));
+    let scale = window_scale(hwnd);
+    let x = left + ((right - left - w) / 2).max(0);
+    let y = (bottom - h - logical_to_device(70.0, scale)).max(top + logical_to_device(20.0, scale));
+    // SAFETY: SetWindowPos on `hwnd` takes no pointers; a stale handle makes a call fail, not misbehave.
+    unsafe {
+        let _ = SetWindowPos(
+            hwnd,
+            HWND_TOPMOST,
+            x,
+            y,
+            w,
+            h,
+            SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        );
+        apply_overlay_dwm(hwnd);
+    }
+}
+
+/// Moves the pill to the screen of `target`, the window that gets the text
+/// of a take (or of the mouse when there is none), when it is on another
+/// screen. Without this, a pill on a second screen listens out of view.
+/// The open panel does not move. The calls send messages to the UI thread,
+/// so they run on a thread of their own.
+pub fn move_pill_to_screen_of(target: Option<isize>) {
+    #[cfg(target_os = "windows")]
+    {
+        if overlay_expanded().load(std::sync::atomic::Ordering::SeqCst) {
+            return;
         }
+        let Some(hwnd) = find_app_hwnd() else {
+            return;
+        };
+        let raw = hwnd.0 as isize;
+        std::thread::spawn(move || place_on_screen_of(HWND(raw as _), target));
+    }
+    #[cfg(not(target_os = "windows"))]
+    let _ = target;
+}
+
+#[cfg(target_os = "windows")]
+fn place_on_screen_of(hwnd: HWND, target: Option<isize>) {
+    // SAFETY: Win32 monitor and cursor queries; `point` and `info` are valid out values, `info` has
+    // `cbSize` set, and a stale handle makes a call fail, not misbehave.
+    unsafe {
+        let monitor = match target.filter(|raw| hwnd_still_valid(*raw)) {
+            Some(raw) => MonitorFromWindow(HWND(raw as _), MONITOR_DEFAULTTONEAREST),
+            None => {
+                let mut point = POINT::default();
+                if GetCursorPos(&mut point).is_err() {
+                    return;
+                }
+                MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST)
+            }
+        };
+        if monitor.is_invalid() || monitor == MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) {
+            return;
+        }
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !GetMonitorInfoW(monitor, &mut info).as_bool() {
+            return;
+        }
+        let work = info.rcWork;
+        let work = (work.left, work.top, work.right, work.bottom);
+        // Twice: the first move puts the window on the screen, so its scale
+        // is the one of that screen; the second sizes it for that scale.
+        place_at_bottom_center(hwnd, work);
+        place_at_bottom_center(hwnd, work);
     }
 }

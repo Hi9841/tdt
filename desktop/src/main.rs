@@ -880,6 +880,8 @@ fn main() {
                                         // Capture first: the buffer holds the audio until the pump below drains it.
                                         if let Some(recorder) = rec.borrow().as_ref() { recorder.start(); }
                                         *target_hwnd.lock() = ui::window_util::dictation_target_window();
+                                        // The pill shows the take on the screen where the text goes.
+                                        ui::window_util::move_pill_to_screen_of(*target_hwnd.lock());
                                         let _ = this.update(cx, |view, cx| view.close_stats_settings(cx));
                                         let Some(handle) = rec.borrow().as_ref().map(|recorder| recorder.handle()) else {
                                             continue;
