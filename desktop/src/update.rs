@@ -135,7 +135,7 @@ pub fn check(cell: &Arc<Mutex<UpdatePhase>>, kind: CheckKind, ping: &Sender<()>)
             Ok(None) => UpdatePhase::UpToDate,
             Err(error) if kind == CheckKind::Manual => UpdatePhase::Failed(error),
             Err(error) => {
-                eprintln!("TDT: update check failed: {error}");
+                crate::append_log(&format!("The automatic update check failed: {error}"));
                 previous
             }
         };

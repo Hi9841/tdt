@@ -61,6 +61,11 @@ For the v0.2.25 column, check out tag `v0.2.25`, build the bench, and run the
 `--engine app` scores the app's own path, which also cuts long recordings at
 pauses and reads the user's dictionary file.
 
+The app path gets the audio in chunks, as from the microphone. `bench-asr --chunk-ms <N>`
+sets their length (100 ms by default; the capture of the app gives about 10 ms). The text
+of a clip must be the same for each length: run the app path with two lengths after a
+change to the take path, and compare the texts.
+
 ## Engine benchmarks
 
 The engine benchmarks are in the Trit repository, in

@@ -377,3 +377,116 @@ format pass. No change is in the speech path.
 Not verified: a mouse side button as the shortcut, and a tap while the user still speaks.
 
 Released as TDT 0.9.2.
+
+## Session 2026-11-09 to 10 (review: the read point, the hook data, the log lines)
+
+Baseline `c18bd89` (TDT 0.9.4, Trit `178b4cc`). A review of the app, the engine, and the
+native layer gave these changes. No change is in Trit.
+
+### The text of a take depended on the chunks of the capture
+
+Measured first with the Trit 0.9.0 library (Parakeet Unified English, `int8`, language `en`,
+no dictionary) on the owner's saved takes of 1 to 30 s, with a copy of `EndOfSpeech` in a
+script: 103 takes have a read in the quiet that gives the final text. With 10, 20, or 30 ms
+more audio in that read, the text changes in 69 takes, 28 of them in words. With `f32`
+weights: 68 takes, 28 in words, so int8 is not the cause. 300 ms more tail does not remove
+the effect (65 takes with zeros, 68 with the last 100 ms three times). The stage of the
+model that causes it is not found.
+
+Cause in the app: the read in the quiet got all the audio so far at the chunk that
+completed 20 quiet frames, so its length followed the chunk limits. `EndOfSpeech::update`
+also judged all frames of one chunk with one noise level. The capture gives one chunk for
+each device packet (about 10 ms) and a longer chunk when its thread is late. `bench-asr`
+fed fixed chunks of 100 ms, so "0 texts differ" between two builds could not show this.
+
+Change:
+
+- `EndOfSpeech::update` judges each frame alone, with the room noise of the take up to it.
+- The read in the quiet gets the take up to 20 frames after the speech end
+  (`EndOfSpeech::read_samples`, `QuietPoint`): a length from the audio only.
+- A window that ended after that point makes the point old, at any time of the look. With
+  small chunks the read starts first and the window stops it. With one long chunk the
+  window is read first. The two cases now give the same text.
+- While a point is current at the stop, the text of the take is the text of that audio,
+  also when no read ran before the stop. The take then reads the same audio after the stop.
+- `bench-asr --chunk-ms N` sets the chunk length (100 ms by default).
+
+Gate, `bench-asr` app path, 8 cores at below normal priority. The baseline is `c18bd89` with
+only the `--chunk-ms` option (`2d7419d`). "Differ" is texts that are not equal, with the
+count that differ in words in parentheses. Errors are baseline at 100 ms, baseline at 10 ms,
+and the change.
+
+| Model | Set | Baseline, 100 against 10 ms | Change, 10 against 25 and 100 ms | Change against baseline at 10 ms | Errors |
+|---|---|---|---|---|---|
+| Unified | clean, other, tech (440 clips) | 9 differ (1) | 0 | 0 | 214, 213, 213 |
+| Unified | takes (46, `--whole`) | 11 differ (3) | 0 | 0 | 95, 96, 96 |
+| Unified | long (50, `--whole`) | 3 differ (1) | 0 | 0 | 204, 204, 204 |
+| Unified | the owner's saved takes with the owner's dictionary (235, `--whole`) | not run | 0 | 0 | no true reference |
+| Redux | clean, other, tech (440 clips) | 2 differ (0) | 0 | 0 | 314, 314, 314 |
+| Redux | takes (46, `--whole`) | 5 differ (4) | 0 | 0 | 133, 131, 131 |
+| Redux | long (50, `--whole`) | 2 differ (0) | 0 | 0 | 293, 293, 293 |
+
+- "long" is 50 takes of 25 to 92 s, each made of 8 clips of `clean` or `other` in sequence,
+  so the 30 s windows and their joins run.
+- The 25 ms length ran on the takes and on the owner's saved takes. The other sets ran 10
+  and 100 ms.
+- At the pace of speech (`--realtime`, 46 takes, Unified, 10 ms chunks): 0 texts differ from
+  the run with all audio at once, for the change and for the baseline.
+- Ratchet 81/172/34. Clippy and format pass.
+
+So the change gives the text that the baseline gives with 10 ms chunks, for each chunk
+length. In the app with a capture that is not late, the text does not change. The error
+counts at 100 ms chunks, the numbers of the gates before, move by 1 or 2 in each direction.
+
+Model time, Unified, the 440 clips with all audio at once, in turns, two rounds, total of
+the per-clip times: baseline 25,405 and 24,931 ms at 10 ms chunks, the change 25,621 and
+24,554 ms. At 100 ms chunks: baseline 24,535 and 24,778 ms, the change 24,910 and 24,879 ms.
+Level. Wait after the release at the pace of speech, 10 ms chunks, one run each: baseline
+mean 31.6 ms (p90 112, 28 takes ready at the release). The change: 29.2 ms (p90 104, 27
+ready) and, in a second run, 39.8 ms (p90 144, 27 ready). Two runs of one build differ more
+than the two builds, so there is no claim about the wait. An earlier run of the change on
+the 440 clips took 3 to 6 times longer. A repeat showed that the cause was other load on
+the PC, not the change.
+
+### Hooks
+
+- The line for hooks that TDT installs again now holds: the time from the last hook event
+  to the input that Windows reported, the key and mouse events since the check before, what
+  Windows said for each hook at the removal (still installed, or gone), the app in front,
+  and the installs that got no line. A hook that Windows had removed always gets a line
+  (one each 10 minutes at most). The log of the installed 0.9.4 showed 19 such lines in
+  3.5 days, at the limit of one line each hour, with no data to find the cause.
+- The shortcut key stays kept from the apps until its key-up, also when a modifier comes
+  up first. Before, the repeats of the key then went to the app as typed characters, and
+  the check for typed keys stopped the typing of the text. A key-down more than 1.5 s
+  after the last one counts as a new press, so a lost key-up costs one keystroke at most.
+  This defect comes from the code only: the log of the owner showed no such take.
+
+### Small changes
+
+- `eprintln!` and `println!` go nowhere in a windowed program. The errors now go to
+  `tdt.log` (`voice_stt_desktop::log` for the library, `append_log` for the app): the
+  microphone stream, a model download, a settings save, the automatic update check, the
+  mouse hook, the startup setting, a stopped read that did not end, and a take that was
+  not saved. The line for dictionary terms that the model cannot spell holds the count
+  only. Two lines that only repeated the delivery line are removed.
+- Parakeet Redux downloads from revision `2bf1286` of its repository, not from `main`. The
+  four files at that revision have the checksums of `models.rs`.
+- The actions of the CI and release workflows are pinned to commits. No run was started,
+  so the pins are not tested on a runner.
+
+### Not verified
+
+The app itself did not run. The hook changes (the kept key repeats, the new line of the
+watch), the log lines, and the microphone path have no test in the real app. The headless
+gate covers the speech path only.
+
+### Not done, from the same review
+
+- A signature for the update (a key in the app, a signed setup). The owner must decide
+  where the private key stays.
+- One state type for a take in place of the flags in the UI loop of `main.rs`, and events
+  in place of polls (the mouse hook only for a mouse shortcut). These change the hook, the
+  microphone, and the pill, so they need a full run of the app with the owner.
+
+Released as TDT 0.9.5.

@@ -1062,7 +1062,7 @@ impl HudView {
                     };
                 }
                 Err(error) => {
-                    eprintln!("{error}");
+                    crate::append_log(&format!("The download of {} failed: {error}", spec.label));
                     *phase.lock() = DownloadPhase::Failed {
                         id: spec.id.to_string(),
                         message: format!(
@@ -1133,7 +1133,7 @@ impl HudView {
                 true
             }
             Err(error) => {
-                eprintln!("Could not save the settings: {error}");
+                crate::append_log(&format!("Could not save the settings: {error}"));
                 self.settings_error =
                     Some(format!("Could not save the setting. Try again. {error}"));
                 false
@@ -1153,7 +1153,7 @@ impl HudView {
                 self.settings_error = None;
             }
             Err(error) => {
-                eprintln!("{error}");
+                crate::append_log(&format!("Could not change the start with Windows: {error}"));
                 self.autostart_enabled = crate::autostart::is_enabled();
                 self.settings_error = Some(
                     "Could not change startup. Check Windows startup permissions and try again."

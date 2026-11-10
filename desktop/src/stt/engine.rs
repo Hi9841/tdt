@@ -149,53 +149,72 @@ impl Drop for QuietSlot {
     }
 }
 
+/// The audio that gives the text of a take while the user stays quiet after
+/// the speech: the take up to the quiet after the speech end. Each value
+/// comes from the audio only. So a take has the same point, and the same
+/// text, on each computer, under each load, and with each chunk length of
+/// the capture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct QuietPoint {
+    /// The frame where the speech ended.
+    end: usize,
+    /// The start of the audio that no window has read.
+    window: usize,
+    /// The samples of the take that the read gets.
+    heard: usize,
+}
+
+impl QuietPoint {
+    /// The point of the take so far. `None` while the user talks, and when
+    /// the last window ended after the point (`windows_end`): that window
+    /// made the read of the point old. The time of the look does not change
+    /// the result. With one chunk for each packet, the read starts before
+    /// the end of the window and the window then stops it. With one long
+    /// chunk, the window is read first.
+    fn of(speech: &segment::EndOfSpeech, window: usize, windows_end: usize) -> Option<Self> {
+        let end = speech.quiet_after()?;
+        let heard = segment::EndOfSpeech::read_samples(end);
+        (heard >= windows_end).then_some(Self { end, window, heard })
+    }
+}
+
 /// A read of the take in the quiet after the speech, on its own thread: new
 /// audio must reach the capture loop during the read, so the loop can stop a
 /// read that new speech made useless. Dropping the read stops it and waits
 /// for its end, for `QUIET_STOP_WAIT` at most, so the next read does not run
 /// next to it. A read that does not end keeps its `QuietSlot`: no other quiet
-/// read starts, and the take reads after the release.
+/// read starts, and the take reads the same audio after the release.
 struct QuietRead {
-    /// The frame where the speech ended.
-    end: usize,
-    /// The window at the start of the read.
-    window: usize,
+    point: QuietPoint,
     cancel: Cancel,
     result: Receiver<Result<String, String>>,
 }
 
 impl QuietRead {
-    /// `None` when a stopped read has not ended yet.
+    /// `heard` is the take up to `point.heard`. `None` when a stopped read
+    /// has not ended yet.
     fn start(
         engine: &Arc<Trit>,
         text: &Option<String>,
-        captured: &[f32],
-        window: usize,
-        end: usize,
+        heard: &[f32],
+        point: QuietPoint,
     ) -> Option<Self> {
         let slot = QuietSlot::claim()?;
         let (done, result) = crossbeam_channel::bounded(1);
         let cancel = Cancel::new();
         let flag = cancel.clone();
-        let (engine, text, samples) = (Arc::clone(engine), text.clone(), captured.to_vec());
+        let (engine, text, samples) = (Arc::clone(engine), text.clone(), heard.to_vec());
         std::thread::spawn(move || {
-            let read = read_rest(&engine, &text, &samples, window, Some(&flag));
+            let read = read_rest(&engine, &text, &samples, point.window, Some(&flag));
             // First the slot: a wait that ends at the send can start a read.
             drop(slot);
             let _ = done.send(read.map(|(text, _)| text));
         });
         Some(Self {
-            end,
-            window,
+            point,
             cancel,
             result,
         })
-    }
-
-    /// The text is the text of the take: no speech came after the read, and
-    /// no window ended.
-    fn is_current(&self, end: usize, window: usize) -> bool {
-        self.end == end && self.window == window
     }
 
     /// Waits for the text; `None` when the read died.
@@ -209,7 +228,9 @@ impl Drop for QuietRead {
         self.cancel.cancel();
         // After `wait` the channel is empty and closes at once.
         if let Err(RecvTimeoutError::Timeout) = self.result.recv_timeout(QUIET_STOP_WAIT) {
-            eprintln!("A stopped quiet read did not end in {QUIET_STOP_WAIT:?}");
+            crate::log::note(&format!(
+                "A stopped read in the quiet did not end in {QUIET_STOP_WAIT:?}."
+            ));
         }
     }
 }
@@ -358,7 +379,12 @@ impl SttEngine {
         if let Some(terms) = self.dictionary.lock().changed_terms(path.as_deref()) {
             let skipped = engine.set_dictionary(&terms, BiasWeights::default());
             if !skipped.is_empty() {
-                eprintln!("Dictionary terms the model cannot spell: {skipped:?}");
+                // The count only: the log holds no text of the user.
+                crate::log::note(&format!(
+                    "The model cannot spell {} of the {} dictionary terms. TDT does not use them.",
+                    skipped.len(),
+                    terms.len()
+                ));
             }
         }
     }
@@ -379,15 +405,18 @@ impl SttEngine {
         // The windows so far are in `text`, `None` once two did not join; the
         // next one starts at `window`.
         let mut window = 0;
+        // The end of the last window that the model read.
+        let mut windows_end = 0;
         let mut text = Some(String::new());
         let mut last_any = Instant::now();
         let mut primed = false;
         let mut speech = segment::EndOfSpeech::default();
-        // The read of the quiet after the last speech, while its text can
-        // still be the text of the take.
+        // The audio of the final text while the user stays quiet, and the
+        // read of that audio.
+        let mut point: Option<QuietPoint> = None;
         let mut quiet: Option<QuietRead> = None;
-        // Each end of speech gets one read, at the same audio on every CPU.
-        let mut read_end = None;
+        // Each point gets one read.
+        let mut read_point = None;
 
         let stop = loop {
             match rx.recv_timeout(Duration::from_millis(20)) {
@@ -411,20 +440,20 @@ impl SttEngine {
                             let end = window + segment::WINDOW_SAMPLES;
                             text = add_window(&engine, done, &captured[window..end], window, None)?;
                             window = end - segment::OVERLAP_SAMPLES;
+                            windows_end = end;
                         }
                         speech.update(&captured);
-                        if quiet
-                            .as_ref()
-                            .is_some_and(|read| !read.is_current(speech.speech_end(), window))
-                        {
+                        point = QuietPoint::of(&speech, window, windows_end);
+                        // New speech or a window made the read old. It ends
+                        // before the next one starts.
+                        if quiet.as_ref().is_some_and(|read| Some(read.point) != point) {
                             quiet = None;
                         }
-                        if let Some(end) = speech.quiet_after() {
-                            if read_end != Some(end) {
-                                read_end = Some(end);
-                                // The old read ends before the new one starts.
-                                drop(quiet.take());
-                                quiet = QuietRead::start(&engine, &text, &captured, window, end);
+                        if let Some(point) = point {
+                            if read_point != Some(point) {
+                                read_point = Some(point);
+                                let heard = &captured[..point.heard];
+                                quiet = QuietRead::start(&engine, &text, heard, point);
                             }
                         }
                     }
@@ -461,10 +490,15 @@ impl SttEngine {
             });
         }
 
-        // A release waits only for a read of the final text: a read that new
-        // speech or a window made old has stopped.
-        let (mut text, last_part) = match quiet.and_then(QuietRead::wait) {
-            Some(read) => (read?, 0),
+        // While a quiet point is current, the text of the take is the text of
+        // the audio up to that point, with or without a read that ran before
+        // the release. The read only moves the work to the time before the
+        // release. A read that new speech or a window made old has stopped.
+        let (mut text, last_part) = match point {
+            Some(point) => match quiet.and_then(QuietRead::wait) {
+                Some(read) => (read?, 0),
+                None => read_rest(&engine, &text, &captured[..point.heard], window, None)?,
+            },
             None => read_rest(&engine, &text, &captured, window, None)?,
         };
         let last_part_secs = last_part as f32 / 16000.0;
@@ -483,7 +517,7 @@ impl SttEngine {
             let saved_text = text.clone();
             std::thread::spawn(move || {
                 if let Err(error) = takes::save(&captured, &saved_text) {
-                    eprintln!("Could not save the test take: {error}");
+                    crate::log::note(&format!("Could not save the test take: {error}"));
                 }
             });
         }

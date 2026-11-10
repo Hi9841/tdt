@@ -7,14 +7,19 @@ on:
 permissions:
   contents: write
 
+# Each action is pinned to a commit. This workflow writes the setup that each
+# installed TDT offers as an update, and a tag such as v4 can move to other code.
+
 jobs:
   windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
       - uses: ./.github/actions/cargo-fork
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           # The fork keeps intermediate files here, not in ./target.
           cache-directories: ~/.cargo/targets
@@ -26,7 +31,7 @@ jobs:
       # TDT-Setup.exe is the release. SHA256SUMS.txt only lets TDT 0.2.32
       # and older find it; drop it when those versions are gone.
       - name: Publish GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: |
             dist/TDT-Setup.exe

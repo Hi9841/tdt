@@ -175,6 +175,8 @@ fn log_delivery(
 
 fn main() {
     lock_working_directory();
+    // A windowed program has no console: the lines of the library go to the log.
+    voice_stt_desktop::log::set_sink(append_log);
     std::panic::set_hook(Box::new(|info| {
         let msg = format!("TDT crashed: {info}");
         // The dialog shows where it panicked, not how it got there; the log does.
@@ -237,7 +239,7 @@ fn main() {
     if !preview::is_active() && resolved_id != config.model_id {
         config.model_id = resolved_id;
         if let Err(error) = config.save() {
-            eprintln!("Could not save the model id: {error}");
+            append_log(&format!("Could not save the model id: {error}"));
         }
     } else {
         config.model_id = resolved_id;
@@ -247,15 +249,15 @@ fn main() {
     update::set_auto_checks(config.check_updates);
     voice_stt_desktop::stt::takes::set_saving(config.save_takes);
     let hotkey_binding = HotkeyBinding::parse(&config.hotkey).unwrap_or_else(|| {
-        eprintln!(
-            "Could not parse the configured hotkey '{}'; using the default.",
+        append_log(&format!(
+            "Could not read the shortcut '{}' of the settings. TDT uses the default.",
             config.hotkey
-        );
+        ));
         let binding = HotkeyBinding::default();
         config.hotkey = binding.display();
         if !preview::is_active() {
             if let Err(error) = config.save() {
-                eprintln!("Could not save the default shortcut: {error}");
+                append_log(&format!("Could not save the default shortcut: {error}"));
             }
         }
         binding
@@ -799,7 +801,7 @@ fn main() {
                                         view.hotkey_label = label;
                                         view.hotkey_capturing = false;
                                         view.settings_error = saved.err().map(|error| {
-                                            eprintln!("Could not save the shortcut: {error}");
+                                            append_log(&format!("Could not save the shortcut: {error}"));
                                             format!(
                                                 "The shortcut works now, but TDT could not save it. Set it again. {error}"
                                             )
@@ -1063,8 +1065,6 @@ fn main() {
                                 InternalEvent::TranscribeSuccess { text, auto_pasted, notice, latency_ms, .. } => {
                                     is_processing_state = false;
                                     play_sound(SoundEffect::Success);
-                                    let word_count = text.split_whitespace().count();
-                                    println!("Transcription completed ({word_count} words, latency: {latency_ms}ms)");
                                     let finished_at = Instant::now();
                                     let notice = notice.or(microphone_lost.take()).or_else(|| {
                                         std::mem::take(&mut late_start).then(|| {

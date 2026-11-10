@@ -134,7 +134,7 @@ fn has_input_focus(hwnd: windows::Win32::Foundation::HWND) -> bool {
 }
 
 #[cfg(target_os = "windows")]
-fn wait_for_input_focus(hwnd: windows::Win32::Foundation::HWND) -> Duration {
+fn wait_for_input_focus(hwnd: windows::Win32::Foundation::HWND) {
     let started = Instant::now();
     while started.elapsed() < INPUT_READY_BUDGET {
         if has_input_focus(hwnd) {
@@ -142,7 +142,6 @@ fn wait_for_input_focus(hwnd: windows::Win32::Foundation::HWND) -> Duration {
         }
         thread::sleep(INPUT_READY_STEP);
     }
-    started.elapsed()
 }
 
 fn deliver_with(
@@ -327,11 +326,9 @@ impl PasteInjector {
                     // Wait for the window to be able to accept text, rather
                     // than sleeping a fixed 60 ms on every dictation. A window
                     // that is already live costs nothing; one that never
-                    // becomes live still costs no more than it used to.
-                    let waited = wait_for_input_focus(hwnd);
-                    if waited > Duration::ZERO {
-                        println!("delivery: input focus live after {} ms", waited.as_millis());
-                    }
+                    // becomes live still costs no more than it used to. The
+                    // `focus` time of the delivery line in the log holds this wait.
+                    wait_for_input_focus(hwnd);
                 }
             }
         }

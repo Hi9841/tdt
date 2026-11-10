@@ -168,7 +168,6 @@ fn open_named(
         .map_err(|e| format!("Failed to start input stream: {e}"))?;
 
     let format = format!("{input_sample_rate} Hz, {channels} ch, {sample_format}");
-    eprintln!("Microphone open: {device_name} ({format})");
 
     Ok(AudioRecorder {
         is_recording: parts.is_recording,
@@ -472,7 +471,7 @@ fn stream_error_callback(
     envelope: Arc<Mutex<SpeechEnvelope>>,
 ) -> impl FnMut(cpal::StreamError) + Send + 'static {
     move |err| {
-        eprintln!("Audio stream error: {err}");
+        crate::append_log(&format!("Microphone stream error: {err}"));
         apply_stream_error(&last_error, &is_recording, err);
         *envelope.lock() = SpeechEnvelope::default();
     }

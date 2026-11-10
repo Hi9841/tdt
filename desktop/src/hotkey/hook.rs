@@ -1,6 +1,6 @@
 use async_channel::{Receiver, Sender};
 use parking_lot::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -125,7 +125,46 @@ static SENDER: Mutex<Option<Sender<HotkeyAction>>> = Mutex::new(None);
 pub fn set_binding(binding: HotkeyBinding) {
     if binding.is_valid() {
         *BINDING.lock() = binding;
+        // The mark is for the key of the binding before.
+        SHORTCUT_DOWN.store(false, Ordering::SeqCst);
     }
+}
+
+/// The shortcut key is down from a press that TDT kept from the apps. TDT
+/// keeps the repeats of the key and its key-up from the apps too. A hold that
+/// ends with the modifier up first gave the repeats of the key to the app:
+/// the app got characters that the user did not type, and TDT then did not
+/// type the text, because a key went down.
+static SHORTCUT_DOWN: AtomicBool = AtomicBool::new(false);
+/// When the shortcut key last went down or repeated, as a Windows tick count.
+static SHORTCUT_DOWN_TICK: AtomicU32 = AtomicU32::new(0);
+/// A held key repeats after 1 s at most, the longest repeat delay of
+/// Windows. A key-down after a longer time is a new press: the key-up of the
+/// press before did not reach the hook.
+const REPEAT_WITHIN_MS: u32 = 1_500;
+
+/// Marks the shortcut key as down from a press that TDT kept.
+#[cfg(target_os = "windows")]
+fn shortcut_went_down() {
+    SHORTCUT_DOWN_TICK.store(tick_count(), Ordering::SeqCst);
+    SHORTCUT_DOWN.store(true, Ordering::SeqCst);
+}
+
+/// True for a key-down of the shortcut key that is a repeat of a press that
+/// TDT kept.
+#[cfg(target_os = "windows")]
+fn shortcut_repeats() -> bool {
+    if !SHORTCUT_DOWN.load(Ordering::SeqCst) {
+        return false;
+    }
+    let now = tick_count();
+    // Tick counts wrap, so compare them through their difference.
+    if now.wrapping_sub(SHORTCUT_DOWN_TICK.load(Ordering::SeqCst)) > REPEAT_WITHIN_MS {
+        SHORTCUT_DOWN.store(false, Ordering::SeqCst);
+        return false;
+    }
+    SHORTCUT_DOWN_TICK.store(now, Ordering::SeqCst);
+    true
 }
 
 pub fn current_binding() -> HotkeyBinding {
@@ -301,11 +340,17 @@ impl HotkeyListener {
                 windows::Win32::System::Threading::GetCurrentThreadId(),
                 Ordering::SeqCst,
             );
-            if let Err(error) = install_hooks() {
-                let _ = ready_tx.send(Err(format!(
-                    "Could not install the keyboard hook. Restart TDT. {error}"
-                )));
-                return;
+            match install_hooks() {
+                Err(error) => {
+                    let _ = ready_tx.send(Err(format!(
+                        "Could not install the keyboard hook. Restart TDT. {error}"
+                    )));
+                    return;
+                }
+                Ok(Some(mouse_error)) => crate::append_log(&format!(
+                    "Could not install the mouse hook, so a mouse button cannot be the shortcut. {mouse_error}"
+                )),
+                Ok(None) => {}
             }
             let _ = ready_tx.send(Ok(()));
             let timer = SetTimer(HWND::default(), 0, HOOK_WATCH_MS, None);
@@ -323,7 +368,7 @@ impl HotkeyListener {
             let _ = KillTimer(HWND::default(), timer);
             remove_hooks();
             if running_thread.load(Ordering::Relaxed) {
-                eprintln!("Keyboard hook message loop exited unexpectedly.");
+                crate::append_log("The message loop of the hooks ended. The shortcut does not work until TDT starts again.");
             }
         });
 
@@ -403,17 +448,30 @@ const HOOK_WATCH_MS: u32 = 2_000;
 #[cfg(target_os = "windows")]
 const UNSEEN_INPUT_MS: i32 = 1_000;
 
+/// Key events and mouse events that the hooks got since the last check of the
+/// watch, for its log line.
 #[cfg(target_os = "windows")]
-fn note_hook_event() {
+static KEY_EVENTS: AtomicU32 = AtomicU32::new(0);
+#[cfg(target_os = "windows")]
+static MOUSE_EVENTS: AtomicU32 = AtomicU32::new(0);
+
+#[cfg(target_os = "windows")]
+fn tick_count() -> u32 {
     // SAFETY: GetTickCount takes no pointers.
-    let now = unsafe { windows::Win32::System::SystemInformation::GetTickCount() };
-    HOOK_SEEN_TICK.store(now, Ordering::Relaxed);
+    unsafe { windows::Win32::System::SystemInformation::GetTickCount() }
+}
+
+#[cfg(target_os = "windows")]
+fn note_hook_event(events: &AtomicU32) {
+    HOOK_SEEN_TICK.store(tick_count(), Ordering::Relaxed);
+    events.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Installs the keyboard hook and the mouse hook on the calling thread.
-/// Without the mouse hook only a mouse shortcut fails, so that is no error.
+/// Without the mouse hook only a mouse shortcut fails, so that is no error:
+/// the result then holds the cause.
 #[cfg(target_os = "windows")]
-unsafe fn install_hooks() -> Result<(), String> {
+unsafe fn install_hooks() -> Result<Option<String>, String> {
     use windows::Win32::Foundation::HINSTANCE;
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::WindowsAndMessaging::{SetWindowsHookExW, WH_KEYBOARD_LL, WH_MOUSE_LL};
@@ -426,25 +484,55 @@ unsafe fn install_hooks() -> Result<(), String> {
     )
     .map_err(|error| error.to_string())?;
     HOOK_PTR.store(keyboard.0, Ordering::SeqCst);
-    match SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook_proc), HINSTANCE(module.0), 0) {
-        Ok(mouse) => MOUSE_HOOK_PTR.store(mouse.0, Ordering::SeqCst),
-        Err(error) => eprintln!("Could not install the mouse hook. {error}"),
-    }
-    note_hook_event();
-    Ok(())
+    let mouse_error =
+        match SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook_proc), HINSTANCE(module.0), 0) {
+            Ok(mouse) => {
+                MOUSE_HOOK_PTR.store(mouse.0, Ordering::SeqCst);
+                None
+            }
+            Err(error) => Some(error.to_string()),
+        };
+    HOOK_SEEN_TICK.store(tick_count(), Ordering::Relaxed);
+    Ok(mouse_error)
 }
 
-/// Removes the hooks on the thread that installed them.
+/// What Windows said when TDT removed one hook.
 #[cfg(target_os = "windows")]
-unsafe fn remove_hooks() {
-    use windows::Win32::UI::WindowsAndMessaging::{UnhookWindowsHookEx, HHOOK};
-    for slot in [&MOUSE_HOOK_PTR, &HOOK_PTR] {
-        let hook = slot.swap(std::ptr::null_mut(), Ordering::SeqCst);
-        if !hook.is_null() {
-            // A hook that Windows removed makes this call fail, and that is fine.
-            let _ = UnhookWindowsHookEx(HHOOK(hook));
+enum HookEnd {
+    /// TDT had no hook of this kind.
+    NotInstalled,
+    /// Windows still had the hook.
+    Removed,
+    /// Windows did not know the hook: it removed the hook before.
+    Gone(String),
+}
+
+#[cfg(target_os = "windows")]
+impl std::fmt::Display for HookEnd {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotInstalled => f.write_str("was not installed"),
+            Self::Removed => f.write_str("was installed"),
+            Self::Gone(error) => write!(f, "was gone ({error})"),
         }
     }
+}
+
+/// Removes the hooks on the thread that installed them. Returns what Windows
+/// said for the mouse hook and for the keyboard hook.
+#[cfg(target_os = "windows")]
+unsafe fn remove_hooks() -> [HookEnd; 2] {
+    use windows::Win32::UI::WindowsAndMessaging::{UnhookWindowsHookEx, HHOOK};
+    [&MOUSE_HOOK_PTR, &HOOK_PTR].map(|slot| {
+        let hook = slot.swap(std::ptr::null_mut(), Ordering::SeqCst);
+        if hook.is_null() {
+            return HookEnd::NotInstalled;
+        }
+        match UnhookWindowsHookEx(HHOOK(hook)) {
+            Ok(()) => HookEnd::Removed,
+            Err(error) => HookEnd::Gone(error.to_string()),
+        }
+    })
 }
 
 /// Windows removes a low-level hook that answers too slowly, and gives no
@@ -466,6 +554,8 @@ struct HookWatch {
     /// The last line in the log. Touch input can cause an install each
     /// minute, and the log needs only one line for that.
     logged: Option<Instant>,
+    /// Installs since that line that got no line.
+    unlogged: u32,
 }
 
 #[cfg(target_os = "windows")]
@@ -477,12 +567,16 @@ impl HookWatch {
             cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
             dwTime: 0,
         };
+        // The events of the time since the last check, for the log line.
+        let keys = KEY_EVENTS.swap(0, Ordering::Relaxed);
+        let mouse = MOUSE_EVENTS.swap(0, Ordering::Relaxed);
         if !GetLastInputInfo(&mut last).as_bool() {
             return;
         }
         // Tick counts wrap, so compare them through their difference.
         let seen = HOOK_SEEN_TICK.load(Ordering::Relaxed);
-        if (last.dwTime.wrapping_sub(seen) as i32) < UNSEEN_INPUT_MS {
+        let unseen_ms = last.dwTime.wrapping_sub(seen) as i32;
+        if unseen_ms < UNSEEN_INPUT_MS {
             self.failed = 0;
             self.skip = 0;
             return;
@@ -490,26 +584,49 @@ impl HookWatch {
         // An administrator window in front takes the input: Windows gives it
         // to no hook of a normal program. The hooks are still there.
         let front = windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow();
-        if !front.is_invalid() && crate::paste::Target::of(front.0 as isize).blocks_input() {
+        let front_app = (!front.is_invalid()).then(|| crate::paste::Target::of(front.0 as isize));
+        if front_app
+            .as_ref()
+            .is_some_and(crate::paste::Target::blocks_input)
+        {
             return;
         }
         if self.skip > 0 {
             self.skip -= 1;
             return;
         }
-        remove_hooks();
+        let [mouse_end, keyboard_end] = remove_hooks();
         let installed = install_hooks();
-        let quiet_log = self
-            .logged
-            .is_some_and(|at| at.elapsed() < Duration::from_secs(3600));
-        if self.failed == 0 && !quiet_log {
+        // A hook that Windows removed is the case that this watch is for. A
+        // hook that was still installed means input that no hook can get.
+        // The line holds the data that tells the two apart.
+        let gone =
+            matches!(mouse_end, HookEnd::Gone(_)) || matches!(keyboard_end, HookEnd::Gone(_));
+        let line_due = |limit: u64| {
+            self.logged
+                .is_none_or(|at| at.elapsed() >= Duration::from_secs(limit))
+        };
+        if (gone && line_due(600)) || (self.failed == 0 && line_due(3600)) {
             self.logged = Some(Instant::now());
-            crate::append_log(&match installed {
-                Ok(()) => "The hooks got no event for input that Windows reported. TDT installed them again.".to_string(),
-                Err(error) => format!(
-                    "The hooks got no event for input that Windows reported, and TDT could not install them again: {error}"
-                ),
-            });
+            let app = front_app.map_or_else(|| "no window".to_string(), |app| app.to_string());
+            let result = match installed {
+                Ok(None) => "TDT installed the hooks again.".to_string(),
+                Ok(Some(error)) => {
+                    format!(
+                        "TDT installed the keyboard hook again, but not the mouse hook: {error}"
+                    )
+                }
+                Err(error) => format!("TDT could not install the hooks again: {error}"),
+            };
+            crate::append_log(&format!(
+                "The hooks got no event for input that Windows reported {unseen_ms} ms after the last hook event. \
+                 Since the check before: {keys} key events, {mouse} mouse events. Keyboard hook: {keyboard_end}. \
+                 Mouse hook: {mouse_end}. App in front: {app}. {result} Installs with no line before this one: {}.",
+                self.unlogged
+            ));
+            self.unlogged = 0;
+        } else {
+            self.unlogged += 1;
         }
         self.failed = (self.failed + 1).min(5);
         self.skip = (1 << self.failed) - 1;
@@ -611,7 +728,7 @@ unsafe extern "system" fn hotkey_hook_proc(
     };
 
     if code >= 0 {
-        note_hook_event();
+        note_hook_event(&KEY_EVENTS);
         let kbd = *(lparam.0 as *const KBDLLHOOKSTRUCT);
         let msg = wparam.0 as u32;
         let vk = kbd.vkCode as u16;
@@ -653,16 +770,29 @@ unsafe extern "system" fn hotkey_hook_proc(
             }
         } else {
             let binding = current_binding();
-            if is_down && vk == binding.vk && modifiers_match(binding) {
-                start_press();
-                return LRESULT(1);
+            if is_down && vk == binding.vk {
+                if modifiers_match(binding) {
+                    start_press();
+                    shortcut_went_down();
+                    return LRESULT(1);
+                }
+                // A repeat of a press that TDT kept, after a modifier came up.
+                if shortcut_repeats() {
+                    return LRESULT(1);
+                }
             }
             if is_down && physical {
                 note_physical_key(vk, binding.vk);
             }
             if is_up && vk == binding.vk {
+                // The apps did not get the key-down of a press that TDT
+                // kept, so they do not get its key-up.
+                let kept = SHORTCUT_DOWN.swap(false, Ordering::SeqCst);
                 if PRESS_START.lock().is_some() {
                     finish_press();
+                    return LRESULT(1);
+                }
+                if kept {
                     return LRESULT(1);
                 }
             } else if is_up && is_required_modifier(vk, binding) {
@@ -700,7 +830,7 @@ unsafe extern "system" fn mouse_hook_proc(
     };
 
     if code >= 0 {
-        note_hook_event();
+        note_hook_event(&MOUSE_EVENTS);
     }
     let msg = wparam.0 as u32;
     if code >= 0 && (msg == WM_XBUTTONDOWN || msg == WM_XBUTTONUP) {

@@ -47,12 +47,16 @@ pub struct EndOfSpeech {
     /// `levels` in rising order. A sort of the whole take for each chunk of
     /// audio would grow with the take.
     sorted: Vec<f32>,
+    /// The level in the middle of the first `OPENING_FRAMES` frames.
+    opening: f32,
     /// The frame after the last speech.
     speech_end: usize,
 }
 
 impl EndOfSpeech {
-    /// `samples` is the whole take so far.
+    /// `samples` is the whole take so far. Each frame is judged alone, with
+    /// the room noise of the take up to that frame. So the speech end does
+    /// not depend on where the capture cut the take into chunks.
     pub fn update(&mut self, samples: &[f32]) {
         let first = self.levels.len();
         let (frames, _) = samples[first * FRAME_SAMPLES..].as_chunks::<FRAME_SAMPLES>();
@@ -63,16 +67,15 @@ impl EndOfSpeech {
                 .partition_point(|other| other.total_cmp(&level).is_le());
             self.sorted.insert(place, level);
             self.levels.push(level);
-        }
-        if self.levels.len() < MIN_FRAMES {
-            return;
-        }
-        let speech = self.room_noise() + SPEECH_OVER_NOISE_DB;
-        if let Some(last) = self.levels[first..]
-            .iter()
-            .rposition(|level| *level >= speech)
-        {
-            self.speech_end = first + last + 1;
+            if self.levels.len() == OPENING_FRAMES {
+                let mut opening = self.levels.clone();
+                opening.sort_by(f32::total_cmp);
+                self.opening = opening[OPENING_FRAMES / 2];
+            }
+            if self.levels.len() >= MIN_FRAMES && level >= self.room_noise() + SPEECH_OVER_NOISE_DB
+            {
+                self.speech_end = self.levels.len();
+            }
         }
     }
 
@@ -81,9 +84,7 @@ impl EndOfSpeech {
     /// and its quietest frames are soft speech.
     fn room_noise(&self) -> f32 {
         let quietest = self.sorted[self.sorted.len() / 20];
-        let mut opening = self.levels[..OPENING_FRAMES].to_vec();
-        opening.sort_by(f32::total_cmp);
-        quietest.min(opening[OPENING_FRAMES / 2])
+        quietest.min(self.opening)
     }
 
     /// The frame where the last speech ended, once enough quiet follows it.
@@ -92,8 +93,13 @@ impl EndOfSpeech {
         (self.speech_end > 0 && quiet >= READ_AFTER_QUIET_FRAMES).then_some(self.speech_end)
     }
 
-    pub fn speech_end(&self) -> usize {
-        self.speech_end
+    /// The samples of the take that the read in the quiet gets for the
+    /// speech end `end`: the take up to the end of the quiet that
+    /// `quiet_after` waits for. The length comes from the audio only. A read
+    /// of all the audio so far has a length that follows the chunks of the
+    /// capture, and 10 ms more audio can change the text.
+    pub fn read_samples(end: usize) -> usize {
+        (end + READ_AFTER_QUIET_FRAMES) * FRAME_SAMPLES
     }
 }
 

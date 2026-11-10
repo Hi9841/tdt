@@ -102,7 +102,9 @@ pub const CATALOG: &[ModelSpec] = &[
         size_label: "178 MB",
         size_bytes: 179_005_408,
         hf_repo: REDUX_REPO,
-        revision: "main",
+        // The commit of `main` on 2026-11-09. With "main", a new commit in the
+        // repository fails the checksums of each TDT that is installed.
+        revision: "2bf128600aac4b16946f7ed8372e56117fe5e23b",
         dir_name: REDUX_DIR,
         files: REDUX_FILES,
         precision: trit::Precision::Auto,
@@ -320,7 +322,7 @@ fn download_file(
                 Ok(()) => return Ok(()),
                 Err(error) => error,
             };
-        eprintln!("Model download try failed: {error}");
+        crate::log::note(&format!("A try of the model download failed: {error}"));
         // A try that added bytes is progress: the next one continues from there.
         failed = if file_len(&partial) > before {
             0
