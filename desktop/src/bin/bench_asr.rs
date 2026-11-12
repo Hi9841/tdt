@@ -209,6 +209,9 @@ fn bench_model(spec: &ModelSpec, clips: &[Clip], options: &Options) {
         println!("Skipped: model directory not found.");
         return;
     };
+    // The folder is the first one of the search that holds the model: a
+    // `models` folder in the current folder comes before the installed one.
+    println!("Folder: {}", model_dir.display());
 
     let t0 = Instant::now();
     let engine = SttEngine::new(&model_dir, spec.precision);
@@ -301,6 +304,7 @@ fn bench_native(clips: &[Clip], options: &Options) {
         "\nNative engine. Init: {} ms",
         started.elapsed().as_millis()
     );
+    println!("Folder: {}", model_dir.display());
     // TDT_DICTIONARY: one term per line. TDT_BIAS: "start,cont,margin[,min_start,min_prefix]"
     // (Canary, Moonshine).
     if let Some(path) = std::env::var_os("TDT_DICTIONARY") {

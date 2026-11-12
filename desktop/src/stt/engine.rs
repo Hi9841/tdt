@@ -37,6 +37,25 @@ fn release_when_idle() {
     });
 }
 
+/// One dictation, from its start to its end. A release that waits from the
+/// dictation before does not run during this one. Each end starts the wait
+/// for the next release, also the end with an error: the engine holds the
+/// buffers of a take that failed as it holds those of a take with text.
+struct Dictation;
+
+impl Dictation {
+    fn start() -> Self {
+        DICTATIONS.fetch_add(1, Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for Dictation {
+    fn drop(&mut self) {
+        release_when_idle();
+    }
+}
+
 /// Engine calls that run now; each has a `catch_unwind` around it.
 static ENGINE_CALLS: AtomicUsize = AtomicUsize::new(0);
 
@@ -393,8 +412,7 @@ impl SttEngine {
         &self,
         rx: &Receiver<LiveAudio>,
     ) -> Result<LiveTranscript, String> {
-        // A release waiting from the last dictation must not run during this one.
-        DICTATIONS.fetch_add(1, Ordering::Relaxed);
+        let _dictation = Dictation::start();
         self.prepare().map_err(|error| {
             format!("Could not load the speech model. Choose another model in Settings. {error}")
         })?;
@@ -521,7 +539,6 @@ impl SttEngine {
                 }
             });
         }
-        release_when_idle();
         Ok(LiveTranscript {
             text,
             duration_secs,
