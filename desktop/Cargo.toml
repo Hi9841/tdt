@@ -41,7 +41,7 @@ crossbeam-channel = "0.5"
 # The hotkey channel: the UI loop awaits it, so a key press wakes the loop at once.
 async-channel = "2.5"
 parking_lot = "0.12"
-trit = { git = "https://github.com/Hi9841/trit", rev = "f8e3bf939f8036e9a823002753121e944a5ff39b" }
+trit = { git = "https://github.com/Hi9841/trit", rev = "1acca69ca54f04d1746f5af1c8e2482ccce9a836" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 directories = "5.0"

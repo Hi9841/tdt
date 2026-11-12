@@ -24,7 +24,10 @@ results for these two sets can be different on another computer.
 
 - **WER:** `accuracy.py` normalizes the reference and the transcript with the
   Whisper English normalizer, as the Open ASR Leaderboard does. Then it counts
-  the word substitutions, insertions and deletions.
+  the word substitutions, insertions and deletions. The scripts pin
+  `whisper-normalizer` 0.1.12, the version of the budgets in
+  `engine-budget.json`: version 1.0.1 counts 77 errors on `clean` for the
+  texts that 0.1.12 counts as 81.
 - **Speed (× realtime):** the total audio time divided by the total
   transcription time. The bench gives each whole clip to the engine in one
   call. The model loads before the first clip, so the load time is not in the

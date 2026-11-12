@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["whisper-normalizer"]
+# dependencies = ["whisper-normalizer==0.1.12"]
 # ///
 """Word error rate and speed of bench-asr on folders of clips.
 

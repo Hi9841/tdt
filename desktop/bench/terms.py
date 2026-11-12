@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["whisper-normalizer"]
+# dependencies = ["whisper-normalizer==0.1.12"]
 # ///
 """How well the dictionary works: terms spelled right, and terms put where they were not said.
 
