@@ -490,3 +490,102 @@ gate covers the speech path only.
   microphone, and the pill, so they need a full run of the app with the owner.
 
 Released as TDT 0.9.5.
+
+## Session 2026-11-12 (Trit 0.12.0, review of the update)
+
+Baseline `581cfe0` (TDT 0.9.6, Trit 0.11.0 `f8e3bf9`). Change: Trit 0.12.0 (`1acca69`).
+The API that TDT uses did not change. All runs: `bench-asr` app path, 8 cores at below
+normal priority, 10 ms chunks unless the line says other. Other sessions built on the
+computer during the runs, so the time numbers are a guide only.
+
+### Text
+
+"Differ" is texts that are not equal. The baseline is the 0.9.6 build at 10 ms chunks.
+
+| Model | Set | Change at 10 and 100 ms against the baseline | Errors |
+|---|---|---|---|
+| Redux | clean, other, tech (440 clips) | 0 differ | 314 |
+| Redux | the owner's saved takes (328, `--whole`) | 0 differ | no true reference |
+| Redux | long (50 takes of 25 to 92 s, `--whole`) | 0 differ | 293 |
+| Unified | clean, other, tech (440 clips) | 0 differ | 213 |
+| Unified | the owner's saved takes (328, `--whole`) | 0 differ | no true reference |
+| Unified | long (50, `--whole`) | 0 differ | 204 |
+
+- At the pace of speech (`--realtime`, tech, 40 clips): 0 texts differ from the baseline.
+- Other thread counts (`TRIT_THREADS=4` on 440 clips, `TRIT_THREADS=1` on tech) and the
+  256-bit VNNI path (`TRIT_ISA=avxvnni`, 440 clips): 0 differ from the default path.
+- The AVX2 path (`TRIT_ISA=avx2`, 440 clips) and the scalar path (tech): 0 differ from the
+  baseline on the same path. So a computer without AVX-512 gets the text of 0.9.6.
+- Ratchet 81/172/34. Clippy and format pass.
+
+### Found: the text is not the same on each CPU path (not new)
+
+With `TRIT_ISA=avx2`, 26 of 440 texts differ from the AVX-512 path for Redux (10 in
+words) and 12 for Unified (5 in words). The error totals are equal (Redux 315 against
+314, Unified 211 against 213). The scalar path differs in 1 of 40 tech clips for Redux,
+in punctuation. TDT 0.9.6 has the same differences in the same clips. The cause is in
+the engine, and the item is open: the rule is the same text on each computer.
+
+### Found: the ratchet counted with a normalizer that was not pinned
+
+`accuracy.py` and `terms.py` asked for `whisper-normalizer` with no version. uv took 1.0.1,
+which counts 77 errors on `clean` for the texts that 0.1.12 counts as 81. The budget of 81
+then had 4 errors of slack. The scripts now pin 0.1.12, as the Trit repository does.
+
+### The capture resampler stays
+
+Trit 0.12.0 has a resampler (`trit::resample`). It takes a whole recording. The capture
+needs a filter that keeps its state from one packet to the next, so TDT keeps its own.
+The 440 clips at another rate (SciPy `resample_poly`), back to 16 kHz in two ways:
+
+| Rate | TDT capture resampler, 10 ms packets (Redux + Unified) | `trit::resample` | 16 kHz clips |
+|---|---|---|---|
+| 48 kHz | 322 + 206 = 528 errors | 321 + 214 = 535 | 314 + 213 = 527 |
+| 44.1 kHz | 322 + 205 = 527 | 317 + 211 = 528 | |
+
+The totals are equal inside the noise of this test, so the filter of the capture does not
+change.
+
+### Time, CPU, and memory
+
+Each build had its own model folder: two builds that share a folder write the weight
+cache of the other again at each load (the file name holds the Trit version).
+
+| Measure | 0.9.6 | Change |
+|---|---|---|
+| Wait after the stop, pace of speech, 40 clips, median (Redux, Unified) | 23, 27 ms | 23, 25 ms |
+| The same after 6 s of idle time, 20 clips, median and maximum | 25 and 30, 28 and 34 ms | 25 and 31, 29 and 34 ms |
+| The same with all processors at normal priority, 10 clips, median and maximum | 33 and 97, 33 and 38 ms | 36 and 51, 30 and 48 ms |
+| Load with a warm cache, 2 runs (Redux) | 156, 164 ms | 121, 124 ms |
+| Load with a warm cache, 2 runs (Unified) | 516, 545 ms | 495, 582 ms |
+| First load, which writes the cache (Redux, Unified) | 483, 1,455 ms | 389, 1,421 ms |
+| CPU time, 20 clips at once with both models, 2 runs | 16.3, 17.2 s | 15.6, 16.6 s |
+| Peak private memory of those runs | 666, 633 MB | 613, 628 MB |
+| Peak working set of those runs | 1,216, 1,221 MB | 1,113, 1,126 MB |
+
+So for the two models of TDT the wait is the same, Redux loads about 35 ms sooner, and
+the peak working set is about 8 % lower. The larger gains of Trit 0.12.0 are for Whisper
+and Moonshine, which TDT does not ship.
+
+- The limit to 8 processors hides the second cache domain from the team, so the runs at
+  below normal priority do not use the new rule of Trit for a move between domains. The
+  run with all processors does: no take waited longer than 51 ms.
+- In two runs, takes of both builds waited 0.1 to 2 s while another session loaded the
+  computer (the model loads of the same runs were 2 to 9 times slower). In the turns
+  with no such load, the two builds gave the same waits.
+
+### Review changes
+
+- Each end of a dictation starts the wait for the memory release (`Dictation` in
+  `stt/engine.rs`). Before, a take that ended with an error started no release, and the
+  engine kept its buffers until the next take ended.
+- `bench-asr` prints the model folder. A `models` folder in the current folder comes
+  before the installed one: in this session Redux came from the old checkout and Unified
+  from `%LOCALAPPDATA%`, and no line said so. Both folders hold the files of the catalog.
+
+### Not verified
+
+The app itself did not run. The change is in the engine and in the release of its memory.
+The hook, the microphone, the pill, and the typing did not change.
+
+Released as TDT 0.9.7.
