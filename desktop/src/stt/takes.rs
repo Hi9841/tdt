@@ -20,7 +20,7 @@ pub fn saving() -> bool {
 
 /// `%LOCALAPPDATA%\TDT\takes`.
 pub fn folder() -> Option<PathBuf> {
-    std::env::var_os("LOCALAPPDATA").map(|dir| PathBuf::from(dir).join("TDT").join("takes"))
+    crate::data_dir().map(|dir| dir.join("takes"))
 }
 
 /// Writes `take-<unix milliseconds>.wav` (16 kHz mono, 16-bit) and `.txt` when

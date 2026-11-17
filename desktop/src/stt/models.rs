@@ -484,10 +484,7 @@ fn preferred_root() -> PathBuf {
             return root;
         }
     }
-    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
-        return PathBuf::from(local).join("TDT").join("models");
-    }
-    PathBuf::from("models")
+    crate::data_dir().map_or_else(|| PathBuf::from("models"), |dir| dir.join("models"))
 }
 
 fn model_roots() -> Vec<PathBuf> {
@@ -504,8 +501,8 @@ fn model_roots() -> Vec<PathBuf> {
             roots.push(dir.join("../../../models"));
         }
     }
-    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
-        roots.push(PathBuf::from(local).join("TDT").join("models"));
+    if let Some(dir) = crate::data_dir() {
+        roots.push(dir.join("models"));
     }
     roots
 }

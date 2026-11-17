@@ -14,8 +14,7 @@ const USER_FILE_HEADER: &str = "\
 
 /// `%LOCALAPPDATA%\TDT\dictionary.txt`.
 pub fn user_file() -> Option<PathBuf> {
-    std::env::var_os("LOCALAPPDATA")
-        .map(|dir| PathBuf::from(dir).join("TDT").join("dictionary.txt"))
+    crate::data_dir().map(|dir| dir.join("dictionary.txt"))
 }
 
 /// The user file, created with a short explanation when it does not exist.
