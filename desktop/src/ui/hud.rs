@@ -1021,18 +1021,9 @@ impl HudView {
         let id = spec.id.to_string();
         let phase = Arc::clone(&self.model_phase);
         let ping = self.update_ping.clone();
-        let first_file = spec
-            .files
-            .first()
-            .map(|file| file.name.to_string())
-            .unwrap_or_default();
         *phase.lock() = DownloadPhase::Downloading {
             id: id.clone(),
-            done: 0,
-            total: spec.size_bytes.max(1),
-            file: first_file,
-            file_index: 1,
-            file_count: spec.files.len().max(1),
+            progress: models::DownloadProgress::start(spec),
         };
         std::thread::spawn(move || {
             let spec = models::resolve(&id);
@@ -1042,11 +1033,7 @@ impl HudView {
                 let pct = models::percent(progress.done, progress.total);
                 *phase.lock() = DownloadPhase::Downloading {
                     id: spec.id.to_string(),
-                    done: progress.done,
-                    total: progress.total,
-                    file: progress.file,
-                    file_index: progress.file_index,
-                    file_count: progress.file_count,
+                    progress,
                 };
                 if last_ping.elapsed() >= Duration::from_millis(100) || pct != last_pct {
                     let _ = ping.send(());
@@ -2297,15 +2284,11 @@ impl HudView {
             DownloadPhase::Downloading { id, .. } if id == spec.id
         );
         let model_sub = match model_phase {
-            DownloadPhase::Downloading {
-                id,
-                file,
-                file_index,
-                file_count,
-                ..
-            } if id == spec.id => format!(
-                "Downloading {} ({file_index} of {file_count}).",
-                models::file_label(file)
+            DownloadPhase::Downloading { id, progress } if id == spec.id => format!(
+                "Downloading {} ({} of {}).",
+                models::file_label(&progress.file),
+                progress.file_index,
+                progress.file_count
             ),
             DownloadPhase::Failed { id, message } if id == spec.id => message.clone(),
             _ if self.model_loading.as_deref() == Some(spec.id) => {
@@ -2367,10 +2350,8 @@ impl HudView {
             })
             .collect();
         let download_action = match model_phase {
-            DownloadPhase::Downloading {
-                id, done, total, ..
-            } if id == spec.id => {
-                format!("{}%", models::percent(*done, *total))
+            DownloadPhase::Downloading { id, progress } if id == spec.id => {
+                format!("{}%", models::percent(progress.done, progress.total))
             }
             DownloadPhase::Failed { id, .. } if id == spec.id => "Try again".to_string(),
             _ => "Download".to_string(),
@@ -2381,9 +2362,9 @@ impl HudView {
                 DownloadPhase::Failed { id, .. } if id == spec.id
             );
         let model_meter = match model_phase {
-            DownloadPhase::Downloading {
-                id, done, total, ..
-            } if id == spec.id => Some(controls::progress_bar("model_progress", *done, *total)),
+            DownloadPhase::Downloading { id, progress } if id == spec.id => Some(
+                controls::progress_bar("model_progress", progress.done, progress.total),
+            ),
             _ if self.model_loading.as_deref() == Some(spec.id) => Some(controls::progress_bar(
                 "model_load",
                 u64::from(self.model_progress.load(Ordering::Relaxed)),

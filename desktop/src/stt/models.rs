@@ -39,11 +39,7 @@ pub enum DownloadPhase {
     Idle,
     Downloading {
         id: String,
-        done: u64,
-        total: u64,
-        file: String,
-        file_index: usize,
-        file_count: usize,
+        progress: DownloadProgress,
     },
     Ready {
         id: String,
@@ -54,7 +50,7 @@ pub enum DownloadPhase {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DownloadProgress {
     pub done: u64,
     pub total: u64,
@@ -63,11 +59,21 @@ pub struct DownloadProgress {
     pub file_count: usize,
 }
 
+impl DownloadProgress {
+    /// No byte yet, at the first file of `spec`.
+    pub fn start(spec: &ModelSpec) -> Self {
+        Self {
+            done: 0,
+            total: spec.size_bytes.max(1),
+            file: spec.files.first().map_or("", |file| file.name).to_string(),
+            file_index: 1,
+            file_count: spec.files.len().max(1),
+        }
+    }
+}
+
 /// Recommended default: Moondream Parakeet Redux 1.58-bit ternary.
 pub const DEFAULT_MODEL_ID: &str = "parakeet-redux";
-
-const REDUX_DIR: &str = "parakeet-redux";
-const REDUX_REPO: &str = "moondream/parakeet-redux";
 
 const REDUX_FILES: &[ModelFile] = &[
     ModelFile {
@@ -107,11 +113,11 @@ pub const CATALOG: &[ModelSpec] = &[
         label: "Parakeet Redux",
         size_label: "178 MB",
         size_bytes: 179_005_408,
-        hf_repo: REDUX_REPO,
+        hf_repo: "moondream/parakeet-redux",
         // The commit of `main` on 2026-11-09. With "main", a new commit in the
         // repository fails the checksums of each TDT that is installed.
         revision: "2bf128600aac4b16946f7ed8372e56117fe5e23b",
-        dir_name: REDUX_DIR,
+        dir_name: "parakeet-redux",
         files: REDUX_FILES,
         precision: trit::Precision::Auto,
         // The quiet cost Redux words: other 173 to 183 errors.
@@ -232,15 +238,10 @@ pub fn percent(done: u64, total: u64) -> u8 {
     }
 }
 
-pub fn file_label(name: &str) -> String {
-    name.rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(name)
-        .trim_end_matches(".safetensors")
+/// The name of a model file without its type, as the download shows it.
+pub fn file_label(name: &str) -> &str {
+    name.trim_end_matches(".safetensors")
         .trim_end_matches(".json")
-        .trim_end_matches(".onnx")
-        .trim_end_matches(".txt")
-        .replace(".int8", "")
 }
 
 pub fn download(
@@ -418,7 +419,7 @@ fn download_file_once(
     drop(file);
 
     let actual = format!("{:X}", hasher.finalize());
-    if !expected_sha.is_empty() && !actual.eq_ignore_ascii_case(expected_sha) {
+    if !actual.eq_ignore_ascii_case(expected_sha) {
         let _ = fs::remove_file(partial);
         return Err(format!(
             "SHA256 mismatch for {}",
@@ -461,21 +462,16 @@ fn file_len(path: &Path) -> u64 {
 /// The HTTP agent for model downloads. The read limit is for one read, not
 /// for the file: a connection that gives no bytes for this long fails, and
 /// the next try continues the file.
-#[doc(hidden)]
-pub fn download_agent(user_agent: &str) -> ureq::Agent {
+fn model_download_agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(20))
         .timeout_read(Duration::from_secs(60))
         .timeout_write(Duration::from_secs(60))
-        .user_agent(user_agent)
+        .user_agent(&format!(
+            "TDT/{} (+https://github.com/Hi9841/tdt)",
+            env!("CARGO_PKG_VERSION")
+        ))
         .build()
-}
-
-fn model_download_agent() -> ureq::Agent {
-    download_agent(&format!(
-        "TDT/{} (+https://github.com/Hi9841/tdt)",
-        env!("CARGO_PKG_VERSION")
-    ))
 }
 
 fn preferred_root() -> PathBuf {
