@@ -471,7 +471,7 @@ fn stream_error_callback(
     envelope: Arc<Mutex<SpeechEnvelope>>,
 ) -> impl FnMut(cpal::StreamError) + Send + 'static {
     move |err| {
-        crate::append_log(&format!("Microphone stream error: {err}"));
+        voice_stt_desktop::log::note(&format!("Microphone stream error: {err}"));
         apply_stream_error(&last_error, &is_recording, err);
         *envelope.lock() = SpeechEnvelope::default();
     }

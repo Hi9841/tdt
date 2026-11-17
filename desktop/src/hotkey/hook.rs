@@ -328,7 +328,7 @@ impl HotkeyListener {
         std::thread::spawn(move || unsafe {
             // Each key event of every app waits for this thread, and so does
             // each character TDT types.
-            crate::raise_thread();
+            crate::priority::raise_thread();
             HOOK_THREAD_ID.store(
                 windows::Win32::System::Threading::GetCurrentThreadId(),
                 Ordering::SeqCst,
@@ -340,7 +340,7 @@ impl HotkeyListener {
                     )));
                     return;
                 }
-                Ok(Some(mouse_error)) => crate::append_log(&format!(
+                Ok(Some(mouse_error)) => voice_stt_desktop::log::note(&format!(
                     "Could not install the mouse hook, so a mouse button cannot be the shortcut. {mouse_error}"
                 )),
                 Ok(None) => {}
@@ -361,7 +361,7 @@ impl HotkeyListener {
             let _ = KillTimer(HWND::default(), timer);
             remove_hooks();
             if running_thread.load(Ordering::Relaxed) {
-                crate::append_log("The message loop of the hooks ended. The shortcut does not work until TDT starts again.");
+                voice_stt_desktop::log::note("The message loop of the hooks ended. The shortcut does not work until TDT starts again.");
             }
         });
 
@@ -586,7 +586,7 @@ impl HookWatch {
                 }
                 Err(error) => format!("TDT could not install the hooks again: {error}"),
             };
-            crate::append_log(&format!(
+            voice_stt_desktop::log::note(&format!(
                 "The hooks got no event for input that Windows reported {unseen_ms} ms after the last hook event. \
                  Since the check before: {keys} key events, {mouse} mouse events. Keyboard hook: {keyboard_end}. \
                  Mouse hook: {mouse_end}. App in front: {app}. {result} Installs with no line before this one: {}.",

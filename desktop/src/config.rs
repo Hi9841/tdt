@@ -35,14 +35,14 @@ fn load_json<T: serde::de::DeserializeOwned>(
     }
     let backup = path.with_extension("json.bak");
     let content = fs::read_to_string(path).map_err(|error| {
-        crate::append_log(&format!("Could not read {}: {error}", path.display()));
+        voice_stt_desktop::log::note(&format!("Could not read {}: {error}", path.display()));
         backup.clone()
     })?;
     match serde_json::from_str(&content) {
         Ok(value) => Ok(Some(value)),
         Err(error) => {
             let _ = fs::copy(path, &backup);
-            crate::append_log(&format!(
+            voice_stt_desktop::log::note(&format!(
                 "Could not parse {} ({error}). A copy is at {}.",
                 path.display(),
                 backup.display()

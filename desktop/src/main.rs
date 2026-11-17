@@ -8,7 +8,9 @@ mod autostart;
 mod config;
 mod hotkey;
 mod integrity;
+mod logfile;
 mod paste;
+mod priority;
 mod ui;
 mod update;
 
@@ -33,9 +35,6 @@ use hotkey::{
 use parking_lot::Mutex;
 use paste::{DeliveryOutcome, DeliverySteps, NotTyped, PasteInjector};
 use std::cell::RefCell;
-use std::fs::OpenOptions;
-use std::io::Write;
-use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -50,6 +49,7 @@ use ui::window_util::{
 };
 use ui::{HudStatus, HudView, SystemTray};
 use update::{CheckKind, UpdatePhase};
+use voice_stt_desktop::log;
 use voice_stt_desktop::stt::{
     models, remove_fillers, EngineSlot, Latency, LiveAudio, LiveTranscript, StopTimes, SttEngine,
 };
@@ -123,18 +123,6 @@ fn deliver_transcript(
     });
 }
 
-/// For a thread between the key and the typed text. These threads sleep
-/// nearly all the time, so the priority costs other programs nothing, and a
-/// CPU load at normal priority no longer stands in front of each step.
-pub(crate) fn raise_thread() {
-    use windows::Win32::System::Threading::{
-        GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
-    };
-    // SAFETY: the pseudo handle names the calling thread; the call takes no
-    // pointer. A failed call only leaves the thread at normal priority.
-    let _ = unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) };
-}
-
 /// One line per dictation, so a paste that did not arrive or a slow take can
 /// be explained from the log. It names the app, never the text.
 fn log_delivery(
@@ -161,7 +149,7 @@ fn log_delivery(
         || "no window".to_string(),
         |raw| paste::Target::of(raw).to_string(),
     );
-    append_log(&format!(
+    log::note(&format!(
         "Delivery: {result}. App: {app}. Latency: {latency}. Take {:.1} s, last part {:.1} s, {} characters ({steps}).",
         take.duration_secs,
         take.last_part_secs,
@@ -172,11 +160,11 @@ fn log_delivery(
 fn main() {
     lock_working_directory();
     // A windowed program has no console: the lines of the library go to the log.
-    voice_stt_desktop::log::set_sink(append_log);
+    log::set_sink(logfile::append);
     std::panic::set_hook(Box::new(|info| {
         let msg = format!("TDT crashed: {info}");
         // The dialog shows where it panicked, not how it got there; the log does.
-        append_log(&format!(
+        log::note(&format!(
             "{msg}\n{}",
             std::backtrace::Backtrace::force_capture()
         ));
@@ -204,7 +192,7 @@ fn main() {
             InstanceClaim::AlreadyRunning => return,
             InstanceClaim::Owned(guard) => guard,
             InstanceClaim::Failed(error) => {
-                append_log(&error);
+                log::note(&error);
                 show_error(&error);
                 return;
             }
@@ -226,7 +214,7 @@ fn main() {
     let config_error = config::take_reset_notice();
     if config_error.is_some() {
         if let Err(error) = config.save() {
-            append_log(&format!("Could not save the default settings: {error}"));
+            log::note(&format!("Could not save the default settings: {error}"));
         }
     }
     // Persist the exact resolved internal model id so app restarts reopen the
@@ -235,7 +223,7 @@ fn main() {
     if !preview::is_active() && resolved_id != config.model_id {
         config.model_id = resolved_id;
         if let Err(error) = config.save() {
-            append_log(&format!("Could not save the model id: {error}"));
+            log::note(&format!("Could not save the model id: {error}"));
         }
     } else {
         config.model_id = resolved_id;
@@ -245,7 +233,7 @@ fn main() {
     update::set_auto_checks(config.check_updates);
     voice_stt_desktop::stt::takes::set_saving(config.save_takes);
     let hotkey_binding = HotkeyBinding::parse(&config.hotkey).unwrap_or_else(|| {
-        append_log(&format!(
+        log::note(&format!(
             "Could not read the shortcut '{}' of the settings. TDT uses the default.",
             config.hotkey
         ));
@@ -253,7 +241,7 @@ fn main() {
         config.hotkey = binding.display();
         if !preview::is_active() {
             if let Err(error) = config.save() {
-                append_log(&format!("Could not save the default shortcut: {error}"));
+                log::note(&format!("Could not save the default shortcut: {error}"));
             }
         }
         binding
@@ -270,7 +258,7 @@ fn main() {
         watch_default_input();
         match AudioRecorder::new() {
             Ok(recorder) => {
-                append_log(&format!("Microphone: {}", recorder.describe()));
+                log::note(&format!("Microphone: {}", recorder.describe()));
                 (Some(recorder), None)
             }
             Err(error) => (
@@ -288,14 +276,14 @@ fn main() {
     let stt_engine = EngineSlot::default();
     stt_engine.set(
         if let Some(dir) = models::find_dir(model_spec, config.model_dir.as_deref()) {
-            append_log(&format!(
+            log::note(&format!(
                 "{} speech model found at: {}",
                 model_spec.label,
                 dir.display()
             ));
             Some(Arc::new(SttEngine::new(&dir, model_spec)))
         } else {
-            append_log(&format!(
+            log::note(&format!(
                 "{} is not downloaded. Open Settings to download it.",
                 model_spec.label
             ));
@@ -310,7 +298,7 @@ fn main() {
         if let Some(engine) = stt_engine.get() {
             std::thread::spawn(move || {
                 if let Err(error) = engine.prepare() {
-                    append_log(&format!("Could not prepare the speech model: {error}"));
+                    log::note(&format!("Could not prepare the speech model: {error}"));
                 }
             });
         }
@@ -336,11 +324,11 @@ fn main() {
                 // typed into normal apps, so say why instead of failing silently.
                 hotkey_error = low_rights_message();
                 if let Some(message) = &hotkey_error {
-                    append_log(message);
+                    log::note(message);
                 }
             }
             Err(error) => {
-                append_log(&format!("Hotkey hook failed: {error}"));
+                log::note(&format!("Hotkey hook failed: {error}"));
                 _hotkey_guard = None;
                 hotkey_rx = None;
                 hotkey_error = Some(error);
@@ -363,7 +351,7 @@ fn main() {
         let mut tray = if preview::is_active() && !preview::wants_tray() { None } else { match SystemTray::new(auto_paste, &hotkey_label) {
             Ok(tray) => Some(tray),
             Err(error) => {
-                append_log(&format!("Failed to create system tray: {error}"));
+                log::note(&format!("Failed to create system tray: {error}"));
                 None
             }
         } };
@@ -606,7 +594,7 @@ fn main() {
                             let _ = this.update(cx, |view, cx| {
                                 match opened {
                                     Some(Ok(recorder)) => {
-                                        append_log(&format!("Microphone: {}", recorder.describe()));
+                                        log::note(&format!("Microphone: {}", recorder.describe()));
                                         *rec.borrow_mut() = Some(recorder);
                                         view.status = HudStatus::Idle;
                                         view.recovery_message = None;
@@ -734,7 +722,7 @@ fn main() {
                                 // The stream gave no audio in this take, as it
                                 // can after the PC wakes. The user still talks,
                                 // so open the microphone again in this press.
-                                append_log(&format!(
+                                log::note(&format!(
                                     "The microphone gave no audio. TDT opens it again in the same take. {error}"
                                 ));
                                 if let Some(live) = session.take() {
@@ -796,7 +784,7 @@ fn main() {
                                         view.hotkey_label = label;
                                         view.hotkey_capturing = false;
                                         view.settings_error = saved.err().map(|error| {
-                                            append_log(&format!("Could not save the shortcut: {error}"));
+                                            log::note(&format!("Could not save the shortcut: {error}"));
                                             format!(
                                                 "The shortcut works now, but TDT could not save it. Set it again. {error}"
                                             )
@@ -860,7 +848,7 @@ fn main() {
                                             match AudioRecorder::new() {
                                                 Ok(recorder) => {
                                                     let reason = reopen.map(|reason| format!(", opened again: {reason}")).unwrap_or_default();
-                                                    append_log(&format!(
+                                                    log::note(&format!(
                                                         "Microphone: {}{reason}",
                                                         recorder.describe()
                                                     ));
@@ -898,7 +886,7 @@ fn main() {
                                             let target_flag = Arc::clone(&target_hwnd);
                                             let discard_worker = Arc::clone(&discard);
                                             std::thread::spawn(move || {
-                                                raise_thread();
+                                                priority::raise_thread();
                                                 match engine.transcribe_live_reporting(&rx) {
                                                     Ok(result) => {
                                                         if discard_worker.load(Ordering::SeqCst) {
@@ -930,7 +918,7 @@ fn main() {
                                         let pump_limit = Arc::clone(&hit_limit);
                                         drop(tx);
                                         std::thread::spawn(move || {
-                                            raise_thread();
+                                            priority::raise_thread();
                                             loop {
                                                 if pump_halt.load(Ordering::SeqCst) {
                                                     break;
@@ -1232,10 +1220,10 @@ fn main() {
                 view
             })
         }) {
-            Ok(_) => append_log("TDT window opened successfully."),
+            Ok(_) => log::note("TDT window opened successfully."),
             Err(e) => {
                 let msg = format!("Failed to open TDT window: {e:?}");
-                append_log(&msg);
+                log::note(&msg);
                 show_error(&msg);
             }
         }
@@ -1375,42 +1363,6 @@ fn lock_working_directory() {
         if let Some(dir) = exe.parent() {
             let _ = std::env::set_current_dir(dir);
         }
-    }
-}
-
-fn log_file() -> PathBuf {
-    std::env::current_exe()
-        .ok()
-        .and_then(|path| path.parent().map(|dir| dir.join("tdt.log")))
-        .unwrap_or_else(|| std::env::temp_dir().join("tdt.log"))
-}
-
-const MAX_LOG_BYTES: u64 = 512 * 1024;
-
-fn append_log(message: &str) {
-    let path = log_file();
-    let mut path = path;
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .or_else(|_| {
-            // The exe directory may be read-only (Program Files); fall back
-            // to the temp dir once.
-            path = std::env::temp_dir().join("tdt.log");
-            OpenOptions::new().create(true).append(true).open(&path)
-        });
-    if let Ok(ref mut file) = file {
-        if let Ok(metadata) = file.metadata() {
-            if metadata.len() > MAX_LOG_BYTES {
-                // Keep the latest half rather than growing forever.
-                if let Ok(contents) = std::fs::read(&path) {
-                    let keep = &contents[contents.len() / 2..];
-                    let _ = std::fs::write(&path, keep);
-                }
-            }
-        }
-        let _ = writeln!(file, "{} {message}", config::local_hms());
     }
 }
 
