@@ -23,21 +23,18 @@ mod update;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use audio::{play_sound, prewarm, watch_default_input, AudioRecorder, SoundEffect};
+use audio::{prewarm, watch_default_input, AudioRecorder};
 use config::{AppConfig, Settings};
-use dictation::{deliver_transcript, InternalEvent, LiveTake};
+use dictation::{Dictation, ErrorKind, Input};
 use ely_gpui_component::Assets;
 use gpui::*;
 use hotkey::{
-    current_binding, poll_capture_timeout, poll_missed_release, reset_user_typed, set_binding,
-    user_typed, wake_loop, HotkeyAction, HotkeyBinding, HotkeyListener,
+    poll_capture_timeout, poll_missed_release, set_binding, wake_loop, HotkeyAction, HotkeyBinding,
+    HotkeyListener,
 };
 use parking_lot::Mutex;
-use paste::PasteInjector;
-use std::cell::RefCell;
-use std::rc::Rc;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tray_icon::menu::MenuEvent;
 use tray_icon::{MouseButton, MouseButtonState, TrayIconEvent};
 use ui::preview;
@@ -46,7 +43,7 @@ use ui::window_util::{
     ensure_overlay_topmost, find_app_hwnd, follow_current_virtual_desktop, lock_overlay_chrome,
     position_bubble_on_preferred_monitor, PANEL_HEIGHT, PANEL_WIDTH,
 };
-use ui::{ErrorKind, HudView, SystemTray};
+use ui::{HudView, SystemTray};
 use update::{CheckKind, UpdatePhase};
 use voice_stt_desktop::log;
 use voice_stt_desktop::stt::{models, EngineSlot, SttEngine};
@@ -154,7 +151,6 @@ fn main() {
             ),
         }
     };
-    let recorder = Rc::new(RefCell::new(recorder));
 
     let model_dir = settings.get(|config| config.model_dir.clone());
     let stt_engine = EngineSlot::default();
@@ -188,8 +184,6 @@ fn main() {
         }
     }
 
-    let injector = Arc::new(PasteInjector::new());
-
     // A failed install must not look like a working shortcut.
     let _hotkey_guard;
     let hotkey_rx;
@@ -221,22 +215,29 @@ fn main() {
 
     // Ely's components read fonts and colors registered by init.
     let app = gpui_platform::application().with_assets(Assets);
-    let recorder_clone = Rc::clone(&recorder);
-    let injector_clone = Arc::clone(&injector);
-    let stt_clone = stt_engine.clone();
+    let mut dictation = Some(Dictation::new(
+        recorder,
+        stt_engine.clone(),
+        settings.clone(),
+        preview::is_active(),
+    ));
     let stt_for_view = stt_engine.clone();
 
     app.run(move |cx: &mut App| {
         ely_gpui_component::init(cx);
         ui::theme::install(cx);
         // Windows requires the event loop to exist before creating the tray icon.
-        let mut tray = if preview::is_active() && !preview::wants_tray() { None } else { match SystemTray::new(settings.get(|config| config.auto_paste), &hotkey_label) {
-            Ok(tray) => Some(tray),
-            Err(error) => {
-                log::note(&format!("Failed to create system tray: {error}"));
-                None
+        let mut tray = if preview::is_active() && !preview::wants_tray() {
+            None
+        } else {
+            match SystemTray::new(settings.get(|config| config.auto_paste), &hotkey_label) {
+                Ok(tray) => Some(tray),
+                Err(error) => {
+                    log::note(&format!("Failed to create system tray: {error}"));
+                    None
+                }
             }
-        } };
+        };
 
         // The idle tick of the UI loop is slow, so a tray click wakes it.
         let (menu_tx, menu_rx) = crossbeam_channel::unbounded::<MenuEvent>();
@@ -282,12 +283,6 @@ fn main() {
         let update_for_view = Arc::clone(&update_state);
         let update_for_boot = Arc::clone(&update_state);
         let update_for_loop = Arc::clone(&update_state);
-
-        // The window that had the focus when the take started gets its text.
-        let target_hwnd_state = Arc::new(Mutex::new(None::<isize>));
-        let target_hwnd_loop = Arc::clone(&target_hwnd_state);
-
-        let (internal_tx, internal_rx) = crossbeam_channel::unbounded::<InternalEvent>();
 
         // The panel is open from the start for `VOICE_STT_OPEN_PANEL` and the
         // panel previews.
@@ -350,32 +345,15 @@ fn main() {
                     let _ = hud.update(cx, |view, cx| view.close_stats_settings(cx));
                     false
                 });
-                let rec = Rc::clone(&recorder_clone);
-                let inj = Arc::clone(&injector_clone);
-                let stt = stt_clone.clone();
                 let settings = settings_loop.clone();
-                let target_hwnd = Arc::clone(&target_hwnd_loop);
                 let update_phase = Arc::clone(&update_for_loop);
+                let mut dictation = dictation.take().expect("GPUI opens the window once");
 
                 cx.spawn(async move |this, cx| {
-                    let mut is_recording_state = false;
-                    let mut is_processing_state = false;
-                    let mut recording_before_press = false;
-                    let mut limit_notice = false;
-                    // A microphone that failed during the take, for the
-                    // notice after its text.
-                    let mut microphone_lost: Option<String> = None;
-                    let mut session: Option<LiveTake> = None;
                     // The view has nothing that changes with time.
                     let mut at_rest = false;
-                    // A stream that gave no audio: the take starts again one
-                    // time, with the microphone opened again.
-                    let mut restart_take = false;
-                    let mut reopened_in_take = false;
-                    let mut late_start = false;
-
                     loop {
-                        let poll_interval = if is_recording_state || is_processing_state {
+                        let poll_interval = if dictation.is_busy() {
                             Duration::from_millis(25)
                         } else if at_rest && hotkey_rx.is_some() {
                             // Nothing moves, and the shortcut, the pill, and
@@ -423,18 +401,9 @@ fn main() {
                             // update that loop would run GPUI tasks and panic
                             // ("RefCell already borrowed"), so open it between
                             // updates.
-                            let opened = (!preview::is_active() && !is_recording_state && !is_processing_state)
-                                .then(AudioRecorder::new);
+                            let changes = dictation.retry_microphone();
                             let _ = this.update(cx, |view, cx| {
-                                match opened {
-                                    Some(Ok(recorder)) => {
-                                        log::note(&format!("Microphone: {}", recorder.describe()));
-                                        *rec.borrow_mut() = Some(recorder);
-                                        view.microphone_ready();
-                                    }
-                                    Some(Err(error)) => view.set_error(format!("Could not open the microphone. Check Windows microphone access and try again. {error}"), ErrorKind::Microphone),
-                                    None => {}
-                                }
+                                view.apply(changes, cx);
                                 cx.notify();
                             });
                         }
@@ -498,9 +467,7 @@ fn main() {
                             }
                         }
                         if quitting {
-                            if let Some(live) = session.take() {
-                                live.discard();
-                            }
+                            dictation.quit();
                             break;
                         }
 
@@ -513,95 +480,20 @@ fn main() {
                             }
                         }
 
-                        let mut actions: Vec<_> = woke
+                        let actions = woke
                             .into_iter()
-                            .chain(std::iter::from_fn(|| hotkey_rx.as_ref()?.try_recv().ok()))
-                            .collect();
-                        // A click on the resting pill is a tap of the shortcut.
-                        let clicked = this
-                            .update(cx, |view, _| view.take_click())
-                            .unwrap_or(false);
-                        if clicked && !is_recording_state && !is_processing_state {
-                            // The hook clears this when the shortcut goes down. A
-                            // click must clear it too, or a key typed before the
-                            // click stops the paste.
-                            reset_user_typed();
-                            actions.push(HotkeyAction::PressStarted);
-                            actions.push(HotkeyAction::Toggled(Instant::now()));
-                        }
-                        let mut stop_now = false;
-                        let stream_error = rec.borrow().as_ref().and_then(|recorder| {
-                            recorder.take_error().or_else(|| {
-                                (is_recording_state && recorder.stalled()).then(|| {
-                                    "The microphone stopped during the recording. Check the input device and try again.".to_string()
-                                })
-                            })
-                        });
-                        if let Some(error) = stream_error {
-                            let silent = rec
-                                .borrow()
-                                .as_ref()
-                                .is_some_and(|recorder| recorder.captured_samples() == 0);
-                            let held = session.as_ref().is_some_and(LiveTake::is_held);
-                            // The next press opens the microphone again.
-                            *rec.borrow_mut() = None;
-                            if is_recording_state && silent && held && !reopened_in_take {
-                                // The stream gave no audio in this take, as it
-                                // can after the PC wakes. The user still talks,
-                                // so open the microphone again in this press.
-                                log::note(&format!(
-                                    "The microphone gave no audio. TDT opens it again in the same take. {error}"
-                                ));
-                                if let Some(live) = session.take() {
-                                    live.discard();
-                                }
-                                is_recording_state = false;
-                                reopened_in_take = true;
-                                restart_take = true;
-                                late_start = true;
-                                actions.insert(0, HotkeyAction::PressStarted);
-                            } else if is_recording_state || is_processing_state {
-                                // The audio before the failure is already with
-                                // the engine: finish the take, then say why it
-                                // ended.
-                                stop_now = is_recording_state;
-                                microphone_lost = Some(error);
-                            } else {
-                                let _ = this.update(cx, |view, cx| { view.set_error(error, ErrorKind::Microphone); cx.notify(); });
-                            }
-                        }
-                        let hit_limit = is_recording_state
-                            && session.as_ref().is_some_and(LiveTake::hit_limit);
-                        let at_limit = is_recording_state
-                            && (hit_limit
-                                || rec.borrow().as_ref().is_some_and(AudioRecorder::limit_reached));
-                        let stop_requested = if is_recording_state {
-                            this.update(cx, |view, _| view.take_stop_request()).unwrap_or(false)
-                        } else {
-                            false
-                        };
-                        if is_recording_state && (at_limit || stop_requested) {
-                            if stop_requested {
-                                // As a stop press of the shortcut does: only keys
-                                // typed after the stop keep the text off the app.
-                                reset_user_typed();
-                            }
-                            limit_notice = at_limit;
-                            stop_now = true;
-                        }
+                            .chain(std::iter::from_fn(|| hotkey_rx.as_ref()?.try_recv().ok()));
+                        let mut input = Vec::new();
                         for action in actions {
-                            if preview::is_active() {
-                                continue;
-                            }
                             match action {
                                 HotkeyAction::Captured(binding) => {
                                     let label = binding.display();
                                     set_binding(binding);
-                                    let saved = settings.update(|config| config.hotkey = label.clone());
+                                    let saved =
+                                        settings.update(|config| config.hotkey = label.clone());
                                     if let Some(ref tray) = tray {
-                                        let _ = tray
-                                            .tray_icon
-                                            .set_tooltip(Some(tooltip_text(&label)));
+                                        let _ =
+                                            tray.tray_icon.set_tooltip(Some(tooltip_text(&label)));
                                     }
                                     let _ = this.update(cx, |view, cx| {
                                         view.shortcut_captured(binding, saved);
@@ -614,196 +506,27 @@ fn main() {
                                         cx.notify();
                                     });
                                 }
-                                HotkeyAction::PressStarted => {
-                                    // Snapshot the before-press state; it is
-                                    // cleared on every release below, so a
-                                    // swallowed press can never stop a session
-                                    // it did not start.
-                                    recording_before_press = is_recording_state;
-                                    // A press during a take can only be the stop
-                                    // of a take that a tap started. The stop
-                                    // starts when the key goes down. At the
-                                    // key-up, the click of the key is in the
-                                    // audio, and the microphone stays open until
-                                    // that sound ends (about 300 ms).
-                                    if is_recording_state && !stop_now {
-                                        stop_now = LiveTake::begin_stop(
-                                            &mut session,
-                                            Instant::now(),
-                                            Some(current_binding().vk),
-                                        );
-                                    }
-                                    // Do not overlap recordings with an in-flight
-                                    // transcription. The current recorder and STT
-                                    // engine are single-session by design.
-                                    let pump_busy = session.as_ref().is_some_and(|live| !live.is_done());
-                                    if !is_recording_state && !is_processing_state && !pump_busy {
-                                        let restarted = std::mem::take(&mut restart_take);
-                                        if !restarted {
-                                            reopened_in_take = false;
-                                            late_start = false;
-                                        }
-                                        if stt.get().is_none() {
-                                            let _ = this.update(cx, |view, cx| {
-                                                view.set_error("Download a speech model in Settings before recording.".into(), ErrorKind::Other);
-                                                view.open_settings(cx);
-                                                cx.notify();
-                                            });
-                                            continue;
-                                        }
-                                        // A stream that does not start again is opened again too.
-                                        let reopen = rec.borrow().as_ref().and_then(|recorder| {
-                                            recorder
-                                                .reopen_reason()
-                                                .or_else(|| recorder.resume_input().err())
-                                        });
-                                        if rec.borrow().is_none() || reopen.is_some() {
-                                            *rec.borrow_mut() = None;
-                                            match AudioRecorder::new() {
-                                                Ok(recorder) => {
-                                                    let reason = reopen.map(|reason| format!(", opened again: {reason}")).unwrap_or_default();
-                                                    log::note(&format!(
-                                                        "Microphone: {}{reason}",
-                                                        recorder.describe()
-                                                    ));
-                                                    *rec.borrow_mut() = Some(recorder);
-                                                }
-                                                Err(error) => {
-                                                    let _ = this.update(cx, |view, cx| { view.set_error(format!("Could not open the microphone. Connect a microphone and retry. {error}"), ErrorKind::Microphone); cx.notify(); });
-                                                    continue;
-                                                }
-                                            }
-                                        }
-                                        // Capture first: the buffer holds the audio until the pump below drains it.
-                                        if let Some(recorder) = rec.borrow().as_ref() { recorder.start(); }
-                                        *target_hwnd.lock() = ui::window_util::dictation_target_window();
-                                        // The pill shows the take on the screen where the text goes.
-                                        ui::window_util::move_pill_to_screen_of(*target_hwnd.lock());
-                                        let _ = this.update(cx, |view, cx| view.close_stats_settings(cx));
-                                        let Some(handle) = rec.borrow().as_ref().map(|recorder| recorder.handle()) else {
-                                            continue;
-                                        };
-                                        limit_notice = false;
-                                        let events = internal_tx.clone();
-                                        let inj_worker = Arc::clone(&inj);
-                                        let settings_worker = settings.clone();
-                                        let target_flag = Arc::clone(&target_hwnd);
-                                        session = Some(LiveTake::start(handle, stt.get(), move |result| match result {
-                                            Ok(result) => {
-                                                let target = *target_flag.lock();
-                                                deliver_transcript(result, inj_worker, events, &settings_worker, target, user_typed());
-                                            }
-                                            // The engine's errors are written for the user.
-                                            Err(error) => {
-                                                let _ = events.send(InternalEvent::TranscribeError(error));
-                                            }
-                                        }));
-                                        if !restarted {
-                                            play_sound(SoundEffect::StartListening);
-                                        }
-                                        is_recording_state = true;
-                                        let wave = rec.borrow().as_ref().map(AudioRecorder::live_wave);
-                                        let _ = this.update(cx, |view, cx| {
-                                            view.show_listening(wave);
-                                            cx.notify();
-                                        });
-                                    }
+                                HotkeyAction::PressStarted => input.push(Input::Press),
+                                HotkeyAction::HoldReleased(asked) => {
+                                    input.push(Input::HoldReleased(asked))
                                 }
+                                HotkeyAction::Toggled(asked) => input.push(Input::Toggled(asked)),
                                 HotkeyAction::Wake => {}
-                                HotkeyAction::HoldReleased(asked) | HotkeyAction::Toggled(asked) => {
-                                    // A hold always stops; a tap only stops a session it
-                                    // started, otherwise it has just started one.
-                                    let should_stop = if matches!(action, HotkeyAction::Toggled(_))
-                                    {
-                                        let stop = recording_before_press;
-                                        recording_before_press = false;
-                                        stop
-                                    } else {
-                                        recording_before_press = false;
-                                        true
-                                    };
-                                    if should_stop && is_recording_state && !stop_now {
-                                        stop_now = LiveTake::begin_stop(&mut session, asked, None);
-                                    }
-                                }
                             }
                         }
-
-                        if is_recording_state && session.as_ref().is_some_and(LiveTake::must_stop_now) {
-                            stop_now = true;
-                        }
-                        if is_recording_state && session.as_ref().is_some_and(LiveTake::is_done) {
-                            if session.as_ref().is_some_and(LiveTake::hit_limit) {
-                                limit_notice = true;
-                            }
-                            stop_now = true;
-                        }
-                        if stop_now && is_recording_state {
-                            if let Some(live) = session.as_mut() {
-                                live.halt();
-                            }
-                            is_recording_state = false;
-                            is_processing_state = true;
-                            play_sound(SoundEffect::StopListening);
+                        // A click on the resting pill is a tap of the shortcut.
+                        let clicked = this
+                            .update(cx, |view, _| view.take_click())
+                            .unwrap_or(false);
+                        let changes = dictation.step(input, clicked, || {
+                            this.update(cx, |view, _| view.take_stop_request())
+                                .unwrap_or(false)
+                        });
+                        if !changes.is_empty() {
                             let _ = this.update(cx, |view, cx| {
-                                view.show_transcribing(limit_notice);
+                                view.apply(changes, cx);
                                 cx.notify();
                             });
-                        }
-
-                        while let Ok(event) = internal_rx.try_recv() {
-                            match event {
-                                InternalEvent::TranscribeSuccess { text, auto_pasted, notice, latency_ms } => {
-                                    is_processing_state = false;
-                                    play_sound(SoundEffect::Success);
-                                    let notice = notice.or(microphone_lost.take()).or_else(|| {
-                                        std::mem::take(&mut late_start).then(|| {
-                                            "The microphone started late, so the first words can be missing.".to_string()
-                                        })
-                                    });
-                                    let _ = this.update(cx, |view, cx| {
-                                        view.show_success(text, auto_pasted, latency_ms, notice);
-                                        cx.notify();
-                                    });
-                                }
-                                InternalEvent::TranscribeError(err) => {
-                                    is_processing_state = false;
-                                    microphone_lost = None;
-                                    late_start = false;
-                                    if is_recording_state {
-                                        if let Some(live) = session.as_mut() {
-                                            live.halt();
-                                        }
-                                        is_recording_state = false;
-                                    }
-                                    play_sound(SoundEffect::Error);
-                                    let _ = this.update(cx, |view, cx| {
-                                        view.show_take_error(err);
-                                        cx.notify();
-                                    });
-                                }
-                                InternalEvent::NoSpeech => {
-                                    is_processing_state = false;
-                                    late_start = false;
-                                    if let Some(error) = microphone_lost.take() {
-                                        let _ = this.update(cx, |view, cx| { view.set_error(error, ErrorKind::Microphone); cx.notify(); });
-                                        continue;
-                                    }
-                                    let _ = this.update(cx, |view, cx| {
-                                        view.show_no_speech();
-                                        cx.notify();
-                                    });
-                                }
-
-                            }
-                        }
-
-                        // Fully idle means no recording and no transcription:
-                        // park the microphone until the next press.
-                        if !is_recording_state && !is_processing_state {
-                            if let Some(active) = rec.borrow().as_ref() {
-                                active.pause_input();
-                            }
                         }
                         let view_state = this.update(cx, |view, cx| {
                             let rest = view.tick(cx);

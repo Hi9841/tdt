@@ -301,10 +301,6 @@ impl AudioRecorder {
     pub fn take_error(&self) -> Option<String> {
         self.capture.last_error.lock().take()
     }
-
-    pub fn limit_reached(&self) -> bool {
-        self.capture.at_limit.load(Ordering::Relaxed)
-    }
 }
 
 impl CaptureHandle {

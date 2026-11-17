@@ -1,5 +1,6 @@
 use crate::audio::{LiveWave, VIS_BARS};
 use crate::config::{AppConfig, AppStats, Settings};
+use crate::dictation::{ErrorKind, ViewChange};
 use crate::hotkey;
 use crate::paste::PasteInjector;
 use crate::ui::controls;
@@ -349,13 +350,6 @@ fn finishing_dots() -> AnyElement {
         .gap(px(3.0))
         .children(dots)
         .into_any_element()
-}
-
-/// What an error on the pill is about. A microphone error offers Retry microphone.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ErrorKind {
-    Microphone,
-    Other,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1138,8 +1132,36 @@ impl HudView {
         self.copied_at = None;
     }
 
+    /// Shows the changes of the dictation, in order.
+    pub fn apply(&mut self, changes: Vec<ViewChange>, cx: &mut Context<Self>) {
+        for change in changes {
+            match change {
+                ViewChange::Error(message, kind) => self.set_error(message, kind),
+                ViewChange::NeedModel => {
+                    self.set_error(
+                        "Download a speech model in Settings before recording.".into(),
+                        ErrorKind::Other,
+                    );
+                    self.open_settings(cx);
+                }
+                ViewChange::CloseSettings => self.close_stats_settings(cx),
+                ViewChange::Listening(wave) => self.show_listening(wave),
+                ViewChange::Transcribing { at_limit } => self.show_transcribing(at_limit),
+                ViewChange::Success {
+                    text,
+                    auto_pasted,
+                    latency_ms,
+                    notice,
+                } => self.show_success(text, auto_pasted, latency_ms, notice),
+                ViewChange::TakeError(error) => self.show_take_error(error),
+                ViewChange::NoSpeech => self.show_no_speech(),
+                ViewChange::MicrophoneReady => self.microphone_ready(),
+            }
+        }
+    }
+
     /// A take started. The pill shows the live wave of `wave`.
-    pub fn show_listening(&mut self, wave: Option<LiveWave>) {
+    fn show_listening(&mut self, wave: Option<LiveWave>) {
         self.recovery_message = None;
         self.wave_source = wave;
         self.status = HudStatus::Listening {
@@ -1149,7 +1171,7 @@ impl HudView {
 
     /// The recording ended, and the pill waits for the text. `at_limit`: the
     /// take stopped at the take limit.
-    pub fn show_transcribing(&mut self, at_limit: bool) {
+    fn show_transcribing(&mut self, at_limit: bool) {
         self.wave_peaks = [0.0; WAVE_BARS];
         self.wave_source = None;
         let recorded_for = match &self.status {
@@ -1166,7 +1188,7 @@ impl HudView {
     }
 
     /// The text of a take is in the app or on the clipboard.
-    pub fn show_success(
+    fn show_success(
         &mut self,
         text: String,
         auto_pasted: bool,
@@ -1184,7 +1206,7 @@ impl HudView {
     }
 
     /// A take ended with an error.
-    pub fn show_take_error(&mut self, error: TakeError) {
+    fn show_take_error(&mut self, error: TakeError) {
         self.stats = AppStats::load();
         let kind = if error.microphone {
             ErrorKind::Microphone
@@ -1195,7 +1217,7 @@ impl HudView {
     }
 
     /// A take had no speech.
-    pub fn show_no_speech(&mut self) {
+    fn show_no_speech(&mut self) {
         self.status = HudStatus::NoSpeech {
             since: Instant::now(),
         };
@@ -1204,7 +1226,7 @@ impl HudView {
     }
 
     /// The microphone opened again after a failure.
-    pub fn microphone_ready(&mut self) {
+    fn microphone_ready(&mut self) {
         self.status = HudStatus::Idle;
         self.recovery_message = None;
     }
