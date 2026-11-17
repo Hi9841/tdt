@@ -522,7 +522,6 @@ fn main() {
                     let mut is_recording_state = false;
                     let mut is_processing_state = false;
                     let mut recording_before_press = false;
-                    let mut recording_session = 0u64;
                     let mut limit_notice = false;
                     let mut no_speech_at: Option<Instant> = None;
                     // A microphone that failed during the take, for the
@@ -866,7 +865,6 @@ fn main() {
                                         let Some(handle) = rec.borrow().as_ref().map(|recorder| recorder.handle()) else {
                                             continue;
                                         };
-                                        recording_session = recording_session.wrapping_add(1);
                                         limit_notice = false;
                                         let tail = Arc::new(Mutex::new(SpeechTail::default()));
                                         let release = Arc::new(AtomicBool::new(false));
