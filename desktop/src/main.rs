@@ -6,6 +6,7 @@ compile_error!("TDT desktop is a Windows-only build.");
 mod audio;
 mod autostart;
 mod config;
+mod dictation;
 mod hotkey;
 mod integrity;
 mod keys;
@@ -20,24 +21,19 @@ mod update;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use audio::recorder::CaptureHandle;
-use audio::{
-    play_sound, prewarm, watch_default_input, AudioRecorder, SoundEffect, SpeechTail, MAX_TAIL,
-    VIS_BARS,
-};
+use audio::{play_sound, prewarm, watch_default_input, AudioRecorder, SoundEffect, VIS_BARS};
 use config::{AppConfig, AppStats, Settings};
+use dictation::LiveTake;
 use ely_gpui_component::Assets;
 use gpui::*;
 use hotkey::{
-    current_binding, input_appeared, input_held, input_mask, note_user_typed, poll_capture_timeout,
-    poll_missed_release, reset_user_typed, set_binding, user_typed, wake_loop, HotkeyAction,
-    HotkeyBinding, HotkeyListener,
+    current_binding, poll_capture_timeout, poll_missed_release, reset_user_typed, set_binding,
+    user_typed, wake_loop, HotkeyAction, HotkeyBinding, HotkeyListener,
 };
 use parking_lot::Mutex;
 use paste::{DeliveryOutcome, DeliverySteps, NotTyped, PasteInjector};
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tray_icon::menu::MenuEvent;
@@ -52,7 +48,7 @@ use ui::{HudStatus, HudView, SystemTray};
 use update::{CheckKind, UpdatePhase};
 use voice_stt_desktop::log;
 use voice_stt_desktop::stt::{
-    models, remove_fillers, EngineSlot, Latency, LiveAudio, LiveTranscript, StopTimes, SttEngine,
+    models, remove_fillers, EngineSlot, Latency, LiveTranscript, SttEngine,
 };
 
 enum InternalEvent {
@@ -478,51 +474,6 @@ fn main() {
 
                 // Spawn UI coordination loop running on GPUI executor
                 cx.spawn(async move |this, cx| {
-                    struct LiveTake {
-                        tail: Arc<Mutex<SpeechTail>>,
-                        release: Arc<AtomicBool>,
-                        halt: Arc<AtomicBool>,
-                        done: Arc<AtomicBool>,
-                        hit_limit: Arc<AtomicBool>,
-                        discard: Arc<AtomicBool>,
-                        baseline: Option<[bool; 256]>,
-                        released_at: Option<Instant>,
-                        /// Wakes the pump at the release and at the stop.
-                        handle: CaptureHandle,
-                    }
-                    /// Starts the end of a take: the microphone stays open
-                    /// only while the last word ends. `shortcut` is the
-                    /// shortcut key when it is down now (a stop at the
-                    /// key-down): it is not a key that the user types.
-                    /// Returns true when the take must stop at once.
-                    fn begin_stop(
-                        session: &mut Option<LiveTake>,
-                        asked: Instant,
-                        shortcut: Option<u16>,
-                    ) -> bool {
-                        if session.as_ref().is_some_and(|live| live.baseline.is_some()) {
-                            // The end of the take started before.
-                            return false;
-                        }
-                        let mut baseline = input_mask();
-                        if let Some(slot) = shortcut.and_then(|vk| baseline.get_mut(usize::from(vk))) {
-                            *slot = true;
-                        }
-                        if let Some(vk) = input_held(current_binding().vk) {
-                            note_user_typed(vk);
-                            return true;
-                        }
-                        let Some(live) = session.as_mut() else {
-                            return true;
-                        };
-                        live.tail.lock().mark_release(asked);
-                        live.released_at = Some(Instant::now());
-                        live.release.store(true, Ordering::SeqCst);
-                        // A user who was quiet stops now, not at the next audio buffer.
-                        live.handle.wake();
-                        live.baseline = Some(baseline);
-                        false
-                    }
                     let mut is_recording_state = false;
                     let mut is_processing_state = false;
                     let mut recording_before_press = false;
@@ -667,8 +618,7 @@ fn main() {
                         }
                         if quitting {
                             if let Some(live) = session.take() {
-                                live.discard.store(true, Ordering::SeqCst);
-                                live.halt.store(true, Ordering::SeqCst);
+                                live.discard();
                             }
                             break;
                         }
@@ -712,10 +662,7 @@ fn main() {
                                 .borrow()
                                 .as_ref()
                                 .is_some_and(|recorder| recorder.captured_samples() == 0);
-                            let held = session.as_ref().is_some_and(|live| {
-                                !live.release.load(Ordering::SeqCst)
-                                    && !live.done.load(Ordering::SeqCst)
-                            });
+                            let held = session.as_ref().is_some_and(LiveTake::is_held);
                             // The next press opens the microphone again.
                             *rec.borrow_mut() = None;
                             if is_recording_state && silent && held && !reopened_in_take {
@@ -726,9 +673,7 @@ fn main() {
                                     "The microphone gave no audio. TDT opens it again in the same take. {error}"
                                 ));
                                 if let Some(live) = session.take() {
-                                    live.discard.store(true, Ordering::SeqCst);
-                                    live.halt.store(true, Ordering::SeqCst);
-                                    live.handle.wake();
+                                    live.discard();
                                 }
                                 is_recording_state = false;
                                 reopened_in_take = true;
@@ -746,7 +691,7 @@ fn main() {
                             }
                         }
                         let hit_limit = is_recording_state
-                            && session.as_ref().is_some_and(|live| live.hit_limit.load(Ordering::SeqCst));
+                            && session.as_ref().is_some_and(LiveTake::hit_limit);
                         let at_limit = is_recording_state
                             && (hit_limit
                                 || rec.borrow().as_ref().is_some_and(AudioRecorder::limit_reached));
@@ -809,7 +754,7 @@ fn main() {
                                     // audio, and the microphone stays open until
                                     // that sound ends (about 300 ms).
                                     if is_recording_state && !stop_now {
-                                        stop_now = begin_stop(
+                                        stop_now = LiveTake::begin_stop(
                                             &mut session,
                                             Instant::now(),
                                             Some(current_binding().vk),
@@ -818,9 +763,7 @@ fn main() {
                                     // Do not overlap recordings with an in-flight
                                     // transcription. The current recorder and STT
                                     // engine are single-session by design.
-                                    let pump_busy = session
-                                        .as_ref()
-                                        .is_some_and(|live| !live.done.load(Ordering::SeqCst));
+                                    let pump_busy = session.as_ref().is_some_and(|live| !live.is_done());
                                     if !is_recording_state && !is_processing_state && !pump_busy {
                                         let restarted = std::mem::take(&mut restart_take);
                                         if !restarted {
@@ -868,93 +811,20 @@ fn main() {
                                             continue;
                                         };
                                         limit_notice = false;
-                                        let tail = Arc::new(Mutex::new(SpeechTail::default()));
-                                        let release = Arc::new(AtomicBool::new(false));
-                                        let halt = Arc::new(AtomicBool::new(false));
-                                        let done = Arc::new(AtomicBool::new(false));
-                                        let hit_limit = Arc::new(AtomicBool::new(false));
-                                        let discard = Arc::new(AtomicBool::new(false));
-                                        let (tx, rx) = crossbeam_channel::unbounded();
-                                        if let Some(engine) = stt.get() {
-                                            let events = internal_tx.clone();
-                                            let inj_worker = Arc::clone(&inj);
-                                            let settings_worker = settings.clone();
-                                            let target_flag = Arc::clone(&target_hwnd);
-                                            let discard_worker = Arc::clone(&discard);
-                                            std::thread::spawn(move || {
-                                                priority::raise_thread();
-                                                match engine.transcribe_live_reporting(&rx) {
-                                                    Ok(result) => {
-                                                        if discard_worker.load(Ordering::SeqCst) {
-                                                            return;
-                                                        }
-                                                        let target = *target_flag.lock();
-                                                        deliver_transcript(result, inj_worker, events, &settings_worker, target, user_typed());
-                                                    }
-                                                    Err(error) => {
-                                                        if discard_worker.load(Ordering::SeqCst) {
-                                                            return;
-                                                        }
-                                                        // The engine's errors are written for the user.
-                                                        let _ = events.send(InternalEvent::TranscribeError(error));
-                                                    }
-                                                }
-                                            });
-                                        } else {
-                                            drop(rx);
-                                        }
-                                        let take_handle = handle.clone();
-                                        let pump_tx = tx.clone();
-                                        let pump_tail = Arc::clone(&tail);
-                                        let pump_release = Arc::clone(&release);
-                                        let pump_halt = Arc::clone(&halt);
-                                        let pump_done = Arc::clone(&done);
-                                        let pump_limit = Arc::clone(&hit_limit);
-                                        drop(tx);
-                                        std::thread::spawn(move || {
-                                            priority::raise_thread();
-                                            loop {
-                                                if pump_halt.load(Ordering::SeqCst) {
-                                                    break;
-                                                }
-                                                if handle.limit_reached() {
-                                                    pump_limit.store(true, Ordering::SeqCst);
-                                                    break;
-                                                }
-                                                let chunk = handle.drain();
-                                                let empty = chunk.is_empty();
-                                                if !empty {
-                                                    pump_tail.lock().push_samples(&chunk);
-                                                    let _ = pump_tx.send(LiveAudio::Chunk(chunk));
-                                                }
-                                                if pump_release.load(Ordering::SeqCst) && pump_tail.lock().should_stop() {
-                                                    break;
-                                                }
-                                                if empty {
-                                                    handle.wait_for_audio(Duration::from_millis(8));
-                                                }
+                                        let events = internal_tx.clone();
+                                        let inj_worker = Arc::clone(&inj);
+                                        let settings_worker = settings.clone();
+                                        let target_flag = Arc::clone(&target_hwnd);
+                                        session = Some(LiveTake::start(handle, stt.get(), move |result| match result {
+                                            Ok(result) => {
+                                                let target = *target_flag.lock();
+                                                deliver_transcript(result, inj_worker, events, &settings_worker, target, user_typed());
                                             }
-                                            let rest = handle.stop();
-                                            if !rest.is_empty() {
-                                                let _ = pump_tx.send(LiveAudio::Chunk(rest));
+                                            // The engine's errors are written for the user.
+                                            Err(error) => {
+                                                let _ = events.send(InternalEvent::TranscribeError(error));
                                             }
-                                            // Latency counts from the stop request, the wait the user feels.
-                                            let closed = Instant::now();
-                                            let asked = pump_tail.lock().asked_at().unwrap_or(closed);
-                                            let _ = pump_tx.send(LiveAudio::Finish(StopTimes { asked, closed }));
-                                            pump_done.store(true, Ordering::SeqCst);
-                                        });
-                                        session = Some(LiveTake {
-                                            tail,
-                                            release,
-                                            halt,
-                                            done,
-                                            hit_limit,
-                                            discard,
-                                            baseline: None,
-                                            released_at: None,
-                                            handle: take_handle,
-                                        });
+                                        }));
                                         if !restarted {
                                             play_sound(SoundEffect::StartListening);
                                         }
@@ -986,37 +856,24 @@ fn main() {
                                         true
                                     };
                                     if should_stop && is_recording_state && !stop_now {
-                                        stop_now = begin_stop(&mut session, asked, None);
+                                        stop_now = LiveTake::begin_stop(&mut session, asked, None);
                                     }
                                 }
                             }
                         }
 
-                        if is_recording_state {
-                            if let Some(baseline) = session.as_ref().and_then(|live| live.baseline.as_ref()) {
-                                if let Some(vk) = input_appeared(baseline) {
-                                    note_user_typed(vk);
-                                    stop_now = true;
-                                }
-                            }
-                            // Sample time stops if the callback stalls. The cap is wall time too.
-                            if session.as_ref().is_some_and(|live| {
-                                live.released_at.is_some_and(|at| at.elapsed() >= MAX_TAIL)
-                            }) {
-                                stop_now = true;
-                            }
+                        if is_recording_state && session.as_ref().is_some_and(LiveTake::must_stop_now) {
+                            stop_now = true;
                         }
-                        if is_recording_state && session.as_ref().is_some_and(|live| live.done.load(Ordering::SeqCst)) {
-                            if session.as_ref().is_some_and(|live| live.hit_limit.load(Ordering::SeqCst)) {
+                        if is_recording_state && session.as_ref().is_some_and(LiveTake::is_done) {
+                            if session.as_ref().is_some_and(LiveTake::hit_limit) {
                                 limit_notice = true;
                             }
                             stop_now = true;
                         }
                         if stop_now && is_recording_state {
                             if let Some(live) = session.as_mut() {
-                                live.halt.store(true, Ordering::SeqCst);
-                                live.handle.wake();
-                                live.baseline = None;
+                                live.halt();
                             }
                             is_recording_state = false;
                             is_processing_state = true;
@@ -1068,9 +925,7 @@ fn main() {
                                     late_start = false;
                                     if is_recording_state {
                                         if let Some(live) = session.as_mut() {
-                                            live.halt.store(true, Ordering::SeqCst);
-                                            live.handle.wake();
-                                            live.baseline = None;
+                                            live.halt();
                                         }
                                         is_recording_state = false;
                                     }
