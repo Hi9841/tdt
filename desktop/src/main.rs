@@ -819,15 +819,9 @@ fn main() {
                 })
                 .detach();
 
-                // Check soon after start, then every hour, like Prism.
                 if !preview::is_active() {
-                    std::thread::spawn(move || {
-                        std::thread::sleep(Duration::from_secs(8));
-                        loop {
-                            let auto_checks = settings_boot.get(|config| config.check_updates);
-                            update::check(&update_for_boot, CheckKind::Automatic, auto_checks);
-                            std::thread::sleep(Duration::from_secs(60 * 60));
-                        }
+                    update::start_automatic_checks(update_for_boot, move || {
+                        settings_boot.get(|config| config.check_updates)
                     });
                 }
 

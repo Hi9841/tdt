@@ -2354,11 +2354,14 @@ impl HudView {
         let takes_row = settings_row(
             "Save takes for testing",
             if self.save_takes() {
-                "Audio and text go to LOCALAPPDATA\\TDT\\takes."
+                format!(
+                    "Audio and text go to LOCALAPPDATA\\{}\\{}.",
+                    voice_stt_desktop::DATA_DIR_NAME,
+                    voice_stt_desktop::stt::takes::FOLDER_NAME
+                )
             } else {
-                "Off. Nothing is kept."
-            }
-            .to_string(),
+                "Off. Nothing is kept.".to_string()
+            },
             takes_switch.into_any_element(),
         )
         .on_click(
@@ -2383,7 +2386,7 @@ impl HudView {
         let auto_updates_row = settings_row(
             "Check for updates automatically",
             if self.auto_updates() {
-                "At start, every hour, and when Settings opens."
+                update::AUTOMATIC_SCHEDULE
             } else {
                 "Only when you select Check for updates."
             }

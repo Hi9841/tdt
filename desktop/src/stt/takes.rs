@@ -7,9 +7,12 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+/// The name of the takes folder in the data folder.
+pub const FOLDER_NAME: &str = "takes";
+
 /// `%LOCALAPPDATA%\TDT\takes`.
 pub fn folder() -> Option<PathBuf> {
-    crate::data_dir().map(|dir| dir.join("takes"))
+    crate::data_dir().map(|dir| dir.join(FOLDER_NAME))
 }
 
 /// Writes `take-<unix milliseconds>.wav` (16 kHz mono, 16-bit) and `.txt`.

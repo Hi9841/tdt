@@ -92,6 +92,26 @@ pub fn updates_disabled() -> bool {
     )
 }
 
+/// When TDT checks by itself; the Settings text of the automatic checks.
+const FIRST_CHECK_AFTER: Duration = Duration::from_secs(8);
+const CHECK_EVERY: Duration = Duration::from_secs(60 * 60);
+pub const AUTOMATIC_SCHEDULE: &str = "At start, every hour, and when Settings opens.";
+
+/// Checks soon after the start, then each `CHECK_EVERY`, while
+/// `auto_checks` gives true. Opening the panel checks too (`AUTOMATIC_SCHEDULE`).
+pub fn start_automatic_checks(
+    cell: Arc<Mutex<UpdatePhase>>,
+    auto_checks: impl Fn() -> bool + Send + 'static,
+) {
+    std::thread::spawn(move || {
+        std::thread::sleep(FIRST_CHECK_AFTER);
+        loop {
+            check(&cell, CheckKind::Automatic, auto_checks());
+            std::thread::sleep(CHECK_EVERY);
+        }
+    });
+}
+
 /// Who asked for an update check.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CheckKind {
