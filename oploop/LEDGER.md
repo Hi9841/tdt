@@ -589,3 +589,54 @@ The app itself did not run. The change is in the engine and in the release of it
 The hook, the microphone, the pill, and the typing did not change.
 
 Released as TDT 0.9.7.
+
+
+## Session 2026-11-18: Trit 0.14.0 (from TDT for Android)
+
+The speech engine goes from Trit 0.12.0 to 0.14.0. 0.13.0 made Whisper faster on AVX-512;
+0.14.0 has the changes that this session made for TDT for Android (Trit's ledger, SI-042 to
+SI-046). For TDT on x86-64 two of them apply:
+
+- The joint layer of the decoder keeps its weights as f32 from the load. Before, each decoder
+  step widened the int8 weights of the joint again. Trit's profile build, 81 takes, Parakeet
+  Unified English as `int8`, 8 threads: decoder 271 to 288 ms before, 184 to 186 ms after.
+- The Q8_0 values of the Unified GGUF become f32 on all worker threads at the load. A load
+  with a 1.1 s clip: 728 to 788 ms before, 643 to 719 ms after.
+
+The other changes are for arm64 only (int8 `smmla` product, NEON activations, one-row
+products, the NEON load quantizer).
+
+Checked, not taken for the desktop:
+
+- TDT for Android 0.6.7 drops the near-silence that the phone's microphone sends when it
+  opens (it put the room noise 35 dB too low, so every tail ran to its 600 ms cap). The
+  desktop takes do not have it: on 510 saved takes the median of the first 80 ms is -46 dB
+  against a quiet floor of -50 dB, and no take starts with that silence. `tail.rs` and
+  `segment.rs` stay as they are.
+- The one-row int8 product of the LSTM spends 61 of its 72 ms (81 takes) over its floor on
+  x86-64 too: the same cause as on the phone (too many small tasks). About 0.75 ms for each
+  take: not changed in this release.
+
+### Gate
+
+`bench-asr --chunk-ms 10`, TDT 0.9.7 (Trit 0.12.0) against this build (Trit 0.14.0), each with
+its own copy of the two models: clean (200), other (200), tech (40), and 200 saved takes, both
+models, with AVX-512 and with `TRIT_ISA=avx2`: 0 texts differ in each of the 16 comparisons,
+and the error counts are equal. The release build ran the ratchet: clean 81, other 172, tech 34 errors on 200, 200, and 40
+clips, the budget.
+
+### Found: the ratchet passed with no clip scored
+
+The first release build of this session printed "clean: 0 errors / 0 words, 0 clips" for each
+set and went on. `accuracy.py` runs Parakeet Redux, and from a worktree `bench-asr` found no
+Redux folder (the installed models folder had only Unified English): it printed "model
+directory not found", 0 clips were scored, and 0 errors are under every budget. Now a set with
+no scored clip stops the release. The second build had the two models in `desktop/models` (a
+link, removed after the build).
+
+### Not verified
+
+The app itself did not run. The change is in the engine; the hook, the microphone, the pill,
+and the typing did not change.
+
+Released as TDT 0.9.8.
