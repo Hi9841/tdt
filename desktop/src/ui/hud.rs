@@ -24,7 +24,7 @@ use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use voice_stt_desktop::stt::{models, DownloadPhase, EngineSlot, SttEngine, CATALOG};
+use voice_stt_desktop::stt::{models, DownloadPhase, EngineSlot, SttEngine, TakeError, CATALOG};
 
 /// Compact actions leave seven pixels above and below inside the overlay.
 const SETTINGS_SURFACE_HEIGHT: f32 = 28.0;
@@ -351,6 +351,13 @@ fn finishing_dots() -> AnyElement {
         .into_any_element()
 }
 
+/// What an error on the pill is about. A microphone error offers Retry microphone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorKind {
+    Microphone,
+    Other,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum HudStatus {
     Idle,
@@ -621,7 +628,7 @@ impl HudView {
                 self.show_no_speech();
                 self.recovery_is_microphone = true;
             }
-            PreviewSpec::BubbleCopyFailed => self.set_error("Could not copy text. Open History to copy the saved transcript.".into()),
+            PreviewSpec::BubbleCopyFailed => self.set_error("Could not copy text. Open History to copy the saved transcript.".into(), ErrorKind::Other),
             PreviewSpec::BubblePasteFallback => {
                 self.status = HudStatus::Success {
                     text: "This transcript is ready to paste.".into(),
@@ -654,7 +661,7 @@ impl HudView {
                 self.active_model = Some(PREVIEW_OTHER_MODEL.into());
                 self.model_ready_note = Some(models::resolve(PREVIEW_OTHER_MODEL).label);
             }
-            PreviewSpec::PanelRecovery => self.set_error("Microphone disconnected. Connect a microphone, check Windows microphone access, then choose Retry microphone.".into()),
+            PreviewSpec::PanelRecovery => self.set_error("Microphone disconnected. Connect a microphone, check Windows microphone access, then choose Retry microphone.".into(), ErrorKind::Microphone),
             PreviewSpec::PanelClearHistory => {
                 self.active_tab = SettingsTab::Stats;
                 self.stats = preview::fixture_stats(3);
@@ -811,7 +818,10 @@ impl HudView {
     fn copy_history(&mut self, key: &str, text: &str) {
         if !preview::is_active() {
             if let Err(error) = self.injector.copy_to_clipboard(text) {
-                self.set_error(format!("Could not copy text. Try Copy again. {error}"));
+                self.set_error(
+                    format!("Could not copy text. Try Copy again. {error}"),
+                    ErrorKind::Other,
+                );
                 return;
             }
         }
@@ -1174,9 +1184,14 @@ impl HudView {
     }
 
     /// A take ended with an error.
-    pub fn show_take_error(&mut self, error: String) {
+    pub fn show_take_error(&mut self, error: TakeError) {
         self.stats = AppStats::load();
-        self.set_error(error);
+        let kind = if error.microphone {
+            ErrorKind::Microphone
+        } else {
+            ErrorKind::Other
+        };
+        self.set_error(error.message, kind);
     }
 
     /// A take had no speech.
@@ -1241,14 +1256,24 @@ impl HudView {
     }
 
     /// Shows the errors of the start, one after the other.
-    pub fn show_startup_error(&mut self, error: String) {
-        let message = match &self.status {
+    pub fn show_startup_error(&mut self, error: String, kind: ErrorKind) {
+        let (message, kind) = match &self.status {
             HudStatus::Error {
                 message: existing, ..
-            } if !existing.is_empty() && existing != &error => format!("{existing} {error}"),
-            _ => error,
+            } if !existing.is_empty() && existing != &error => {
+                let microphone = self.recovery_is_microphone || kind == ErrorKind::Microphone;
+                (
+                    format!("{existing} {error}"),
+                    if microphone {
+                        ErrorKind::Microphone
+                    } else {
+                        ErrorKind::Other
+                    },
+                )
+            }
+            _ => (error, kind),
         };
-        self.set_error(message);
+        self.set_error(message, kind);
     }
 
     /// Moves the states that end with time: the "Copied" mark of a History
@@ -1296,8 +1321,8 @@ impl HudView {
         self.at_rest()
     }
 
-    pub fn set_error(&mut self, message: String) {
-        self.recovery_is_microphone = message.to_lowercase().contains("microphone");
+    pub fn set_error(&mut self, message: String, kind: ErrorKind) {
+        self.recovery_is_microphone = kind == ErrorKind::Microphone;
         self.recovery_message = Some(message.clone());
         self.status = HudStatus::Error {
             message,

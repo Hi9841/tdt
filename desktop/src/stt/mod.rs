@@ -5,7 +5,9 @@ pub mod models;
 pub mod segment;
 pub mod takes;
 
-pub use engine::{panic_in_engine_call, Latency, LiveAudio, LiveTranscript, StopTimes, SttEngine};
+pub use engine::{
+    panic_in_engine_call, Latency, LiveAudio, LiveTranscript, StopTimes, SttEngine, TakeError,
+};
 pub use fillers::remove_fillers;
 pub use models::{DownloadPhase, CATALOG, DEFAULT_MODEL_ID};
 

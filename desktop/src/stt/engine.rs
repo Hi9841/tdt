@@ -279,6 +279,35 @@ impl Drop for QuietRead {
     }
 }
 
+/// Why a take has no text. The text is written for the user.
+#[derive(Debug)]
+pub struct TakeError {
+    pub message: String,
+    /// The microphone failed, not the engine.
+    pub microphone: bool,
+}
+
+impl From<String> for TakeError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            microphone: false,
+        }
+    }
+}
+
+impl From<&str> for TakeError {
+    fn from(message: &str) -> Self {
+        message.to_string().into()
+    }
+}
+
+impl std::fmt::Display for TakeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
 /// Audio captured while the user is still holding the hotkey.
 pub enum LiveAudio {
     Chunk(Vec<f32>),
@@ -441,7 +470,7 @@ impl SttEngine {
     pub fn transcribe_live_reporting(
         &self,
         rx: &Receiver<LiveAudio>,
-    ) -> Result<LiveTranscript, String> {
+    ) -> Result<LiveTranscript, TakeError> {
         let _dictation = Dictation::start();
         self.prepare().map_err(|error| {
             format!("Could not load the speech model. Choose another model in Settings. {error}")
@@ -512,16 +541,17 @@ impl SttEngine {
                 Err(RecvTimeoutError::Timeout) => {
                     // A stalled producer must not hang transcription forever.
                     if last_any.elapsed() > Duration::from_secs(120) {
-                        return Err(
-                            "The microphone stopped sending audio. Check the input device and try again."
+                        return Err(TakeError {
+                            message: "The microphone stopped sending audio. Check the input device and try again."
                                 .to_string(),
-                        );
+                            microphone: true,
+                        });
                     }
                 }
                 // The pump always ends a take with `Finish`, so audio may be
                 // missing: text from a part of the take must not look whole.
                 Err(RecvTimeoutError::Disconnected) => {
-                    return Err("The recording stopped too early. Try again.".to_string());
+                    return Err("The recording stopped too early. Try again.".into());
                 }
             }
         };

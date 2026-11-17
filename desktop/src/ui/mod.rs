@@ -6,5 +6,5 @@ pub mod theme;
 pub mod tray;
 pub mod window_util;
 
-pub use hud::HudView;
+pub use hud::{ErrorKind, HudView};
 pub use tray::SystemTray;

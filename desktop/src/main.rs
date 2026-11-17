@@ -46,7 +46,7 @@ use ui::window_util::{
     ensure_overlay_topmost, find_app_hwnd, follow_current_virtual_desktop, lock_overlay_chrome,
     position_bubble_on_preferred_monitor, PANEL_HEIGHT, PANEL_WIDTH,
 };
-use ui::{HudView, SystemTray};
+use ui::{ErrorKind, HudView, SystemTray};
 use update::{CheckKind, UpdatePhase};
 use voice_stt_desktop::log;
 use voice_stt_desktop::stt::{models, EngineSlot, SttEngine};
@@ -432,7 +432,7 @@ fn main() {
                                         *rec.borrow_mut() = Some(recorder);
                                         view.microphone_ready();
                                     }
-                                    Some(Err(error)) => view.set_error(format!("Could not open the microphone. Check Windows microphone access and try again. {error}")),
+                                    Some(Err(error)) => view.set_error(format!("Could not open the microphone. Check Windows microphone access and try again. {error}"), ErrorKind::Microphone),
                                     None => {}
                                 }
                                 cx.notify();
@@ -567,7 +567,7 @@ fn main() {
                                 stop_now = is_recording_state;
                                 microphone_lost = Some(error);
                             } else {
-                                let _ = this.update(cx, |view, cx| { view.set_error(error); cx.notify(); });
+                                let _ = this.update(cx, |view, cx| { view.set_error(error, ErrorKind::Microphone); cx.notify(); });
                             }
                         }
                         let hit_limit = is_recording_state
@@ -645,7 +645,7 @@ fn main() {
                                         }
                                         if stt.get().is_none() {
                                             let _ = this.update(cx, |view, cx| {
-                                                view.set_error("Download a speech model in Settings before recording.".into());
+                                                view.set_error("Download a speech model in Settings before recording.".into(), ErrorKind::Other);
                                                 view.open_settings(cx);
                                                 cx.notify();
                                             });
@@ -669,7 +669,7 @@ fn main() {
                                                     *rec.borrow_mut() = Some(recorder);
                                                 }
                                                 Err(error) => {
-                                                    let _ = this.update(cx, |view, cx| { view.set_error(format!("Could not open the microphone. Connect a microphone and retry. {error}")); cx.notify(); });
+                                                    let _ = this.update(cx, |view, cx| { view.set_error(format!("Could not open the microphone. Connect a microphone and retry. {error}"), ErrorKind::Microphone); cx.notify(); });
                                                     continue;
                                                 }
                                             }
@@ -786,7 +786,7 @@ fn main() {
                                     is_processing_state = false;
                                     late_start = false;
                                     if let Some(error) = microphone_lost.take() {
-                                        let _ = this.update(cx, |view, cx| { view.set_error(error); cx.notify(); });
+                                        let _ = this.update(cx, |view, cx| { view.set_error(error, ErrorKind::Microphone); cx.notify(); });
                                         continue;
                                     }
                                     let _ = this.update(cx, |view, cx| {
@@ -840,11 +840,15 @@ fn main() {
                     open_panel,
                     cx,
                 );
-                for error in [config_error, microphone_error, hotkey_error]
-                    .into_iter()
-                    .flatten()
-                {
-                    view.show_startup_error(error);
+                let startup_errors = [
+                    (config_error, ErrorKind::Other),
+                    (microphone_error, ErrorKind::Microphone),
+                    (hotkey_error, ErrorKind::Other),
+                ];
+                for (error, kind) in startup_errors {
+                    if let Some(error) = error {
+                        view.show_startup_error(error, kind);
+                    }
                 }
                 view
             })

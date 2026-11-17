@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use voice_stt_desktop::log;
 use voice_stt_desktop::stt::{
-    remove_fillers, Latency, LiveAudio, LiveTranscript, StopTimes, SttEngine,
+    remove_fillers, Latency, LiveAudio, LiveTranscript, StopTimes, SttEngine, TakeError,
 };
 
 /// A take from its start until its pump has sent the last audio.
@@ -39,7 +39,7 @@ impl LiveTake {
     pub fn start(
         handle: CaptureHandle,
         engine: Option<Arc<SttEngine>>,
-        on_result: impl FnOnce(Result<LiveTranscript, String>) + Send + 'static,
+        on_result: impl FnOnce(Result<LiveTranscript, TakeError>) + Send + 'static,
     ) -> Self {
         let take = Self {
             tail: Arc::new(Mutex::new(SpeechTail::default())),
@@ -185,7 +185,7 @@ pub enum InternalEvent {
         notice: Option<String>,
         latency_ms: u64,
     },
-    TranscribeError(String),
+    TranscribeError(TakeError),
     NoSpeech,
 }
 
@@ -244,9 +244,10 @@ pub fn deliver_transcript(
         ),
         Ok(DeliveryOutcome::CopiedFallback(reason)) => (false, Some(reason.notice().to_string())),
         Err(error) => {
-            let _ = tx.send(InternalEvent::TranscribeError(format!(
-                "Could not copy text. Open History to copy the saved transcript. {error}"
-            )));
+            let _ = tx.send(InternalEvent::TranscribeError(
+                format!("Could not copy text. Open History to copy the saved transcript. {error}")
+                    .into(),
+            ));
             return;
         }
     };
