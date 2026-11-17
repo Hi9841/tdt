@@ -289,6 +289,10 @@ fn main() {
 
         let (internal_tx, internal_rx) = crossbeam_channel::unbounded::<InternalEvent>();
 
+        // The panel is open from the start for `VOICE_STT_OPEN_PANEL` and the
+        // panel previews.
+        let open_panel =
+            std::env::var_os("VOICE_STT_OPEN_PANEL").is_some() || preview::wants_panel();
         // GPUI creates the window late on a cold start, so its Win32 styles
         // are set from a thread that waits for it.
         std::thread::spawn(move || {
@@ -316,6 +320,9 @@ fn main() {
                 position_bubble_on_preferred_monitor(hwnd);
                 // Strips caption and resize handles and snaps the pill back to size.
                 lock_overlay_chrome();
+                if open_panel {
+                    ui::window_util::set_window_mode(true);
+                }
             }
             // The pill follows the user to another virtual desktop. The check
             // is a COM call into Explorer, so it runs here: a slow Explorer
@@ -830,6 +837,7 @@ fn main() {
                     stt_for_view,
                     settings_loop.clone(),
                     update_for_view,
+                    open_panel,
                     cx,
                 );
                 for error in [config_error, microphone_error, hotkey_error]

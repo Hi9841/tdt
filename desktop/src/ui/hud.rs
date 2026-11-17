@@ -480,17 +480,9 @@ impl HudView {
         stt_engine: EngineSlot,
         settings: Settings,
         update: Arc<Mutex<UpdatePhase>>,
+        open_panel: bool,
         cx: &mut Context<Self>,
     ) -> Self {
-        let open_panel =
-            std::env::var_os("VOICE_STT_OPEN_PANEL").is_some() || preview::wants_panel();
-        if open_panel {
-            std::thread::spawn(|| {
-                std::thread::sleep(Duration::from_millis(450));
-                set_window_mode(true);
-            });
-        }
-
         let config = settings.get(AppConfig::clone);
         let selected_model = models::resolve(&config.model_id).id.to_string();
         let active_model = stt_engine.is_some().then(|| selected_model.clone());
