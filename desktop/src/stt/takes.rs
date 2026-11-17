@@ -35,7 +35,7 @@ pub fn save(samples: &[f32], text: &str) -> Result<(), String> {
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |time| time.as_millis());
-    let wav = wav_bytes(samples);
+    let wav = crate::wav::encode_mono(samples, crate::SAMPLE_RATE as u32);
     let (mut text_file, base) = claim_name(&dir, stamp)
         .map_err(|e| format!("Could not write a take in {}: {e}", dir.display()))?;
     let text_path = base.with_extension("txt");
@@ -91,30 +91,4 @@ fn write_whole(path: &Path, bytes: &[u8]) -> io::Result<()> {
         let _ = std::fs::remove_file(&part);
     }
     written
-}
-
-/// A 16 kHz mono 16-bit WAV file.
-fn wav_bytes(samples: &[f32]) -> Vec<u8> {
-    let data: Vec<u8> = samples
-        .iter()
-        .flat_map(|sample| ((sample.clamp(-1.0, 1.0) * 32767.0) as i16).to_le_bytes())
-        .collect();
-    let mut wav = Vec::with_capacity(44 + data.len());
-    wav.extend_from_slice(b"RIFF");
-    wav.extend_from_slice(&(36 + data.len() as u32).to_le_bytes());
-    wav.extend_from_slice(b"WAVEfmt ");
-    // PCM, mono, 16 kHz, 32000 bytes per second, 2-byte frames, 16 bits.
-    for field in [
-        16u32.to_le_bytes(),
-        [1, 0, 1, 0],
-        16_000u32.to_le_bytes(),
-        32_000u32.to_le_bytes(),
-        [2, 0, 16, 0],
-    ] {
-        wav.extend_from_slice(&field);
-    }
-    wav.extend_from_slice(b"data");
-    wav.extend_from_slice(&(data.len() as u32).to_le_bytes());
-    wav.extend_from_slice(&data);
-    wav
 }

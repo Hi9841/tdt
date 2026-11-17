@@ -417,45 +417,7 @@ fn main() {
 /// PCM16 WAV as 16 kHz mono f32; None for any other format. Other rates go
 /// through the app's capture resampler in 10 ms packets, as from a microphone.
 fn pcm16_wav(path: &Path) -> Option<Vec<f32>> {
-    let bytes = std::fs::read(path).ok()?;
-    if bytes.len() < 44 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
-        return None;
-    }
-    let mut offset = 12usize;
-    let mut channels = 1u16;
-    let mut rate = 0u32;
-    let mut bits = 16u16;
-    let mut data: Option<&[u8]> = None;
-    while offset + 8 <= bytes.len() {
-        let id = &bytes[offset..offset + 4];
-        let size = u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().ok()?) as usize;
-        let body = offset + 8;
-        if body + size > bytes.len() {
-            break;
-        }
-        if id == b"fmt " && size >= 16 {
-            channels = u16::from_le_bytes(bytes[body + 2..body + 4].try_into().ok()?);
-            rate = u32::from_le_bytes(bytes[body + 4..body + 8].try_into().ok()?);
-            bits = u16::from_le_bytes(bytes[body + 14..body + 16].try_into().ok()?);
-        } else if id == b"data" {
-            data = Some(&bytes[body..body + size]);
-        }
-        offset = body + size + (size % 2);
-    }
-    let data = data?;
-    if bits != 16 || channels == 0 || rate == 0 {
-        return None;
-    }
-    let width = channels as usize;
-    let mut mono = Vec::with_capacity(data.len() / (2 * width));
-    for frame in data.chunks_exact(2 * width) {
-        let mut sum = 0.0f32;
-        for channel in 0..width {
-            let sample = i16::from_le_bytes([frame[channel * 2], frame[channel * 2 + 1]]);
-            sum += f32::from(sample) / f32::from(i16::MAX);
-        }
-        mono.push(sum / width as f32);
-    }
+    let (mono, rate) = voice_stt_desktop::wav::decode_mono(&std::fs::read(path).ok()?)?;
     let Some(mut resampler) = Resampler::new(rate) else {
         return Some(mono);
     };

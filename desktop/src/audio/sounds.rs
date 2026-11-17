@@ -64,7 +64,10 @@ fn wav_for(effect: SoundEffect) -> &'static [u8] {
             let sr = 22_050;
             let a = tone(659.25, 0.042, 0.10, sr);
             let b = tone(987.77, 0.070, 0.09, sr);
-            pcm_to_wav(&crossfade(&a, &b, (0.008 * sr as f32) as usize), sr)
+            voice_stt_desktop::wav::encode_mono(
+                &crossfade(&a, &b, (0.008 * sr as f32) as usize),
+                sr,
+            )
         }),
         SoundEffect::Error => ERROR_WAV.get_or_init(|| chirp_wav(220.0, 146.0, 0.090, 0.10)),
     }
@@ -72,7 +75,7 @@ fn wav_for(effect: SoundEffect) -> &'static [u8] {
 
 fn chirp_wav(f0: f32, f1: f32, dur: f32, amp: f32) -> Vec<u8> {
     let sr = 22_050u32;
-    pcm_to_wav(&chirp(f0, f1, dur, amp, sr), sr)
+    voice_stt_desktop::wav::encode_mono(&chirp(f0, f1, dur, amp, sr), sr)
 }
 
 fn chirp(f0: f32, f1: f32, dur: f32, amp: f32, sample_rate: u32) -> Vec<f32> {
@@ -120,31 +123,4 @@ fn crossfade(a: &[f32], b: &[f32], fade: usize) -> Vec<f32> {
     }
     out.extend_from_slice(&b[fade..]);
     out
-}
-
-fn pcm_to_wav(pcm: &[f32], sample_rate: u32) -> Vec<u8> {
-    let mut samples: Vec<i16> = Vec::with_capacity(pcm.len());
-    for &s in pcm {
-        samples.push((s.clamp(-1.0, 1.0) * 32767.0) as i16);
-    }
-    let data_len = (samples.len() * 2) as u32;
-    let file_len = 36 + data_len;
-    let mut wav = Vec::with_capacity(44 + samples.len() * 2);
-    wav.extend_from_slice(b"RIFF");
-    wav.extend_from_slice(&file_len.to_le_bytes());
-    wav.extend_from_slice(b"WAVE");
-    wav.extend_from_slice(b"fmt ");
-    wav.extend_from_slice(&16u32.to_le_bytes());
-    wav.extend_from_slice(&1u16.to_le_bytes());
-    wav.extend_from_slice(&1u16.to_le_bytes());
-    wav.extend_from_slice(&sample_rate.to_le_bytes());
-    wav.extend_from_slice(&(sample_rate * 2).to_le_bytes());
-    wav.extend_from_slice(&2u16.to_le_bytes());
-    wav.extend_from_slice(&16u16.to_le_bytes());
-    wav.extend_from_slice(b"data");
-    wav.extend_from_slice(&data_len.to_le_bytes());
-    for s in samples {
-        wav.extend_from_slice(&s.to_le_bytes());
-    }
-    wav
 }

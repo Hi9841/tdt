@@ -5,3 +5,4 @@ pub const SAMPLE_RATE: usize = 16_000;
 pub mod log;
 pub mod resample;
 pub mod stt;
+pub mod wav;
