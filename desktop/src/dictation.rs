@@ -212,6 +212,19 @@ enum Phase {
     Transcribing,
 }
 
+/// A take whose stream gave no audio starts again one time, with the
+/// microphone opened again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Restart {
+    None,
+    /// The silent take is gone; the next press starts it again, with no
+    /// start sound.
+    Pending,
+    /// The take started again. It does not start again a second time, and
+    /// its result says that the first words can be missing.
+    Reopened,
+}
+
 /// The press of a shortcut, a click on the pill, or the release.
 #[derive(Clone, Copy, Debug)]
 pub enum Input {
@@ -236,13 +249,7 @@ pub struct Dictation {
     limit_notice: bool,
     /// A microphone that failed during the take, for the notice after its text.
     microphone_lost: Option<String>,
-    /// A stream that gave no audio: the take starts again one time, with
-    /// the microphone opened again.
-    restart_take: bool,
-    reopened_in_take: bool,
-    late_start: bool,
-    /// The take must stop in this step.
-    stop_now: bool,
+    restart: Restart,
     engine: EngineSlot,
     injector: Arc<PasteInjector>,
     settings: Settings,
@@ -269,10 +276,7 @@ impl Dictation {
             recording_before_press: false,
             limit_notice: false,
             microphone_lost: None,
-            restart_take: false,
-            reopened_in_take: false,
-            late_start: false,
-            stop_now: false,
+            restart: Restart::None,
             engine,
             injector: Arc::new(PasteInjector::new()),
             settings,
@@ -335,8 +339,8 @@ impl Dictation {
             input.push(Input::Press);
             input.push(Input::Toggled(Instant::now()));
         }
-        self.stop_now = false;
-        self.check_stream(&mut input, &mut changes);
+        // The take must stop in this step.
+        let mut stop_now = self.check_stream(&mut input, &mut changes);
         let at_limit = self.recording() && self.take.as_ref().is_some_and(LiveTake::at_limit);
         let stop_requested = self.recording() && stop_requested();
         if self.recording() && (at_limit || stop_requested) {
@@ -346,27 +350,27 @@ impl Dictation {
                 reset_user_typed();
             }
             self.limit_notice = at_limit;
-            self.stop_now = true;
+            stop_now = true;
         }
         if !self.frozen {
             for input in input {
                 match input {
-                    Input::Press => self.press(&mut changes),
-                    Input::HoldReleased(asked) => self.release(asked, true),
-                    Input::Toggled(asked) => self.release(asked, false),
+                    Input::Press => self.press(&mut changes, &mut stop_now),
+                    Input::HoldReleased(asked) => self.release(asked, true, &mut stop_now),
+                    Input::Toggled(asked) => self.release(asked, false, &mut stop_now),
                 }
             }
         }
         if self.recording() && self.take.as_ref().is_some_and(LiveTake::must_stop_now) {
-            self.stop_now = true;
+            stop_now = true;
         }
         if self.recording() && self.take.as_ref().is_some_and(LiveTake::is_done) {
             if self.take.as_ref().is_some_and(LiveTake::at_limit) {
                 self.limit_notice = true;
             }
-            self.stop_now = true;
+            stop_now = true;
         }
-        if self.stop_now && self.recording() {
+        if stop_now && self.recording() {
             if let Some(take) = self.take.as_mut() {
                 take.halt();
             }
@@ -386,8 +390,9 @@ impl Dictation {
         changes
     }
 
-    /// A stream error, or a stream that stopped during the take.
-    fn check_stream(&mut self, input: &mut Vec<Input>, changes: &mut Vec<ViewChange>) {
+    /// A stream error, or a stream that stopped during the take. Returns
+    /// true when the take must stop.
+    fn check_stream(&mut self, input: &mut Vec<Input>, changes: &mut Vec<ViewChange>) -> bool {
         let recording = self.recording();
         let Some(error) = self.recorder.as_ref().and_then(|recorder| {
             recorder.take_error().or_else(|| {
@@ -396,7 +401,7 @@ impl Dictation {
                 })
             })
         }) else {
-            return;
+            return false;
         };
         let silent = self
             .recorder
@@ -405,7 +410,7 @@ impl Dictation {
         let held = self.take.as_ref().is_some_and(LiveTake::is_held);
         // The next press opens the microphone again.
         self.recorder = None;
-        if recording && silent && held && !self.reopened_in_take {
+        if recording && silent && held && self.restart == Restart::None {
             // The stream gave no audio in this take, as it can after the PC
             // wakes. The user still talks, so open the microphone again in
             // this press.
@@ -416,21 +421,21 @@ impl Dictation {
                 take.discard();
             }
             self.phase = Phase::Idle;
-            self.reopened_in_take = true;
-            self.restart_take = true;
-            self.late_start = true;
+            self.restart = Restart::Pending;
             input.insert(0, Input::Press);
+            false
         } else if self.is_busy() {
             // The audio before the failure is already with the engine:
             // finish the take, then say why it ended.
-            self.stop_now = recording;
             self.microphone_lost = Some(error);
+            recording
         } else {
             changes.push(ViewChange::Error(error, ErrorKind::Microphone));
+            false
         }
     }
 
-    fn press(&mut self, changes: &mut Vec<ViewChange>) {
+    fn press(&mut self, changes: &mut Vec<ViewChange>, stop_now: &mut bool) {
         // Snapshot the before-press state; it is cleared on every release,
         // so a swallowed press can never stop a take it did not start.
         self.recording_before_press = self.recording();
@@ -438,8 +443,8 @@ impl Dictation {
         // started. The stop starts when the key goes down. At the key-up,
         // the click of the key is in the audio, and the microphone stays open
         // until that sound ends (about 300 ms).
-        if self.recording() && !self.stop_now {
-            self.stop_now =
+        if self.recording() && !*stop_now {
+            *stop_now =
                 LiveTake::begin_stop(&mut self.take, Instant::now(), Some(current_binding().vk));
         }
         // One take at a time: the recorder and the engine have one session.
@@ -447,11 +452,12 @@ impl Dictation {
         if self.is_busy() || pump_busy {
             return;
         }
-        let restarted = std::mem::take(&mut self.restart_take);
-        if !restarted {
-            self.reopened_in_take = false;
-            self.late_start = false;
-        }
+        let restarted = self.restart == Restart::Pending;
+        self.restart = if restarted {
+            Restart::Reopened
+        } else {
+            Restart::None
+        };
         if self.engine.get().is_none() {
             changes.push(ViewChange::NeedModel);
             return;
@@ -517,11 +523,11 @@ impl Dictation {
     }
 
     /// A hold always stops; a tap only stops a take that it did not start.
-    fn release(&mut self, asked: Instant, hold: bool) {
+    fn release(&mut self, asked: Instant, hold: bool, stop_now: &mut bool) {
         let should_stop = hold || self.recording_before_press;
         self.recording_before_press = false;
-        if should_stop && self.recording() && !self.stop_now {
-            self.stop_now = LiveTake::begin_stop(&mut self.take, asked, None);
+        if should_stop && self.recording() && !*stop_now {
+            *stop_now = LiveTake::begin_stop(&mut self.take, asked, None);
         }
     }
 
@@ -535,7 +541,7 @@ impl Dictation {
                     notice,
                     latency_ms,
                 } => {
-                    self.end_transcribing();
+                    let late_start = self.end_take();
                     play_sound(SoundEffect::Success);
                     let notice = notice
                         .map(|notice| (notice, ErrorKind::Other))
@@ -544,7 +550,7 @@ impl Dictation {
                             .take()
                             .map(|lost| (lost, ErrorKind::Microphone)))
                         .or_else(|| {
-                            std::mem::take(&mut self.late_start).then(|| {
+                            late_start.then(|| {
                                 (
                                     "The microphone started late, so the first words can be missing."
                                         .to_string(),
@@ -561,19 +567,12 @@ impl Dictation {
                 }
                 InternalEvent::TranscribeError(error) => {
                     self.microphone_lost = None;
-                    self.late_start = false;
-                    if self.recording() {
-                        if let Some(take) = self.take.as_mut() {
-                            take.halt();
-                        }
-                    }
-                    self.phase = Phase::Idle;
+                    self.end_take();
                     play_sound(SoundEffect::Error);
                     changes.push(ViewChange::TakeError(error));
                 }
                 InternalEvent::NoSpeech => {
-                    self.end_transcribing();
-                    self.late_start = false;
+                    self.end_take();
                     if let Some(error) = self.microphone_lost.take() {
                         changes.push(ViewChange::Error(error, ErrorKind::Microphone));
                         continue;
@@ -584,12 +583,21 @@ impl Dictation {
         }
     }
 
-    /// The text came. A take that still records (its pump has not said that
-    /// it is done) stays in `Recording` and ends in the next step.
-    fn end_transcribing(&mut self) {
-        if self.phase == Phase::Transcribing {
-            self.phase = Phase::Idle;
+    /// The engine gave the result of the take, so the take is over, also
+    /// when the loop has not seen the end of its pump yet. Returns true when
+    /// the take started again late (`Restart::Reopened`).
+    fn end_take(&mut self) -> bool {
+        if self.recording() {
+            if let Some(take) = self.take.as_mut() {
+                take.halt();
+            }
         }
+        self.phase = Phase::Idle;
+        let late_start = self.restart == Restart::Reopened;
+        if late_start {
+            self.restart = Restart::None;
+        }
+        late_start
     }
 }
 
