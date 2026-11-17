@@ -25,6 +25,7 @@ from pathlib import Path
 from whisper_normalizer.english import EnglishTextNormalizer
 
 DESKTOP = Path(__file__).resolve().parents[1]
+# The clip line of `print_clip` in src/bin/bench_asr.rs: change both together.
 LINE = re.compile(r'^\[([\d.]+)s\] (\S+)\.wav -> ([\d.]+) ms[^:]*: "(.*)"$')
 FLAGS = {"native": ["--native"], "app": []}
 BUDGET = json.loads((DESKTOP / "bench" / "engine-budget.json").read_text(encoding="utf-8"))

@@ -240,23 +240,15 @@ fn bench_model(spec: &ModelSpec, clips: &[Clip], options: &Options) {
                     latencies.push(latency_ms);
                     let windows = res.duration_secs * SAMPLE_RATE as f32 > WINDOW_SAMPLES as f32;
                     whole_runs += usize::from(windows && res.last_part_secs >= res.duration_secs);
-                    let mut wer_note = String::new();
+                    let mut note = String::new();
                     if let Some(reference) = &clip.reference {
-                        format_errors += word_errors(&raw_words(reference), &raw_words(&res.text));
-                        let reference = normalize_words(reference);
-                        let clip_errors = word_errors(&reference, &normalize_words(&res.text));
-                        errors += clip_errors;
-                        reference_words += reference.len();
-                        wer_note = format!(" {clip_errors}/{} errors", reference.len());
+                        let (e, f, w) = score(reference, &res.text);
+                        errors += e;
+                        format_errors += f;
+                        reference_words += w;
+                        note = format!(" {e}/{w} errors");
                     }
-                    println!(
-                        "[{:.2}s] {} -> {} ms{}: {:?}",
-                        clip.duration_secs,
-                        clip.name,
-                        latency_ms,
-                        wer_note,
-                        res.text.trim()
-                    );
+                    print_clip(clip, latency_ms, &note, res.text.trim());
                 }
                 Err(e) => println!("[{:.2}s] {} -> Error: {e}", clip.duration_secs, clip.name),
             }
@@ -277,6 +269,15 @@ fn bench_model(spec: &ModelSpec, clips: &[Clip], options: &Options) {
     }
 
     engine.release();
+}
+
+/// One line for each clip. `bench/accuracy.py` and `bench/terms.py` read
+/// this format (`LINE` in `accuracy.py`): change both together.
+fn print_clip(clip: &Clip, ms: impl std::fmt::Display, note: &str, text: &str) {
+    println!(
+        "[{:.2}s] {} -> {ms} ms{note}: {text:?}",
+        clip.duration_secs, clip.name
+    );
 }
 
 /// Scores one transcript; returns (word errors, format errors, reference words).
@@ -374,12 +375,8 @@ fn whole_clips(
                 words += w;
                 note = format!(" {e}/{w} errors");
             }
-            println!(
-                "[{:.2}s] {} -> {:.1} ms{note}: {text:?}",
-                clip.duration_secs,
-                clip.name,
-                elapsed.as_secs_f64() * 1e3
-            );
+            let ms = format!("{:.1}", elapsed.as_secs_f64() * 1e3);
+            print_clip(clip, ms, &note, &text);
         }
         latencies.sort_unstable();
         let total: u64 = latencies.iter().sum();
