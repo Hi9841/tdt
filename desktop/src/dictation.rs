@@ -22,7 +22,7 @@ use voice_stt_desktop::stt::{
 };
 
 /// A take from its start until its pump has sent the last audio.
-pub struct LiveTake {
+struct LiveTake {
     tail: Arc<Mutex<SpeechTail>>,
     release: Arc<AtomicBool>,
     halt: Arc<AtomicBool>,
@@ -40,7 +40,7 @@ impl LiveTake {
     /// Starts the pump of `handle`, and the engine thread when there is an
     /// engine. `on_result` gets the text or the error of the engine, unless
     /// the take was discarded.
-    pub fn start(
+    fn start(
         handle: CaptureHandle,
         engine: Option<Arc<SttEngine>>,
         on_result: impl FnOnce(Result<LiveTranscript, TakeError>) + Send + 'static,
@@ -112,7 +112,7 @@ impl LiveTake {
     /// last word ends. `shortcut` is the shortcut key when it is down now (a
     /// stop at the key-down): it is not a key that the user types. Returns
     /// true when the take must stop at once.
-    pub fn begin_stop(take: &mut Option<Self>, asked: Instant, shortcut: Option<u16>) -> bool {
+    fn begin_stop(take: &mut Option<Self>, asked: Instant, shortcut: Option<u16>) -> bool {
         if take.as_ref().is_some_and(|live| live.baseline.is_some()) {
             return false;
         }
@@ -139,7 +139,7 @@ impl LiveTake {
     /// True when the end of the take must not wait for the tail: a key went
     /// down after the end started, or the tail ran for `MAX_TAIL` of wall
     /// time (the sample time stops when the capture callback stalls).
-    pub fn must_stop_now(&self) -> bool {
+    fn must_stop_now(&self) -> bool {
         if let Some(vk) = self.baseline.as_ref().and_then(input_appeared) {
             note_user_typed(vk);
             return true;
@@ -148,31 +148,31 @@ impl LiveTake {
     }
 
     /// Stops the recording now. The audio so far still goes to the engine.
-    pub fn halt(&mut self) {
+    fn halt(&mut self) {
         self.halt.store(true, Ordering::SeqCst);
         self.handle.wake();
         self.baseline = None;
     }
 
     /// Stops the take, and drops its text and its errors.
-    pub fn discard(mut self) {
+    fn discard(mut self) {
         self.discard.store(true, Ordering::SeqCst);
         self.halt();
     }
 
     /// The user still holds or records: the end of the take has not started,
     /// and the pump runs.
-    pub fn is_held(&self) -> bool {
+    fn is_held(&self) -> bool {
         !self.release.load(Ordering::SeqCst) && !self.done.load(Ordering::SeqCst)
     }
 
     /// The pump has sent the last audio.
-    pub fn is_done(&self) -> bool {
+    fn is_done(&self) -> bool {
         self.done.load(Ordering::SeqCst)
     }
 
     /// The take reached the take limit. The pump stops there.
-    pub fn at_limit(&self) -> bool {
+    fn at_limit(&self) -> bool {
         self.handle.limit_reached()
     }
 }
@@ -600,7 +600,7 @@ impl Dictation {
 }
 
 /// What the engine thread of a take tells the UI loop.
-pub enum InternalEvent {
+enum InternalEvent {
     TranscribeSuccess {
         text: String,
         auto_pasted: bool,
@@ -611,7 +611,7 @@ pub enum InternalEvent {
     NoSpeech,
 }
 
-pub fn deliver_transcript(
+fn deliver_transcript(
     mut result: LiveTranscript,
     injector: Arc<PasteInjector>,
     tx: crossbeam_channel::Sender<InternalEvent>,
