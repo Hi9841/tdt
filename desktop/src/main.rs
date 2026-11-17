@@ -5,6 +5,7 @@ compile_error!("TDT desktop is a Windows-only build.");
 
 mod audio;
 mod autostart;
+mod clock;
 mod config;
 mod dictation;
 mod hotkey;

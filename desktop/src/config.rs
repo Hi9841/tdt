@@ -235,7 +235,7 @@ impl AppStats {
         self.total_transcriptions += 1;
         self.last_latency_ms = latency_ms;
 
-        let time_str = local_hms();
+        let time_str = crate::clock::local_hms();
 
         self.history.insert(
             0,
@@ -266,13 +266,4 @@ impl AppStats {
     pub fn save(&self) -> Result<(), std::io::Error> {
         write_json_atomic(&Self::stats_path(), self)
     }
-}
-
-pub(crate) fn local_hms() -> String {
-    // SAFETY: GetLocalTime takes no pointer and returns the time by value.
-    let time = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
-    format!(
-        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-        time.wYear, time.wMonth, time.wDay, time.wHour, time.wMinute, time.wSecond
-    )
 }

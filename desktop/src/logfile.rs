@@ -37,6 +37,6 @@ pub fn append(message: &str) {
                 }
             }
         }
-        let _ = writeln!(file, "{} {message}", crate::config::local_hms());
+        let _ = writeln!(file, "{} {message}", crate::clock::local_hms());
     }
 }
