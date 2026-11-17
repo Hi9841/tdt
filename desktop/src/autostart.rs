@@ -63,9 +63,7 @@ pub fn is_enabled() -> bool {
 }
 
 fn legacy_enabled() -> bool {
-    let shortcut = shortcut_path();
-    if !shortcut.as_os_str().is_empty()
-        && shortcut.exists()
+    if shortcut_path().is_some_and(|shortcut| shortcut.exists())
         && !is_approved_disabled(APPROVED_FOLDER, SHORTCUT_NAME)
     {
         return true;
@@ -143,24 +141,23 @@ fn enable_legacy(exe: &Path) -> Result<(), String> {
     let lnk = shortcut_path();
     // A claimed-successful write that left no file must fall back to the Run
     // key, not silently report enabled.
-    let shortcut_result = if lnk.as_os_str().is_empty() {
-        Err("Could not find the Startup folder.".into())
-    } else {
-        write_shortcut(exe, &lnk).and_then(|_| {
+    let shortcut_result = match &lnk {
+        None => Err("Could not find the Startup folder.".into()),
+        Some(lnk) => write_shortcut(exe, lnk).and_then(|_| {
             if lnk.is_file() {
                 Ok(())
             } else {
                 Err("The Startup shortcut was not written.".into())
             }
-        })
+        }),
     };
     match shortcut_result {
         Ok(()) => {
             let _ = delete_value(RUN_SUBKEY, VALUE_NAME);
             let _ = delete_value(APPROVED_RUN, VALUE_NAME);
             if let Err(error) = write_approved(APPROVED_FOLDER, SHORTCUT_NAME) {
-                if !lnk.as_os_str().is_empty() {
-                    let _ = remove_shortcut(&lnk);
+                if let Some(lnk) = &lnk {
+                    let _ = remove_shortcut(lnk);
                 }
                 return Err(error);
             }
@@ -168,8 +165,8 @@ fn enable_legacy(exe: &Path) -> Result<(), String> {
         }
         Err(shortcut_error) => {
             // Never both: a stale .lnk beside the Run key launches TDT twice.
-            if !lnk.as_os_str().is_empty() {
-                let _ = remove_shortcut(&lnk);
+            if let Some(lnk) = &lnk {
+                let _ = remove_shortcut(lnk);
             }
             match write_run_key(exe) {
                 Ok(()) => {
@@ -184,8 +181,7 @@ fn enable_legacy(exe: &Path) -> Result<(), String> {
 
 fn remove_legacy() -> Result<(), String> {
     let mut errors = Vec::new();
-    let shortcut = shortcut_path();
-    if !shortcut.as_os_str().is_empty() {
+    if let Some(shortcut) = shortcut_path() {
         if let Err(error) = remove_shortcut(&shortcut) {
             errors.push(error);
         }
@@ -375,30 +371,25 @@ fn win32_launch_path(path: &Path) -> PathBuf {
     }
 }
 
-fn shortcut_path() -> PathBuf {
-    let folder = startup_folder();
-    if folder.as_os_str().is_empty() {
-        return PathBuf::new();
-    }
-    folder.join(SHORTCUT_NAME)
+/// `None` when Windows names no Startup folder.
+fn shortcut_path() -> Option<PathBuf> {
+    startup_folder().map(|folder| folder.join(SHORTCUT_NAME))
 }
 
-fn startup_folder() -> PathBuf {
-    // SHGetKnownFolderPath is the canonical answer and follows profile
-    // redirection; APPDATA is only a fallback. No "." fallback — it would
-    // drop the .lnk beside the exe where Explorer never reads it.
-    if let Some(folder) = known_startup_folder() {
-        return folder;
-    }
-    if let Some(appdata) = std::env::var_os("APPDATA") {
-        return PathBuf::from(appdata)
-            .join("Microsoft")
-            .join("Windows")
-            .join("Start Menu")
-            .join("Programs")
-            .join("Startup");
-    }
-    PathBuf::new()
+fn startup_folder() -> Option<PathBuf> {
+    // SHGetKnownFolderPath follows profile redirection; APPDATA is only a
+    // fallback. No "." fallback: it would drop the .lnk beside the exe, where
+    // Explorer never reads it.
+    known_startup_folder().or_else(|| {
+        std::env::var_os("APPDATA").map(|appdata| {
+            PathBuf::from(appdata)
+                .join("Microsoft")
+                .join("Windows")
+                .join("Start Menu")
+                .join("Programs")
+                .join("Startup")
+        })
+    })
 }
 
 fn known_startup_folder() -> Option<PathBuf> {
