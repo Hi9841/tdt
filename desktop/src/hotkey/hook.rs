@@ -20,11 +20,11 @@ pub enum HotkeyAction {
 }
 
 /// A press longer than this records until release instead of toggling.
-pub const HOLD_THRESHOLD: Duration = Duration::from_millis(350);
+const HOLD_THRESHOLD: Duration = Duration::from_millis(350);
 
 /// A rebind request that is left unanswered stops listening for keys after
 /// this long, so a forgotten capture cannot swallow the keyboard.
-pub const CAPTURE_TIMEOUT: Duration = Duration::from_secs(6);
+const CAPTURE_TIMEOUT: Duration = Duration::from_secs(6);
 
 /// Virtual-key codes of the side mouse buttons (XBUTTON1 and XBUTTON2).
 const VK_MOUSE4: u16 = 0x05;
@@ -258,7 +258,7 @@ pub fn user_typed() -> Option<u16> {
 }
 
 /// Mouse buttons are 0x01 through 0x06. The shortcut key and modifiers are not typing.
-pub fn note_physical_key(vk: u16, binding_vk: u16) {
+fn note_physical_key(vk: u16, binding_vk: u16) {
     if vk > 0x06 && !crate::keys::is_modifier(vk) && vk != binding_vk {
         note_user_typed(vk);
     }

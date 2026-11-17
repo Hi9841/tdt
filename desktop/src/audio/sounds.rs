@@ -15,8 +15,7 @@ static SUCCESS_WAV: OnceLock<Vec<u8>> = OnceLock::new();
 static ERROR_WAV: OnceLock<Vec<u8>> = OnceLock::new();
 
 impl SoundEffect {
-    /// Every cue. The prewarm test matches each one, so a new cue fails the build
-    /// until it is listed here and synthesized in `wav_for`.
+    /// Every cue, for `prewarm`.
     const ALL: [SoundEffect; 4] = [
         SoundEffect::StartListening,
         SoundEffect::StopListening,

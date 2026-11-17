@@ -225,8 +225,7 @@ fn main() {
             log::note(&format!("Could not save the default settings: {error}"));
         }
     }
-    // Persist the exact resolved internal model id so app restarts reopen the
-    // same STT backend (and migrate retired ids forward).
+    // A retired model id moves to the model that replaces it, also in the file.
     let resolved_id = models::resolve(&config.model_id).id.to_string();
     if !preview::is_active() && resolved_id != config.model_id {
         config.model_id = resolved_id;
@@ -276,7 +275,6 @@ fn main() {
     };
     let recorder = Rc::new(RefCell::new(recorder));
 
-    // 2. Initialize STT Engine
     let model_spec = models::resolve(&config.model_id);
     let stt_engine = EngineSlot::default();
     stt_engine.set(
@@ -309,10 +307,9 @@ fn main() {
         }
     }
 
-    // 3. Initialize paste injector
     let injector = Arc::new(PasteInjector::new());
 
-    // 4. Initialize hotkey hook. A failed install must not look like a working shortcut.
+    // A failed install must not look like a working shortcut.
     let _hotkey_guard;
     let hotkey_rx;
     let hotkey_error;
@@ -341,7 +338,6 @@ fn main() {
         }
     };
 
-    // 5. Launch GPUI application with floating bubble window.
     // Ely's components read fonts and colors registered by init.
     let app = gpui_platform::application().with_assets(Assets);
     let recorder_clone = Rc::clone(&recorder);
@@ -406,13 +402,14 @@ fn main() {
         let update_for_boot = Arc::clone(&update_state);
         let update_for_loop = Arc::clone(&update_state);
 
-        // Store foreground window HWND so auto-paste always restores focus to user target app
+        // The window that had the focus when the take started gets its text.
         let target_hwnd_state = Arc::new(Mutex::new(None::<isize>));
         let target_hwnd_loop = Arc::clone(&target_hwnd_state);
 
         let (internal_tx, internal_rx) = crossbeam_channel::unbounded::<InternalEvent>();
 
-        // Background thread to apply Win32 WS_EX_TOPMOST & WS_EX_NOACTIVATE & WS_EX_TOOLWINDOW
+        // GPUI creates the window late on a cold start, so its Win32 styles
+        // are set from a thread that waits for it.
         std::thread::spawn(move || {
             let mut overlay = None;
             for _ in 0..60 {
@@ -472,7 +469,6 @@ fn main() {
                 let target_hwnd = Arc::clone(&target_hwnd_loop);
                 let update_phase = Arc::clone(&update_for_loop);
 
-                // Spawn UI coordination loop running on GPUI executor
                 cx.spawn(async move |this, cx| {
                     let mut is_recording_state = false;
                     let mut is_processing_state = false;
@@ -555,8 +551,7 @@ fn main() {
                             });
                         }
 
-                        // 1. Process Menu Events from tray. Drain every queued
-                        // event so quick tray clicks are never dropped.
+                        // Every queued event, so quick tray clicks are never dropped.
                         let mut quitting = false;
                         while let Ok(event) = menu_rx.try_recv() {
                             if let Some(ref tray) = tray {
@@ -630,7 +625,6 @@ fn main() {
                             }
                         }
 
-                        // 2. Process Hotkey Events
                         let mut actions: Vec<_> = woke
                             .into_iter()
                             .chain(std::iter::from_fn(|| hotkey_rx.as_ref()?.try_recv().ok()))
@@ -869,7 +863,6 @@ fn main() {
                             });
                         }
 
-                        // 3. Process background transcription results
                         while let Ok(event) = internal_rx.try_recv() {
                             match event {
                                 InternalEvent::TranscribeSuccess { text, auto_pasted, notice, latency_ms } => {
@@ -917,7 +910,6 @@ fn main() {
                             }
                         }
 
-                        // 4. Animation frame & audio level updates
                         // Fully idle means no recording and no transcription:
                         // park the microphone until the next press.
                         if !is_recording_state && !is_processing_state {

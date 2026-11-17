@@ -219,8 +219,7 @@ impl AppStats {
         }
     }
 
-    /// Update the running totals in memory. Callers decide when to persist, so
-    /// this stays pure and testable.
+    /// Adds a take to the totals and to History, in memory.
     pub fn record(&mut self, text: &str, duration_secs: f32, latency_ms: u64) {
         let words = text.split_whitespace().count();
         self.total_words += words;
