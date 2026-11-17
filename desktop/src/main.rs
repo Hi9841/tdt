@@ -79,7 +79,7 @@ fn deliver_transcript(
         result.text = remove_fillers(&result.text);
     }
     let mut steps = DeliverySteps::default();
-    let delivered = injector.apply_final(
+    let delivered = injector.deliver(
         &result.text,
         should_paste,
         target,
@@ -146,7 +146,7 @@ fn log_delivery(
         Ok(DeliveryOutcome::CopiedFallback(reason)) => format!("copied, not typed: {reason}"),
         Err(error) => format!("not copied: {error}"),
     };
-    let app = target.filter(|&raw| raw != 0).map_or_else(
+    let app = target.map_or_else(
         || "no window".to_string(),
         |raw| paste::Target::of(raw).to_string(),
     );

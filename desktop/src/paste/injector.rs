@@ -4,11 +4,8 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// Longest we will wait for a restored window to become able to accept text.
-///
-/// This replaces a fixed sleep that every dictation paid whether or not the
-/// window was already ready, so it is the ceiling, not the common case. An
-/// app that never reports input focus waits exactly as long as it used to.
+/// The longest wait for a restored window to accept text. An app that never
+/// reports an input focus waits this long.
 const INPUT_READY_BUDGET: Duration = Duration::from_millis(60);
 /// Granularity of the readiness poll. Small enough that a late-ready window is
 /// still caught early, large enough not to spin.
@@ -133,31 +130,6 @@ fn wait_for_input_focus(hwnd: windows::Win32::Foundation::HWND) {
     }
 }
 
-fn deliver_with(
-    text: &str,
-    should_paste: bool,
-    copy: impl FnOnce(&str) -> Result<(), String>,
-    insert: impl FnOnce(&str) -> Result<(), NotTyped>,
-) -> Result<DeliveryOutcome, String> {
-    if text.trim().is_empty() {
-        return Ok(DeliveryOutcome::NoSpeech);
-    }
-    if !should_paste {
-        copy(text)?;
-        return Ok(DeliveryOutcome::Copied);
-    }
-    // The app gets the text first. A clipboard manager can hold the copy for
-    // a time, and the user does not wait for the clipboard.
-    let typed = insert(text);
-    let copied = copy(text);
-    match (typed, copied) {
-        (Ok(()), Ok(())) => Ok(DeliveryOutcome::Pasted),
-        (Ok(()), Err(error)) => Ok(DeliveryOutcome::PastedNotCopied(error)),
-        (Err(reason), Ok(())) => Ok(DeliveryOutcome::CopiedFallback(reason)),
-        (Err(_), Err(error)) => Err(error),
-    }
-}
-
 #[derive(Clone)]
 pub struct PasteInjector {
     clipboard: Arc<Mutex<Option<Clipboard>>>,
@@ -187,7 +159,8 @@ impl PasteInjector {
                     Ok(_) => return Ok(()),
                     Err(e) => {
                         last_err = format!("Clipboard error: {e}");
-                        *guard = None; // Reset clipboard handle and retry
+                        // Another app can hold the clipboard for a moment.
+                        *guard = None;
                     }
                 }
             } else {
@@ -199,137 +172,105 @@ impl PasteInjector {
         Err(last_err)
     }
 
+    /// Puts the final transcript on the clipboard, and types it into
+    /// `target_hwnd` when auto-paste is on. `user_typed` keeps TDT from typing
+    /// over keys that the user pressed while the transcript was finishing.
     pub fn deliver(
         &self,
         text: &str,
         should_paste: bool,
         target_hwnd: Option<isize>,
-        steps: &mut DeliverySteps,
-    ) -> Result<DeliveryOutcome, String> {
-        let DeliverySteps {
-            copy,
-            focus,
-            typing,
-            typed_at,
-        } = steps;
-        deliver_with(
-            text,
-            should_paste,
-            |text| {
-                let started = Instant::now();
-                let copied = self.copy_to_clipboard(text);
-                *copy = started.elapsed();
-                copied
-            },
-            |text| {
-                let typed = self.insert_text(text, target_hwnd, focus, typing);
-                if typed.is_ok() {
-                    *typed_at = Some(Instant::now());
-                }
-                typed
-            },
-        )
-    }
-
-    /// Apply the final transcript: copy it, and type it when auto-paste is on.
-    /// `user_typed` keeps us from typing over keys the user pressed while the
-    /// transcript was finishing.
-    pub fn apply_final(
-        &self,
-        final_text: &str,
-        should_paste: bool,
-        target_hwnd: Option<isize>,
         user_typed: bool,
         steps: &mut DeliverySteps,
     ) -> Result<DeliveryOutcome, String> {
-        if final_text.trim().is_empty() {
+        if text.trim().is_empty() {
             return Ok(DeliveryOutcome::NoSpeech);
         }
         if user_typed {
-            self.copy_to_clipboard(final_text.trim())?;
+            self.copy_to_clipboard(text.trim())?;
             return Ok(DeliveryOutcome::CopiedFallback(NotTyped::UserTyped));
         }
-        self.deliver(final_text, should_paste, target_hwnd, steps)
+        if !should_paste {
+            self.copy_timed(text, steps)?;
+            return Ok(DeliveryOutcome::Copied);
+        }
+        // The app gets the text first. A clipboard manager can hold the copy for
+        // a time, and the user does not wait for the clipboard.
+        let typed = self.insert_text(text, target_hwnd, steps);
+        let copied = self.copy_timed(text, steps);
+        match (typed, copied) {
+            (Ok(()), Ok(())) => Ok(DeliveryOutcome::Pasted),
+            (Ok(()), Err(error)) => Ok(DeliveryOutcome::PastedNotCopied(error)),
+            (Err(reason), Ok(())) => Ok(DeliveryOutcome::CopiedFallback(reason)),
+            (Err(_), Err(error)) => Err(error),
+        }
+    }
+
+    fn copy_timed(&self, text: &str, steps: &mut DeliverySteps) -> Result<(), String> {
+        let started = Instant::now();
+        let copied = self.copy_to_clipboard(text);
+        steps.copy = started.elapsed();
+        copied
     }
 
     fn insert_text(
         &self,
         text: &str,
         target_hwnd: Option<isize>,
-        focus: &mut Duration,
-        typing: &mut Duration,
+        steps: &mut DeliverySteps,
     ) -> Result<(), NotTyped> {
         let started = Instant::now();
         let prepared = self.prepare_target(target_hwnd);
-        *focus = started.elapsed();
+        steps.focus = started.elapsed();
         prepared?;
         let started = Instant::now();
-        let typed = self.type_prepared(text);
-        *typing = started.elapsed();
+        // Unicode key events, not Ctrl+V: some apps paste a synthetic Ctrl+V
+        // as an image, even when the clipboard holds text.
+        let typed = type_text_windows(text).map_err(NotTyped::Partial);
+        steps.typing = started.elapsed();
+        if typed.is_ok() {
+            steps.typed_at = Some(Instant::now());
+        }
         typed
     }
 
+    /// Brings the window of the dictation back to the front.
     fn prepare_target(&self, target_hwnd: Option<isize>) -> Result<(), NotTyped> {
-        if target_hwnd.is_none_or(|handle| handle == 0) {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            BringWindowToTop, GetForegroundWindow, SetForegroundWindow,
+        };
+        let Some(raw) = target_hwnd else {
             return Err(NotTyped::NoFocus("no target window"));
+        };
+        // Windows would drop the keys and report success, so do not
+        // claim a paste that cannot happen.
+        if super::Target::of(raw).blocks_input() {
+            return Err(NotTyped::Elevated);
         }
-
-        // Bring the original target back to the foreground.
-        if let Some(raw) = target_hwnd {
-            if raw != 0 {
-                use windows::Win32::Foundation::HWND;
-                use windows::Win32::UI::WindowsAndMessaging::{
-                    BringWindowToTop, GetForegroundWindow, SetForegroundWindow,
-                };
-                // Windows would drop the keys and report success, so do not
-                // claim a paste that cannot happen.
-                if super::Target::of(raw).blocks_input() {
-                    return Err(NotTyped::Elevated);
-                }
-                // SAFETY: foreground calls on the caller's target handle; a stale handle makes a call fail, not misbehave.
-                unsafe {
-                    let hwnd = HWND(raw as _);
-                    // SetForegroundWindow is frequently denied to background
-                    // apps; the retry loop below is the real check. A denial
-                    // here just means focus arrives via the loop or not at all.
-                    let foreground_allowed = SetForegroundWindow(hwnd).as_bool();
-                    let _ = BringWindowToTop(hwnd);
-
-                    let mut focused = false;
-                    for _ in 0..8 {
-                        if GetForegroundWindow() == hwnd {
-                            focused = true;
-                            break;
-                        }
-                        thread::sleep(Duration::from_millis(15));
-                    }
-                    if !focused {
-                        return Err(NotTyped::NoFocus(if foreground_allowed {
-                            "the window did not come to the front"
-                        } else {
-                            "Windows refused the focus"
-                        }));
-                    }
-
-                    // Wait for the window to be able to accept text, rather
-                    // than sleeping a fixed 60 ms on every dictation. A window
-                    // that is already live costs nothing; one that never
-                    // becomes live still costs no more than it used to. The
-                    // `focus` time of the delivery line in the log holds this wait.
-                    wait_for_input_focus(hwnd);
-                }
+        let hwnd = HWND(raw as _);
+        // SAFETY: foreground calls on the caller's target handle; a stale handle makes a call fail, not misbehave.
+        let foreground_allowed = unsafe {
+            // SetForegroundWindow is frequently denied to background
+            // apps; the loop below is the real check.
+            let allowed = SetForegroundWindow(hwnd).as_bool();
+            let _ = BringWindowToTop(hwnd);
+            allowed
+        };
+        for _ in 0..8 {
+            // SAFETY: GetForegroundWindow takes no arguments.
+            if unsafe { GetForegroundWindow() } == hwnd {
+                // The `focus` time of the delivery line in the log holds this wait.
+                wait_for_input_focus(hwnd);
+                return Ok(());
             }
+            thread::sleep(Duration::from_millis(15));
         }
-
-        Ok(())
-    }
-
-    fn type_prepared(&self, text: &str) -> Result<(), NotTyped> {
-        // Inject Unicode text directly. A synthetic Ctrl+V is interpreted as an image
-        // paste by some apps, even when CF_UNICODETEXT is present.
-        type_text_windows(text).map_err(NotTyped::Partial)?;
-
-        Ok(())
+        Err(NotTyped::NoFocus(if foreground_allowed {
+            "the window did not come to the front"
+        } else {
+            "Windows refused the focus"
+        }))
     }
 }
 
