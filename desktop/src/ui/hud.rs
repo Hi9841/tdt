@@ -481,8 +481,9 @@ pub struct HudView {
     model_ready_tx: crossbeam_channel::Sender<Result<PreparedModel, String>>,
     model_ready_rx: crossbeam_channel::Receiver<Result<PreparedModel, String>>,
     preview_ready: Option<bool>,
-    /// The preview captures: a frozen clock (`age`).
-    frozen: bool,
+    /// The preview captures (`ui::preview`): a frozen clock (`age`), and
+    /// no side effects outside the view.
+    preview: bool,
     root_focus: FocusHandle,
     panel_focus: FocusHandle,
     panel_needs_focus: bool,
@@ -495,6 +496,7 @@ impl HudView {
         settings: Settings,
         update: Arc<Mutex<UpdatePhase>>,
         open_panel: bool,
+        is_preview: bool,
         cx: &mut Context<Self>,
     ) -> Self {
         let config = settings.get(AppConfig::clone);
@@ -520,7 +522,7 @@ impl HudView {
                 WindowViewMode::Bubble
             },
             active_tab: SettingsTab::Stats,
-            stats: if preview::is_active() {
+            stats: if is_preview {
                 AppStats::default()
             } else {
                 AppStats::load()
@@ -554,7 +556,7 @@ impl HudView {
             model_ready_tx,
             model_ready_rx,
             preview_ready: None,
-            frozen: preview::is_active(),
+            preview: is_preview,
             root_focus: cx.focus_handle(),
             panel_focus: cx.focus_handle().tab_stop(false),
             panel_needs_focus: open_panel,
@@ -749,7 +751,7 @@ impl HudView {
     /// Opening the panel also asks for an automatic check, so a new
     /// version shows up where the user looks for it.
     pub fn check_for_update(&self, kind: CheckKind) {
-        if preview::is_active() {
+        if self.preview {
             return;
         }
         let auto_checks = self.settings.get(|config| config.check_updates);
@@ -757,7 +759,7 @@ impl HudView {
     }
 
     fn install_update(&self) {
-        if preview::is_active() {
+        if self.preview {
             return;
         }
         update::install(&self.update);
@@ -806,7 +808,7 @@ impl HudView {
         }
         self.mode = WindowViewMode::StatsAndSettings;
         self.pill_hovered = false;
-        if !preview::is_active() {
+        if !self.preview {
             self.stats = AppStats::load();
         }
         self.active_tab = SettingsTab::Settings;
@@ -822,7 +824,7 @@ impl HudView {
     }
 
     fn copy_history(&mut self, key: &str, text: &str) {
-        if !preview::is_active() {
+        if !self.preview {
             if let Err(error) = self.injector.copy_to_clipboard(text) {
                 self.set_error(
                     format!("Could not copy text. Try Copy again. {error}"),
@@ -927,7 +929,7 @@ impl HudView {
         if self.model_loading.is_some() {
             return;
         }
-        if preview::is_active() {
+        if self.preview {
             self.active_model = Some(id.into());
             self.preview_ready = Some(true);
             return;
@@ -990,7 +992,7 @@ impl HudView {
     }
 
     fn start_model_download(&mut self) {
-        if preview::is_active() || self.model_loading.is_some() {
+        if self.preview || self.model_loading.is_some() {
             return;
         }
         if let DownloadPhase::Downloading { id, .. } = &*self.model_phase.lock() {
@@ -1094,7 +1096,7 @@ impl HudView {
     }
 
     fn toggle_autostart(&mut self) {
-        if preview::is_active() {
+        if self.preview {
             self.autostart_enabled = !self.autostart_enabled;
             return;
         }
@@ -1133,7 +1135,7 @@ impl HudView {
 
     fn clear_recents(&mut self) {
         self.clear_history_pending = false;
-        if preview::is_active() {
+        if self.preview {
             self.stats.history.clear();
         } else {
             self.stats = AppStats::update(|stats| stats.history.clear());
@@ -1328,7 +1330,7 @@ impl HudView {
             // The live wave requests a frame on every vsync and reads the
             // microphone itself, so the UI loop does not pace it.
             HudStatus::Listening { .. } => {
-                if self.frozen {
+                if self.preview {
                     cx.notify();
                 }
                 false
@@ -1353,7 +1355,7 @@ impl HudView {
     /// The time since `since`. The preview captures have a frozen clock, so
     /// their states never time out.
     fn age(&self, since: Instant) -> Duration {
-        if self.frozen {
+        if self.preview {
             Duration::ZERO
         } else {
             since.elapsed()
@@ -1414,7 +1416,7 @@ impl HudView {
         // GPUI on Windows sends no mouse-exit event, so a mouse that leaves
         // through the window edge never moves outside the zone. The window
         // does know it lost the mouse.
-        if !preview::is_active() && !window.is_window_hovered() {
+        if !self.preview && !window.is_window_hovered() {
             self.pill_hovered = false;
         }
         let hover_tip = self.pill_hovered && ready && matches!(self.status, HudStatus::Idle);

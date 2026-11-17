@@ -497,6 +497,7 @@ fn main() {
                     settings_loop.clone(),
                     update_for_view,
                     open_panel,
+                    is_preview,
                     cx,
                 );
                 let startup_errors = [
