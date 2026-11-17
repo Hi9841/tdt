@@ -6,27 +6,16 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-
-static SAVING: AtomicBool = AtomicBool::new(false);
-
-pub fn set_saving(on: bool) {
-    SAVING.store(on, Ordering::Relaxed);
-}
-
-pub fn saving() -> bool {
-    SAVING.load(Ordering::Relaxed)
-}
 
 /// `%LOCALAPPDATA%\TDT\takes`.
 pub fn folder() -> Option<PathBuf> {
     crate::data_dir().map(|dir| dir.join("takes"))
 }
 
-/// Writes `take-<unix milliseconds>.wav` (16 kHz mono, 16-bit) and `.txt` when
-/// the setting is on. Takes of the same millisecond get `-1`, `-2`, and so on.
+/// Writes `take-<unix milliseconds>.wav` (16 kHz mono, 16-bit) and `.txt`.
+/// Takes of the same millisecond get `-1`, `-2`, and so on.
 pub fn save(samples: &[f32], text: &str) -> Result<(), String> {
-    if !saving() || samples.is_empty() {
+    if samples.is_empty() {
         return Ok(());
     }
     let dir = folder().ok_or("LOCALAPPDATA is not set")?;

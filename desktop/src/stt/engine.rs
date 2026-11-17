@@ -1,7 +1,6 @@
 use super::dictionary;
 use super::models::ModelSpec;
 use super::segment;
-use super::takes;
 use super::MAX_TAKE_SAMPLES;
 use crate::SAMPLE_RATE;
 use crossbeam_channel::{Receiver, RecvTimeoutError};
@@ -309,6 +308,8 @@ impl StopTimes {
 
 pub struct LiveTranscript {
     pub text: String,
+    /// The audio that the model heard, for a test take.
+    pub audio: Vec<f32>,
     pub duration_secs: f32,
     /// The speech the model still had to read after the stop. The model part
     /// of the latency follows it.
@@ -532,6 +533,7 @@ impl SttEngine {
         if captured.is_empty() {
             return Ok(LiveTranscript {
                 text: String::new(),
+                audio: captured,
                 duration_secs,
                 last_part_secs: 0.0,
                 stop,
@@ -568,17 +570,9 @@ impl SttEngine {
         }
 
         let transcribed = Instant::now();
-        // The disk write must not delay the text.
-        if takes::saving() {
-            let saved_text = text.clone();
-            std::thread::spawn(move || {
-                if let Err(error) = takes::save(&captured, &saved_text) {
-                    crate::log::note(&format!("Could not save the test take: {error}"));
-                }
-            });
-        }
         Ok(LiveTranscript {
             text,
+            audio: captured,
             duration_secs,
             last_part_secs,
             stop,

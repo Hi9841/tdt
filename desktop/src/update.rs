@@ -4,7 +4,6 @@
 
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -93,13 +92,6 @@ pub fn updates_disabled() -> bool {
     )
 }
 
-/// The "Check for updates automatically" setting. A manual check runs when it is off.
-static AUTO_CHECKS: AtomicBool = AtomicBool::new(true);
-
-pub fn set_auto_checks(on: bool) {
-    AUTO_CHECKS.store(on, Ordering::Relaxed);
-}
-
 /// Who asked for an update check.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CheckKind {
@@ -113,10 +105,11 @@ pub enum CheckKind {
 /// call finds it busy; the network work runs on a new thread. A manual
 /// check always runs and shows its errors. An automatic check runs only when
 /// the last one is `AUTO_CHECK_EVERY` old, and a failure keeps the previous
-/// state.
-pub fn check(cell: &Arc<Mutex<UpdatePhase>>, kind: CheckKind) {
+/// state. `auto_checks` is the "Check for updates automatically" setting; a
+/// manual check runs when it is off.
+pub fn check(cell: &Arc<Mutex<UpdatePhase>>, kind: CheckKind, auto_checks: bool) {
     let manual = kind == CheckKind::Manual;
-    if updates_disabled() || (!manual && !AUTO_CHECKS.load(Ordering::Relaxed)) {
+    if updates_disabled() || (!manual && !auto_checks) {
         return;
     }
     let previous = {

@@ -1,5 +1,5 @@
 use crate::audio::{LiveWave, VIS_BARS};
-use crate::config::{AppConfig, AppStats};
+use crate::config::{AppConfig, AppStats, Settings};
 use crate::hotkey;
 use crate::paste::PasteInjector;
 use crate::ui::controls;
@@ -21,7 +21,7 @@ use ely_gpui_component::theme::{ActiveTheme, ControlSize, IconSize};
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use parking_lot::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use voice_stt_desktop::stt::{models, DownloadPhase, EngineSlot, SttEngine, CATALOG};
@@ -417,14 +417,10 @@ struct PreparedModel {
 
 pub struct HudView {
     pub status: HudStatus,
-    pub auto_paste_enabled: bool,
-    remove_fillers_enabled: bool,
-    remove_fillers_state: Arc<AtomicBool>,
-    save_takes_enabled: bool,
+    settings: Settings,
     autostart_enabled: bool,
     /// A failed startup change or settings save, shown under the settings.
     pub settings_error: Option<String>,
-    auto_updates_enabled: bool,
     pub hotkey: hotkey::HotkeyBinding,
     pub wave_peaks: [f32; WAVE_BARS],
     /// The open microphone while listening. The wave reads it on each frame.
@@ -441,7 +437,6 @@ pub struct HudView {
     pub injector: PasteInjector,
     pub selected_model: String,
     pub stt_engine: EngineSlot,
-    pub auto_paste_state: Arc<Mutex<bool>>,
     panel_motion: Option<PanelMotion>,
     update: Arc<Mutex<UpdatePhase>>,
     model_phase: Arc<Mutex<DownloadPhase>>,
@@ -481,8 +476,7 @@ impl HudView {
     pub fn new(
         hotkey: hotkey::HotkeyBinding,
         stt_engine: EngineSlot,
-        auto_paste_state: Arc<Mutex<bool>>,
-        remove_fillers_state: Arc<AtomicBool>,
+        settings: Settings,
         update: Arc<Mutex<UpdatePhase>>,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -495,11 +489,7 @@ impl HudView {
             });
         }
 
-        let config = if preview::is_active() {
-            AppConfig::default()
-        } else {
-            AppConfig::load()
-        };
+        let config = settings.get(AppConfig::clone);
         let selected_model = models::resolve(&config.model_id).id.to_string();
         let active_model = stt_engine.is_some().then(|| selected_model.clone());
         let installed_models = CATALOG
@@ -508,16 +498,11 @@ impl HudView {
             .map(|model| model.id.to_string())
             .collect();
         let (model_ready_tx, model_ready_rx) = crossbeam_channel::unbounded();
-        let auto_paste_enabled = *auto_paste_state.lock();
         let mut view = Self {
             status: HudStatus::Idle,
-            auto_paste_enabled,
-            remove_fillers_enabled: remove_fillers_state.load(Ordering::Relaxed),
-            remove_fillers_state,
-            save_takes_enabled: voice_stt_desktop::stt::takes::saving(),
+            settings,
             autostart_enabled: crate::autostart::is_enabled(),
             settings_error: None,
-            auto_updates_enabled: config.check_updates,
             hotkey,
             wave_peaks: [0.0; WAVE_BARS],
             wave_source: None,
@@ -541,7 +526,6 @@ impl HudView {
             injector: PasteInjector::new(),
             selected_model,
             stt_engine,
-            auto_paste_state,
             panel_motion: None,
             update,
             model_phase: Arc::new(Mutex::new(DownloadPhase::Idle)),
@@ -583,11 +567,8 @@ impl HudView {
             self.mode = WindowViewMode::Bubble;
         }
 
-        self.auto_paste_enabled = true;
-        self.remove_fillers_enabled = true;
         self.autostart_enabled = false;
         self.settings_error = None;
-        self.auto_updates_enabled = true;
 
         self.selected_model = models::DEFAULT_MODEL_ID.into();
         self.hotkey_capturing = false;
@@ -719,7 +700,7 @@ impl HudView {
             }
             PreviewSpec::PanelSettingsDefaults => {}
             PreviewSpec::PanelSettingsAutoPasteOff => {
-                self.auto_paste_enabled = false;
+                let _ = self.settings.update(|config| config.auto_paste = false);
             }
             PreviewSpec::PanelSettingsStartupOn => {
                 self.autostart_enabled = true;
@@ -766,7 +747,8 @@ impl HudView {
         if preview::is_active() {
             return;
         }
-        update::check(&self.update, kind);
+        let auto_checks = self.settings.get(|config| config.check_updates);
+        update::check(&self.update, kind, auto_checks);
     }
 
     fn install_update(&self) {
@@ -890,9 +872,10 @@ impl HudView {
             .is_some_and(|model| model.id == self.selected_model);
         if matches_selection {
             if let Some(model) = self.prepared_model.take() {
-                let mut config = AppConfig::load();
-                config.model_id = model.id.clone();
-                match config.save() {
+                match self
+                    .settings
+                    .update(|config| config.model_id = model.id.clone())
+                {
                     Ok(()) => {
                         self.stt_engine.set(Some(model.engine));
                         // The previous engine is gone now: give its memory back.
@@ -1051,66 +1034,47 @@ impl HudView {
     }
 
     pub fn toggle_auto_paste(&mut self) {
-        let on = !self.auto_paste_enabled;
-        if preview::is_active() {
-            self.auto_paste_enabled = on;
-            return;
-        }
-        if self.save_setting(|cfg| cfg.auto_paste = on) {
-            self.auto_paste_enabled = on;
-            *self.auto_paste_state.lock() = on;
-        }
+        let on = !self.auto_paste();
+        self.save_setting(|config| config.auto_paste = on);
     }
 
     fn set_remove_fillers(&mut self, on: bool) {
-        if preview::is_active() {
-            self.remove_fillers_enabled = on;
-            return;
-        }
-        if self.save_setting(|cfg| cfg.remove_fillers = on) {
-            self.remove_fillers_enabled = on;
-            self.remove_fillers_state.store(on, Ordering::Relaxed);
-        }
+        self.save_setting(|config| config.remove_fillers = on);
     }
 
     fn set_save_takes(&mut self, on: bool) {
-        if preview::is_active() {
-            self.save_takes_enabled = on;
-            return;
-        }
-        if self.save_setting(|cfg| cfg.save_takes = on) {
-            self.save_takes_enabled = on;
-            voice_stt_desktop::stt::takes::set_saving(on);
-        }
+        self.save_setting(|config| config.save_takes = on);
     }
 
     fn set_auto_updates(&mut self, on: bool) {
-        if preview::is_active() {
-            self.auto_updates_enabled = on;
-            return;
-        }
-        if self.save_setting(|cfg| cfg.check_updates = on) {
-            self.auto_updates_enabled = on;
-            update::set_auto_checks(on);
-        }
+        self.save_setting(|config| config.check_updates = on);
     }
 
-    /// Loads the config, applies `change`, and saves it. A failed save
-    /// shows an error under the settings and returns false, so the switch
-    /// keeps the value that is on disk.
-    fn save_setting(&mut self, change: impl FnOnce(&mut AppConfig)) -> bool {
-        let mut cfg = AppConfig::load();
-        change(&mut cfg);
-        match cfg.save() {
-            Ok(()) => {
-                self.settings_error = None;
-                true
-            }
+    fn auto_paste(&self) -> bool {
+        self.settings.get(|config| config.auto_paste)
+    }
+
+    fn remove_fillers(&self) -> bool {
+        self.settings.get(|config| config.remove_fillers)
+    }
+
+    fn save_takes(&self) -> bool {
+        self.settings.get(|config| config.save_takes)
+    }
+
+    fn auto_updates(&self) -> bool {
+        self.settings.get(|config| config.check_updates)
+    }
+
+    /// Saves a change of the settings. A failed save shows an error under the
+    /// settings, and the switch keeps the value that is on disk.
+    fn save_setting(&mut self, change: impl Fn(&mut AppConfig)) {
+        match self.settings.update(change) {
+            Ok(()) => self.settings_error = None,
             Err(error) => {
                 voice_stt_desktop::log::note(&format!("Could not save the settings: {error}"));
                 self.settings_error =
                     Some(format!("Could not save the setting. Try again. {error}"));
-                false
             }
         }
     }
@@ -1994,7 +1958,7 @@ impl HudView {
     }
 
     fn render_settings_tab(&mut self, cx: &mut Context<'_, Self>) -> AnyElement {
-        let is_auto_paste = self.auto_paste_enabled;
+        let is_auto_paste = self.auto_paste();
         let hotkey = self.hotkey;
 
         let settings_row = |title: &'static str, subtitle: String, trailing: AnyElement| {
@@ -2006,7 +1970,7 @@ impl HudView {
             let hud = hud.clone();
             move |on, _, cx| {
                 hud.update(cx, |this, cx| {
-                    if this.auto_paste_enabled != on {
+                    if this.auto_paste() != on {
                         this.toggle_auto_paste();
                     }
                     cx.notify();
@@ -2031,21 +1995,20 @@ impl HudView {
             }),
         );
 
-        let fillers_switch =
-            Switch::new("remove_fillers", self.remove_fillers_enabled).on_change({
-                let hud = hud.clone();
-                move |on, _, cx| {
-                    hud.update(cx, |this, cx| {
-                        if this.remove_fillers_enabled != on {
-                            this.set_remove_fillers(on);
-                        }
-                        cx.notify();
-                    });
-                }
-            });
+        let fillers_switch = Switch::new("remove_fillers", self.remove_fillers()).on_change({
+            let hud = hud.clone();
+            move |on, _, cx| {
+                hud.update(cx, |this, cx| {
+                    if this.remove_fillers() != on {
+                        this.set_remove_fillers(on);
+                    }
+                    cx.notify();
+                });
+            }
+        });
         let fillers_row = settings_row(
             "Remove filler words",
-            if self.remove_fillers_enabled {
+            if self.remove_fillers() {
                 "Drops um, uh, and similar sounds."
             } else {
                 "Keeps every word as spoken."
@@ -2056,7 +2019,7 @@ impl HudView {
         .on_click(
             "fillers_row",
             cx.listener(|this, _, _, cx| {
-                let on = !this.remove_fillers_enabled;
+                let on = !this.remove_fillers();
                 this.set_remove_fillers(on);
                 cx.notify();
             }),
@@ -2200,11 +2163,11 @@ impl HudView {
             _ => None,
         };
         let update_row = settings_row("Updates", update_sub, update_btn.into_any_element());
-        let takes_switch = Switch::new("save_takes", self.save_takes_enabled).on_change({
+        let takes_switch = Switch::new("save_takes", self.save_takes()).on_change({
             let hud = hud.clone();
             move |on, _, cx| {
                 hud.update(cx, |this, cx| {
-                    if this.save_takes_enabled != on {
+                    if this.save_takes() != on {
                         this.set_save_takes(on);
                     }
                     cx.notify();
@@ -2213,7 +2176,7 @@ impl HudView {
         });
         let takes_row = settings_row(
             "Save takes for testing",
-            if self.save_takes_enabled {
+            if self.save_takes() {
                 "Audio and text go to LOCALAPPDATA\\TDT\\takes."
             } else {
                 "Off. Nothing is kept."
@@ -2224,26 +2187,25 @@ impl HudView {
         .on_click(
             "save_takes_row",
             cx.listener(|this, _, _, cx| {
-                let on = !this.save_takes_enabled;
+                let on = !this.save_takes();
                 this.set_save_takes(on);
                 cx.notify();
             }),
         );
-        let auto_updates_switch =
-            Switch::new("auto_updates", self.auto_updates_enabled).on_change({
-                let hud = hud.clone();
-                move |on, _, cx| {
-                    hud.update(cx, |this, cx| {
-                        if this.auto_updates_enabled != on {
-                            this.set_auto_updates(on);
-                        }
-                        cx.notify();
-                    });
-                }
-            });
+        let auto_updates_switch = Switch::new("auto_updates", self.auto_updates()).on_change({
+            let hud = hud.clone();
+            move |on, _, cx| {
+                hud.update(cx, |this, cx| {
+                    if this.auto_updates() != on {
+                        this.set_auto_updates(on);
+                    }
+                    cx.notify();
+                });
+            }
+        });
         let auto_updates_row = settings_row(
             "Check for updates automatically",
-            if self.auto_updates_enabled {
+            if self.auto_updates() {
                 "At start, every hour, and when Settings opens."
             } else {
                 "Only when you select Check for updates."
@@ -2254,7 +2216,7 @@ impl HudView {
         .on_click(
             "auto_updates_row",
             cx.listener(|this, _, _, cx| {
-                let on = !this.auto_updates_enabled;
+                let on = !this.auto_updates();
                 this.set_auto_updates(on);
                 cx.notify();
             }),

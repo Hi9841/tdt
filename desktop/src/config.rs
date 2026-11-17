@@ -149,6 +149,42 @@ impl AppConfig {
     }
 }
 
+/// The settings of this run. The UI changes them, and the threads of a take
+/// read them. Each change goes to `config.json` first, so the app never runs
+/// with a setting that the file does not hold.
+#[derive(Clone)]
+pub struct Settings {
+    live: std::sync::Arc<parking_lot::Mutex<AppConfig>>,
+    /// False for the preview captures: they never write the file.
+    persist: bool,
+}
+
+impl Settings {
+    pub fn new(config: AppConfig, persist: bool) -> Self {
+        Self {
+            live: std::sync::Arc::new(parking_lot::Mutex::new(config)),
+            persist,
+        }
+    }
+
+    pub fn get<T>(&self, read: impl FnOnce(&AppConfig) -> T) -> T {
+        read(&self.live.lock())
+    }
+
+    /// Applies `change` to the file, and then to this run. The file is read
+    /// again first, so a change keeps the other values in the file. When the
+    /// file cannot be written, this run keeps its settings.
+    pub fn update(&self, change: impl Fn(&mut AppConfig)) -> Result<(), std::io::Error> {
+        if self.persist {
+            let mut file = AppConfig::load();
+            change(&mut file);
+            file.save()?;
+        }
+        change(&mut self.live.lock());
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistoryItem {
     pub text: String,

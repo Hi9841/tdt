@@ -25,7 +25,7 @@ use audio::{
     play_sound, prewarm, watch_default_input, AudioRecorder, SoundEffect, SpeechTail, MAX_TAIL,
     VIS_BARS,
 };
-use config::{AppConfig, AppStats};
+use config::{AppConfig, AppStats, Settings};
 use ely_gpui_component::Assets;
 use gpui::*;
 use hotkey::{
@@ -70,11 +70,22 @@ fn deliver_transcript(
     mut result: LiveTranscript,
     injector: Arc<PasteInjector>,
     tx: crossbeam_channel::Sender<InternalEvent>,
-    should_paste: bool,
-    clean_fillers: bool,
+    settings: &Settings,
     target: Option<isize>,
     typed_key: Option<u16>,
 ) {
+    let (should_paste, clean_fillers, save_take) =
+        settings.get(|config| (config.auto_paste, config.remove_fillers, config.save_takes));
+    // The model's own text, before the filler removal. The disk write must
+    // not delay the text.
+    if save_take {
+        let (audio, text) = (std::mem::take(&mut result.audio), result.text.clone());
+        std::thread::spawn(move || {
+            if let Err(error) = voice_stt_desktop::stt::takes::save(&audio, &text) {
+                log::note(&format!("Could not save the test take: {error}"));
+            }
+        });
+    }
     if clean_fillers {
         result.text = remove_fillers(&result.text);
     }
@@ -229,10 +240,6 @@ fn main() {
     } else {
         config.model_id = resolved_id;
     }
-    let auto_paste = config.auto_paste;
-    let remove_fillers_state = Arc::new(AtomicBool::new(config.remove_fillers));
-    update::set_auto_checks(config.check_updates);
-    voice_stt_desktop::stt::takes::set_saving(config.save_takes);
     let hotkey_binding = HotkeyBinding::parse(&config.hotkey).unwrap_or_else(|| {
         log::note(&format!(
             "Could not read the shortcut '{}' of the settings. TDT uses the default.",
@@ -248,6 +255,7 @@ fn main() {
         binding
     });
     set_binding(hotkey_binding);
+    let settings = Settings::new(config.clone(), !preview::is_active());
     let hotkey_label = hotkey_binding.display();
 
     // Open the microphone before the window. Doing it on the GPUI executor
@@ -349,7 +357,7 @@ fn main() {
         ely_gpui_component::init(cx);
         ui::theme::install(cx);
         // Windows requires the event loop to exist before creating the tray icon.
-        let mut tray = if preview::is_active() && !preview::wants_tray() { None } else { match SystemTray::new(auto_paste, &hotkey_label) {
+        let mut tray = if preview::is_active() && !preview::wants_tray() { None } else { match SystemTray::new(settings.get(|config| config.auto_paste), &hotkey_label) {
             Ok(tray) => Some(tray),
             Err(error) => {
                 log::note(&format!("Failed to create system tray: {error}"));
@@ -395,11 +403,8 @@ fn main() {
             ..Default::default()
         };
 
-        let auto_paste_state = Arc::new(Mutex::new(auto_paste));
-        let auto_paste_bg = Arc::clone(&auto_paste_state);
-        let auto_paste_view = Arc::clone(&auto_paste_state);
-        let fillers_bg = Arc::clone(&remove_fillers_state);
-        let fillers_view = Arc::clone(&remove_fillers_state);
+        let settings_loop = settings.clone();
+        let settings_boot = settings.clone();
         let update_state = Arc::new(Mutex::new(UpdatePhase::Idle));
         let update_for_view = Arc::clone(&update_state);
         let update_for_boot = Arc::clone(&update_state);
@@ -467,8 +472,7 @@ fn main() {
                 let rec = Rc::clone(&recorder_clone);
                 let inj = Arc::clone(&injector_clone);
                 let stt = stt_clone.clone();
-                let auto_paste_flag = Arc::clone(&auto_paste_bg);
-                let fillers_flag = Arc::clone(&fillers_bg);
+                let settings = settings_loop.clone();
                 let target_hwnd = Arc::clone(&target_hwnd_loop);
                 let update_phase = Arc::clone(&update_for_loop);
 
@@ -672,7 +676,7 @@ fn main() {
                         // The settings panel can change auto-paste too, so keep the
                         // tray checkmark in sync with the single source of truth.
                         if let Some(ref tray) = tray {
-                            let current = *auto_paste_flag.lock();
+                            let current = settings.get(|config| config.auto_paste);
                             if tray.auto_paste_item.is_checked() != current {
                                 tray.auto_paste_item.set_checked(current);
                             }
@@ -768,9 +772,7 @@ fn main() {
                                 HotkeyAction::Captured(binding) => {
                                     let label = binding.display();
                                     set_binding(binding);
-                                    let mut cfg = AppConfig::load();
-                                    cfg.hotkey = label.clone();
-                                    let saved = cfg.save();
+                                    let saved = settings.update(|config| config.hotkey = label.clone());
                                     if let Some(ref tray) = tray {
                                         let _ = tray
                                             .tray_icon
@@ -876,8 +878,7 @@ fn main() {
                                         if let Some(engine) = stt.get() {
                                             let events = internal_tx.clone();
                                             let inj_worker = Arc::clone(&inj);
-                                            let paste_flag = Arc::clone(&auto_paste_flag);
-                                            let fillers_worker = Arc::clone(&fillers_flag);
+                                            let settings_worker = settings.clone();
                                             let target_flag = Arc::clone(&target_hwnd);
                                             let discard_worker = Arc::clone(&discard);
                                             std::thread::spawn(move || {
@@ -887,10 +888,8 @@ fn main() {
                                                         if discard_worker.load(Ordering::SeqCst) {
                                                             return;
                                                         }
-                                                        let should_paste = *paste_flag.lock();
-                                                        let clean = fillers_worker.load(Ordering::Relaxed);
                                                         let target = *target_flag.lock();
-                                                        deliver_transcript(result, inj_worker, events, should_paste, clean, target, user_typed());
+                                                        deliver_transcript(result, inj_worker, events, &settings_worker, target, user_typed());
                                                     }
                                                     Err(error) => {
                                                         if discard_worker.load(Ordering::SeqCst) {
@@ -1183,7 +1182,8 @@ fn main() {
                     std::thread::spawn(move || {
                         std::thread::sleep(Duration::from_secs(8));
                         loop {
-                            update::check(&update_for_boot, CheckKind::Automatic);
+                            let auto_checks = settings_boot.get(|config| config.check_updates);
+                            update::check(&update_for_boot, CheckKind::Automatic, auto_checks);
                             std::thread::sleep(Duration::from_secs(60 * 60));
                         }
                     });
@@ -1192,8 +1192,7 @@ fn main() {
                 let mut view = HudView::new(
                     hotkey_binding,
                     stt_for_view,
-                    auto_paste_view,
-                    fillers_view,
+                    settings_loop.clone(),
                     update_for_view,
                     cx,
                 );
