@@ -17,7 +17,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use voice_stt_desktop::log;
 use voice_stt_desktop::stt::{
-    remove_fillers, EngineSlot, Latency, LiveAudio, LiveTranscript, StopTimes, SttEngine, TakeError,
+    remove_fillers, EngineSlot, ErrorKind, Latency, LiveAudio, LiveTranscript, StopTimes,
+    SttEngine, TakeError,
 };
 
 /// A take from its start until its pump has sent the last audio.
@@ -177,13 +178,6 @@ impl LiveTake {
     }
 }
 
-/// What an error on the pill is about. A microphone error offers Retry microphone.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ErrorKind {
-    Microphone,
-    Other,
-}
-
 /// A change that the pill must show. `Dictation` gives them in order; the
 /// UI loop gives each one to the view.
 pub enum ViewChange {
@@ -200,7 +194,7 @@ pub enum ViewChange {
         text: String,
         auto_pasted: bool,
         latency_ms: u64,
-        notice: Option<String>,
+        notice: Option<(String, ErrorKind)>,
     },
     TakeError(TakeError),
     NoSpeech,
@@ -543,12 +537,21 @@ impl Dictation {
                 } => {
                     self.end_transcribing();
                     play_sound(SoundEffect::Success);
-                    let notice = notice.or(self.microphone_lost.take()).or_else(|| {
-                        std::mem::take(&mut self.late_start).then(|| {
-                            "The microphone started late, so the first words can be missing."
-                                .to_string()
-                        })
-                    });
+                    let notice = notice
+                        .map(|notice| (notice, ErrorKind::Other))
+                        .or(self
+                            .microphone_lost
+                            .take()
+                            .map(|lost| (lost, ErrorKind::Microphone)))
+                        .or_else(|| {
+                            std::mem::take(&mut self.late_start).then(|| {
+                                (
+                                    "The microphone started late, so the first words can be missing."
+                                        .to_string(),
+                                    ErrorKind::Other,
+                                )
+                            })
+                        });
                     changes.push(ViewChange::Success {
                         text,
                         auto_pasted,

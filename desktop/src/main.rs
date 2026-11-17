@@ -25,7 +25,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use audio::{prewarm, watch_default_input, AudioRecorder};
 use config::{AppConfig, Settings};
-use dictation::{Dictation, ErrorKind, Input};
+use dictation::{Dictation, Input};
 use ely_gpui_component::Assets;
 use gpui::*;
 use hotkey::{
@@ -46,6 +46,7 @@ use ui::window_util::{
 use ui::{HudView, SystemTray};
 use update::{CheckKind, UpdatePhase};
 use voice_stt_desktop::log;
+use voice_stt_desktop::stt::ErrorKind;
 use voice_stt_desktop::stt::{models, EngineSlot, SttEngine};
 
 fn main() {

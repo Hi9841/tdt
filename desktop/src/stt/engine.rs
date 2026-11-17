@@ -279,19 +279,25 @@ impl Drop for QuietRead {
     }
 }
 
+/// What an error is about. A microphone error offers Retry microphone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorKind {
+    Microphone,
+    Other,
+}
+
 /// Why a take has no text. The text is written for the user.
 #[derive(Debug)]
 pub struct TakeError {
     pub message: String,
-    /// The microphone failed, not the engine.
-    pub microphone: bool,
+    pub kind: ErrorKind,
 }
 
 impl From<String> for TakeError {
     fn from(message: String) -> Self {
         Self {
             message,
-            microphone: false,
+            kind: ErrorKind::Other,
         }
     }
 }
@@ -544,7 +550,7 @@ impl SttEngine {
                         return Err(TakeError {
                             message: "The microphone stopped sending audio. Check the input device and try again."
                                 .to_string(),
-                            microphone: true,
+                            kind: ErrorKind::Microphone,
                         });
                     }
                 }

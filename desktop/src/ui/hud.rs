@@ -1,6 +1,6 @@
 use crate::audio::{LiveWave, VIS_BARS};
 use crate::config::{AppConfig, AppStats, Settings};
-use crate::dictation::{ErrorKind, ViewChange};
+use crate::dictation::ViewChange;
 use crate::hotkey;
 use crate::paste::PasteInjector;
 use crate::ui::controls;
@@ -25,7 +25,9 @@ use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use voice_stt_desktop::stt::{models, DownloadPhase, EngineSlot, SttEngine, TakeError, CATALOG};
+use voice_stt_desktop::stt::{
+    models, DownloadPhase, EngineSlot, ErrorKind, SttEngine, TakeError, CATALOG,
+};
 
 /// Compact actions leave seven pixels above and below inside the overlay.
 const SETTINGS_SURFACE_HEIGHT: f32 = 28.0;
@@ -352,6 +354,15 @@ fn finishing_dots() -> AnyElement {
         .into_any_element()
 }
 
+/// The text of the "Action needed" box of the panel, and what it is about.
+#[derive(Clone)]
+struct Recovery {
+    message: String,
+    kind: ErrorKind,
+}
+
+const NO_SPEECH: &str = "No speech detected. Try again and check your microphone.";
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum HudStatus {
     Idle,
@@ -454,8 +465,8 @@ pub struct HudView {
     click_dictation: bool,
     stop_requested: bool,
     retry_microphone: bool,
-    recovery_message: Option<String>,
-    recovery_is_microphone: bool,
+    /// The "Action needed" box of the panel.
+    recovery: Option<Recovery>,
     clear_history_pending: bool,
     active_model: Option<String>,
     installed_models: Vec<String>,
@@ -531,8 +542,7 @@ impl HudView {
             hotkey_capturing: false,
             stop_requested: false,
             retry_microphone: false,
-            recovery_message: None,
-            recovery_is_microphone: false,
+            recovery: None,
             clear_history_pending: false,
             active_model,
             installed_models,
@@ -623,7 +633,10 @@ impl HudView {
             }
             PreviewSpec::BubbleNoSpeech => {
                 self.show_no_speech();
-                self.recovery_is_microphone = true;
+                self.recovery = Some(Recovery {
+                    message: NO_SPEECH.into(),
+                    kind: ErrorKind::Microphone,
+                });
             }
             PreviewSpec::BubbleCopyFailed => self.set_error("Could not copy text. Open History to copy the saved transcript.".into(), ErrorKind::Other),
             PreviewSpec::BubblePasteFallback => {
@@ -633,8 +646,7 @@ impl HudView {
                     latency_ms: 240,
                     finished_at: Instant::now(),
                 };
-                self.recovery_message = Some("Copied. Could not insert all text. Check the destination before pasting with Ctrl+V.".into());
-                self.recovery_is_microphone = false;
+                self.recovery = Some(Recovery { message: "Copied. Could not insert all text. Check the destination before pasting with Ctrl+V.".into(), kind: ErrorKind::Other });
             }
             PreviewSpec::BubbleLimit => {
                 self.status = HudStatus::Listening {
@@ -879,8 +891,7 @@ impl HudView {
                         self.model_ready_note = Some(models::resolve(&model.id).label);
                         self.active_model = Some(model.id);
                         self.model_error = None;
-                        self.recovery_message = None;
-                        self.recovery_is_microphone = false;
+                        self.recovery = None;
                         if matches!(
                             self.status,
                             HudStatus::Error { .. } | HudStatus::NoSpeech { .. }
@@ -1162,7 +1173,7 @@ impl HudView {
 
     /// A take started. The pill shows the live wave of `wave`.
     fn show_listening(&mut self, wave: Option<LiveWave>) {
-        self.recovery_message = None;
+        self.recovery = None;
         self.wave_source = wave;
         self.status = HudStatus::Listening {
             started_at: Instant::now(),
@@ -1180,10 +1191,13 @@ impl HudView {
         };
         self.status = HudStatus::Transcribing { recorded_for };
         if at_limit {
-            self.recovery_message = Some(format!(
-                "Recording stopped at the {}-minute limit. Transcribing the recorded audio.",
-                voice_stt_desktop::stt::MAX_TAKE_SECONDS / 60
-            ));
+            self.recovery = Some(Recovery {
+                message: format!(
+                    "Recording stopped at the {}-minute limit. Transcribing the recorded audio.",
+                    voice_stt_desktop::stt::MAX_TAKE_SECONDS / 60
+                ),
+                kind: ErrorKind::Other,
+            });
         }
     }
 
@@ -1193,10 +1207,10 @@ impl HudView {
         text: String,
         auto_pasted: bool,
         latency_ms: u64,
-        notice: Option<String>,
+        notice: Option<(String, ErrorKind)>,
     ) {
         self.stats = AppStats::load();
-        self.recovery_message = notice;
+        self.recovery = notice.map(|(message, kind)| Recovery { message, kind });
         self.status = HudStatus::Success {
             text,
             auto_pasted,
@@ -1208,12 +1222,7 @@ impl HudView {
     /// A take ended with an error.
     fn show_take_error(&mut self, error: TakeError) {
         self.stats = AppStats::load();
-        let kind = if error.microphone {
-            ErrorKind::Microphone
-        } else {
-            ErrorKind::Other
-        };
-        self.set_error(error.message, kind);
+        self.set_error(error.message, error.kind);
     }
 
     /// A take had no speech.
@@ -1221,14 +1230,16 @@ impl HudView {
         self.status = HudStatus::NoSpeech {
             since: Instant::now(),
         };
-        self.recovery_message =
-            Some("No speech detected. Try again and check your microphone.".into());
+        self.recovery = Some(Recovery {
+            message: NO_SPEECH.into(),
+            kind: ErrorKind::Other,
+        });
     }
 
     /// The microphone opened again after a failure.
     fn microphone_ready(&mut self) {
         self.status = HudStatus::Idle;
-        self.recovery_message = None;
+        self.recovery = None;
     }
 
     /// The hook captured a new shortcut. `saved` is the result of the save of
@@ -1283,7 +1294,11 @@ impl HudView {
             HudStatus::Error {
                 message: existing, ..
             } if !existing.is_empty() && existing != &error => {
-                let microphone = self.recovery_is_microphone || kind == ErrorKind::Microphone;
+                let microphone = kind == ErrorKind::Microphone
+                    || self
+                        .recovery
+                        .as_ref()
+                        .is_some_and(|recovery| recovery.kind == ErrorKind::Microphone);
                 (
                     format!("{existing} {error}"),
                     if microphone {
@@ -1322,14 +1337,14 @@ impl HudView {
             // loop keeps repainting even when reduced motion is on.
             HudStatus::Transcribing { .. } => false,
             HudStatus::Success { finished_at, .. } => {
-                success_returns_to_idle(self.age(*finished_at), self.recovery_message.is_some())
+                success_returns_to_idle(self.age(*finished_at), self.recovery.is_some())
             }
             HudStatus::NoSpeech { since } => success_returns_to_idle(self.age(*since), true),
             HudStatus::Error { .. } | HudStatus::Idle => false,
         };
         if back_to_idle {
             self.status = HudStatus::Idle;
-            self.recovery_message = None;
+            self.recovery = None;
             cx.notify();
         }
         self.at_rest()
@@ -1346,8 +1361,10 @@ impl HudView {
     }
 
     pub fn set_error(&mut self, message: String, kind: ErrorKind) {
-        self.recovery_is_microphone = kind == ErrorKind::Microphone;
-        self.recovery_message = Some(message.clone());
+        self.recovery = Some(Recovery {
+            message: message.clone(),
+            kind,
+        });
         self.status = HudStatus::Error {
             message,
             occurred_at: Instant::now(),
@@ -1572,7 +1589,7 @@ impl HudView {
                     PillPart::snippet(said, soft(), SNIPPET_MAX_W),
                     PillPart::meta(format_latency_ms(*latency_ms)),
                 ];
-                if self.recovery_message.is_some() {
+                if self.recovery.is_some() {
                     parts.push(details());
                 }
                 parts
@@ -1596,9 +1613,7 @@ impl HudView {
             HudStatus::Idle | HudStatus::Error { .. } | HudStatus::NoSpeech { .. } => {
                 Some(PillAction::Settings)
             }
-            HudStatus::Success { .. } if self.recovery_message.is_some() => {
-                Some(PillAction::Settings)
-            }
+            HudStatus::Success { .. } if self.recovery.is_some() => Some(PillAction::Settings),
             _ => None,
         }
     }
@@ -1893,8 +1908,9 @@ impl HudView {
             }))
             .child({
                 let panel = panel_body
-                    .when_some(self.recovery_message.clone(), |panel, message| {
-                        let retry = self.recovery_is_microphone;
+                    .when_some(self.recovery.clone(), |panel, recovery| {
+                        let retry = recovery.kind == ErrorKind::Microphone;
+                        let message = recovery.message;
                         let hud = cx.entity();
                         let mut alert = Alert::new("recovery", Severity::Warning, "Action needed")
                             .body(message)
@@ -1902,8 +1918,7 @@ impl HudView {
                                 let hud = hud.clone();
                                 move |_, cx| {
                                     hud.update(cx, |this, cx| {
-                                        this.recovery_message = None;
-                                        this.recovery_is_microphone = false;
+                                        this.recovery = None;
                                         if matches!(
                                             this.status,
                                             HudStatus::Error { .. } | HudStatus::NoSpeech { .. }
