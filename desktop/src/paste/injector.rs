@@ -11,11 +11,6 @@ const INPUT_READY_BUDGET: Duration = Duration::from_millis(60);
 /// still caught early, large enough not to spin.
 const INPUT_READY_STEP: Duration = Duration::from_millis(4);
 
-/// The mark on each key event that TDT sends. The keyboard hook passes
-/// these events on, so the typed text cannot start a recording. Events from
-/// other programs (a remap tool, a remote desktop) have another mark.
-pub const OWN_INPUT: usize = 0x5444_5401;
-
 /// Characters in one `SendInput` call. A short pause follows each call but
 /// the last, so the app can read its input before more comes.
 const TYPED_AT_ONCE: usize = 256;
@@ -341,7 +336,7 @@ fn keyboard_input(
                 wScan: scan_code,
                 dwFlags: flags,
                 time: 0,
-                dwExtraInfo: OWN_INPUT,
+                dwExtraInfo: crate::keys::OWN_INPUT,
             },
         },
     }

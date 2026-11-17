@@ -706,7 +706,7 @@ unsafe extern "system" fn hotkey_hook_proc(
         // mistaken for a new shortcut. Keys that other programs send (a remap
         // tool, a remote desktop) can be the shortcut.
         // With no listener left (a failed start), every key passes on.
-        if kbd.dwExtraInfo == crate::paste::OWN_INPUT || SENDER.lock().is_none() {
+        if kbd.dwExtraInfo == crate::keys::OWN_INPUT || SENDER.lock().is_none() {
             return CallNextHookEx(
                 HHOOK(HOOK_PTR.load(Ordering::Relaxed)),
                 code,

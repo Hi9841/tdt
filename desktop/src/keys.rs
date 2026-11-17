@@ -8,3 +8,8 @@ pub const MODIFIERS: [u16; 11] = [
 pub fn is_modifier(vk: u16) -> bool {
     MODIFIERS.contains(&vk)
 }
+
+/// The mark on each key event that TDT sends. The keyboard hook passes
+/// these events on, so the typed text cannot start a recording. Events from
+/// other programs (a remap tool, a remote desktop) have another mark.
+pub const OWN_INPUT: usize = 0x5444_5401;
