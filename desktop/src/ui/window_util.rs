@@ -124,7 +124,7 @@ fn shell_open(path: &std::path::Path) -> Result<(), String> {
 
 /// Shell popups the pill must not cover. The taskbar is absent on purpose:
 /// a topmost taskbar was painting over the pill and leaving it there.
-pub fn overlay_should_yield_to(class_name: &str) -> bool {
+fn overlay_should_yield_to(class_name: &str) -> bool {
     matches!(
         class_name,
         "#32768"
@@ -138,16 +138,9 @@ pub fn overlay_should_yield_to(class_name: &str) -> bool {
     )
 }
 
-/// Raise when topmost style was dropped, or when an app or the taskbar is
-/// above the pill. `covered_by_app_or_taskbar` is false when nothing is above
-/// or the only windows above are shell popups from `overlay_should_yield_to`.
-pub fn overlay_should_raise(style_is_current: bool, covered_by_app_or_taskbar: bool) -> bool {
-    !style_is_current || covered_by_app_or_taskbar
-}
-
 /// Compute the overlay extended style. Always keeps topmost + toolwindow.
 /// Expanded panels drop WS_EX_NOACTIVATE so they can take keyboard focus.
-pub fn overlay_extended_style(current_ex: i32, expanded: bool) -> i32 {
+fn overlay_extended_style(current_ex: i32, expanded: bool) -> i32 {
     let topmost_tool = (WS_EX_TOPMOST.0 | WS_EX_TOOLWINDOW.0) as i32;
     let noactivate = WS_EX_NOACTIVATE.0 as i32;
     if expanded {
@@ -158,7 +151,7 @@ pub fn overlay_extended_style(current_ex: i32, expanded: bool) -> i32 {
 }
 
 /// Restore the captured app only while this overlay still holds foreground.
-pub fn should_restore_previous_foreground(
+fn should_restore_previous_foreground(
     overlay: isize,
     current_fg: isize,
     previous: Option<isize>,
@@ -173,7 +166,7 @@ pub fn should_restore_previous_foreground(
 }
 
 /// After the open morph, activate only if the user did not switch apps.
-pub fn should_activate_overlay_after_open(
+fn should_activate_overlay_after_open(
     overlay: isize,
     current_fg: isize,
     previous: Option<isize>,
@@ -188,7 +181,7 @@ pub fn should_activate_overlay_after_open(
 /// the live foreground may be the TDT window itself. A known overlay is never
 /// returned. Otherwise this is the live foreground, or a still-valid previous
 /// hwnd captured when settings opened.
-pub fn dictation_target_from_handles(
+fn dictation_target_from_handles(
     overlay: Option<isize>,
     current_fg: isize,
     previous: Option<isize>,
@@ -205,7 +198,6 @@ pub fn dictation_target_from_handles(
 }
 
 /// Apply topmost/toolwindow and NOACTIVATE according to the live expanded flag.
-/// Main startup should call this instead of OR-ing WS_EX_NOACTIVATE blindly.
 /// SetWindowPos always uses SWP_NOACTIVATE so a style refresh cannot steal focus.
 pub fn apply_overlay_window_style(hwnd: HWND) {
     if hwnd.is_invalid() {
@@ -307,8 +299,9 @@ pub fn ensure_overlay_topmost() {
     }
     let expanded = overlay_expanded().load(std::sync::atomic::Ordering::SeqCst);
     let style_is_current = overlay_extended_style(ex, expanded) == ex;
-    let covered = covered_by_app_or_taskbar(hwnd);
-    if !overlay_should_raise(style_is_current, covered) {
+    // Raise when the topmost style was dropped, or when an app or the
+    // taskbar is above the pill. Shell popups above it do not count.
+    if style_is_current && !covered_by_app_or_taskbar(hwnd) {
         return;
     }
     if !style_is_current {
