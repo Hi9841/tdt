@@ -640,3 +640,28 @@ The app itself did not run. The change is in the engine; the hook, the microphon
 and the typing did not change.
 
 Released as TDT 0.9.8.
+
+
+## Session 2026-11-18 (later): Trit 0.15.0
+
+The speech engine goes from Trit 0.14.0 to 0.15.0: the Android team follows the app's cpuset
+(it was only in TDT for Android's copy of Trit), every int8 path groups its product tasks the
+same way, and the two clippy findings of the new stable toolchain are gone. For TDT on
+Windows nothing changes: the task rule gave no change on x86-64 (Trit's profile build, 81
+takes, 3 rounds: decoder 157-167 against 161-179 ms), and the team rule is for Android only.
+
+### Gate
+
+`bench-asr --chunk-ms 10`, TDT 0.9.8 (Trit 0.14.0) against this build (Trit 0.15.0), each with
+its own copy of the two models: clean (200), other (200), tech (40), and 200 saved takes, both
+models, with AVX-512 and with `TRIT_ISA=avx2`: 0 texts differ in each of the 16 comparisons,
+and the error counts are equal. The wait totals of these runs are not usable: another session
+started an Android emulator and a Rust build during them, and the totals moved 2 to 5 times in
+both directions.
+
+### Not verified
+
+The app itself did not run. The change is in the engine; the hook, the microphone, the pill,
+and the typing did not change.
+
+Released as TDT 0.9.9.
