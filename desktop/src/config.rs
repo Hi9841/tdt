@@ -167,6 +167,14 @@ impl Settings {
         }
     }
 
+    /// Writes the settings of this run to the file.
+    pub fn save(&self) -> Result<(), std::io::Error> {
+        if self.persist {
+            self.live.lock().save()?;
+        }
+        Ok(())
+    }
+
     pub fn get<T>(&self, read: impl FnOnce(&AppConfig) -> T) -> T {
         read(&self.live.lock())
     }

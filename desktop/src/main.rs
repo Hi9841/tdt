@@ -212,45 +212,40 @@ fn main() {
         update::remove_downloaded_setups();
     }
 
-    let mut config = if preview::is_active() {
-        AppConfig::default()
+    // The preview captures never read or write the settings file.
+    let settings = if preview::is_active() {
+        Settings::new(AppConfig::default(), false)
     } else {
-        AppConfig::load()
+        Settings::new(AppConfig::load(), true)
     };
     // A damaged settings file: say so on the pill, and write the defaults so
     // the next load is clean. `load` kept a copy of the old file.
     let config_error = config::take_reset_notice();
     if config_error.is_some() {
-        if let Err(error) = config.save() {
+        if let Err(error) = settings.save() {
             log::note(&format!("Could not save the default settings: {error}"));
         }
     }
     // A retired model id moves to the model that replaces it, also in the file.
-    let resolved_id = models::resolve(&config.model_id).id.to_string();
-    if !preview::is_active() && resolved_id != config.model_id {
-        config.model_id = resolved_id;
-        if let Err(error) = config.save() {
+    let model_id = settings.get(|config| config.model_id.clone());
+    let model_spec = models::resolve(&model_id);
+    if model_spec.id != model_id {
+        if let Err(error) = settings.update(|config| config.model_id = model_spec.id.to_string()) {
             log::note(&format!("Could not save the model id: {error}"));
         }
-    } else {
-        config.model_id = resolved_id;
     }
-    let hotkey_binding = HotkeyBinding::parse(&config.hotkey).unwrap_or_else(|| {
+    let hotkey_text = settings.get(|config| config.hotkey.clone());
+    let hotkey_binding = HotkeyBinding::parse(&hotkey_text).unwrap_or_else(|| {
         log::note(&format!(
-            "Could not read the shortcut '{}' of the settings. TDT uses the default.",
-            config.hotkey
+            "Could not read the shortcut '{hotkey_text}' of the settings. TDT uses the default."
         ));
         let binding = HotkeyBinding::default();
-        config.hotkey = binding.display();
-        if !preview::is_active() {
-            if let Err(error) = config.save() {
-                log::note(&format!("Could not save the default shortcut: {error}"));
-            }
+        if let Err(error) = settings.update(|config| config.hotkey = binding.display()) {
+            log::note(&format!("Could not save the default shortcut: {error}"));
         }
         binding
     });
     set_binding(hotkey_binding);
-    let settings = Settings::new(config.clone(), !preview::is_active());
     let hotkey_label = hotkey_binding.display();
 
     // Open the microphone before the window. Doing it on the GPUI executor
@@ -275,10 +270,10 @@ fn main() {
     };
     let recorder = Rc::new(RefCell::new(recorder));
 
-    let model_spec = models::resolve(&config.model_id);
+    let model_dir = settings.get(|config| config.model_dir.clone());
     let stt_engine = EngineSlot::default();
     stt_engine.set(
-        if let Some(dir) = models::find_dir(model_spec, config.model_dir.as_deref()) {
+        if let Some(dir) = models::find_dir(model_spec, model_dir.as_deref()) {
             log::note(&format!(
                 "{} speech model found at: {}",
                 model_spec.label,
