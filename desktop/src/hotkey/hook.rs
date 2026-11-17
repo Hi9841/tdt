@@ -144,7 +144,6 @@ static SHORTCUT_DOWN_TICK: AtomicU32 = AtomicU32::new(0);
 const REPEAT_WITHIN_MS: u32 = 1_500;
 
 /// Marks the shortcut key as down from a press that TDT kept.
-#[cfg(target_os = "windows")]
 fn shortcut_went_down() {
     SHORTCUT_DOWN_TICK.store(tick_count(), Ordering::SeqCst);
     SHORTCUT_DOWN.store(true, Ordering::SeqCst);
@@ -152,7 +151,6 @@ fn shortcut_went_down() {
 
 /// True for a key-down of the shortcut key that is a repeat of a press that
 /// TDT kept.
-#[cfg(target_os = "windows")]
 fn shortcut_repeats() -> bool {
     if !SHORTCUT_DOWN.load(Ordering::SeqCst) {
         return false;
@@ -211,7 +209,6 @@ pub fn wake_loop() {
 /// administrator window took it. Windows still knows that a modifier of the
 /// shortcut is up. A shortcut with no modifier has no such sign: Windows
 /// does not keep the state of a key that the hook holds back.
-#[cfg(target_os = "windows")]
 pub fn poll_missed_release() {
     if PRESS_START.lock().is_none() {
         return;
@@ -226,9 +223,6 @@ pub fn poll_missed_release() {
         finish_press();
     }
 }
-
-#[cfg(not(target_os = "windows"))]
-pub fn poll_missed_release() {}
 
 fn send_action(action: HotkeyAction) {
     if let Some(ref sender) = *SENDER.lock() {
@@ -310,7 +304,6 @@ pub struct HotkeyListener {
 }
 
 impl HotkeyListener {
-    #[cfg(target_os = "windows")]
     pub fn start() -> Result<(Self, Receiver<HotkeyAction>), String> {
         use windows::Win32::Foundation::HWND;
         use windows::Win32::UI::WindowsAndMessaging::{
@@ -393,7 +386,6 @@ impl HotkeyListener {
         }
     }
 
-    #[cfg(target_os = "windows")]
     fn shutdown_thread(&self) {
         self.running.store(false, Ordering::SeqCst);
         let thread_id = HOOK_THREAD_ID.load(Ordering::SeqCst);
@@ -410,58 +402,40 @@ impl HotkeyListener {
             }
         }
     }
-
-    #[cfg(not(target_os = "windows"))]
-    pub fn start() -> Result<(Self, Receiver<HotkeyAction>), String> {
-        let (_sender, receiver) = async_channel::unbounded();
-        let running = Arc::new(AtomicBool::new(true));
-        Ok((Self { running }, receiver))
-    }
 }
 
-#[cfg(target_os = "windows")]
 impl Drop for HotkeyListener {
     fn drop(&mut self) {
         self.shutdown_thread();
     }
 }
 
-#[cfg(target_os = "windows")]
 static HOOK_THREAD_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
-#[cfg(target_os = "windows")]
 static HOOK_PTR: std::sync::atomic::AtomicPtr<core::ffi::c_void> =
     std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 
-#[cfg(target_os = "windows")]
 static MOUSE_HOOK_PTR: std::sync::atomic::AtomicPtr<core::ffi::c_void> =
     std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 
 /// When a hook last got an event, as a Windows tick count.
-#[cfg(target_os = "windows")]
 static HOOK_SEEN_TICK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// The time between two checks of the hooks.
-#[cfg(target_os = "windows")]
 const HOOK_WATCH_MS: u32 = 2_000;
 /// Input this much newer than the last hook event did not reach the hooks.
-#[cfg(target_os = "windows")]
 const UNSEEN_INPUT_MS: i32 = 1_000;
 
 /// Key events and mouse events that the hooks got since the last check of the
 /// watch, for its log line.
-#[cfg(target_os = "windows")]
 static KEY_EVENTS: AtomicU32 = AtomicU32::new(0);
-#[cfg(target_os = "windows")]
 static MOUSE_EVENTS: AtomicU32 = AtomicU32::new(0);
 
-#[cfg(target_os = "windows")]
 fn tick_count() -> u32 {
     // SAFETY: GetTickCount takes no pointers.
     unsafe { windows::Win32::System::SystemInformation::GetTickCount() }
 }
 
-#[cfg(target_os = "windows")]
 fn note_hook_event(events: &AtomicU32) {
     HOOK_SEEN_TICK.store(tick_count(), Ordering::Relaxed);
     events.fetch_add(1, Ordering::Relaxed);
@@ -470,7 +444,6 @@ fn note_hook_event(events: &AtomicU32) {
 /// Installs the keyboard hook and the mouse hook on the calling thread.
 /// Without the mouse hook only a mouse shortcut fails, so that is no error:
 /// the result then holds the cause.
-#[cfg(target_os = "windows")]
 unsafe fn install_hooks() -> Result<Option<String>, String> {
     use windows::Win32::Foundation::HINSTANCE;
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -497,7 +470,6 @@ unsafe fn install_hooks() -> Result<Option<String>, String> {
 }
 
 /// What Windows said when TDT removed one hook.
-#[cfg(target_os = "windows")]
 enum HookEnd {
     /// TDT had no hook of this kind.
     NotInstalled,
@@ -507,7 +479,6 @@ enum HookEnd {
     Gone(String),
 }
 
-#[cfg(target_os = "windows")]
 impl std::fmt::Display for HookEnd {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -520,7 +491,6 @@ impl std::fmt::Display for HookEnd {
 
 /// Removes the hooks on the thread that installed them. Returns what Windows
 /// said for the mouse hook and for the keyboard hook.
-#[cfg(target_os = "windows")]
 unsafe fn remove_hooks() -> [HookEnd; 2] {
     use windows::Win32::UI::WindowsAndMessaging::{UnhookWindowsHookEx, HHOOK};
     [&MOUSE_HOOK_PTR, &HOOK_PTR].map(|slot| {
@@ -544,7 +514,6 @@ unsafe fn remove_hooks() -> [HookEnd; 2] {
 /// that case is no reason for an install. For other input that the hooks
 /// cannot see (the lock screen), the installs become less frequent, down to
 /// about one each minute, until a hook sees an event again.
-#[cfg(target_os = "windows")]
 #[derive(Default)]
 struct HookWatch {
     /// Installs in sequence that no hook event followed.
@@ -558,7 +527,6 @@ struct HookWatch {
     unlogged: u32,
 }
 
-#[cfg(target_os = "windows")]
 impl HookWatch {
     /// Runs on the hook thread.
     unsafe fn check(&mut self) {
@@ -633,7 +601,6 @@ impl HookWatch {
     }
 }
 
-#[cfg(target_os = "windows")]
 fn key_down(vk: i32) -> bool {
     use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
     // SAFETY: GetAsyncKeyState takes no pointers.
@@ -641,7 +608,6 @@ fn key_down(vk: i32) -> bool {
 }
 
 /// Keys and mouse buttons that are down right now. Index is the virtual-key code.
-#[cfg(target_os = "windows")]
 pub fn input_mask() -> [bool; 256] {
     let mut mask = [false; 256];
     for (vk, slot) in mask.iter_mut().enumerate().skip(1) {
@@ -652,7 +618,6 @@ pub fn input_mask() -> [bool; 256] {
 
 /// A key or button that was up when `baseline` was taken and is down now.
 /// Modifiers are ignored so the shortcut's Ctrl can stay held.
-#[cfg(target_os = "windows")]
 pub fn input_appeared(baseline: &[bool; 256]) -> Option<u16> {
     let now = input_mask();
     (0..now.len())
@@ -665,7 +630,6 @@ pub fn input_appeared(baseline: &[bool; 256]) -> Option<u16> {
 /// A keyboard key counts only when the hook saw it go down. Some laptop
 /// drivers report a key as down that never goes up, and that key would stop
 /// every paste.
-#[cfg(target_os = "windows")]
 pub fn input_held(binding_vk: u16) -> Option<u16> {
     (1..=255u16).find(|&vk| {
         let real = is_mouse_vk(vk) || PHYSICAL_DOWN[usize::from(vk)].load(Ordering::SeqCst);
@@ -673,7 +637,6 @@ pub fn input_held(binding_vk: u16) -> Option<u16> {
     })
 }
 
-#[cfg(target_os = "windows")]
 fn modifiers_down() -> (bool, bool, bool, bool) {
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_RCONTROL, VK_RMENU,
@@ -690,7 +653,6 @@ fn modifiers_down() -> (bool, bool, bool, bool) {
     (ctrl, alt, shift, win)
 }
 
-#[cfg(target_os = "windows")]
 fn binding_with_modifiers(vk: u16) -> HotkeyBinding {
     let (ctrl, alt, shift, win) = modifiers_down();
     HotkeyBinding {
@@ -702,7 +664,6 @@ fn binding_with_modifiers(vk: u16) -> HotkeyBinding {
     }
 }
 
-#[cfg(target_os = "windows")]
 fn modifiers_match(binding: HotkeyBinding) -> bool {
     let (ctrl, alt, shift, win) = modifiers_down();
     ctrl == binding.ctrl && alt == binding.alt && shift == binding.shift && win == binding.win
@@ -715,7 +676,6 @@ fn is_required_modifier(vk: u16, binding: HotkeyBinding) -> bool {
         || (binding.win && matches!(vk, 0x5B | 0x5C))
 }
 
-#[cfg(target_os = "windows")]
 unsafe extern "system" fn hotkey_hook_proc(
     code: i32,
     wparam: windows::Win32::Foundation::WPARAM,
@@ -813,12 +773,10 @@ unsafe extern "system" fn hotkey_hook_proc(
 
 /// Side buttons whose down event TDT swallowed. Their up event is swallowed
 /// too, so an app never gets a lone up and goes Back or Forward.
-#[cfg(target_os = "windows")]
 static MOUSE_SWALLOWED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 /// Only Mouse 4 and Mouse 5 events are read. All other mouse events pass on
 /// at once, because this hook runs for each mouse move on the system.
-#[cfg(target_os = "windows")]
 unsafe extern "system" fn mouse_hook_proc(
     code: i32,
     wparam: windows::Win32::Foundation::WPARAM,
@@ -856,7 +814,6 @@ unsafe extern "system" fn mouse_hook_proc(
 }
 
 /// Returns true when TDT keeps the event from other apps.
-#[cfg(target_os = "windows")]
 fn handle_mouse_button(vk: u16, is_down: bool) -> bool {
     let bit = 1u8 << (vk - VK_MOUSE4);
     if !is_down {

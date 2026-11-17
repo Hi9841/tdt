@@ -35,24 +35,21 @@ pub fn prewarm() {
 pub fn play_sound(effect: SoundEffect) {
     let wav_bytes: &'static [u8] = wav_for(effect);
 
-    #[cfg(target_os = "windows")]
-    {
-        use windows::core::PCWSTR;
-        use windows::Win32::Media::Audio::{PlaySoundW, SND_ASYNC, SND_MEMORY, SND_NODEFAULT};
+    use windows::core::PCWSTR;
+    use windows::Win32::Media::Audio::{PlaySoundW, SND_ASYNC, SND_MEMORY, SND_NODEFAULT};
 
-        // SAFETY: `wav_bytes` is `'static`. With SND_MEMORY, PlaySoundW reads the WAV from that address and
-        // never as text, and SND_ASYNC needs it to stay valid, which `'static` guarantees.
-        unsafe {
-            // SND_ASYNC replaces any in-flight sound: a success chime cuts off
-            // the start blip. That overlap is accepted UI behavior, not a bug.
-            // The PCWSTR cast is only an address under SND_MEMORY; the WAV
-            // bytes are never read as UTF-16.
-            let _ = PlaySoundW(
-                PCWSTR(wav_bytes.as_ptr() as *const u16),
-                None,
-                SND_ASYNC | SND_MEMORY | SND_NODEFAULT,
-            );
-        }
+    // SAFETY: `wav_bytes` is `'static`. With SND_MEMORY, PlaySoundW reads the WAV from that address and
+    // never as text, and SND_ASYNC needs it to stay valid, which `'static` guarantees.
+    unsafe {
+        // SND_ASYNC replaces any in-flight sound: a success chime cuts off
+        // the start blip. That overlap is accepted UI behavior, not a bug.
+        // The PCWSTR cast is only an address under SND_MEMORY; the WAV
+        // bytes are never read as UTF-16.
+        let _ = PlaySoundW(
+            PCWSTR(wav_bytes.as_ptr() as *const u16),
+            None,
+            SND_ASYNC | SND_MEMORY | SND_NODEFAULT,
+        );
     }
 }
 

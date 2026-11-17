@@ -112,7 +112,6 @@ impl std::fmt::Display for NotTyped {
 
 /// True once the window's input focus is live, meaning synthesized keystrokes
 /// will land in a real edit control rather than being dropped.
-#[cfg(target_os = "windows")]
 fn has_input_focus(hwnd: windows::Win32::Foundation::HWND) -> bool {
     use windows::Win32::UI::WindowsAndMessaging::{
         GetGUIThreadInfo, GetWindowThreadProcessId, GUITHREADINFO,
@@ -133,7 +132,6 @@ fn has_input_focus(hwnd: windows::Win32::Foundation::HWND) -> bool {
     }
 }
 
-#[cfg(target_os = "windows")]
 fn wait_for_input_focus(hwnd: windows::Win32::Foundation::HWND) {
     let started = Instant::now();
     while started.elapsed() < INPUT_READY_BUDGET {
@@ -286,7 +284,6 @@ impl PasteInjector {
         }
 
         // Bring the original target back to the foreground.
-        #[cfg(target_os = "windows")]
         if let Some(raw) = target_hwnd {
             if raw != 0 {
                 use windows::Win32::Foundation::HWND;
@@ -333,31 +330,18 @@ impl PasteInjector {
             }
         }
 
-        // Non-Windows targets keep the fixed delay: the readiness probe is a
-        // Win32 concept and this path is not shipped.
-        #[cfg(not(target_os = "windows"))]
-        thread::sleep(INPUT_READY_BUDGET);
-
         Ok(())
     }
 
     fn type_prepared(&self, text: &str) -> Result<(), NotTyped> {
         // Inject Unicode text directly. A synthetic Ctrl+V is interpreted as an image
         // paste by some apps, even when CF_UNICODETEXT is present.
-        #[cfg(target_os = "windows")]
-        {
-            type_text_windows(text).map_err(NotTyped::Partial)?;
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            let _ = text;
-        }
+        type_text_windows(text).map_err(NotTyped::Partial)?;
 
         Ok(())
     }
 }
 
-#[cfg(target_os = "windows")]
 fn release_physical_modifiers() {
     use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, KEYEVENTF_KEYUP};
 
@@ -381,7 +365,6 @@ fn release_physical_modifiers() {
     let _ = send_inputs(&inputs);
 }
 
-#[cfg(target_os = "windows")]
 fn type_text_windows(text: &str) -> Result<(), String> {
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, VIRTUAL_KEY, VK_RETURN, VK_TAB,
@@ -411,7 +394,6 @@ fn type_text_windows(text: &str) -> Result<(), String> {
     send_inputs(&inputs)
 }
 
-#[cfg(target_os = "windows")]
 fn keyboard_input(
     virtual_key: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY,
     scan_code: u16,
@@ -432,7 +414,6 @@ fn keyboard_input(
     }
 }
 
-#[cfg(target_os = "windows")]
 fn push_key(
     inputs: &mut Vec<windows::Win32::UI::Input::KeyboardAndMouse::INPUT>,
     virtual_key: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY,
@@ -442,7 +423,6 @@ fn push_key(
     inputs.push(keyboard_input(virtual_key, 0, KEYEVENTF_KEYUP));
 }
 
-#[cfg(target_os = "windows")]
 fn send_inputs(
     inputs: &[windows::Win32::UI::Input::KeyboardAndMouse::INPUT],
 ) -> Result<(), String> {

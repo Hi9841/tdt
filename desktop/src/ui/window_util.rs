@@ -1,24 +1,18 @@
-#[cfg(target_os = "windows")]
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-#[cfg(target_os = "windows")]
 use windows::Win32::Graphics::Dwm::{
     DwmGetWindowAttribute, DwmSetWindowAttribute, DWMNCRP_DISABLED, DWMWA_BORDER_COLOR,
     DWMWA_CLOAKED, DWMWA_COLOR_NONE, DWMWA_NCRENDERING_POLICY, DWMWA_WINDOW_CORNER_PREFERENCE,
     DWMWCP_DONOTROUND,
 };
-#[cfg(target_os = "windows")]
 use windows::Win32::Graphics::Gdi::{
     ClientToScreen, CreateRectRgn, DeleteObject, EnumDisplayMonitors, GetMonitorInfoW,
     MonitorFromPoint, MonitorFromWindow, SetWindowRgn, HDC, HGDIOBJ, HMONITOR, HRGN, MONITORINFO,
     MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTONULL,
 };
-#[cfg(target_os = "windows")]
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED,
 };
-#[cfg(target_os = "windows")]
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
-#[cfg(target_os = "windows")]
 use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::Shell::{IVirtualDesktopManager, VirtualDesktopManager};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -69,7 +63,6 @@ pub fn set_pill_hit_rect(rect: (f32, f32, f32, f32)) {
         }
         *current = Some(rect);
     }
-    #[cfg(target_os = "windows")]
     if let Some(hwnd) = find_app_hwnd() {
         apply_overlay_region(hwnd);
     }
@@ -214,7 +207,6 @@ pub fn dictation_target_from_handles(
 /// Apply topmost/toolwindow and NOACTIVATE according to the live expanded flag.
 /// Main startup should call this instead of OR-ing WS_EX_NOACTIVATE blindly.
 /// SetWindowPos always uses SWP_NOACTIVATE so a style refresh cannot steal focus.
-#[cfg(target_os = "windows")]
 pub fn apply_overlay_window_style(hwnd: HWND) {
     if hwnd.is_invalid() {
         return;
@@ -244,7 +236,6 @@ pub fn apply_overlay_window_style(hwnd: HWND) {
 /// Put TDT's icon on the window so the taskbar, Alt-Tab, Task Manager and
 /// Start Menu search stop showing the blank default Zed::Window icon. The
 /// image is resource ordinal 1 — the same "1 ICON ..." the .lnk and tray use.
-#[cfg(target_os = "windows")]
 pub fn set_window_icon(hwnd: HWND) {
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     if hwnd.is_invalid() {
@@ -288,7 +279,6 @@ pub fn set_window_icon(hwnd: HWND) {
 /// Put the pill back at the top of the topmost band. The startup pass runs
 /// once and can miss the HWND; the taskbar can also step above a window that
 /// already has WS_EX_TOPMOST. Call this from the existing overlay poll.
-#[cfg(target_os = "windows")]
 pub fn ensure_overlay_topmost() {
     let Some(hwnd) = find_app_hwnd() else {
         return;
@@ -342,7 +332,6 @@ pub fn ensure_overlay_topmost() {
 /// True when another app fills the overlay's whole monitor, as a game or a
 /// fullscreen video does. A maximized window fills only the work area, and
 /// the desktop and shell views are not apps.
-#[cfg(target_os = "windows")]
 fn fullscreen_app_in_front(overlay: HWND) -> bool {
     // SAFETY: Win32 window and monitor queries. `info` has `cbSize` set, `rect` is a valid out value, and
     // a stale handle makes a call fail, not misbehave.
@@ -378,13 +367,11 @@ fn fullscreen_app_in_front(overlay: HWND) -> bool {
 }
 
 /// GPUI's window procedure, saved by `keep_pill_from_activating`.
-#[cfg(target_os = "windows")]
 static GPUI_WNDPROC: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 
 /// GPUI answers WM_MOUSEACTIVATE with MA_ACTIVATE, so a click on the pill
 /// would take focus from the app the user dictates into, or knock a game
 /// out of fullscreen. Only the open panel may take focus.
-#[cfg(target_os = "windows")]
 pub fn keep_pill_from_activating(hwnd: HWND) {
     use std::sync::atomic::Ordering;
     if hwnd.is_invalid() || GPUI_WNDPROC.load(Ordering::SeqCst) != 0 {
@@ -404,7 +391,6 @@ pub fn keep_pill_from_activating(hwnd: HWND) {
     }
 }
 
-#[cfg(target_os = "windows")]
 unsafe extern "system" fn overlay_wndproc(
     hwnd: HWND,
     msg: u32,
@@ -420,7 +406,6 @@ unsafe extern "system" fn overlay_wndproc(
     CallWindowProcW(gpui, hwnd, msg, wparam, lparam)
 }
 
-#[cfg(target_os = "windows")]
 fn window_class_name(hwnd: HWND) -> String {
     let mut class_name = [0u16; 256];
     // SAFETY: `class_name` is a valid buffer for the call.
@@ -432,7 +417,6 @@ fn window_class_name(hwnd: HWND) -> String {
     }
 }
 
-#[cfg(target_os = "windows")]
 fn window_is_cloaked(hwnd: HWND) -> bool {
     let mut cloaked = 0u32;
     // SAFETY: `cloaked` is a u32, the size DWMWA_CLOAKED writes.
@@ -448,7 +432,6 @@ fn window_is_cloaked(hwnd: HWND) -> bool {
     }
 }
 
-#[cfg(target_os = "windows")]
 fn covered_by_app_or_taskbar(hwnd: HWND) -> bool {
     // SAFETY: GetWindow reads the window order only; a stale handle makes a call fail, not misbehave.
     let mut above = unsafe { GetWindow(hwnd, GW_HWNDPREV) }.ok();
@@ -471,7 +454,6 @@ fn covered_by_app_or_taskbar(hwnd: HWND) -> bool {
     false
 }
 
-#[cfg(target_os = "windows")]
 fn apply_overlay_dwm(hwnd: HWND) {
     // GPUI owns the alpha-capable client surface. A second system backdrop or
     // an extended DWM frame can hide GPUI's painted content, so keep DWM
@@ -501,7 +483,6 @@ fn apply_overlay_dwm(hwnd: HWND) {
     apply_overlay_region(hwnd);
 }
 
-#[cfg(target_os = "windows")]
 fn apply_overlay_region(hwnd: HWND) {
     // A GDI round region is not antialiased and produces a second, jagged
     // curve over GPUI's GPU-painted corner. So the region is a plain
@@ -517,7 +498,6 @@ fn apply_overlay_region(hwnd: HWND) {
     }
 }
 
-#[cfg(target_os = "windows")]
 fn pill_region(hwnd: HWND) -> Option<HRGN> {
     let collapsed = !overlay_expanded().load(std::sync::atomic::Ordering::SeqCst);
     let (x, y, w, h) = (*pill_hit_rect().lock()).filter(|_| collapsed)?;
@@ -544,24 +524,16 @@ fn pill_region(hwnd: HWND) -> Option<HRGN> {
 
 /// HWND of the app that should receive inserted text. Never the TDT overlay.
 pub fn dictation_target_window() -> Option<isize> {
-    #[cfg(target_os = "windows")]
-    {
-        let overlay = find_app_hwnd();
-        let overlay_raw = overlay.map(|h| h.0 as isize);
-        // SAFETY: GetForegroundWindow takes no arguments.
-        let fg = unsafe { GetForegroundWindow() };
-        let fg_raw = if fg.is_invalid() { 0 } else { fg.0 as isize };
-        let previous = *previous_foreground().lock();
-        let previous_is_live = previous.is_some_and(hwnd_still_valid);
-        dictation_target_from_handles(overlay_raw, fg_raw, previous, previous_is_live)
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        None
-    }
+    let overlay = find_app_hwnd();
+    let overlay_raw = overlay.map(|h| h.0 as isize);
+    // SAFETY: GetForegroundWindow takes no arguments.
+    let fg = unsafe { GetForegroundWindow() };
+    let fg_raw = if fg.is_invalid() { 0 } else { fg.0 as isize };
+    let previous = *previous_foreground().lock();
+    let previous_is_live = previous.is_some_and(hwnd_still_valid);
+    dictation_target_from_handles(overlay_raw, fg_raw, previous, previous_is_live)
 }
 
-#[cfg(target_os = "windows")]
 fn hwnd_still_valid(raw: isize) -> bool {
     if raw == 0 {
         return false;
@@ -570,7 +542,6 @@ fn hwnd_still_valid(raw: isize) -> bool {
     unsafe { IsWindow(HWND(raw as _)).as_bool() }
 }
 
-#[cfg(target_os = "windows")]
 fn capture_previous_foreground(overlay: HWND) {
     // SAFETY: GetForegroundWindow takes no arguments, and the handle is used only as a number.
     unsafe {
@@ -582,7 +553,6 @@ fn capture_previous_foreground(overlay: HWND) {
     }
 }
 
-#[cfg(target_os = "windows")]
 fn set_foreground_hwnd(hwnd: HWND) {
     if hwnd.is_invalid() {
         return;
@@ -596,7 +566,6 @@ fn set_foreground_hwnd(hwnd: HWND) {
     }
 }
 
-#[cfg(target_os = "windows")]
 fn activate_overlay_window(hwnd: HWND) {
     if hwnd.is_invalid() {
         return;
@@ -608,7 +577,6 @@ fn activate_overlay_window(hwnd: HWND) {
     }
 }
 
-#[cfg(target_os = "windows")]
 fn restore_previous_foreground(overlay: HWND) {
     let previous = *previous_foreground().lock();
     // SAFETY: GetForegroundWindow takes no arguments.
@@ -626,7 +594,6 @@ fn restore_previous_foreground(overlay: HWND) {
     set_foreground_hwnd(HWND(raw as _));
 }
 
-#[cfg(target_os = "windows")]
 fn apply_window_mode(hwnd: HWND, is_expanded: bool) {
     if !is_expanded {
         apply_overlay_window_style(hwnd);
@@ -646,7 +613,6 @@ fn apply_window_mode(hwnd: HWND, is_expanded: bool) {
 
 /// GPUI's popup can finish creation without WS_VISIBLE when the first frame
 /// was delayed. Show it without activating.
-#[cfg(target_os = "windows")]
 pub fn show_overlay_window(hwnd: HWND) {
     if hwnd.is_invalid() {
         return;
@@ -657,7 +623,6 @@ pub fn show_overlay_window(hwnd: HWND) {
     }
 }
 
-#[cfg(target_os = "windows")]
 fn window_scale(hwnd: HWND) -> f32 {
     // SAFETY: GetDpiForWindow returns 0 for a bad handle.
     let dpi = unsafe { GetDpiForWindow(hwnd) };
@@ -676,7 +641,6 @@ fn logical_to_device(value: f32, scale: f32) -> i32 {
 /// between the outer window rect and its client rect. Sizing the window with
 /// the raw bubble constants leaves the client area smaller than the UI
 /// expects, clipping the pill's right and bottom edges.
-#[cfg(target_os = "windows")]
 fn chrome_inset(hwnd: HWND) -> (i32, i32) {
     // SAFETY: `outer` and `client` are valid RECTs for the calls to fill.
     unsafe {
@@ -692,7 +656,6 @@ fn chrome_inset(hwnd: HWND) -> (i32, i32) {
 }
 
 /// Outer window size for the panel on the work area `work`.
-#[cfg(target_os = "windows")]
 fn canvas_outer_size(hwnd: HWND, work: (i32, i32, i32, i32)) -> (i32, i32) {
     let (dw, dh) = chrome_inset(hwnd);
     let (w, h) = panel_size_for_work_at_scale(work.2 - work.0, work.3 - work.1, window_scale(hwnd));
@@ -702,56 +665,52 @@ fn canvas_outer_size(hwnd: HWND, work: (i32, i32, i32, i32)) -> (i32, i32) {
 /// Make the overlay a true popup, strip resize handles, and keep it at the
 /// panel's size for its monitor without an overlapped-window frame.
 pub fn lock_overlay_chrome() {
-    #[cfg(target_os = "windows")]
-    {
-        let Some(hwnd) = find_app_hwnd() else {
+    let Some(hwnd) = find_app_hwnd() else {
+        return;
+    };
+    // SAFETY: Win32 calls on the overlay window; a stale handle makes a call fail, not misbehave. `rect` is a valid out value.
+    unsafe {
+        let style = GetWindowLongW(hwnd, GWL_STYLE);
+        let blocked = (WS_CAPTION.0 | WS_THICKFRAME.0 | WS_MAXIMIZEBOX.0 | WS_MINIMIZEBOX.0) as i32;
+        let popup_style = (style & !blocked) | WS_POPUP.0 as i32;
+        if popup_style != style {
+            let _ = SetWindowLongW(hwnd, GWL_STYLE, popup_style);
+            let _ = SetWindowPos(
+                hwnd,
+                HWND::default(),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOACTIVATE
+                    | SWP_NOZORDER
+                    | SWP_NOCOPYBITS
+                    | SWP_FRAMECHANGED
+                    | SWP_NOMOVE
+                    | SWP_NOSIZE,
+            );
+            apply_overlay_dwm(hwnd);
+        }
+        let Some(work) = monitor_work_area(hwnd) else {
             return;
         };
-        // SAFETY: Win32 calls on the overlay window; a stale handle makes a call fail, not misbehave. `rect` is a valid out value.
-        unsafe {
-            let style = GetWindowLongW(hwnd, GWL_STYLE);
-            let blocked =
-                (WS_CAPTION.0 | WS_THICKFRAME.0 | WS_MAXIMIZEBOX.0 | WS_MINIMIZEBOX.0) as i32;
-            let popup_style = (style & !blocked) | WS_POPUP.0 as i32;
-            if popup_style != style {
-                let _ = SetWindowLongW(hwnd, GWL_STYLE, popup_style);
-                let _ = SetWindowPos(
-                    hwnd,
-                    HWND::default(),
-                    0,
-                    0,
-                    0,
-                    0,
-                    SWP_NOACTIVATE
-                        | SWP_NOZORDER
-                        | SWP_NOCOPYBITS
-                        | SWP_FRAMECHANGED
-                        | SWP_NOMOVE
-                        | SWP_NOSIZE,
-                );
-                apply_overlay_dwm(hwnd);
-            }
-            let Some(work) = monitor_work_area(hwnd) else {
-                return;
-            };
-            let mut rect = RECT::default();
-            let _ = GetWindowRect(hwnd, &mut rect);
-            let (want_w, want_h) = canvas_outer_size(hwnd, work);
-            let w = rect.right - rect.left;
-            let h = rect.bottom - rect.top;
-            if w != want_w || h != want_h {
-                let bottom = rect.bottom;
-                let _ = SetWindowPos(
-                    hwnd,
-                    HWND::default(),
-                    rect.left,
-                    bottom - want_h,
-                    want_w,
-                    want_h,
-                    SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOCOPYBITS,
-                );
-                apply_overlay_region(hwnd);
-            }
+        let mut rect = RECT::default();
+        let _ = GetWindowRect(hwnd, &mut rect);
+        let (want_w, want_h) = canvas_outer_size(hwnd, work);
+        let w = rect.right - rect.left;
+        let h = rect.bottom - rect.top;
+        if w != want_w || h != want_h {
+            let bottom = rect.bottom;
+            let _ = SetWindowPos(
+                hwnd,
+                HWND::default(),
+                rect.left,
+                bottom - want_h,
+                want_w,
+                want_h,
+                SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOCOPYBITS,
+            );
+            apply_overlay_region(hwnd);
         }
     }
 }
@@ -786,7 +745,6 @@ fn clamp_panel_extent(
     }
 }
 
-#[cfg(target_os = "windows")]
 pub fn client_animations_enabled() -> bool {
     // Cached; the Win32 call is cheap but this runs on every render and the
     // value only changes via the system settings dialog.
@@ -817,12 +775,6 @@ pub fn client_animations_enabled() -> bool {
     enabled.as_bool()
 }
 
-#[cfg(not(target_os = "windows"))]
-pub fn client_animations_enabled() -> bool {
-    false
-}
-
-#[cfg(target_os = "windows")]
 pub fn find_app_hwnd() -> Option<HWND> {
     if let Some(hwnd) = stored_overlay_hwnd() {
         return Some(hwnd);
@@ -864,12 +816,10 @@ pub fn find_app_hwnd() -> Option<HWND> {
     None
 }
 
-#[cfg(target_os = "windows")]
 fn is_gpui_overlay_window(hwnd: HWND) -> bool {
     window_class_name(hwnd) == "Zed::Window"
 }
 
-#[cfg(target_os = "windows")]
 fn stored_overlay_hwnd() -> Option<HWND> {
     let stored = *remembered_hwnd().lock();
     stored.and_then(|raw| {
@@ -885,7 +835,6 @@ fn stored_overlay_hwnd() -> Option<HWND> {
     })
 }
 
-#[cfg(target_os = "windows")]
 fn monitor_work_area(hwnd: HWND) -> Option<(i32, i32, i32, i32)> {
     // SAFETY: Win32 monitor queries. `info` has `cbSize` set and outlives the call.
     unsafe {
@@ -905,7 +854,6 @@ fn monitor_work_area(hwnd: HWND) -> Option<(i32, i32, i32, i32)> {
     }
 }
 
-#[cfg(target_os = "windows")]
 fn preferred_startup_work_area() -> Option<(i32, i32, i32, i32)> {
     struct Found {
         primary: Option<(i32, i32, i32, i32)>,
@@ -956,75 +904,68 @@ fn preferred_startup_work_area() -> Option<(i32, i32, i32, i32)> {
 /// Switch between the pill and the open panel. The window keeps its size;
 /// only focus behavior and the input region change.
 pub fn set_window_mode(is_expanded: bool) {
-    #[cfg(target_os = "windows")]
-    {
-        overlay_expanded().store(is_expanded, std::sync::atomic::Ordering::SeqCst);
-        let Some(hwnd) = find_app_hwnd() else {
-            return;
-        };
-        if is_expanded {
-            capture_previous_foreground(hwnd);
-        }
-        let raw = hwnd.0 as isize;
-        // Focus changes send window messages back into GPUI; make them off
-        // the UI thread so they never arrive in the middle of an update.
-        std::thread::spawn(move || apply_window_mode(HWND(raw as _), is_expanded));
+    overlay_expanded().store(is_expanded, std::sync::atomic::Ordering::SeqCst);
+    let Some(hwnd) = find_app_hwnd() else {
+        return;
+    };
+    if is_expanded {
+        capture_previous_foreground(hwnd);
     }
+    let raw = hwnd.0 as isize;
+    // Focus changes send window messages back into GPUI; make them off
+    // the UI thread so they never arrive in the middle of an update.
+    std::thread::spawn(move || apply_window_mode(HWND(raw as _), is_expanded));
 }
 
 /// Moves the pill to the virtual desktop that the user looks at. The check
 /// is a COM call into Explorer: call it from a thread that can wait, not
 /// from the UI loop.
 pub fn follow_current_virtual_desktop() {
-    #[cfg(target_os = "windows")]
-    {
-        let Some(hwnd) = find_app_hwnd() else {
-            return;
-        };
-        // SAFETY: COM calls on this thread. `VDM` initializes COM here and keeps its proxy until the thread ends.
-        unsafe {
-            thread_local! {
-                // Never released. The manager is a proxy into Explorer, and the
-                // release at process exit is an RPC call that never returns
-                // after Windows stops the COM threads, so TDT never exits.
-                // SAFETY: COM is initialized on this thread before the proxy is created, and `ManuallyDrop` keeps the
-                // proxy from being released.
-                static VDM: std::mem::ManuallyDrop<Option<IVirtualDesktopManager>> = unsafe {
-                    let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-                    std::mem::ManuallyDrop::new(
-                        CoCreateInstance::<_, IVirtualDesktopManager>(
-                            &VirtualDesktopManager,
-                            None,
-                            CLSCTX_ALL,
-                        )
-                        .ok(),
+    let Some(hwnd) = find_app_hwnd() else {
+        return;
+    };
+    // SAFETY: COM calls on this thread. `VDM` initializes COM here and keeps its proxy until the thread ends.
+    unsafe {
+        thread_local! {
+            // Never released. The manager is a proxy into Explorer, and the
+            // release at process exit is an RPC call that never returns
+            // after Windows stops the COM threads, so TDT never exits.
+            // SAFETY: COM is initialized on this thread before the proxy is created, and `ManuallyDrop` keeps the
+            // proxy from being released.
+            static VDM: std::mem::ManuallyDrop<Option<IVirtualDesktopManager>> = unsafe {
+                let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+                std::mem::ManuallyDrop::new(
+                    CoCreateInstance::<_, IVirtualDesktopManager>(
+                        &VirtualDesktopManager,
+                        None,
+                        CLSCTX_ALL,
                     )
-                };
-            }
-            VDM.with(|vdm| {
-                let Some(vdm) = &**vdm else {
-                    return;
-                };
-                if vdm
-                    .IsWindowOnCurrentVirtualDesktop(hwnd)
-                    .is_ok_and(|v| v.as_bool())
-                {
-                    return;
-                }
-                let fg = GetForegroundWindow();
-                if fg.is_invalid() || fg == hwnd {
-                    return;
-                }
-                if let Ok(desktop_id) = vdm.GetWindowDesktopId(fg) {
-                    let _ = vdm.MoveWindowToDesktop(hwnd, &desktop_id);
-                    apply_overlay_window_style(hwnd);
-                }
-            });
+                    .ok(),
+                )
+            };
         }
+        VDM.with(|vdm| {
+            let Some(vdm) = &**vdm else {
+                return;
+            };
+            if vdm
+                .IsWindowOnCurrentVirtualDesktop(hwnd)
+                .is_ok_and(|v| v.as_bool())
+            {
+                return;
+            }
+            let fg = GetForegroundWindow();
+            if fg.is_invalid() || fg == hwnd {
+                return;
+            }
+            if let Ok(desktop_id) = vdm.GetWindowDesktopId(fg) {
+                let _ = vdm.MoveWindowToDesktop(hwnd, &desktop_id);
+                apply_overlay_window_style(hwnd);
+            }
+        });
     }
 }
 
-#[cfg(target_os = "windows")]
 pub fn position_bubble_on_preferred_monitor(hwnd: HWND) {
     if let Some(work) = preferred_startup_work_area() {
         place_at_bottom_center(hwnd, work);
@@ -1033,7 +974,6 @@ pub fn position_bubble_on_preferred_monitor(hwnd: HWND) {
 
 /// Puts the overlay at the bottom center of the work area `work`, at the
 /// panel's size for it.
-#[cfg(target_os = "windows")]
 fn place_at_bottom_center(hwnd: HWND, (left, top, right, bottom): (i32, i32, i32, i32)) {
     let (w, h) = canvas_outer_size(hwnd, (left, top, right, bottom));
     let scale = window_scale(hwnd);
@@ -1060,22 +1000,16 @@ fn place_at_bottom_center(hwnd: HWND, (left, top, right, bottom): (i32, i32, i32
 /// The open panel does not move. The calls send messages to the UI thread,
 /// so they run on a thread of their own.
 pub fn move_pill_to_screen_of(target: Option<isize>) {
-    #[cfg(target_os = "windows")]
-    {
-        if overlay_expanded().load(std::sync::atomic::Ordering::SeqCst) {
-            return;
-        }
-        let Some(hwnd) = find_app_hwnd() else {
-            return;
-        };
-        let raw = hwnd.0 as isize;
-        std::thread::spawn(move || place_on_screen_of(HWND(raw as _), target));
+    if overlay_expanded().load(std::sync::atomic::Ordering::SeqCst) {
+        return;
     }
-    #[cfg(not(target_os = "windows"))]
-    let _ = target;
+    let Some(hwnd) = find_app_hwnd() else {
+        return;
+    };
+    let raw = hwnd.0 as isize;
+    std::thread::spawn(move || place_on_screen_of(HWND(raw as _), target));
 }
 
-#[cfg(target_os = "windows")]
 fn place_on_screen_of(hwnd: HWND, target: Option<isize>) {
     // SAFETY: Win32 monitor and cursor queries; `point` and `info` are valid out values, `info` has
     // `cbSize` set, and a stale handle makes a call fail, not misbehave.

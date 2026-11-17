@@ -126,7 +126,6 @@ fn deliver_transcript(
 /// For a thread between the key and the typed text. These threads sleep
 /// nearly all the time, so the priority costs other programs nothing, and a
 /// CPU load at normal priority no longer stands in front of each step.
-#[cfg(target_os = "windows")]
 pub(crate) fn raise_thread() {
     use windows::Win32::System::Threading::{
         GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
@@ -135,9 +134,6 @@ pub(crate) fn raise_thread() {
     // pointer. A failed call only leaves the thread at normal priority.
     let _ = unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) };
 }
-
-#[cfg(not(target_os = "windows"))]
-pub(crate) fn raise_thread() {}
 
 /// One line per dictation, so a paste that did not arrive or a slow take can
 /// be explained from the log. It names the app, never the text.
@@ -430,7 +426,6 @@ fn main() {
         let (internal_tx, internal_rx) = crossbeam_channel::unbounded::<InternalEvent>();
 
         // Background thread to apply Win32 WS_EX_TOPMOST & WS_EX_NOACTIVATE & WS_EX_TOOLWINDOW
-        #[cfg(target_os = "windows")]
         std::thread::spawn(move || {
             let mut overlay = None;
             for _ in 0..60 {
@@ -1254,7 +1249,6 @@ fn main() {
 /// after Windows stops every other thread, so a step that waits on one, as a
 /// COM release into Explorer did, keeps a windowless TDT alive forever.
 fn exit_now(code: u32) -> ! {
-    #[cfg(windows)]
     // SAFETY: TerminateProcess on this process's own pseudo-handle.
     unsafe {
         use windows::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
@@ -1270,13 +1264,10 @@ enum InstanceClaim {
 }
 
 struct InstanceGuard {
-    #[cfg(windows)]
     mutex: windows::Win32::Foundation::HANDLE,
-    #[cfg(windows)]
     show_event: windows::Win32::Foundation::HANDLE,
 }
 
-#[cfg(windows)]
 impl Drop for InstanceGuard {
     fn drop(&mut self) {
         // SAFETY: both handles come from `claim_instance` and are closed once, here. The slot is cleared first,
@@ -1295,37 +1286,26 @@ fn show_event_slot() -> &'static Mutex<Option<isize>> {
 }
 
 fn take_show_request() -> bool {
-    #[cfg(windows)]
-    {
-        use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
-        use windows::Win32::System::Threading::WaitForSingleObject;
-        // The lock stays held, so `InstanceGuard::drop` cannot close the event mid-call.
-        let slot = show_event_slot().lock();
-        let Some(raw) = *slot else {
-            return false;
-        };
-        // SAFETY: the slot holds the event until `InstanceGuard::drop` clears it under this
-        // lock, so the handle is open. A zero timeout only reads the event state.
-        unsafe { WaitForSingleObject(HANDLE(raw as _), 0) == WAIT_OBJECT_0 }
-    }
-    #[cfg(not(windows))]
-    {
-        false
-    }
+    use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
+    use windows::Win32::System::Threading::WaitForSingleObject;
+    // The lock stays held, so `InstanceGuard::drop` cannot close the event mid-call.
+    let slot = show_event_slot().lock();
+    let Some(raw) = *slot else {
+        return false;
+    };
+    // SAFETY: the slot holds the event until `InstanceGuard::drop` clears it under this
+    // lock, so the handle is open. A zero timeout only reads the event state.
+    unsafe { WaitForSingleObject(HANDLE(raw as _), 0) == WAIT_OBJECT_0 }
 }
 
 fn signal_running_instance() {
-    #[cfg(windows)]
-    {
-        use windows::core::w;
-        use windows::Win32::System::Threading::{OpenEventW, SetEvent, EVENT_MODIFY_STATE};
-        // SAFETY: the name is a static null-terminated string, and the opened handle is closed after use.
-        unsafe {
-            if let Ok(handle) = OpenEventW(EVENT_MODIFY_STATE, false, w!("Local\\TDT-ShowOverlay"))
-            {
-                let _ = SetEvent(handle);
-                let _ = windows::Win32::Foundation::CloseHandle(handle);
-            }
+    use windows::core::w;
+    use windows::Win32::System::Threading::{OpenEventW, SetEvent, EVENT_MODIFY_STATE};
+    // SAFETY: the name is a static null-terminated string, and the opened handle is closed after use.
+    unsafe {
+        if let Ok(handle) = OpenEventW(EVENT_MODIFY_STATE, false, w!("Local\\TDT-ShowOverlay")) {
+            let _ = SetEvent(handle);
+            let _ = windows::Win32::Foundation::CloseHandle(handle);
         }
     }
 }
@@ -1333,7 +1313,6 @@ fn signal_running_instance() {
 /// Windows starts an exe at low integrity when the file carries a low-rights
 /// label (files saved into a folder with that label inherit it). A low process
 /// cannot read keys from, or paste into, normal apps.
-#[cfg(windows)]
 fn low_rights_message() -> Option<String> {
     if integrity::own()? >= integrity::MEDIUM {
         return None;
@@ -1347,59 +1326,47 @@ fn low_rights_message() -> Option<String> {
     ))
 }
 
-#[cfg(not(windows))]
-fn low_rights_message() -> Option<String> {
-    None
-}
-
 fn claim_instance() -> InstanceClaim {
-    #[cfg(windows)]
-    {
-        use windows::core::w;
-        use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
-        use windows::Win32::System::Threading::{CreateEventW, CreateMutexW};
+    use windows::core::w;
+    use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
+    use windows::Win32::System::Threading::{CreateEventW, CreateMutexW};
 
-        // SAFETY: Win32 object calls with static names. Each handle is closed on every failure path or owned
-        // by the returned guard.
-        unsafe {
-            // CreateMutexW's wrapper does not surface ERROR_ALREADY_EXISTS.
-            // Open the existing object first so a second launch cannot start
-            // another speech worker.
-            if let Ok(existing) = windows::Win32::System::Threading::OpenMutexW(
-                windows::Win32::System::Threading::SYNCHRONIZATION_ACCESS_RIGHTS(0x00100000),
-                false,
-                w!("Local\\TDT-TalkDontType"),
-            ) {
-                let _ = windows::Win32::Foundation::CloseHandle(existing);
-                signal_running_instance();
-                return InstanceClaim::AlreadyRunning;
-            }
-            match CreateMutexW(None, true, w!("Local\\TDT-TalkDontType")) {
-                Ok(mutex) => {
-                    if GetLastError() == ERROR_ALREADY_EXISTS {
-                        let _ = windows::Win32::Foundation::CloseHandle(mutex);
-                        signal_running_instance();
-                        InstanceClaim::AlreadyRunning
-                    } else {
-                        match CreateEventW(None, false, false, w!("Local\\TDT-ShowOverlay")) {
-                            Ok(show_event) => {
-                                *show_event_slot().lock() = Some(show_event.0 as isize);
-                                InstanceClaim::Owned(InstanceGuard { mutex, show_event })
-                            }
-                            Err(error) => {
-                                let _ = windows::Win32::Foundation::CloseHandle(mutex);
-                                InstanceClaim::Failed(format!("Could not start TDT: {error}"))
-                            }
+    // SAFETY: Win32 object calls with static names. Each handle is closed on every failure path or owned
+    // by the returned guard.
+    unsafe {
+        // CreateMutexW's wrapper does not surface ERROR_ALREADY_EXISTS.
+        // Open the existing object first so a second launch cannot start
+        // another speech worker.
+        if let Ok(existing) = windows::Win32::System::Threading::OpenMutexW(
+            windows::Win32::System::Threading::SYNCHRONIZATION_ACCESS_RIGHTS(0x00100000),
+            false,
+            w!("Local\\TDT-TalkDontType"),
+        ) {
+            let _ = windows::Win32::Foundation::CloseHandle(existing);
+            signal_running_instance();
+            return InstanceClaim::AlreadyRunning;
+        }
+        match CreateMutexW(None, true, w!("Local\\TDT-TalkDontType")) {
+            Ok(mutex) => {
+                if GetLastError() == ERROR_ALREADY_EXISTS {
+                    let _ = windows::Win32::Foundation::CloseHandle(mutex);
+                    signal_running_instance();
+                    InstanceClaim::AlreadyRunning
+                } else {
+                    match CreateEventW(None, false, false, w!("Local\\TDT-ShowOverlay")) {
+                        Ok(show_event) => {
+                            *show_event_slot().lock() = Some(show_event.0 as isize);
+                            InstanceClaim::Owned(InstanceGuard { mutex, show_event })
+                        }
+                        Err(error) => {
+                            let _ = windows::Win32::Foundation::CloseHandle(mutex);
+                            InstanceClaim::Failed(format!("Could not start TDT: {error}"))
                         }
                     }
                 }
-                Err(error) => InstanceClaim::Failed(format!("Could not start TDT: {error}")),
             }
+            Err(error) => InstanceClaim::Failed(format!("Could not start TDT: {error}")),
         }
-    }
-    #[cfg(not(windows))]
-    {
-        InstanceClaim::Owned(InstanceGuard {})
     }
 }
 
@@ -1448,22 +1415,15 @@ fn append_log(message: &str) {
 }
 
 fn show_error(message: &str) {
-    #[cfg(windows)]
-    {
-        use windows::core::HSTRING;
-        use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
-        // SAFETY: MessageBoxW gets owned strings that outlive the call.
-        unsafe {
-            let _ = MessageBoxW(
-                None,
-                &HSTRING::from(message),
-                &HSTRING::from("TDT"),
-                MB_OK | MB_ICONERROR,
-            );
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        eprintln!("{message}");
+    use windows::core::HSTRING;
+    use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+    // SAFETY: MessageBoxW gets owned strings that outlive the call.
+    unsafe {
+        let _ = MessageBoxW(
+            None,
+            &HSTRING::from(message),
+            &HSTRING::from("TDT"),
+            MB_OK | MB_ICONERROR,
+        );
     }
 }

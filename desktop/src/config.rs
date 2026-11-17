@@ -226,57 +226,10 @@ impl AppStats {
 }
 
 pub(crate) fn local_hms() -> String {
-    #[cfg(windows)]
-    {
-        #[repr(C)]
-        struct SystemTime {
-            year: u16,
-            month: u16,
-            day_of_week: u16,
-            day: u16,
-            hour: u16,
-            minute: u16,
-            second: u16,
-            millisecond: u16,
-        }
-
-        #[link(name = "kernel32")]
-        extern "system" {
-            fn GetLocalTime(time: *mut SystemTime);
-        }
-
-        let mut time = SystemTime {
-            year: 0,
-            month: 0,
-            day_of_week: 0,
-            day: 0,
-            hour: 0,
-            minute: 0,
-            second: 0,
-            millisecond: 0,
-        };
-        // SAFETY: `time` is a valid SYSTEMTIME for GetLocalTime to fill.
-        unsafe {
-            GetLocalTime(&mut time);
-        }
-        format!(
-            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-            time.year, time.month, time.day, time.hour, time.minute, time.second
-        )
-    }
-
-    #[cfg(not(windows))]
-    {
-        let now = std::time::SystemTime::now();
-        let duration = now
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default();
-        let secs = duration.as_secs();
-        format!(
-            "{:02}:{:02}:{:02}",
-            (secs / 3600) % 24,
-            (secs / 60) % 60,
-            secs % 60
-        )
-    }
+    // SAFETY: GetLocalTime takes no pointer and returns the time by value.
+    let time = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        time.wYear, time.wMonth, time.wDay, time.wHour, time.wMinute, time.wSecond
+    )
 }
