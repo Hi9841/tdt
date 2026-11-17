@@ -458,7 +458,6 @@ pub struct HudView {
     clear_history_pending: bool,
     active_model: Option<String>,
     installed_models: Vec<String>,
-    model_dir: Option<std::path::PathBuf>,
     model_loading: Option<String>,
     /// Thousandths of the model load in progress, written by the load thread.
     model_progress: Arc<AtomicU32>,
@@ -542,7 +541,6 @@ impl HudView {
             clear_history_pending: false,
             active_model,
             installed_models,
-            model_dir: config.model_dir,
             model_loading: None,
             model_progress: Arc::new(AtomicU32::new(0)),
             model_progress_drawn: 0,
@@ -928,7 +926,7 @@ impl HudView {
             return;
         }
         let spec = models::resolve(id);
-        let Some(dir) = models::find_dir(spec, self.model_dir.as_deref()) else {
+        let Some(dir) = models::find_dir(spec, self.model_dir().as_deref()) else {
             self.model_error = Some("Download this model before using it.".into());
             return;
         };
@@ -995,8 +993,7 @@ impl HudView {
             return;
         }
         let spec = models::resolve(&self.selected_model);
-        let override_dir = AppConfig::load().model_dir;
-        if models::find_dir(spec, override_dir.as_deref()).is_some() {
+        if models::find_dir(spec, self.model_dir().as_deref()).is_some() {
             self.install_engine(spec.id);
             return;
         }
@@ -1053,6 +1050,11 @@ impl HudView {
 
     fn set_auto_updates(&mut self, on: bool) {
         self.save_setting(|config| config.check_updates = on);
+    }
+
+    /// The model folder of the settings file, when it names one.
+    fn model_dir(&self) -> Option<std::path::PathBuf> {
+        self.settings.get(|config| config.model_dir.clone())
     }
 
     fn auto_paste(&self) -> bool {
