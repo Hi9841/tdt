@@ -5,7 +5,7 @@ use crate::audio::recorder::CaptureHandle;
 use crate::audio::{SpeechTail, MAX_TAIL};
 use crate::config::{AppStats, Settings};
 use crate::hotkey::{current_binding, input_appeared, input_held, input_mask, note_user_typed};
-use crate::paste::{self, DeliveryOutcome, DeliverySteps, NotTyped, PasteInjector};
+use crate::paste::{DeliveryOutcome, DeliverySteps, NotTyped, PasteInjector};
 use crate::priority;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -282,7 +282,7 @@ fn log_delivery(
     };
     let app = target.map_or_else(
         || "no window".to_string(),
-        |raw| paste::Target::of(raw).to_string(),
+        |raw| crate::target::Target::of(raw).to_string(),
     );
     log::note(&format!(
         "Delivery: {result}. App: {app}. Latency: {latency}. Take {:.1} s, last part {:.1} s, {} characters ({steps}).",

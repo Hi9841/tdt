@@ -558,10 +558,10 @@ impl HookWatch {
         // An administrator window in front takes the input: Windows gives it
         // to no hook of a normal program. The hooks are still there.
         let front = windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow();
-        let front_app = (!front.is_invalid()).then(|| crate::paste::Target::of(front.0 as isize));
+        let front_app = (!front.is_invalid()).then(|| crate::target::Target::of(front.0 as isize));
         if front_app
             .as_ref()
-            .is_some_and(crate::paste::Target::blocks_input)
+            .is_some_and(crate::target::Target::blocks_input)
         {
             return;
         }

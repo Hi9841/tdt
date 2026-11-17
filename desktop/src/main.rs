@@ -13,6 +13,7 @@ mod keys;
 mod logfile;
 mod paste;
 mod priority;
+mod target;
 mod ui;
 mod update;
 

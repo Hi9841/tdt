@@ -240,7 +240,7 @@ impl PasteInjector {
         };
         // Windows would drop the keys and report success, so do not
         // claim a paste that cannot happen.
-        if super::Target::of(raw).blocks_input() {
+        if crate::target::Target::of(raw).blocks_input() {
             return Err(NotTyped::Elevated);
         }
         let hwnd = HWND(raw as _);
