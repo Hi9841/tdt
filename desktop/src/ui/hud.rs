@@ -444,7 +444,6 @@ pub struct HudView {
     pub auto_paste_state: Arc<Mutex<bool>>,
     panel_motion: Option<PanelMotion>,
     update: Arc<Mutex<UpdatePhase>>,
-    update_ping: crossbeam_channel::Sender<()>,
     model_phase: Arc<Mutex<DownloadPhase>>,
     model_error: Option<String>,
     /// Why the dictionary file could not be opened, shown under the Dictionary row.
@@ -485,7 +484,6 @@ impl HudView {
         auto_paste_state: Arc<Mutex<bool>>,
         remove_fillers_state: Arc<AtomicBool>,
         update: Arc<Mutex<UpdatePhase>>,
-        update_ping: crossbeam_channel::Sender<()>,
         cx: &mut Context<Self>,
     ) -> Self {
         let open_panel =
@@ -546,7 +544,6 @@ impl HudView {
             auto_paste_state,
             panel_motion: None,
             update,
-            update_ping,
             model_phase: Arc::new(Mutex::new(DownloadPhase::Idle)),
             model_error: None,
             dictionary_error: None,
@@ -769,14 +766,14 @@ impl HudView {
         if preview::is_active() {
             return;
         }
-        update::check(&self.update, kind, &self.update_ping);
+        update::check(&self.update, kind);
     }
 
     fn install_update(&self) {
         if preview::is_active() {
             return;
         }
-        update::install(&self.update, &self.update_ping);
+        update::install(&self.update);
     }
 
     pub fn close_stats_settings(&mut self, cx: &mut Context<Self>) {
@@ -953,7 +950,6 @@ impl HudView {
         self.model_progress.store(0, Ordering::Relaxed);
         self.model_progress_drawn = 0;
         let tx = self.model_ready_tx.clone();
-        let ping = self.update_ping.clone();
         let progress = Arc::clone(&self.model_progress);
         std::thread::spawn(move || {
             let engine = SttEngine::new(&dir, spec);
@@ -973,7 +969,6 @@ impl HudView {
                     )
                 });
             let _ = tx.send(result);
-            let _ = ping.send(());
         });
     }
 
@@ -1020,26 +1015,17 @@ impl HudView {
         let dest = models::install_dir(spec);
         let id = spec.id.to_string();
         let phase = Arc::clone(&self.model_phase);
-        let ping = self.update_ping.clone();
         *phase.lock() = DownloadPhase::Downloading {
             id: id.clone(),
             progress: models::DownloadProgress::start(spec),
         };
         std::thread::spawn(move || {
             let spec = models::resolve(&id);
-            let mut last_ping = Instant::now();
-            let mut last_pct = 255u8;
             let result = models::download(spec, &dest, |progress| {
-                let pct = models::percent(progress.done, progress.total);
                 *phase.lock() = DownloadPhase::Downloading {
                     id: spec.id.to_string(),
                     progress,
                 };
-                if last_ping.elapsed() >= Duration::from_millis(100) || pct != last_pct {
-                    let _ = ping.send(());
-                    last_ping = Instant::now();
-                    last_pct = pct;
-                }
             });
             match result {
                 Ok(()) => {
@@ -1061,7 +1047,6 @@ impl HudView {
                     };
                 }
             }
-            let _ = ping.send(());
         });
     }
 

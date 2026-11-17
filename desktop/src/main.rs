@@ -404,9 +404,6 @@ fn main() {
         let update_for_view = Arc::clone(&update_state);
         let update_for_boot = Arc::clone(&update_state);
         let update_for_loop = Arc::clone(&update_state);
-        let (update_ping_tx, update_ping_rx) = crossbeam_channel::unbounded::<()>();
-        let update_ping_view = update_ping_tx.clone();
-        let update_ping_boot = update_ping_tx.clone();
 
         // Store foreground window HWND so auto-paste always restores focus to user target app
         let target_hwnd_state = Arc::new(Mutex::new(None::<isize>));
@@ -574,7 +571,6 @@ fn main() {
                                 view.open_settings(cx);
                             });
                         }
-                        while update_ping_rx.try_recv().is_ok() {}
                         let retry = this
                             .update(cx, |view, cx| {
                                 view.take_ready_model();
@@ -1189,7 +1185,7 @@ fn main() {
                     std::thread::spawn(move || {
                         std::thread::sleep(Duration::from_secs(8));
                         loop {
-                            update::check(&update_for_boot, CheckKind::Automatic, &update_ping_boot);
+                            update::check(&update_for_boot, CheckKind::Automatic);
                             std::thread::sleep(Duration::from_secs(60 * 60));
                         }
                     });
@@ -1201,7 +1197,6 @@ fn main() {
                     auto_paste_view,
                     fillers_view,
                     update_for_view,
-                    update_ping_view,
                     cx,
                 );
                 for error in [config_error, microphone_error, hotkey_error]

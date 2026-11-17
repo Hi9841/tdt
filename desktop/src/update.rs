@@ -8,7 +8,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::Sender;
 use parking_lot::Mutex;
 use sha2::Digest;
 
@@ -115,7 +114,7 @@ pub enum CheckKind {
 /// check always runs and shows its errors. An automatic check runs only when
 /// the last one is `AUTO_CHECK_EVERY` old, and a failure keeps the previous
 /// state.
-pub fn check(cell: &Arc<Mutex<UpdatePhase>>, kind: CheckKind, ping: &Sender<()>) {
+pub fn check(cell: &Arc<Mutex<UpdatePhase>>, kind: CheckKind) {
     let manual = kind == CheckKind::Manual;
     if updates_disabled() || (!manual && !AUTO_CHECKS.load(Ordering::Relaxed)) {
         return;
@@ -127,8 +126,7 @@ pub fn check(cell: &Arc<Mutex<UpdatePhase>>, kind: CheckKind, ping: &Sender<()>)
         }
         std::mem::replace(&mut *phase, UpdatePhase::Checking)
     };
-    let _ = ping.send(());
-    let (cell, ping) = (Arc::clone(cell), ping.clone());
+    let cell = Arc::clone(cell);
     std::thread::spawn(move || {
         let next = match latest_release() {
             Ok(Some(release)) => UpdatePhase::Available(release),
@@ -142,13 +140,12 @@ pub fn check(cell: &Arc<Mutex<UpdatePhase>>, kind: CheckKind, ping: &Sender<()>)
             }
         };
         *cell.lock() = next;
-        let _ = ping.send(());
     });
 }
 
 /// Downloads the available release on a new thread and starts its setup.
 /// On success the phase becomes `Installing`, and the main loop quits TDT.
-pub fn install(cell: &Arc<Mutex<UpdatePhase>>, ping: &Sender<()>) {
+pub fn install(cell: &Arc<Mutex<UpdatePhase>>) {
     let release = {
         let mut phase = cell.lock();
         let UpdatePhase::Available(release) = &*phase else {
@@ -161,19 +158,13 @@ pub fn install(cell: &Arc<Mutex<UpdatePhase>>, ping: &Sender<()>) {
         };
         release
     };
-    let _ = ping.send(());
-    let (cell, ping) = (Arc::clone(cell), ping.clone());
+    let cell = Arc::clone(cell);
     std::thread::spawn(move || {
-        let mut last_ping = Instant::now();
         let result = download(&release, |done| {
             *cell.lock() = UpdatePhase::Downloading {
                 done,
                 total: release.size,
             };
-            if last_ping.elapsed() >= Duration::from_millis(100) {
-                let _ = ping.send(());
-                last_ping = Instant::now();
-            }
         })
         .and_then(|setup| {
             std::process::Command::new(&setup)
@@ -186,7 +177,6 @@ pub fn install(cell: &Arc<Mutex<UpdatePhase>>, ping: &Sender<()>) {
             Ok(()) => UpdatePhase::Installing,
             Err(error) => UpdatePhase::Failed(error),
         };
-        let _ = ping.send(());
     });
 }
 
