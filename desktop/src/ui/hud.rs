@@ -470,6 +470,8 @@ pub struct HudView {
     model_ready_tx: crossbeam_channel::Sender<Result<PreparedModel, String>>,
     model_ready_rx: crossbeam_channel::Receiver<Result<PreparedModel, String>>,
     preview_ready: Option<bool>,
+    /// The preview captures: a frozen clock (`age`).
+    frozen: bool,
     root_focus: FocusHandle,
     panel_focus: FocusHandle,
     panel_needs_focus: bool,
@@ -542,6 +544,7 @@ impl HudView {
             model_ready_tx,
             model_ready_rx,
             preview_ready: None,
+            frozen: preview::is_active(),
             root_focus: cx.focus_handle(),
             panel_focus: cx.focus_handle().tab_stop(false),
             panel_needs_focus: open_panel,
@@ -721,16 +724,13 @@ impl HudView {
     }
 
     pub fn toggle_hotkey_capture(&mut self) {
+        // With no hook (the preview captures), a capture changes nothing.
         if self.hotkey_capturing {
             self.hotkey_capturing = false;
-            if !preview::is_active() {
-                hotkey::end_capture();
-            }
+            hotkey::end_capture();
         } else {
             self.hotkey_capturing = true;
-            if !preview::is_active() {
-                hotkey::begin_capture();
-            }
+            hotkey::begin_capture();
         }
     }
 
@@ -1302,20 +1302,18 @@ impl HudView {
     /// row, a result, and "No speech detected". Returns true when nothing on
     /// the pill or the panel changes with time.
     pub fn tick(&mut self, cx: &mut Context<Self>) -> bool {
-        if !preview::is_active() {
-            if let Some(copied_at) = self.copied_at {
-                if copied_at.elapsed() > Duration::from_millis(1400) {
-                    self.copied_key = None;
-                    self.copied_at = None;
-                    cx.notify();
-                }
+        if let Some(copied_at) = self.copied_at {
+            if self.age(copied_at) > Duration::from_millis(1400) {
+                self.copied_key = None;
+                self.copied_at = None;
+                cx.notify();
             }
         }
         let back_to_idle = match &self.status {
             // The live wave requests a frame on every vsync and reads the
             // microphone itself, so the UI loop does not pace it.
             HudStatus::Listening { .. } => {
-                if preview::is_active() {
+                if self.frozen {
                     cx.notify();
                 }
                 false
@@ -1324,15 +1322,9 @@ impl HudView {
             // loop keeps repainting even when reduced motion is on.
             HudStatus::Transcribing { .. } => false,
             HudStatus::Success { finished_at, .. } => {
-                !preview::is_active()
-                    && success_returns_to_idle(
-                        finished_at.elapsed(),
-                        self.recovery_message.is_some(),
-                    )
+                success_returns_to_idle(self.age(*finished_at), self.recovery_message.is_some())
             }
-            HudStatus::NoSpeech { since } => {
-                !preview::is_active() && success_returns_to_idle(since.elapsed(), true)
-            }
+            HudStatus::NoSpeech { since } => success_returns_to_idle(self.age(*since), true),
             HudStatus::Error { .. } | HudStatus::Idle => false,
         };
         if back_to_idle {
@@ -1341,6 +1333,16 @@ impl HudView {
             cx.notify();
         }
         self.at_rest()
+    }
+
+    /// The time since `since`. The preview captures have a frozen clock, so
+    /// their states never time out.
+    fn age(&self, since: Instant) -> Duration {
+        if self.frozen {
+            Duration::ZERO
+        } else {
+            since.elapsed()
+        }
     }
 
     pub fn set_error(&mut self, message: String, kind: ErrorKind) {
