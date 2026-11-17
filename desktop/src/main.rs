@@ -8,6 +8,7 @@ mod autostart;
 mod config;
 mod hotkey;
 mod integrity;
+mod keys;
 mod logfile;
 mod paste;
 mod priority;
@@ -781,7 +782,7 @@ fn main() {
                                             .set_tooltip(Some(tooltip_text(&label)));
                                     }
                                     let _ = this.update(cx, |view, cx| {
-                                        view.hotkey_label = label;
+                                        view.hotkey = binding;
                                         view.hotkey_capturing = false;
                                         view.settings_error = saved.err().map(|error| {
                                             log::note(&format!("Could not save the shortcut: {error}"));
@@ -1166,7 +1167,7 @@ fn main() {
                             }
                             let tray_state = tray
                                 .is_some()
-                                .then(|| (view.status.clone(), view.hotkey_label.clone()));
+                                .then(|| (view.status.clone(), view.hotkey.display()));
                             (view.at_rest(), tray_state)
                         });
                         let (rest, tray_state) = view_state.unwrap_or((false, None));
@@ -1195,7 +1196,7 @@ fn main() {
                 }
 
                 let mut view = HudView::new(
-                    hotkey_label,
+                    hotkey_binding,
                     stt_for_view,
                     auto_paste_view,
                     fillers_view,

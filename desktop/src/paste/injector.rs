@@ -4,15 +4,6 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// Modifier virtual keys to release before Unicode injection. Order is stable.
-const MODIFIER_VKS: [u16; 11] = [
-    0x10, 0x11, 0x12, 0x5B, 0x5C, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5,
-];
-
-pub fn modifier_vks_to_release(down: impl Fn(u16) -> bool) -> Vec<u16> {
-    MODIFIER_VKS.into_iter().filter(|vk| down(*vk)).collect()
-}
-
 /// Longest we will wait for a restored window to become able to accept text.
 ///
 /// This replaces a fixed sleep that every dictation paid whether or not the
@@ -345,10 +336,11 @@ impl PasteInjector {
 fn release_physical_modifiers() {
     use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, KEYEVENTF_KEYUP};
 
-    // SAFETY: GetAsyncKeyState takes no pointers.
-    let down = modifier_vks_to_release(|vk| unsafe {
-        GetAsyncKeyState(i32::from(vk)) as u16 & 0x8000 != 0
-    });
+    let down: Vec<u16> = crate::keys::MODIFIERS
+        .into_iter()
+        // SAFETY: GetAsyncKeyState takes no pointers.
+        .filter(|vk| unsafe { GetAsyncKeyState(i32::from(*vk)) as u16 & 0x8000 != 0 })
+        .collect();
     if down.is_empty() {
         return;
     }

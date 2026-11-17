@@ -425,7 +425,7 @@ pub struct HudView {
     /// A failed startup change or settings save, shown under the settings.
     pub settings_error: Option<String>,
     auto_updates_enabled: bool,
-    pub hotkey_label: String,
+    pub hotkey: hotkey::HotkeyBinding,
     pub wave_peaks: [f32; WAVE_BARS],
     /// The open microphone while listening. The wave reads it on each frame.
     pub wave_source: Option<LiveWave>,
@@ -480,7 +480,7 @@ pub struct HudView {
 
 impl HudView {
     pub fn new(
-        hotkey_label: String,
+        hotkey: hotkey::HotkeyBinding,
         stt_engine: EngineSlot,
         auto_paste_state: Arc<Mutex<bool>>,
         remove_fillers_state: Arc<AtomicBool>,
@@ -520,7 +520,7 @@ impl HudView {
             autostart_enabled: crate::autostart::is_enabled(),
             settings_error: None,
             auto_updates_enabled: config.check_updates,
-            hotkey_label,
+            hotkey,
             wave_peaks: [0.0; WAVE_BARS],
             wave_source: None,
             mode: if open_panel {
@@ -1530,7 +1530,7 @@ impl HudView {
                     .whitespace_nowrap()
                     .child("Click to start dictation"),
             )
-            .child(controls::shortcut_keys(&self.hotkey_label))
+            .child(controls::shortcut_keys(self.hotkey))
             .child(
                 div()
                     .id("open_settings_btn")
@@ -1804,7 +1804,7 @@ impl HudView {
                         div()
                             .text_size(px(TYPE_DESC))
                             .text_color(muted())
-                            .child(format!("Press or hold {} to talk.", self.hotkey_label)),
+                            .child(format!("Press or hold {} to talk.", self.hotkey.display())),
                     )
                     .into_any_element(),
             );
@@ -2023,7 +2023,7 @@ impl HudView {
 
     fn render_settings_tab(&mut self, cx: &mut Context<'_, Self>) -> AnyElement {
         let is_auto_paste = self.auto_paste_enabled;
-        let hotkey_str = self.hotkey_label.clone();
+        let hotkey = self.hotkey;
 
         let settings_row = |title: &'static str, subtitle: String, trailing: AnyElement| {
             controls::line_row(title, subtitle, trailing)
@@ -2148,7 +2148,7 @@ impl HudView {
                     .child("Press keys")
                     .into_any_element()
             } else {
-                controls::shortcut_keys(&hotkey_str)
+                controls::shortcut_keys(hotkey)
             })
             .child(
                 controls::secondary_button(

@@ -77,7 +77,13 @@ impl HotkeyBinding {
         binding.is_valid().then_some(binding)
     }
 
+    /// The text of the shortcut in the settings file and on the screen, such as `Ctrl+;`.
     pub fn display(self) -> String {
+        self.key_labels().join("+")
+    }
+
+    /// The modifiers, then the key, each as the keycap shows it.
+    pub fn key_labels(self) -> Vec<String> {
         let mut parts = Vec::new();
         if self.ctrl {
             parts.push("Ctrl".to_string());
@@ -92,11 +98,11 @@ impl HotkeyBinding {
             parts.push("Win".to_string());
         }
         parts.push(vk_label(self.vk));
-        parts.join("+")
+        parts
     }
 
     pub fn is_valid(self) -> bool {
-        if self.vk == 0 || self.vk == 0x1B || is_modifier_vk(self.vk) {
+        if self.vk == 0 || self.vk == 0x1B || crate::keys::is_modifier(self.vk) {
             return false;
         }
         let has_mod = self.ctrl || self.alt || self.shift || self.win;
@@ -253,7 +259,7 @@ pub fn user_typed() -> Option<u16> {
 
 /// Mouse buttons are 0x01 through 0x06. The shortcut key and modifiers are not typing.
 pub fn note_physical_key(vk: u16, binding_vk: u16) {
-    if vk > 0x06 && !is_modifier_vk(vk) && vk != binding_vk {
+    if vk > 0x06 && !crate::keys::is_modifier(vk) && vk != binding_vk {
         note_user_typed(vk);
     }
 }
@@ -621,7 +627,7 @@ pub fn input_mask() -> [bool; 256] {
 pub fn input_appeared(baseline: &[bool; 256]) -> Option<u16> {
     let now = input_mask();
     (0..now.len())
-        .find(|&vk| now[vk] && !baseline[vk] && !is_modifier_vk(vk as u16))
+        .find(|&vk| now[vk] && !baseline[vk] && !crate::keys::is_modifier(vk as u16))
         .map(|vk| vk as u16)
 }
 
@@ -633,7 +639,7 @@ pub fn input_appeared(baseline: &[bool; 256]) -> Option<u16> {
 pub fn input_held(binding_vk: u16) -> Option<u16> {
     (1..=255u16).find(|&vk| {
         let real = is_mouse_vk(vk) || PHYSICAL_DOWN[usize::from(vk)].load(Ordering::SeqCst);
-        real && !is_modifier_vk(vk) && vk != binding_vk && key_down(i32::from(vk))
+        real && !crate::keys::is_modifier(vk) && vk != binding_vk && key_down(i32::from(vk))
     })
 }
 
@@ -722,7 +728,7 @@ unsafe extern "system" fn hotkey_hook_proc(
                 end_capture();
                 send_action(HotkeyAction::CaptureCancelled);
                 return LRESULT(1);
-            } else if !is_modifier_vk(vk) && (is_down || is_up) {
+            } else if !crate::keys::is_modifier(vk) && (is_down || is_up) {
                 if is_down {
                     finish_capture(binding_with_modifiers(vk));
                 }
@@ -840,70 +846,54 @@ fn handle_mouse_button(vk: u16, is_down: bool) -> bool {
     true
 }
 
-pub fn is_modifier_vk(vk: u16) -> bool {
-    matches!(
-        vk,
-        0x10 | 0x11 | 0x12 | 0x5B | 0x5C | 0xA0 | 0xA1 | 0xA2 | 0xA3 | 0xA4 | 0xA5
-    )
-}
+/// The keys whose name is not their character: the label that the keycap
+/// shows, then each name that the settings file can use for the key.
+const KEY_NAMES: &[(u16, &str, &[&str])] = &[
+    (VK_MOUSE4, "Mouse 4", &["mouse4", "xbutton1"]),
+    (VK_MOUSE5, "Mouse 5", &["mouse5", "xbutton2"]),
+    (0x08, "Backspace", &["backspace"]),
+    (0x09, "Tab", &["tab"]),
+    (0x0D, "Enter", &["enter", "return"]),
+    (0x20, "Space", &["space"]),
+    (0xBA, ";", &[";", "semicolon"]),
+    (0xBB, "=", &["=", "plus", "equal"]),
+    (0xBC, ",", &[",", "comma"]),
+    (0xBD, "-", &["-", "minus"]),
+    (0xBE, ".", &[".", "period", "dot"]),
+    (0xBF, "/", &["/", "slash"]),
+    (0xC0, "`", &["`", "grave"]),
+    (0xDB, "[", &["["]),
+    (0xDC, "\\", &["\\", "backslash"]),
+    (0xDD, "]", &["]"]),
+    (0xDE, "'", &["'", "quote"]),
+];
 
 fn parse_vk(token: &str) -> Option<u16> {
     let lower = token.trim().to_ascii_lowercase().replace(' ', "");
-    match lower.as_str() {
-        "mouse4" | "xbutton1" => Some(VK_MOUSE4),
-        "mouse5" | "xbutton2" => Some(VK_MOUSE5),
-        ";" | "semicolon" => Some(0xBA),
-        "=" | "plus" | "equal" => Some(0xBB),
-        "," | "comma" => Some(0xBC),
-        "-" | "minus" => Some(0xBD),
-        "." | "period" | "dot" => Some(0xBE),
-        "/" | "slash" => Some(0xBF),
-        "`" | "grave" => Some(0xC0),
-        "[" => Some(0xDB),
-        "\\" | "backslash" => Some(0xDC),
-        "]" => Some(0xDD),
-        "'" | "quote" => Some(0xDE),
-        "space" => Some(0x20),
-        "enter" | "return" => Some(0x0D),
-        "tab" => Some(0x09),
-        "backspace" => Some(0x08),
-        other => {
-            if let Some(num) = other.strip_prefix('f') {
-                let n: u16 = num.parse().ok()?;
-                if (1..=24).contains(&n) {
-                    return Some(0x6F + n);
-                }
-            }
-            if other.len() == 1 {
-                let ch = other.chars().next()?.to_ascii_uppercase();
-                if ch.is_ascii_alphanumeric() {
-                    return Some(ch as u16);
-                }
-            }
-            None
+    if let Some((vk, ..)) = KEY_NAMES
+        .iter()
+        .find(|(_, _, names)| names.contains(&lower.as_str()))
+    {
+        return Some(*vk);
+    }
+    if let Some(num) = lower.strip_prefix('f') {
+        let n: u16 = num.parse().ok()?;
+        if (1..=24).contains(&n) {
+            return Some(0x6F + n);
         }
+    }
+    let mut chars = lower.chars();
+    match (chars.next(), chars.next()) {
+        (Some(ch), None) if ch.is_ascii_alphanumeric() => Some(ch.to_ascii_uppercase() as u16),
+        _ => None,
     }
 }
 
 fn vk_label(vk: u16) -> String {
+    if let Some((_, label, _)) = KEY_NAMES.iter().find(|(key, ..)| *key == vk) {
+        return (*label).to_string();
+    }
     match vk {
-        VK_MOUSE4 => "Mouse 4".into(),
-        VK_MOUSE5 => "Mouse 5".into(),
-        0x08 => "Backspace".into(),
-        0x09 => "Tab".into(),
-        0x0D => "Enter".into(),
-        0x20 => "Space".into(),
-        0xBA => ";".into(),
-        0xBB => "=".into(),
-        0xBC => ",".into(),
-        0xBD => "-".into(),
-        0xBE => ".".into(),
-        0xBF => "/".into(),
-        0xC0 => "`".into(),
-        0xDB => "[".into(),
-        0xDC => "\\".into(),
-        0xDD => "]".into(),
-        0xDE => "'".into(),
         0x30..=0x39 | 0x41..=0x5A => char::from(vk as u8).to_string(),
         0x70..=0x87 => format!("F{}", vk - 0x6F),
         _ => format!("Vk{vk:02X}"),

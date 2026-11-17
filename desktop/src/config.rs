@@ -96,7 +96,7 @@ impl Default for AppConfig {
             auto_paste: true,
             remove_fillers: true,
             check_updates: true,
-            hotkey: "Ctrl+;".to_string(),
+            hotkey: crate::hotkey::HotkeyBinding::DEFAULT.display(),
             model_dir: None,
             model_id: voice_stt_desktop::stt::DEFAULT_MODEL_ID.to_string(),
             save_takes: false,

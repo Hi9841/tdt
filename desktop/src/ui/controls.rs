@@ -313,9 +313,9 @@ pub fn progress_bar(id: &'static str, done: u64, total: u64) -> ProgressBar {
     ProgressBar::new(id, fraction)
 }
 
-/// Flat keycaps. `hotkey` is TDT's display form, such as `Ctrl+;`.
-pub fn shortcut_keys(hotkey: &str) -> AnyElement {
-    let keys = hotkey_parts(hotkey).into_iter().map(|key| {
+/// Flat keycaps, one for each key of `hotkey`.
+pub fn shortcut_keys(hotkey: crate::hotkey::HotkeyBinding) -> AnyElement {
+    let keys = hotkey.key_labels().into_iter().map(|key| {
         div()
             .flex()
             .flex_none()
@@ -327,7 +327,7 @@ pub fn shortcut_keys(hotkey: &str) -> AnyElement {
             .text_size(px(11.0))
             .font_weight(FontWeight::MEDIUM)
             .text_color(theme::text())
-            .child(key.to_string())
+            .child(key)
     });
     div()
         .flex()
@@ -336,20 +336,4 @@ pub fn shortcut_keys(hotkey: &str) -> AnyElement {
         .gap(px(4.0))
         .children(keys)
         .into_any_element()
-}
-
-/// The keys of a shortcut label. `+` can itself be the key ("Ctrl++").
-fn hotkey_parts(hotkey: &str) -> Vec<&str> {
-    let (mods, key) = if let Some(mods) = hotkey.strip_suffix("++") {
-        (mods, "+")
-    } else if hotkey == "+" {
-        ("", "+")
-    } else {
-        hotkey.rsplit_once('+').unwrap_or(("", hotkey))
-    };
-    mods.split('+')
-        .chain(std::iter::once(key))
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-        .collect()
 }
