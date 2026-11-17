@@ -42,6 +42,8 @@ use windows::Win32::UI::Shell::{
     SHCNF_PATHW,
 };
 
+// Uninstall (`packaging/tdt-setup`) removes these values, the shortcut, and
+// the task by the same names: change both together.
 const RUN_SUBKEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 const APPROVED_RUN: &str =
     "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run";

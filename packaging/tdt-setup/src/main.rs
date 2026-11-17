@@ -40,9 +40,12 @@ const APPROVED_RUN: &str =
     r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run";
 const APPROVED_FOLDER: &str =
     r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder";
-/// TDT's startup task is this prefix plus the user's SID.
+/// TDT's startup task is this prefix plus the user's SID. These names, the
+/// Run and StartupApproved values, and `TDT.lnk` are TDT's own
+/// (`desktop/src/autostart.rs`): change both together.
 const TASK_PREFIX: &str = "TDT Startup ";
-/// The single-instance mutex that a running TDT.exe holds.
+/// The single-instance mutex that a running TDT.exe holds
+/// (`INSTANCE_MUTEX` in `desktop/src/main.rs`).
 const INSTANCE_MUTEX: PCWSTR = w!("Local\\TDT-TalkDontType");
 /// Files that older TDT versions left in the install folder.
 const STALE_FILES: &[&str] = &[
@@ -65,7 +68,8 @@ const INSTALLED_FILES: &[&str] = &[
     "NOTICE",
     "THIRD_PARTY_NOTICES.md",
 ];
-/// User data in the install folder that uninstall keeps.
+/// User data in the install folder that uninstall keeps (`data_dir` in
+/// `desktop/src/lib.rs`).
 const USER_DATA: &[&str] = &["models", "dictionary.txt"];
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 

@@ -991,6 +991,12 @@ fn exit_now(code: u32) -> ! {
     std::process::exit(code as i32)
 }
 
+/// The single-instance mutex. Setup (`packaging/tdt-setup`, `INSTANCE_MUTEX`)
+/// waits on this name for TDT to quit: change both together.
+const INSTANCE_MUTEX: windows::core::PCWSTR = windows::core::w!("Local\\TDT-TalkDontType");
+/// A second start sets this event, and the running TDT opens its panel.
+const SHOW_EVENT: windows::core::PCWSTR = windows::core::w!("Local\\TDT-ShowOverlay");
+
 enum InstanceClaim {
     Owned(InstanceGuard),
     AlreadyRunning,
@@ -1033,11 +1039,10 @@ fn take_show_request() -> bool {
 }
 
 fn signal_running_instance() {
-    use windows::core::w;
     use windows::Win32::System::Threading::{OpenEventW, SetEvent, EVENT_MODIFY_STATE};
     // SAFETY: the name is a static null-terminated string, and the opened handle is closed after use.
     unsafe {
-        if let Ok(handle) = OpenEventW(EVENT_MODIFY_STATE, false, w!("Local\\TDT-ShowOverlay")) {
+        if let Ok(handle) = OpenEventW(EVENT_MODIFY_STATE, false, SHOW_EVENT) {
             let _ = SetEvent(handle);
             let _ = windows::Win32::Foundation::CloseHandle(handle);
         }
@@ -1061,7 +1066,6 @@ fn low_rights_message() -> Option<String> {
 }
 
 fn claim_instance() -> InstanceClaim {
-    use windows::core::w;
     use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
     use windows::Win32::System::Threading::{CreateEventW, CreateMutexW};
 
@@ -1074,20 +1078,20 @@ fn claim_instance() -> InstanceClaim {
         if let Ok(existing) = windows::Win32::System::Threading::OpenMutexW(
             windows::Win32::System::Threading::SYNCHRONIZATION_ACCESS_RIGHTS(0x00100000),
             false,
-            w!("Local\\TDT-TalkDontType"),
+            INSTANCE_MUTEX,
         ) {
             let _ = windows::Win32::Foundation::CloseHandle(existing);
             signal_running_instance();
             return InstanceClaim::AlreadyRunning;
         }
-        match CreateMutexW(None, true, w!("Local\\TDT-TalkDontType")) {
+        match CreateMutexW(None, true, INSTANCE_MUTEX) {
             Ok(mutex) => {
                 if GetLastError() == ERROR_ALREADY_EXISTS {
                     let _ = windows::Win32::Foundation::CloseHandle(mutex);
                     signal_running_instance();
                     InstanceClaim::AlreadyRunning
                 } else {
-                    match CreateEventW(None, false, false, w!("Local\\TDT-ShowOverlay")) {
+                    match CreateEventW(None, false, false, SHOW_EVENT) {
                         Ok(show_event) => {
                             *show_event_slot().lock() = Some(show_event.0 as isize);
                             InstanceClaim::Owned(InstanceGuard { mutex, show_event })
