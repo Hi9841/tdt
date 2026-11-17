@@ -3,13 +3,18 @@
 
 use crate::audio::recorder::CaptureHandle;
 use crate::audio::{SpeechTail, MAX_TAIL};
+use crate::config::{AppStats, Settings};
 use crate::hotkey::{current_binding, input_appeared, input_held, input_mask, note_user_typed};
+use crate::paste::{self, DeliveryOutcome, DeliverySteps, NotTyped, PasteInjector};
 use crate::priority;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use voice_stt_desktop::stt::{LiveAudio, LiveTranscript, StopTimes, SttEngine};
+use voice_stt_desktop::log;
+use voice_stt_desktop::stt::{
+    remove_fillers, Latency, LiveAudio, LiveTranscript, StopTimes, SttEngine,
+};
 
 /// A take from its start until its pump has sent the last audio.
 pub struct LiveTake {
@@ -170,4 +175,119 @@ impl LiveTake {
     pub fn hit_limit(&self) -> bool {
         self.hit_limit.load(Ordering::SeqCst)
     }
+}
+
+/// What the engine thread of a take tells the UI loop.
+pub enum InternalEvent {
+    TranscribeSuccess {
+        text: String,
+        auto_pasted: bool,
+        notice: Option<String>,
+        latency_ms: u64,
+    },
+    TranscribeError(String),
+    NoSpeech,
+}
+
+pub fn deliver_transcript(
+    mut result: LiveTranscript,
+    injector: Arc<PasteInjector>,
+    tx: crossbeam_channel::Sender<InternalEvent>,
+    settings: &Settings,
+    target: Option<isize>,
+    typed_key: Option<u16>,
+) {
+    let (should_paste, clean_fillers, save_take) =
+        settings.get(|config| (config.auto_paste, config.remove_fillers, config.save_takes));
+    // The model's own text, before the filler removal. The disk write must
+    // not delay the text.
+    if save_take {
+        let (audio, text) = (std::mem::take(&mut result.audio), result.text.clone());
+        std::thread::spawn(move || {
+            if let Err(error) = voice_stt_desktop::stt::takes::save(&audio, &text) {
+                log::note(&format!("Could not save the test take: {error}"));
+            }
+        });
+    }
+    if clean_fillers {
+        result.text = remove_fillers(&result.text);
+    }
+    let mut steps = DeliverySteps::default();
+    let delivered = injector.deliver(
+        &result.text,
+        should_paste,
+        target,
+        typed_key.is_some(),
+        &mut steps,
+    );
+    // The wait of the user ends when the text is in the app. The copy to the
+    // clipboard comes after that.
+    let latency = result.latency(steps.typed_at.unwrap_or_else(Instant::now));
+    log_delivery(&delivered, target, typed_key, latency, &result, steps);
+    // Text reaches the user first; the history write is not on the latency path.
+    // A failed copy still lands in History so the transcript is not lost.
+    if !result.text.trim().is_empty() {
+        AppStats::update(|stats| {
+            stats.record(&result.text, result.duration_secs, latency.total_ms())
+        });
+    }
+    let (auto_pasted, notice) = match delivered {
+        Ok(DeliveryOutcome::NoSpeech) => {
+            let _ = tx.send(InternalEvent::NoSpeech);
+            return;
+        }
+        Ok(DeliveryOutcome::Copied) => (false, None),
+        Ok(DeliveryOutcome::Pasted) => (true, None),
+        Ok(DeliveryOutcome::PastedNotCopied(_)) => (
+            true,
+            Some("TDT typed the text, but could not copy it to the clipboard.".to_string()),
+        ),
+        Ok(DeliveryOutcome::CopiedFallback(reason)) => (false, Some(reason.notice().to_string())),
+        Err(error) => {
+            let _ = tx.send(InternalEvent::TranscribeError(format!(
+                "Could not copy text. Open History to copy the saved transcript. {error}"
+            )));
+            return;
+        }
+    };
+    let _ = tx.send(InternalEvent::TranscribeSuccess {
+        text: result.text,
+        auto_pasted,
+        notice,
+        latency_ms: latency.total_ms(),
+    });
+}
+
+/// One line per dictation, so a paste that did not arrive or a slow take can
+/// be explained from the log. It names the app, never the text.
+fn log_delivery(
+    delivered: &Result<DeliveryOutcome, String>,
+    target: Option<isize>,
+    typed_key: Option<u16>,
+    latency: Latency,
+    take: &LiveTranscript,
+    steps: DeliverySteps,
+) {
+    let result = match delivered {
+        Ok(DeliveryOutcome::NoSpeech) => return,
+        Ok(DeliveryOutcome::Pasted) => "typed".to_string(),
+        Ok(DeliveryOutcome::PastedNotCopied(error)) => format!("typed, not copied: {error}"),
+        Ok(DeliveryOutcome::Copied) => "copied (auto-paste is off)".to_string(),
+        Ok(DeliveryOutcome::CopiedFallback(NotTyped::UserTyped)) => format!(
+            "copied, not typed: key 0x{:02X} went down while TDT was finishing",
+            typed_key.unwrap_or(0)
+        ),
+        Ok(DeliveryOutcome::CopiedFallback(reason)) => format!("copied, not typed: {reason}"),
+        Err(error) => format!("not copied: {error}"),
+    };
+    let app = target.map_or_else(
+        || "no window".to_string(),
+        |raw| paste::Target::of(raw).to_string(),
+    );
+    log::note(&format!(
+        "Delivery: {result}. App: {app}. Latency: {latency}. Take {:.1} s, last part {:.1} s, {} characters ({steps}).",
+        take.duration_secs,
+        take.last_part_secs,
+        take.text.chars().count()
+    ));
 }
