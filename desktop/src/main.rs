@@ -76,10 +76,14 @@ fn main() {
         exit_now(1);
     }));
 
-    let _instance = if preview::is_active() {
-        None
+    // The preview captures (`ui::preview`) run with none of the live
+    // services: no instance claim, no settings file, no microphone, no
+    // hooks, no update checks.
+    let is_preview = preview::is_active();
+    let (_instance, settings) = if is_preview {
+        (None, Settings::new(AppConfig::default(), false))
     } else {
-        Some(match claim_instance() {
+        let guard = match claim_instance() {
             InstanceClaim::AlreadyRunning => return,
             InstanceClaim::Owned(guard) => guard,
             InstanceClaim::Failed(error) => {
@@ -87,19 +91,8 @@ fn main() {
                 show_error(&error);
                 return;
             }
-        })
-    };
-    if !preview::is_active() {
-        // Task Scheduler calls are slow enough to delay the first window.
-        std::thread::spawn(autostart::refresh_if_enabled);
-        update::remove_downloaded_setups();
-    }
-
-    // The preview captures never read or write the settings file.
-    let settings = if preview::is_active() {
-        Settings::new(AppConfig::default(), false)
-    } else {
-        Settings::new(AppConfig::load(), true)
+        };
+        (Some(guard), Settings::new(AppConfig::load(), true))
     };
     // A damaged settings file: say so on the pill, and write the defaults so
     // the next load is clean. `load` kept a copy of the old file.
@@ -131,27 +124,6 @@ fn main() {
     set_binding(hotkey_binding);
     let hotkey_label = hotkey_binding.display();
 
-    // Open the microphone before the window. Doing it on the GPUI executor
-    // blocks the first frame, and the popup then stays without WS_VISIBLE.
-    let (recorder, microphone_error) = if preview::is_active() {
-        (None, None)
-    } else {
-        std::thread::spawn(prewarm);
-        watch_default_input();
-        match AudioRecorder::new() {
-            Ok(recorder) => {
-                log::note(&format!("Microphone: {}", recorder.describe()));
-                (Some(recorder), None)
-            }
-            Err(error) => (
-                None,
-                Some(format!(
-                    "Could not start the microphone. Connect a microphone and choose Retry microphone. {error}"
-                )),
-            ),
-        }
-    };
-
     let model_dir = settings.get(|config| config.model_dir.clone());
     let stt_engine = EngineSlot::default();
     stt_engine.set(
@@ -171,47 +143,19 @@ fn main() {
         },
     );
 
-    // Load and warm the selected model while the app opens, so a short first
-    // dictation does not pay the full initialization cost after release.
-    // prepare() serializes with recording and retries on failure.
-    if !preview::is_active() {
-        if let Some(engine) = stt_engine.get() {
-            std::thread::spawn(move || {
-                if let Err(error) = engine.prepare() {
-                    log::note(&format!("Could not prepare the speech model: {error}"));
-                }
-            });
-        }
-    }
-
-    // A failed install must not look like a working shortcut.
-    let _hotkey_guard;
-    let hotkey_rx;
-    let hotkey_error;
-    if preview::is_active() {
-        _hotkey_guard = None;
-        hotkey_rx = None;
-        hotkey_error = None;
+    let update_state = Arc::new(Mutex::new(UpdatePhase::Idle));
+    let live = if is_preview {
+        Live::default()
     } else {
-        match HotkeyListener::start() {
-            Ok((guard, rx)) => {
-                _hotkey_guard = Some(guard);
-                hotkey_rx = Some(rx);
-                // The hook installs fine at low integrity but never sees keys
-                // typed into normal apps, so say why instead of failing silently.
-                hotkey_error = low_rights_message();
-                if let Some(message) = &hotkey_error {
-                    log::note(message);
-                }
-            }
-            Err(error) => {
-                log::note(&format!("Hotkey hook failed: {error}"));
-                _hotkey_guard = None;
-                hotkey_rx = None;
-                hotkey_error = Some(error);
-            }
-        }
+        Live::start(&stt_engine, &settings, &update_state)
     };
+    let Live {
+        recorder,
+        microphone_error,
+        hotkey: _hotkey_guard,
+        hotkey_rx,
+        hotkey_error,
+    } = live;
 
     // Ely's components read fonts and colors registered by init.
     let app = gpui_platform::application().with_assets(Assets);
@@ -219,7 +163,7 @@ fn main() {
         recorder,
         stt_engine.clone(),
         settings.clone(),
-        preview::is_active(),
+        is_preview,
     ));
     let stt_for_view = stt_engine.clone();
 
@@ -227,7 +171,7 @@ fn main() {
         ely_gpui_component::init(cx);
         ui::theme::install(cx);
         // Windows requires the event loop to exist before creating the tray icon.
-        let mut tray = if preview::is_active() && !preview::wants_tray() {
+        let mut tray = if is_preview && !preview::wants_tray() {
             None
         } else {
             match SystemTray::new(settings.get(|config| config.auto_paste), &hotkey_label) {
@@ -278,10 +222,7 @@ fn main() {
         };
 
         let settings_loop = settings.clone();
-        let settings_boot = settings.clone();
-        let update_state = Arc::new(Mutex::new(UpdatePhase::Idle));
         let update_for_view = Arc::clone(&update_state);
-        let update_for_boot = Arc::clone(&update_state);
         let update_for_loop = Arc::clone(&update_state);
 
         // The panel is open from the start for `VOICE_STT_OPEN_PANEL` and the
@@ -549,12 +490,6 @@ fn main() {
                 })
                 .detach();
 
-                if !preview::is_active() {
-                    update::start_automatic_checks(update_for_boot, move || {
-                        settings_boot.get(|config| config.check_updates)
-                    });
-                }
-
                 let mut view = HudView::new(
                     hotkey_binding,
                     stt_for_view,
@@ -587,6 +522,86 @@ fn main() {
     drop(_hotkey_guard);
     drop(_instance);
     exit_now(0);
+}
+
+/// The services of a real run. The preview captures use `Live::default()`.
+#[derive(Default)]
+struct Live {
+    recorder: Option<AudioRecorder>,
+    microphone_error: Option<String>,
+    hotkey: Option<HotkeyListener>,
+    hotkey_rx: Option<async_channel::Receiver<HotkeyAction>>,
+    hotkey_error: Option<String>,
+}
+
+impl Live {
+    fn start(
+        stt_engine: &EngineSlot,
+        settings: &Settings,
+        update_state: &Arc<Mutex<UpdatePhase>>,
+    ) -> Self {
+        // Task Scheduler calls are slow enough to delay the first window.
+        std::thread::spawn(autostart::refresh_if_enabled);
+        update::remove_downloaded_setups();
+
+        // Open the microphone before the window. Doing it on the GPUI executor
+        // blocks the first frame, and the popup then stays without WS_VISIBLE.
+        std::thread::spawn(prewarm);
+        watch_default_input();
+        let (recorder, microphone_error) = match AudioRecorder::new() {
+            Ok(recorder) => {
+                log::note(&format!("Microphone: {}", recorder.describe()));
+                (Some(recorder), None)
+            }
+            Err(error) => (
+                None,
+                Some(format!(
+                    "Could not start the microphone. Connect a microphone and choose Retry microphone. {error}"
+                )),
+            ),
+        };
+
+        // Load and warm the selected model while the app opens, so a short first
+        // dictation does not pay the full initialization cost after release.
+        // prepare() serializes with recording and retries on failure.
+        if let Some(engine) = stt_engine.get() {
+            std::thread::spawn(move || {
+                if let Err(error) = engine.prepare() {
+                    log::note(&format!("Could not prepare the speech model: {error}"));
+                }
+            });
+        }
+
+        // A failed install must not look like a working shortcut.
+        let (hotkey, hotkey_rx, hotkey_error) = match HotkeyListener::start() {
+            Ok((guard, rx)) => {
+                // The hook installs fine at low integrity but never sees keys
+                // typed into normal apps, so say why instead of failing silently.
+                let error = low_rights_message();
+                if let Some(message) = &error {
+                    log::note(message);
+                }
+                (Some(guard), Some(rx), error)
+            }
+            Err(error) => {
+                log::note(&format!("Hotkey hook failed: {error}"));
+                (None, None, Some(error))
+            }
+        };
+
+        let settings = settings.clone();
+        update::start_automatic_checks(Arc::clone(update_state), move || {
+            settings.get(|config| config.check_updates)
+        });
+
+        Self {
+            recorder,
+            microphone_error,
+            hotkey,
+            hotkey_rx,
+            hotkey_error,
+        }
+    }
 }
 
 /// Ends the process without DLL and thread-local teardown. Teardown runs
