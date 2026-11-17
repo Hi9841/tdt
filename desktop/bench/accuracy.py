@@ -91,6 +91,9 @@ def main() -> None:
     over = []
     for name in sets:
         rows = score(exe, name, engine)
+        # No clip scored: the model or the set was not found, so the check checked nothing.
+        if not rows:
+            sys.exit(f"{name}: no clip was scored (is the model in a models folder that bench-asr finds?)")
         errors, total = sum(r[0] for r in rows), sum(r[1] for r in rows)
         ms = sorted(r[5] for r in rows)
         median = ms[len(ms) // 2] if ms else 0
