@@ -21,7 +21,7 @@ mod update;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use audio::{play_sound, prewarm, watch_default_input, AudioRecorder, SoundEffect, VIS_BARS};
+use audio::{play_sound, prewarm, watch_default_input, AudioRecorder, SoundEffect};
 use config::{AppConfig, AppStats, Settings};
 use dictation::LiveTake;
 use ely_gpui_component::Assets;
@@ -44,7 +44,7 @@ use ui::window_util::{
     ensure_overlay_topmost, find_app_hwnd, follow_current_virtual_desktop, lock_overlay_chrome,
     position_bubble_on_preferred_monitor, PANEL_HEIGHT, PANEL_WIDTH,
 };
-use ui::{HudStatus, HudView, SystemTray};
+use ui::{HudView, SystemTray};
 use update::{CheckKind, UpdatePhase};
 use voice_stt_desktop::log;
 use voice_stt_desktop::stt::{
@@ -478,7 +478,6 @@ fn main() {
                     let mut is_processing_state = false;
                     let mut recording_before_press = false;
                     let mut limit_notice = false;
-                    let mut no_speech_at: Option<Instant> = None;
                     // A microphone that failed during the take, for the
                     // notice after its text.
                     let mut microphone_lost: Option<String> = None;
@@ -531,7 +530,7 @@ fn main() {
                                 if view.model_load_moved() {
                                     cx.notify();
                                 }
-                                std::mem::take(&mut view.retry_microphone)
+                                view.take_retry_microphone()
                             })
                             .unwrap_or(false);
                         if retry {
@@ -547,8 +546,7 @@ fn main() {
                                     Some(Ok(recorder)) => {
                                         log::note(&format!("Microphone: {}", recorder.describe()));
                                         *rec.borrow_mut() = Some(recorder);
-                                        view.status = HudStatus::Idle;
-                                        view.recovery_message = None;
+                                        view.microphone_ready();
                                     }
                                     Some(Err(error)) => view.set_error(format!("Could not open the microphone. Check Windows microphone access and try again. {error}")),
                                     None => {}
@@ -579,7 +577,7 @@ fn main() {
                                         view.open_settings(cx);
                                     });
                                 } else if event.id == tray.stop_item.id() {
-                                    let _ = this.update(cx, |view, _| view.stop_requested = true);
+                                    let _ = this.update(cx, |view, _| view.request_stop());
                                 } else if event.id == tray.show_item.id() {
                                     let _ = this.update(cx, |view, cx| {
                                         view.open_settings(cx);
@@ -639,7 +637,7 @@ fn main() {
                             .collect();
                         // A click on the resting pill is a tap of the shortcut.
                         let clicked = this
-                            .update(cx, |view, _| std::mem::take(&mut view.click_dictation))
+                            .update(cx, |view, _| view.take_click())
                             .unwrap_or(false);
                         if clicked && !is_recording_state && !is_processing_state {
                             // The hook clears this when the shortcut goes down. A
@@ -696,7 +694,7 @@ fn main() {
                             && (hit_limit
                                 || rec.borrow().as_ref().is_some_and(AudioRecorder::limit_reached));
                         let stop_requested = if is_recording_state {
-                            this.update(cx, |view, _| std::mem::take(&mut view.stop_requested)).unwrap_or(false)
+                            this.update(cx, |view, _| view.take_stop_request()).unwrap_or(false)
                         } else {
                             false
                         };
@@ -724,20 +722,13 @@ fn main() {
                                             .set_tooltip(Some(tooltip_text(&label)));
                                     }
                                     let _ = this.update(cx, |view, cx| {
-                                        view.hotkey = binding;
-                                        view.hotkey_capturing = false;
-                                        view.settings_error = saved.err().map(|error| {
-                                            log::note(&format!("Could not save the shortcut: {error}"));
-                                            format!(
-                                                "The shortcut works now, but TDT could not save it. Set it again. {error}"
-                                            )
-                                        });
+                                        view.shortcut_captured(binding, saved);
                                         cx.notify();
                                     });
                                 }
                                 HotkeyAction::CaptureCancelled => {
                                     let _ = this.update(cx, |view, cx| {
-                                        view.hotkey_capturing = false;
+                                        view.shortcut_capture_cancelled();
                                         cx.notify();
                                     });
                                 }
@@ -829,15 +820,9 @@ fn main() {
                                             play_sound(SoundEffect::StartListening);
                                         }
                                         is_recording_state = true;
-                                        no_speech_at = None;
-                                        let started_at = Instant::now();
                                         let wave = rec.borrow().as_ref().map(AudioRecorder::live_wave);
                                         let _ = this.update(cx, |view, cx| {
-                                            view.recovery_message = None;
-                                            view.wave_source = wave;
-                                            view.status = HudStatus::Listening {
-                                                started_at,
-                                            };
+                                            view.show_listening(wave);
                                             cx.notify();
                                         });
                                     }
@@ -879,18 +864,7 @@ fn main() {
                             is_processing_state = true;
                             play_sound(SoundEffect::StopListening);
                             let _ = this.update(cx, |view, cx| {
-                                // Recording is over; drop the live
-                                // waveform here rather than in render.
-                                view.wave_peaks = [0.0; VIS_BARS];
-                                view.wave_source = None;
-                                let recorded_for = match &view.status {
-                                    HudStatus::Listening { started_at, .. } => {
-                                        started_at.elapsed()
-                                    }
-                                    _ => Duration::from_secs(0),
-                                };
-                                view.status = HudStatus::Transcribing { recorded_for };
-                                if limit_notice { view.recovery_message = Some(format!("Recording stopped at the {}-minute limit. Transcribing the recorded audio.", voice_stt_desktop::stt::MAX_TAKE_SECONDS / 60)); }
+                                view.show_transcribing(limit_notice);
                                 cx.notify();
                             });
                         }
@@ -898,24 +872,16 @@ fn main() {
                         // 3. Process background transcription results
                         while let Ok(event) = internal_rx.try_recv() {
                             match event {
-                                InternalEvent::TranscribeSuccess { text, auto_pasted, notice, latency_ms, .. } => {
+                                InternalEvent::TranscribeSuccess { text, auto_pasted, notice, latency_ms } => {
                                     is_processing_state = false;
                                     play_sound(SoundEffect::Success);
-                                    let finished_at = Instant::now();
                                     let notice = notice.or(microphone_lost.take()).or_else(|| {
                                         std::mem::take(&mut late_start).then(|| {
                                             "The microphone started late, so the first words can be missing.".to_string()
                                         })
                                     });
                                     let _ = this.update(cx, |view, cx| {
-                                        view.stats = AppStats::load();
-                                        view.recovery_message = notice;
-                                        view.status = HudStatus::Success {
-                                            text,
-                                            auto_pasted,
-                                            latency_ms,
-                                            finished_at,
-                                        };
+                                        view.show_success(text, auto_pasted, latency_ms, notice);
                                         cx.notify();
                                     });
                                 }
@@ -931,8 +897,7 @@ fn main() {
                                     }
                                     play_sound(SoundEffect::Error);
                                     let _ = this.update(cx, |view, cx| {
-                                        view.stats = AppStats::load();
-                                        view.set_error(err);
+                                        view.show_take_error(err);
                                         cx.notify();
                                     });
                                 }
@@ -943,10 +908,8 @@ fn main() {
                                         let _ = this.update(cx, |view, cx| { view.set_error(error); cx.notify(); });
                                         continue;
                                     }
-                                    no_speech_at = Some(Instant::now());
                                     let _ = this.update(cx, |view, cx| {
-                                        view.status = HudStatus::NoSpeech;
-                                        view.recovery_message = Some("No speech detected. Try again and check your microphone.".into());
+                                        view.show_no_speech();
                                         cx.notify();
                                     });
                                 }
@@ -962,61 +925,12 @@ fn main() {
                                 active.pause_input();
                             }
                         }
-                        let clear_no_speech = !preview::is_active()
-                            && no_speech_at.is_some_and(|at| {
-                                ui::hud::success_returns_to_idle(at.elapsed(), true)
-                            });
-                        if clear_no_speech {
-                            no_speech_at = None;
-                        }
-
                         let view_state = this.update(cx, |view, cx| {
-                            if !preview::is_active() {
-                                if let Some(copied_at) = view.copied_at {
-                                    if copied_at.elapsed() > Duration::from_millis(1400) {
-                                        view.copied_key = None;
-                                        view.copied_at = None;
-                                        cx.notify();
-                                    }
-                                }
-                            }
-
-                            match &mut view.status {
-                                // The live wave requests a frame on every vsync and
-                                // reads the microphone itself, so this 40 Hz loop
-                                // does not pace it.
-                                HudStatus::Listening { .. } => {
-                                    if preview::is_active() {
-                                        cx.notify();
-                                    }
-                                }
-                                // GPUI's pulse requests its own animation frames.
-                                // A second 40Hz redraw loop is redundant, and keeps
-                                // repainting even when reduced motion is enabled.
-                                HudStatus::Transcribing { .. } => {}
-                                HudStatus::Success { finished_at, .. } => {
-                                    if !preview::is_active()
-                                        && ui::hud::success_returns_to_idle(
-                                            finished_at.elapsed(),
-                                            view.recovery_message.is_some(),
-                                        )
-                                    {
-                                        view.status = HudStatus::Idle;
-                                        view.recovery_message = None;
-                                        cx.notify();
-                                    }
-                                }
-                                HudStatus::NoSpeech if clear_no_speech => {
-                                    view.status = HudStatus::Idle;
-                                    view.recovery_message = None;
-                                    cx.notify();
-                                }
-                                HudStatus::NoSpeech | HudStatus::Error { .. } | HudStatus::Idle => {}
-                            }
+                            let rest = view.tick(cx);
                             let tray_state = tray
                                 .is_some()
-                                .then(|| (view.status.clone(), view.hotkey.display()));
-                            (view.at_rest(), tray_state)
+                                .then(|| (view.status().clone(), view.hotkey().display()));
+                            (rest, tray_state)
                         });
                         let (rest, tray_state) = view_state.unwrap_or((false, None));
                         at_rest = rest;
@@ -1055,15 +969,7 @@ fn main() {
                     .into_iter()
                     .flatten()
                 {
-                    let message = match &view.status {
-                        HudStatus::Error {
-                            message: existing, ..
-                        } if !existing.is_empty() && existing != &error => {
-                            format!("{existing} {error}")
-                        }
-                        _ => error,
-                    };
-                    view.set_error(message);
+                    view.show_startup_error(error);
                 }
                 view
             })

@@ -120,7 +120,7 @@ fn status_tooltip(status: &HudStatus, hotkey: &str) -> String {
             if *auto_pasted { "Inserted" } else { "Copied" },
             crate::ui::text::format_latency_ms(*latency_ms)
         ),
-        HudStatus::NoSpeech => "TDT. No speech detected. Try again or open settings.".into(),
+        HudStatus::NoSpeech { .. } => "TDT. No speech detected. Try again or open settings.".into(),
         HudStatus::Error { message, .. } => format!("TDT. {message}"),
     };
     // NOTIFYICONDATAW reserves 128 UTF-16 units including its terminator.

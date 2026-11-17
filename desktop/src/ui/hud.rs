@@ -354,7 +354,10 @@ fn finishing_dots() -> AnyElement {
 #[derive(Debug, Clone, PartialEq)]
 pub enum HudStatus {
     Idle,
-    NoSpeech,
+    /// The last take had no speech, at `since`.
+    NoSpeech {
+        since: Instant,
+    },
     Listening {
         started_at: Instant,
     },
@@ -416,42 +419,42 @@ struct PreparedModel {
 }
 
 pub struct HudView {
-    pub status: HudStatus,
+    status: HudStatus,
     settings: Settings,
     autostart_enabled: bool,
     /// A failed startup change or settings save, shown under the settings.
-    pub settings_error: Option<String>,
-    pub hotkey: hotkey::HotkeyBinding,
-    pub wave_peaks: [f32; WAVE_BARS],
+    settings_error: Option<String>,
+    hotkey: hotkey::HotkeyBinding,
+    wave_peaks: [f32; WAVE_BARS],
     /// The open microphone while listening. The wave reads it on each frame.
-    pub wave_source: Option<LiveWave>,
-    pub mode: WindowViewMode,
-    pub active_tab: SettingsTab,
-    pub stats: AppStats,
+    wave_source: Option<LiveWave>,
+    mode: WindowViewMode,
+    active_tab: SettingsTab,
+    stats: AppStats,
     /// Timestamp of the history row showing "Copied" feedback. Keyed by the
     /// row's timestamp, not its index, so a new transcript landing mid-view
     /// cannot move the checkmark to the wrong row.
-    pub copied_key: Option<String>,
+    copied_key: Option<String>,
     expanded_history_key: Option<String>,
-    pub copied_at: Option<Instant>,
-    pub injector: PasteInjector,
-    pub selected_model: String,
-    pub stt_engine: EngineSlot,
+    copied_at: Option<Instant>,
+    injector: PasteInjector,
+    selected_model: String,
+    stt_engine: EngineSlot,
     panel_motion: Option<PanelMotion>,
     update: Arc<Mutex<UpdatePhase>>,
     model_phase: Arc<Mutex<DownloadPhase>>,
     model_error: Option<String>,
     /// Why the dictionary file could not be opened, shown under the Dictionary row.
     dictionary_error: Option<String>,
-    pub hotkey_capturing: bool,
+    hotkey_capturing: bool,
     pill_hovered: bool,
     pill_motion: PillMotion,
     /// A click on the resting pill asks the main loop to start a take.
-    pub click_dictation: bool,
-    pub stop_requested: bool,
-    pub retry_microphone: bool,
-    pub recovery_message: Option<String>,
-    pub recovery_is_microphone: bool,
+    click_dictation: bool,
+    stop_requested: bool,
+    retry_microphone: bool,
+    recovery_message: Option<String>,
+    recovery_is_microphone: bool,
     clear_history_pending: bool,
     active_model: Option<String>,
     installed_models: Vec<String>,
@@ -625,8 +628,7 @@ impl HudView {
                 self.installed_models.clear();
             }
             PreviewSpec::BubbleNoSpeech => {
-                self.status = HudStatus::NoSpeech;
-                self.recovery_message = Some("No speech detected. Try again and check your microphone.".into());
+                self.show_no_speech();
                 self.recovery_is_microphone = true;
             }
             PreviewSpec::BubbleCopyFailed => self.set_error("Could not copy text. Open History to copy the saved transcript.".into()),
@@ -885,7 +887,10 @@ impl HudView {
                         self.model_error = None;
                         self.recovery_message = None;
                         self.recovery_is_microphone = false;
-                        if matches!(self.status, HudStatus::Error { .. } | HudStatus::NoSpeech) {
+                        if matches!(
+                            self.status,
+                            HudStatus::Error { .. } | HudStatus::NoSpeech { .. }
+                        ) {
                             self.status = HudStatus::Idle;
                         }
                     }
@@ -1129,6 +1134,174 @@ impl HudView {
         self.copied_at = None;
     }
 
+    /// A take started. The pill shows the live wave of `wave`.
+    pub fn show_listening(&mut self, wave: Option<LiveWave>) {
+        self.recovery_message = None;
+        self.wave_source = wave;
+        self.status = HudStatus::Listening {
+            started_at: Instant::now(),
+        };
+    }
+
+    /// The recording ended, and the pill waits for the text. `at_limit`: the
+    /// take stopped at the take limit.
+    pub fn show_transcribing(&mut self, at_limit: bool) {
+        self.wave_peaks = [0.0; WAVE_BARS];
+        self.wave_source = None;
+        let recorded_for = match &self.status {
+            HudStatus::Listening { started_at, .. } => started_at.elapsed(),
+            _ => Duration::from_secs(0),
+        };
+        self.status = HudStatus::Transcribing { recorded_for };
+        if at_limit {
+            self.recovery_message = Some(format!(
+                "Recording stopped at the {}-minute limit. Transcribing the recorded audio.",
+                voice_stt_desktop::stt::MAX_TAKE_SECONDS / 60
+            ));
+        }
+    }
+
+    /// The text of a take is in the app or on the clipboard.
+    pub fn show_success(
+        &mut self,
+        text: String,
+        auto_pasted: bool,
+        latency_ms: u64,
+        notice: Option<String>,
+    ) {
+        self.stats = AppStats::load();
+        self.recovery_message = notice;
+        self.status = HudStatus::Success {
+            text,
+            auto_pasted,
+            latency_ms,
+            finished_at: Instant::now(),
+        };
+    }
+
+    /// A take ended with an error.
+    pub fn show_take_error(&mut self, error: String) {
+        self.stats = AppStats::load();
+        self.set_error(error);
+    }
+
+    /// A take had no speech.
+    pub fn show_no_speech(&mut self) {
+        self.status = HudStatus::NoSpeech {
+            since: Instant::now(),
+        };
+        self.recovery_message =
+            Some("No speech detected. Try again and check your microphone.".into());
+    }
+
+    /// The microphone opened again after a failure.
+    pub fn microphone_ready(&mut self) {
+        self.status = HudStatus::Idle;
+        self.recovery_message = None;
+    }
+
+    /// The hook captured a new shortcut. `saved` is the result of the save of
+    /// the settings.
+    pub fn shortcut_captured(
+        &mut self,
+        hotkey: hotkey::HotkeyBinding,
+        saved: Result<(), std::io::Error>,
+    ) {
+        self.hotkey = hotkey;
+        self.hotkey_capturing = false;
+        self.settings_error = saved.err().map(|error| {
+            voice_stt_desktop::log::note(&format!("Could not save the shortcut: {error}"));
+            format!("The shortcut works now, but TDT could not save it. Set it again. {error}")
+        });
+    }
+
+    pub fn shortcut_capture_cancelled(&mut self) {
+        self.hotkey_capturing = false;
+    }
+
+    /// A click on the pill asked to start a take, since the last call.
+    pub fn take_click(&mut self) -> bool {
+        std::mem::take(&mut self.click_dictation)
+    }
+
+    /// The pill or the tray asked to stop the take, since the last call.
+    pub fn take_stop_request(&mut self) -> bool {
+        std::mem::take(&mut self.stop_requested)
+    }
+
+    /// The user chose Retry microphone, since the last call.
+    pub fn take_retry_microphone(&mut self) -> bool {
+        std::mem::take(&mut self.retry_microphone)
+    }
+
+    pub fn request_stop(&mut self) {
+        self.stop_requested = true;
+    }
+
+    pub fn status(&self) -> &HudStatus {
+        &self.status
+    }
+
+    pub fn hotkey(&self) -> hotkey::HotkeyBinding {
+        self.hotkey
+    }
+
+    /// Shows the errors of the start, one after the other.
+    pub fn show_startup_error(&mut self, error: String) {
+        let message = match &self.status {
+            HudStatus::Error {
+                message: existing, ..
+            } if !existing.is_empty() && existing != &error => format!("{existing} {error}"),
+            _ => error,
+        };
+        self.set_error(message);
+    }
+
+    /// Moves the states that end with time: the "Copied" mark of a History
+    /// row, a result, and "No speech detected". Returns true when nothing on
+    /// the pill or the panel changes with time.
+    pub fn tick(&mut self, cx: &mut Context<Self>) -> bool {
+        if !preview::is_active() {
+            if let Some(copied_at) = self.copied_at {
+                if copied_at.elapsed() > Duration::from_millis(1400) {
+                    self.copied_key = None;
+                    self.copied_at = None;
+                    cx.notify();
+                }
+            }
+        }
+        let back_to_idle = match &self.status {
+            // The live wave requests a frame on every vsync and reads the
+            // microphone itself, so the UI loop does not pace it.
+            HudStatus::Listening { .. } => {
+                if preview::is_active() {
+                    cx.notify();
+                }
+                false
+            }
+            // GPUI's pulse requests its own animation frames. A second redraw
+            // loop keeps repainting even when reduced motion is on.
+            HudStatus::Transcribing { .. } => false,
+            HudStatus::Success { finished_at, .. } => {
+                !preview::is_active()
+                    && success_returns_to_idle(
+                        finished_at.elapsed(),
+                        self.recovery_message.is_some(),
+                    )
+            }
+            HudStatus::NoSpeech { since } => {
+                !preview::is_active() && success_returns_to_idle(since.elapsed(), true)
+            }
+            HudStatus::Error { .. } | HudStatus::Idle => false,
+        };
+        if back_to_idle {
+            self.status = HudStatus::Idle;
+            self.recovery_message = None;
+            cx.notify();
+        }
+        self.at_rest()
+    }
+
     pub fn set_error(&mut self, message: String) {
         self.recovery_is_microphone = message.to_lowercase().contains("microphone");
         self.recovery_message = Some(message.clone());
@@ -1252,7 +1425,7 @@ impl HudView {
             HudStatus::Transcribing { .. } => "pill_finishing",
             HudStatus::Success { .. } => "pill_success",
             HudStatus::Error { .. } => "danger",
-            HudStatus::NoSpeech => "pill_no_speech",
+            HudStatus::NoSpeech { .. } => "pill_no_speech",
         };
         let content = div()
             .flex()
@@ -1365,7 +1538,9 @@ impl HudView {
                 PillPart::snippet(first_sentence(message), danger(), ERROR_MAX_W),
                 details(),
             ],
-            HudStatus::NoSpeech => vec![PillPart::label("No speech detected", text()), details()],
+            HudStatus::NoSpeech { .. } => {
+                vec![PillPart::label("No speech detected", text()), details()]
+            }
             _ => return None,
         })
     }
@@ -1375,7 +1550,7 @@ impl HudView {
         match &self.status {
             HudStatus::Idle if self.model_ready() => Some(PillAction::Start),
             HudStatus::Listening { .. } => Some(PillAction::Stop),
-            HudStatus::Idle | HudStatus::Error { .. } | HudStatus::NoSpeech => {
+            HudStatus::Idle | HudStatus::Error { .. } | HudStatus::NoSpeech { .. } => {
                 Some(PillAction::Settings)
             }
             HudStatus::Success { .. } if self.recovery_message.is_some() => {
@@ -1688,7 +1863,7 @@ impl HudView {
                                         this.recovery_is_microphone = false;
                                         if matches!(
                                             this.status,
-                                            HudStatus::Error { .. } | HudStatus::NoSpeech
+                                            HudStatus::Error { .. } | HudStatus::NoSpeech { .. }
                                         ) {
                                             this.status = HudStatus::Idle;
                                         }
@@ -2431,7 +2606,7 @@ impl HudView {
 }
 
 /// A finished dictation returns to Ready. A notice stays long enough to read, then leaves.
-pub fn success_returns_to_idle(elapsed: Duration, has_notice: bool) -> bool {
+fn success_returns_to_idle(elapsed: Duration, has_notice: bool) -> bool {
     let hold = if has_notice {
         Duration::from_secs(4)
     } else {
