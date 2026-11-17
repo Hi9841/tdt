@@ -92,9 +92,10 @@ pub fn updates_disabled() -> bool {
     )
 }
 
-/// When TDT checks by itself; the Settings text of the automatic checks.
 const FIRST_CHECK_AFTER: Duration = Duration::from_secs(8);
 const CHECK_EVERY: Duration = Duration::from_secs(60 * 60);
+/// The Settings text of the automatic checks: `FIRST_CHECK_AFTER`,
+/// `CHECK_EVERY`, and the check when the panel opens.
 pub const AUTOMATIC_SCHEDULE: &str = "At start, every hour, and when Settings opens.";
 
 /// Checks soon after the start, then each `CHECK_EVERY`, while

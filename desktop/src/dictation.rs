@@ -114,7 +114,6 @@ impl LiveTake {
     /// true when the take must stop at once.
     pub fn begin_stop(take: &mut Option<Self>, asked: Instant, shortcut: Option<u16>) -> bool {
         if take.as_ref().is_some_and(|live| live.baseline.is_some()) {
-            // The end of the take started before.
             return false;
         }
         let mut baseline = input_mask();
@@ -381,7 +380,6 @@ impl Dictation {
             });
         }
         self.take_results(&mut changes);
-        // Fully idle: park the microphone until the next press.
         if !self.is_busy() {
             if let Some(recorder) = &self.recorder {
                 recorder.pause_input();
@@ -648,8 +646,6 @@ pub fn deliver_transcript(
     // clipboard comes after that.
     let latency = result.latency(steps.typed_at.unwrap_or_else(Instant::now));
     log_delivery(&delivered, target, typed_key, latency, &result, steps);
-    // Text reaches the user first; the history write is not on the latency path.
-    // A failed copy still lands in History so the transcript is not lost.
     if !result.text.trim().is_empty() {
         AppStats::update(|stats| {
             stats.record(&result.text, result.duration_secs, latency.total_ms())
