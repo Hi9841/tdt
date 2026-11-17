@@ -10,10 +10,10 @@
 //! treated as quiet.
 
 use std::time::Duration;
+use voice_stt_desktop::SAMPLE_RATE;
 
-const SAMPLE_RATE: usize = 16_000;
-const FRAME_SAMPLES: usize = 160;
 const FRAME_MS: usize = 10;
+const FRAME_SAMPLES: usize = SAMPLE_RATE * FRAME_MS / 1000;
 const OPENING_FRAMES: usize = 8;
 const DB_FLOOR: f32 = -100.0;
 /// Steady speech with no quieter frames still has to run out the cap.

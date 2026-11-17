@@ -4,9 +4,9 @@ use parking_lot::{Condvar, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use voice_stt_desktop::resample::{Resampler, TARGET_SAMPLE_RATE};
+use voice_stt_desktop::resample::Resampler;
+use voice_stt_desktop::stt::MAX_TAKE_SAMPLES;
 
-pub const MAX_RECORDING_SECONDS: usize = 120;
 /// A live WASAPI stream delivers buffers even in silence. Longer than this
 /// with no callback means the endpoint went away.
 const STALE_CALLBACK_MS: u64 = 1_500;
@@ -312,7 +312,7 @@ impl AudioRecorder {
         if !parts.is_recording.load(Ordering::SeqCst) {
             return;
         }
-        let capacity = max_recording_samples();
+        let capacity = MAX_TAKE_SAMPLES;
         let already = parts.captured.load(Ordering::SeqCst);
         let take = take_count(already, resampled.len(), capacity);
         if take == 0 {
@@ -438,10 +438,6 @@ fn stop_samples(
     *envelope.lock() = SpeechEnvelope::default();
     captured.store(0, Ordering::SeqCst);
     std::mem::take(&mut *buffer.lock())
-}
-
-fn max_recording_samples() -> usize {
-    MAX_RECORDING_SECONDS * TARGET_SAMPLE_RATE as usize
 }
 
 fn take_count(already: usize, incoming: usize, capacity: usize) -> usize {

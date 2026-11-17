@@ -1252,7 +1252,7 @@ impl HudView {
         let limit_left = match &self.status {
             HudStatus::Listening { started_at, .. } => {
                 let elapsed = started_at.elapsed().as_secs();
-                let limit = crate::audio::MAX_RECORDING_SECONDS as u64;
+                let limit = voice_stt_desktop::stt::MAX_TAKE_SECONDS as u64;
                 (elapsed >= limit.saturating_sub(10)).then(|| limit.saturating_sub(elapsed))
             }
             _ => None,

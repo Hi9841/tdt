@@ -6,7 +6,8 @@
 //! carries over between capture packets: a packet size that does not divide
 //! the rate ratio does not drop samples or restart the filter.
 
-pub const TARGET_SAMPLE_RATE: u32 = 16_000;
+use crate::SAMPLE_RATE;
+
 /// Zero crossings of the kernel on each side of its center, at the output rate.
 const ZERO_CROSSINGS: f64 = 16.0;
 /// Kaiser window shape. With 16 zero crossings: flat to 6.5 kHz, -85 dB from 9 kHz.
@@ -37,10 +38,10 @@ pub struct Resampler {
 impl Resampler {
     /// `None` when the device rate is already 16 kHz.
     pub fn new(from_rate: u32) -> Option<Self> {
-        if from_rate == TARGET_SAMPLE_RATE || from_rate == 0 {
+        if from_rate as usize == SAMPLE_RATE || from_rate == 0 {
             return None;
         }
-        let step = f64::from(from_rate) / f64::from(TARGET_SAMPLE_RATE);
+        let step = f64::from(from_rate) / SAMPLE_RATE as f64;
         // Cycles per input sample.
         let cutoff = 0.5 * ROLLOFF / step.max(1.0);
         let half = (ZERO_CROSSINGS / (2.0 * cutoff)).ceil() as usize;

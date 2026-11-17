@@ -9,8 +9,13 @@ pub use engine::{panic_in_engine_call, Latency, LiveAudio, LiveTranscript, StopT
 pub use fillers::remove_fillers;
 pub use models::{DownloadPhase, CATALOG, DEFAULT_MODEL_ID};
 
+use crate::SAMPLE_RATE;
 use parking_lot::Mutex;
 use std::sync::Arc;
+
+/// The longest take. The recorder stops here, and the engine reads no more.
+pub const MAX_TAKE_SECONDS: usize = 120;
+pub const MAX_TAKE_SAMPLES: usize = MAX_TAKE_SECONDS * SAMPLE_RATE;
 
 type SharedEngine = Arc<Mutex<Option<Arc<SttEngine>>>>;
 

@@ -22,6 +22,7 @@ use voice_stt_desktop::resample::Resampler;
 use voice_stt_desktop::stt::models::{find_dir, ModelSpec, CATALOG};
 use voice_stt_desktop::stt::segment::WINDOW_SAMPLES;
 use voice_stt_desktop::stt::{LiveAudio, StopTimes, SttEngine};
+use voice_stt_desktop::SAMPLE_RATE;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -30,7 +31,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 const CHUNK_MS: u64 = 100;
 /// The app stops recording after 150 ms of quiet, so a take never ends in
 /// more silence than this. Speech synthesis leaves about 800 ms.
-const KEPT_TRAILING_QUIET: usize = 150 * 16;
+const KEPT_TRAILING_QUIET: usize = 150 * SAMPLE_RATE / 1000;
 /// Frames under this level count as the quiet after the last word.
 const TRAILING_QUIET_DB: f32 = -45.0;
 
@@ -126,7 +127,7 @@ fn load_clips_into(dir: &Path, whole: bool, clips: &mut Vec<Clip>) {
             if !whole {
                 trim_trailing_quiet(&mut samples);
             }
-            let duration_secs = samples.len() as f32 / 16000.0;
+            let duration_secs = samples.len() as f32 / SAMPLE_RATE as f32;
             let reference = std::fs::read_to_string(path.with_extension("txt")).ok();
             clips.push(Clip {
                 name,
@@ -140,7 +141,7 @@ fn load_clips_into(dir: &Path, whole: bool, clips: &mut Vec<Clip>) {
 
 /// Cut the silence after the last word down to what the app's tail keeps.
 fn trim_trailing_quiet(samples: &mut Vec<f32>) {
-    let frame = 160;
+    let frame = SAMPLE_RATE / 100;
     let mut end = samples.len();
     while end >= frame {
         let window = &samples[end - frame..end];
@@ -190,8 +191,10 @@ fn feed(clip: &Clip, realtime: bool, chunk_ms: u64) -> crossbeam_channel::Receiv
     let samples = clip.samples.clone();
     std::thread::spawn(move || {
         let started = Instant::now();
-        // 16 samples for each millisecond at 16 kHz.
-        for (index, chunk) in samples.chunks(chunk_ms as usize * 16).enumerate() {
+        for (index, chunk) in samples
+            .chunks(chunk_ms as usize * SAMPLE_RATE / 1000)
+            .enumerate()
+        {
             if realtime {
                 let due = started + Duration::from_millis(chunk_ms * (index as u64 + 1));
                 std::thread::sleep(due.saturating_duration_since(Instant::now()));
@@ -235,7 +238,7 @@ fn bench_model(spec: &ModelSpec, clips: &[Clip], options: &Options) {
                 Ok(res) => {
                     let latency_ms = res.latency(res.transcribed).total_ms();
                     latencies.push(latency_ms);
-                    let windows = res.duration_secs * 16_000.0 > WINDOW_SAMPLES as f32;
+                    let windows = res.duration_secs * SAMPLE_RATE as f32 > WINDOW_SAMPLES as f32;
                     whole_runs += usize::from(windows && res.last_part_secs >= res.duration_secs);
                     let mut wer_note = String::new();
                     if let Some(reference) = &clip.reference {

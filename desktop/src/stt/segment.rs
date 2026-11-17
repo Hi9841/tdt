@@ -14,11 +14,13 @@
 //! windows with 4 s shared added 106 errors to 1,228, 24 s with 8 s added 46,
 //! and 30 s with 8 s added 15, inside the noise.
 
+use crate::SAMPLE_RATE;
+
 /// The model reads this much speech per run. A take up to this long is one
 /// run, the same as without windows.
-pub const WINDOW_SAMPLES: usize = 30 * 16_000;
+pub const WINDOW_SAMPLES: usize = 30 * SAMPLE_RATE;
 /// Speech that two windows share.
-pub const OVERLAP_SAMPLES: usize = 8 * 16_000;
+pub const OVERLAP_SAMPLES: usize = 8 * SAMPLE_RATE;
 /// Words of each text that can hold the shared speech: 8 words a second.
 const SHARED_WORDS: usize = 64;
 const MATCH_SCORE: i32 = 2;
@@ -27,8 +29,8 @@ const SKIP_COST: i32 = 1;
 /// words than this, a window lost speech, or the overlap is a pause.
 const MIN_MATCHED_WORDS: usize = 8;
 
-/// 10 ms at 16 kHz.
-const FRAME_SAMPLES: usize = 160;
+/// 10 ms.
+const FRAME_SAMPLES: usize = SAMPLE_RATE / 100;
 /// Users stop talking before they release the key: the median take ends in
 /// 375 ms of quiet. After this much quiet the model reads the take, so the
 /// text is ready when the key comes up.

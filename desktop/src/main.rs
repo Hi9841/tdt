@@ -1039,7 +1039,7 @@ fn main() {
                                     _ => Duration::from_secs(0),
                                 };
                                 view.status = HudStatus::Transcribing { recorded_for };
-                                if limit_notice { view.recovery_message = Some("Recording stopped at the 2-minute limit. Transcribing the recorded audio.".into()); }
+                                if limit_notice { view.recovery_message = Some(format!("Recording stopped at the {}-minute limit. Transcribing the recorded audio.", voice_stt_desktop::stt::MAX_TAKE_SECONDS / 60)); }
                                 cx.notify();
                             });
                         }

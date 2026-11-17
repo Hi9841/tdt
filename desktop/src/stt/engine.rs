@@ -2,6 +2,8 @@ use super::dictionary;
 use super::models::ModelSpec;
 use super::segment;
 use super::takes;
+use super::MAX_TAKE_SAMPLES;
+use crate::SAMPLE_RATE;
 use crossbeam_channel::{Receiver, RecvTimeoutError};
 use parking_lot::Mutex;
 use std::cell::Cell;
@@ -12,12 +14,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use trit::{BiasWeights, Cancel, LoadOptions, Trit};
 
-const MAX_CAPTURED_SAMPLES: usize = 120 * 16_000;
 /// The first second of a take runs through the model once while the user
 /// still talks, and its text is dropped. After a long idle the first run
 /// pays for weights the system paged out and cores that slept; this moves
 /// that cost out of the wait after the release.
-const PRIME_SAMPLES: usize = 16_000;
+const PRIME_SAMPLES: usize = SAMPLE_RATE;
 
 /// Dictation starts and ends so far; a release waits for this to stay the same.
 static DICTATIONS: AtomicU64 = AtomicU64::new(0);
@@ -468,8 +469,8 @@ impl SttEngine {
             match rx.recv_timeout(Duration::from_millis(20)) {
                 Ok(LiveAudio::Chunk(samples)) => {
                     last_any = Instant::now();
-                    if captured.len() < MAX_CAPTURED_SAMPLES {
-                        let room = MAX_CAPTURED_SAMPLES - captured.len();
+                    if captured.len() < MAX_TAKE_SAMPLES {
+                        let room = MAX_TAKE_SAMPLES - captured.len();
                         captured.extend_from_slice(&samples[..samples.len().min(room)]);
                         if !primed && captured.len() >= PRIME_SAMPLES {
                             primed = true;
@@ -526,7 +527,7 @@ impl SttEngine {
 
         // Duration actually fed to the model, not the full take when the
         // capture cap truncated it.
-        let duration_secs = captured.len() as f32 / 16000.0;
+        let duration_secs = captured.len() as f32 / SAMPLE_RATE as f32;
 
         if captured.is_empty() {
             return Ok(LiveTranscript {
@@ -556,7 +557,7 @@ impl SttEngine {
             },
             None => read_rest(&engine, &text, &captured, window, self.end_quiet, None)?,
         };
-        let last_part_secs = last_part as f32 / 16000.0;
+        let last_part_secs = last_part as f32 / SAMPLE_RATE as f32;
 
         if text.is_empty() {
             if let Some(boosted) = boost_quiet_speech(&captured) {
@@ -590,8 +591,8 @@ impl SttEngine {
     }
 }
 
-/// 25 ms at 16 kHz. Matches the wave's frame.
-const SPEECH_FRAME_SAMPLES: usize = 400;
+/// 25 ms. Matches the wave's frame.
+const SPEECH_FRAME_SAMPLES: usize = SAMPLE_RATE / 40;
 /// A syllable at this level ticks the wave and still comes back empty.
 const VISIBLE_FRAME_RMS: f32 = 0.0015;
 /// Speech frames are 15 dB or more over the noise floor of the same take.
