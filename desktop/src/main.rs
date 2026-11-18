@@ -297,7 +297,7 @@ fn main() {
                 model_spec.label,
                 dir.display()
             ));
-            Some(Arc::new(SttEngine::new(&dir, model_spec.precision)))
+            Some(Arc::new(SttEngine::new(&dir, model_spec)))
         } else {
             append_log(&format!(
                 "{} is not downloaded. Open Settings to download it.",

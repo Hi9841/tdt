@@ -665,3 +665,71 @@ The app itself did not run. The change is in the engine; the hook, the microphon
 and the typing did not change.
 
 Released as TDT 0.9.9.
+
+## Session 2026-11-18 (later): short takes and fast stops with Unified English
+
+The owner reported: single words, very short phrases, and fast phrases sometimes give no text.
+Three of six "Test" takes of the owner at 09:19 were saved with no text, each with a clear word
+at about -30 dB. Parakeet Redux gives "Test" for all six; Parakeet Unified English gives no text
+for three.
+
+### Cause
+
+Unified English is an RNNT model that learned to stream with right context: it writes each word
+about 0.3 to 0.4 s after the word ends (decoder probe: the word "test" at 0.42 to 0.56 s, its
+tokens at frame 10 to 13, 0.8 to 1.04 s). The tail of TDT ends a take 60 ms after the last word.
+So the model must write the last word in the last frames of the take, or after the take. When
+the take ends first, the last word is lost, and a one-word take gives no text. The int8 weights
+are not the cause: f32 and the stored Q8_0 gave the same empty texts.
+
+### Fix
+
+The reads that end a take (the read in the quiet, the read after the release, and the read of
+quiet speech made louder) get 480 ms of digital quiet after the audio, for Unified English only
+(`ModelSpec::end_quiet_samples`). The windows of a long take, which end inside the speech, get no
+quiet. The user does not wait for the quiet: it is not recorded.
+
+### Gate
+
+A new set: 309 short phrases cut from the clean and other LibriSpeech clips at pauses (1 to 12
+words, 23 single words, 36 of two words), each 150 ms before the speech and 60 ms after the last
+loud frame, as a fast stop; and the same cuts with the natural pause after them. The reference of
+a cut is its known words: a cut is in the set only when Redux, with the natural pause, wrote
+exactly a part of the clip's reference. `bench-asr --whole --chunk-ms 10`:
+
+| Unified English | Fast stop | Natural pause |
+|---|---|---|
+| No quiet (0.9.9) | 52 errors in 1,489 words, 7 empty | 19 errors, 2 empty |
+| 160 ms | 29, 5 empty | 17, 1 empty |
+| 320 ms | 27, 1 empty | 16, 0 empty |
+| 480 ms | 27, 0 empty | 15, 1 empty |
+| 640 ms | 29, 1 empty | 15, 1 empty |
+| 480 ms of the take's quietest 100 ms, repeated | 30, 0 empty | 13, 2 empty |
+| Quiet up to a take length of 1, 1.5, or 2 s | 32 to 38 | 14 to 17 |
+
+In the fast-stop takes of one or two words, the errors went from 16 to 2 (95 words). Redux on
+the fast-stop takes: 29 errors, with 320 ms of quiet 28; on other the quiet added 7 to 10 errors
+(173 to 180 and 183), so Redux gets no quiet.
+
+The long sets with the app path, `--chunk-ms 10`, Unified English: clean 56 to 56, other 102 to
+101, tech 18 to 16 errors. Redux: 0 texts differ on clean, other, tech, the 309 phrases, and the
+owner's short takes. 10 ms and 100 ms chunks give the same text on the owner's 527 saved takes
+(0 differ, both models). The release build gave the same texts as the experiment build.
+
+The owner's 527 saved takes: the texts of 228 takes change (121 in punctuation or case only).
+Many changes are at the end and add a lost word ("Look" to "Look at", "Pro" to "Progress.", "ch"
+to "chat"); some in the middle go either way, and one noisy microphone test got an invented end.
+There are no references for these takes. The empty texts go from 30 to 28: 21 of the 30 have no
+speech. Of the seven with speech, four now give text ("Test" twice, "Hello"); one "Test" stays
+empty, a close call that Unified hears as "Does" or "This" when the audio changes a little.
+
+The model part of the wait grows by about 3 ms: the median of the owner's takes went from 40 to
+42 ms (all audio at once, the same build).
+
+### Not verified
+
+The app itself did not run. The change is in the engine; the hook, the microphone, the pill,
+and the typing did not change. TDT for Android uses the same model and the same tail: it has
+the same problem, and this fix is not in it.
+
+Released as TDT 0.9.10.

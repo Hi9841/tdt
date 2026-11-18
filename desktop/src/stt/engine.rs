@@ -1,4 +1,5 @@
 use super::dictionary;
+use super::models::ModelSpec;
 use super::segment;
 use super::takes;
 use crossbeam_channel::{Receiver, RecvTimeoutError};
@@ -105,21 +106,32 @@ fn transcribe_samples(
     engine_call(|| engine.transcribe_with(samples, &options))
 }
 
-/// `text` with the window `samples` added, or `None` when the two do not
-/// join. `start` is 0 for the first window, which has nothing to join.
-fn add_window(
+/// The text of `samples`, the end of a take, with `end_quiet` samples of
+/// digital quiet after them (`ModelSpec::end_quiet_samples`).
+fn read_end(
     engine: &Trit,
-    text: &str,
     samples: &[f32],
-    start: usize,
+    end_quiet: usize,
     cancel: Option<&Cancel>,
-) -> Result<Option<String>, String> {
-    let part = transcribe_samples(engine, samples, cancel)?;
-    Ok(if start == 0 {
+) -> Result<String, String> {
+    if end_quiet == 0 {
+        return transcribe_samples(engine, samples, cancel);
+    }
+    let mut padded = Vec::with_capacity(samples.len() + end_quiet);
+    padded.extend_from_slice(samples);
+    padded.resize(samples.len() + end_quiet, 0.0);
+    transcribe_samples(engine, &padded, cancel)
+}
+
+/// `text` with `part` added, the text of the window that starts at
+/// `start`, or `None` when the two do not join. `start` is 0 for the first
+/// window, which has nothing to join.
+fn join(text: &str, part: String, start: usize) -> Option<String> {
+    if start == 0 {
         Some(part)
     } else {
         segment::merge(text, &part)
-    })
+    }
 }
 
 /// The text of the whole take, from the windows so far and the speech
@@ -129,16 +141,21 @@ fn read_rest(
     text: &Option<String>,
     captured: &[f32],
     window: usize,
+    end_quiet: usize,
     cancel: Option<&Cancel>,
 ) -> Result<(String, usize), String> {
     let joined = match text {
-        Some(done) => add_window(engine, done, &captured[window..], window, cancel)?,
+        Some(done) => join(
+            done,
+            read_end(engine, &captured[window..], end_quiet, cancel)?,
+            window,
+        ),
         None => None,
     };
     Ok(match joined {
         Some(text) => (text, captured.len() - window),
         None => (
-            transcribe_samples(engine, captured, cancel)?,
+            read_end(engine, captured, end_quiet, cancel)?,
             captured.len(),
         ),
     })
@@ -217,6 +234,7 @@ impl QuietRead {
         text: &Option<String>,
         heard: &[f32],
         point: QuietPoint,
+        end_quiet: usize,
     ) -> Option<Self> {
         let slot = QuietSlot::claim()?;
         let (done, result) = crossbeam_channel::bounded(1);
@@ -224,7 +242,14 @@ impl QuietRead {
         let flag = cancel.clone();
         let (engine, text, samples) = (Arc::clone(engine), text.clone(), heard.to_vec());
         std::thread::spawn(move || {
-            let read = read_rest(&engine, &text, &samples, point.window, Some(&flag));
+            let read = read_rest(
+                &engine,
+                &text,
+                &samples,
+                point.window,
+                end_quiet,
+                Some(&flag),
+            );
             // First the slot: a wait that ends at the send can start a read.
             drop(slot);
             let _ = done.send(read.map(|(text, _)| text));
@@ -340,6 +365,8 @@ pub struct SttEngine {
     model_dir: PathBuf,
     /// How Trit holds this model's weights (`ModelSpec::precision`).
     precision: trit::Precision,
+    /// `ModelSpec::end_quiet_samples`.
+    end_quiet: usize,
     native: Mutex<Option<Arc<Trit>>>,
     /// Held during a load, so a take that starts during the startup load
     /// waits for it instead of loading a second model.
@@ -349,10 +376,11 @@ pub struct SttEngine {
 }
 
 impl SttEngine {
-    pub fn new(model_dir: &Path, precision: trit::Precision) -> Self {
+    pub fn new(model_dir: &Path, spec: &ModelSpec) -> Self {
         Self {
             model_dir: model_dir.to_path_buf(),
-            precision,
+            precision: spec.precision,
+            end_quiet: spec.end_quiet_samples,
             native: Mutex::new(None),
             loading: Mutex::new(()),
             dictionary: Mutex::new(dictionary::Watch::default()),
@@ -456,7 +484,8 @@ impl SttEngine {
                             // The next window makes the read old.
                             quiet = None;
                             let end = window + segment::WINDOW_SAMPLES;
-                            text = add_window(&engine, done, &captured[window..end], window, None)?;
+                            let part = transcribe_samples(&engine, &captured[window..end], None)?;
+                            text = join(done, part, window);
                             window = end - segment::OVERLAP_SAMPLES;
                             windows_end = end;
                         }
@@ -471,7 +500,8 @@ impl SttEngine {
                             if read_point != Some(point) {
                                 read_point = Some(point);
                                 let heard = &captured[..point.heard];
-                                quiet = QuietRead::start(&engine, &text, heard, point);
+                                quiet =
+                                    QuietRead::start(&engine, &text, heard, point, self.end_quiet);
                             }
                         }
                     }
@@ -515,15 +545,22 @@ impl SttEngine {
         let (mut text, last_part) = match point {
             Some(point) => match quiet.and_then(QuietRead::wait) {
                 Some(read) => (read?, 0),
-                None => read_rest(&engine, &text, &captured[..point.heard], window, None)?,
+                None => read_rest(
+                    &engine,
+                    &text,
+                    &captured[..point.heard],
+                    window,
+                    self.end_quiet,
+                    None,
+                )?,
             },
-            None => read_rest(&engine, &text, &captured, window, None)?,
+            None => read_rest(&engine, &text, &captured, window, self.end_quiet, None)?,
         };
         let last_part_secs = last_part as f32 / 16000.0;
 
         if text.is_empty() {
             if let Some(boosted) = boost_quiet_speech(&captured) {
-                if let Ok(boosted_text) = transcribe_samples(&engine, &boosted, None) {
+                if let Ok(boosted_text) = read_end(&engine, &boosted, self.end_quiet, None) {
                     text = boosted_text;
                 }
             }

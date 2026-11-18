@@ -26,6 +26,12 @@ pub struct ModelSpec {
     /// How Trit holds the weights: the fastest choice that keeps the
     /// model's accuracy (see the model's notes).
     pub precision: trit::Precision,
+    /// Digital quiet that the model gets after the audio of each read that
+    /// ends a take. Parakeet Unified English writes a word about 0.3 s after
+    /// the word ends: it learned to stream with right context. A take that
+    /// ends at its last word then loses that word, and a one-word take can
+    /// give no text.
+    pub end_quiet_samples: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -108,6 +114,8 @@ pub const CATALOG: &[ModelSpec] = &[
         dir_name: REDUX_DIR,
         files: REDUX_FILES,
         precision: trit::Precision::Auto,
+        // The quiet cost Redux words: other 173 to 183 errors.
+        end_quiet_samples: 0,
     },
     ModelSpec {
         id: UNIFIED_ID,
@@ -122,6 +130,10 @@ pub const CATALOG: &[ModelSpec] = &[
         // Auto would run the stored Q8_0; Trit's own int8 is faster (40 ms
         // against 52 ms a clip) with one error fewer on the test clips.
         precision: trit::Precision::Int8,
+        // 309 short LibriSpeech phrases that end 60 ms after the last word:
+        // 52 to 27 errors in 1,489 words, 7 to 0 takes with no text. The long
+        // sets stayed the same: clean 56 to 56, other 102 to 101, tech 18 to 16.
+        end_quiet_samples: 480 * 16,
     },
 ];
 

@@ -955,9 +955,8 @@ impl HudView {
         let tx = self.model_ready_tx.clone();
         let ping = self.update_ping.clone();
         let progress = Arc::clone(&self.model_progress);
-        let precision = spec.precision;
         std::thread::spawn(move || {
-            let engine = SttEngine::new(&dir, precision);
+            let engine = SttEngine::new(&dir, spec);
             let report: Arc<dyn Fn(f32) + Send + Sync> = Arc::new(move |fraction: f32| {
                 progress.store((fraction * 1000.0) as u32, Ordering::Relaxed);
             });
