@@ -139,7 +139,7 @@ pub const CATALOG: &[ModelSpec] = &[
         // 309 short LibriSpeech phrases that end 60 ms after the last word:
         // 52 to 27 errors in 1,489 words, 7 to 0 takes with no text. The long
         // sets stayed the same: clean 56 to 56, other 102 to 101, tech 18 to 16.
-        end_quiet_samples: 480 * 16,
+        end_quiet_samples: 480 * crate::SAMPLE_RATE / 1000,
     },
 ];
 
