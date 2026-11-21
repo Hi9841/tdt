@@ -755,3 +755,12 @@ The speech engine moves from Trit 0.15.0 (`65a2c19` moved to 0.16.0, then this r
 The GUI app, microphone device path, and Parakeet Redux ratchet (no local `parakeet-redux` folder on this machine) did not run.
 
 Released as TDT 0.9.11.
+
+## Session 2026-11-21 (later): revert TDT source changes, keep Trit 0.17.0
+
+In live dictation tests on the owner's machine, the `0.9.10` TDT implementation with Trit `0.17.0` felt more consistent than the `0.9.11` capture and tail edits, and an attempted post-release click filter in `tail.rs` still showed 83 to 262 ms `last word` waits live.
+
+- Reverted all `desktop/src/` files (`engine.rs`, `recorder.rs`, `tail.rs`, `dictation.rs`) back to exact `0.9.10` (`44d3d29`).
+- Kept Trit `0.17.0` (`5ba3e73`), which keeps the 2x faster warm model load (217 ms vs 437 ms) and CPU inference improvements with identical transcripts across all tested clips.
+
+Released as TDT 0.9.12.

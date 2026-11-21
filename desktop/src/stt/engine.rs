@@ -444,9 +444,10 @@ impl SttEngine {
             precision: self.precision,
             ..LoadOptions::default()
         };
-        // Trit::load_reporting releases its load temporaries before returning.
         let engine = Trit::load_reporting(&self.model_dir, &options, progress)?;
         *self.native.lock() = Some(Arc::new(engine));
+        // Loading converts weights through buffers that are freed again.
+        trit::release_memory();
         // A fresh engine has no dictionary yet.
         *self.dictionary.lock() = dictionary::Watch::default();
         Ok(())
