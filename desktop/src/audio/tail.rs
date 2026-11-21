@@ -39,9 +39,13 @@ impl SpeechTail {
     pub fn push_samples(&mut self, samples: &[f32]) {
         self.samples += samples.len();
         self.carry.extend_from_slice(samples);
-        while self.carry.len() >= FRAME_SAMPLES {
-            let frame: Vec<f32> = self.carry.drain(..FRAME_SAMPLES).collect();
-            self.frames.push(frame_db(&frame));
+        let (frames, _) = self.carry.as_chunks::<FRAME_SAMPLES>();
+        let used = frames.len() * FRAME_SAMPLES;
+        for frame in frames {
+            self.frames.push(frame_db(frame));
+        }
+        if used > 0 {
+            self.carry.drain(..used);
         }
     }
 
@@ -148,10 +152,10 @@ fn frame_db(samples: &[f32]) -> f32 {
 }
 
 fn percentile_15(values: &[f32]) -> f32 {
-    let mut sorted = values.to_vec();
-    sorted.sort_by(f32::total_cmp);
-    let rank = ((sorted.len() as f32) * 0.15).ceil() as usize;
-    sorted[rank.saturating_sub(1).min(sorted.len() - 1)]
+    let mut scratch = values.to_vec();
+    let rank = ((scratch.len() as f32) * 0.15).ceil() as usize;
+    let index = rank.saturating_sub(1).min(scratch.len() - 1);
+    *scratch.select_nth_unstable_by(index, f32::total_cmp).1
 }
 
 fn median(values: &[f32]) -> f32 {

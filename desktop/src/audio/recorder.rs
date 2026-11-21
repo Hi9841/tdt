@@ -318,12 +318,16 @@ impl CaptureHandle {
         samples
     }
 
-    /// Ends the recording and takes the rest of the buffer.
+    /// Ends the recording and takes the rest of the buffer, keeping its
+    /// capacity so the next take's capture callback does not allocate.
     pub fn stop(&self) -> Vec<f32> {
         self.capture.is_recording.store(false, Ordering::SeqCst);
         *self.capture.envelope.lock() = SpeechEnvelope::default();
         self.capture.captured.store(0, Ordering::SeqCst);
-        std::mem::take(&mut *self.capture.buffer.lock())
+        let mut recorded = self.capture.buffer.lock();
+        let samples = recorded.clone();
+        recorded.clear();
+        samples
     }
 
     pub fn limit_reached(&self) -> bool {
@@ -499,8 +503,6 @@ fn ingest<T: Copy>(
             }
         }
         process_samples(samples, to_f32, converter, capture);
-    } else {
-        *capture.envelope.lock() = SpeechEnvelope::default();
     }
 }
 
@@ -528,7 +530,7 @@ fn build_stream(
             .build_input_stream(
                 config,
                 move |data: &[i16], _| {
-                    let to_f32 = |sample: i16| sample as f32 / i16::MAX as f32;
+                    let to_f32 = |sample: i16| f32::from(sample) / 32_768.0;
                     ingest(data, to_f32, &mut converter, &capture);
                 },
                 on_error,
@@ -539,7 +541,7 @@ fn build_stream(
             .build_input_stream(
                 config,
                 move |data: &[i32], _| {
-                    let to_f32 = |sample: i32| sample as f32 / i32::MAX as f32;
+                    let to_f32 = |sample: i32| sample as f32 / 2_147_483_648.0;
                     ingest(data, to_f32, &mut converter, &capture);
                 },
                 on_error,
