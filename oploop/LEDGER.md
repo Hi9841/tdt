@@ -733,3 +733,25 @@ and the typing did not change. TDT for Android uses the same model and the same 
 the same problem, and this fix is not in it.
 
 Released as TDT 0.9.10.
+
+## Session 2026-11-21: Trit 0.16.0 to 0.17.0 and capture cleanup
+
+The speech engine moves from Trit 0.15.0 (`65a2c19` moved to 0.16.0, then this release pins 0.17.0 `5ba3e73`).
+
+- Engine (Trit 0.16.0 and 0.17.0): CPU inference optimizations across FastConformer, TDT, and `fgemm`; SIMD AVX-512 and AVX2 `Int8::quantize` with zero-copy single-part tensor loading; parallel mapped weight-cache verification; parallel zero-fill for large `Buf::scratch` allocations; and worker thread-local scratch cleanup inside `release_memory()`.
+- App (`65a2c19`): removed duplicate `trit::release_memory()` right after `Trit::load_reporting` in `desktop/src/stt/engine.rs`; replaced per-10 ms `Vec<f32>` allocations in `SpeechTail::push_samples` with `as_chunks` and O(N) `select_nth_unstable_by` in `desktop/src/audio/tail.rs`; kept WASAPI capture capacity warm across takes in `CaptureHandle::stop()`, removed the idle `envelope` lock in `ingest()`, and normalized `I16` and `I32` capture samples by `32_768.0` and `2_147_483_648.0` in `desktop/src/audio/recorder.rs`.
+
+### Gate
+
+`bench-asr --chunk-ms 10` on Parakeet Unified English, TDT 0.9.10 (Trit 0.15.0) against TDT 0.9.11 (Trit 0.17.0):
+
+- Text parity: 0 of 200 differ on `clean` (67 errors, 1.68% WER), 0 of 200 differ on `other` (116 errors, 3.08% WER).
+- Model load (`Init:`): cold first-load cache build dropped from 1,152 to 1,199 ms (0.15.0 and 0.16.0) to 803 ms (0.17.0); warm cached startup ran in 208 ms (`clean`) and 214 ms (`other`). In Trit's 7-round interleaved cached-load benchmark (`precision="int8"`, `cache=True`), warm load dropped from 420.4 ms (0.16.0) to 219.6 ms (0.17.0) with 33.5 MB private memory.
+- Total clip latency: `clean` 11,019 and 11,037 ms (0.15.0) to 10,805 and 10,821 ms (0.17.0); `other` 10,400 and 10,388 ms (0.15.0) to 10,148 ms (0.17.0).
+- Checks: `cargo fmt --check`, `cargo clippy --locked --release --all-targets --all-features -- -D warnings`, `cargo test --locked --release`, `cargo build --locked --release --bins`, `packaging/tdt-setup` fmt and clippy, and the no-word-lists check all passed.
+
+### Not verified
+
+The GUI app, microphone device path, and Parakeet Redux ratchet (no local `parakeet-redux` folder on this machine) did not run.
+
+Released as TDT 0.9.11.
