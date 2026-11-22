@@ -1,0 +1,273 @@
+//! Parakeet: FastConformer encoder with a TDT, RNNT, or CTC decoder (NVIDIA
+//! Parakeet, Moondream Parakeet Redux, and GigaAM v3, a Conformer of the
+//! same plan). The network follows the Apache-2.0 Hugging Face Parakeet
+//! implementation; the files are read as published.
+
+use crate::models::parts::{dictionary, fastconformer as model, logit_bias as bias};
+use crate::models::Family;
+
+use crate::audio::mel::MelFrontend;
+use crate::audio::table_mel::{TableMel, TableShape};
+use crate::config::Json;
+use crate::cpu::tensors::Tensors;
+use crate::models::files::Files;
+use crate::text::sentencepiece::Tokenizer;
+use crate::{Device, Options, Precision, Segment};
+use parking_lot::RwLock;
+
+pub use bias::BiasWeights;
+
+pub struct Parakeet {
+    model: model::Parakeet,
+    /// One lock for both, so a call never pairs one dictionary with the
+    /// ban of another.
+    terms: RwLock<Terms>,
+    frontend: Frontend,
+    tokenizer: Tokenizer,
+    /// Tokens of other languages; blocked when the caller asks for English.
+    non_english: Vec<usize>,
+}
+
+struct Terms {
+    /// The user's dictionary; none means plain greedy decoding.
+    dictionary: Option<dictionary::Dictionary>,
+    /// `non_english` without the pieces of the dictionary terms: a name
+    /// such as "Hetzner" must stay possible.
+    blocked: Vec<usize>,
+}
+
+enum Frontend {
+    /// NeMo's: Slaney filters, pre-emphasis, centered frames.
+    Nemo(MelFrontend),
+    /// The model file's own filterbank and window (GigaAM).
+    Table(TableMel),
+}
+
+impl Frontend {
+    fn load(json: &Json, t: &Tensors, config: &model::Config) -> Result<Self, String> {
+        match json.str("feature_extractor.type") {
+            None => Ok(Self::Nemo(
+                MelFrontend::new(config.mels).normalized(config.normalize_features),
+            )),
+            Some("table") => {
+                let num = |key: &str| json.num(&format!("feature_extractor.{key}"));
+                let float = |key: &str, default: f64| {
+                    json.float(&format!("feature_extractor.{key}"))
+                        .unwrap_or(default) as f32
+                };
+                let shape = TableShape {
+                    n_fft: num("n_fft")?,
+                    hop: num("hop_length")?,
+                    win: num("win_length")?,
+                    floor: float("log_floor", 1e-9),
+                    ceiling: float("log_ceiling", f32::MAX as f64),
+                };
+                let bins = shape.n_fft / 2 + 1;
+                let mut filters = t.f32_len("frontend.mel_filterbank", config.mels * bins)?;
+                // Stored `bins x mels` (MedASR): as `mels x bins`.
+                if json.str("feature_extractor.filterbank_layout") == Some("bins_mels") {
+                    filters = (0..config.mels * bins)
+                        .map(|i| filters[(i % bins) * config.mels + i / bins])
+                        .collect();
+                }
+                let window = t.f32_len("frontend.window", shape.win)?;
+                TableMel::new(shape, filters, &window).map(Self::Table)
+            }
+            Some(other) => Err(format!("config.json: front end `{other}` is not run")),
+        }
+    }
+
+    /// `frames x mels`.
+    fn compute(&self, samples: &[f32]) -> (Vec<f32>, usize) {
+        match self {
+            Self::Nemo(mel) => mel.compute(samples),
+            Self::Table(mel) => mel.compute(samples),
+        }
+    }
+}
+
+/// One minute: 750 encoder frames, a few MB of attention per head.
+const WINDOW_SAMPLES: usize = 60 * crate::SAMPLE_RATE as usize;
+/// A pause this long ends a segment.
+const PAUSE_SECONDS: f32 = 1.0;
+struct Part {
+    start: usize,
+    tokens: Vec<usize>,
+    /// The encoder frame of each token, from the start of the part.
+    frames: Vec<usize>,
+}
+
+impl Parakeet {
+    fn text(&self, parts: &[Part], options: &Options) -> String {
+        if options.cancelled() {
+            return String::new();
+        }
+        if let [one] = parts {
+            return self.tokenizer.decode(&one.tokens);
+        }
+        let pieces: Vec<String> = parts
+            .iter()
+            .map(|part| self.tokenizer.decode(&part.tokens).trim().to_string())
+            .filter(|piece| !piece.is_empty())
+            .collect();
+        pieces.join(" ")
+    }
+
+    /// Decodes a recording in windows cut at quiet points (`audio::windows`).
+    /// A recording of up to `WINDOW_SAMPLES` is one window. A cancelled call
+    /// stops between windows.
+    fn parts(&self, samples: &[f32], options: &Options) -> Vec<Part> {
+        let mut parts = Vec::new();
+        for window in crate::audio::windows(samples, WINDOW_SAMPLES) {
+            if options.cancelled() {
+                break;
+            }
+            let (tokens, frames) = self.decode_window(window, options);
+            parts.push(Part {
+                start: crate::audio::offset(samples, window),
+                tokens,
+                frames,
+            });
+        }
+        parts
+    }
+
+    /// Tokens of one window and the encoder frame of each. A cancelled
+    /// call has none.
+    fn decode_window(&self, samples: &[f32], options: &Options) -> (Vec<usize>, Vec<usize>) {
+        let cancel = options.cancel.as_ref();
+        let (features, frames) = self.frontend.compute(samples);
+        if frames < model::MIN_FRAMES {
+            return (Vec::new(), Vec::new());
+        }
+        // Redux's speech head: no speech, no text.
+        let encoder = crate::prof::span(crate::prof::Stage::Encoder);
+        let Some((encoded, t)) = self.model.encode_speech(&features, frames, cancel) else {
+            return (Vec::new(), Vec::new());
+        };
+        encoder.end();
+        // An encoder that stopped early has no valid output.
+        if options.cancelled() {
+            return (Vec::new(), Vec::new());
+        }
+        let encoded = self.model.prompted(encoded, t, options.language.as_deref());
+        // Parakeet cannot be told a language; it can only be kept to English.
+        let english = options
+            .language
+            .as_deref()
+            .is_some_and(|code| code.trim().eq_ignore_ascii_case("en"));
+        let terms = self.terms.read();
+        let blocked: &[usize] = if english { &terms.blocked } else { &[] };
+        let _span = crate::prof::span(crate::prof::Stage::Decoder);
+        self.model
+            .decode(&encoded, t, terms.dictionary.as_ref(), blocked, cancel)
+    }
+}
+
+impl Family for Parakeet {
+    fn load(
+        files: &Files,
+        config: &Json,
+        precision: Precision,
+        device: Device,
+    ) -> Result<Self, String> {
+        let json = config;
+        let tensors = files.tensors(precision, device)?;
+        let config = model::Config::parse(json)?;
+        let frontend = Frontend::load(json, &tensors, &config)?;
+        let model = model::Parakeet::load(&tensors, config)?;
+        // The weight file is no longer needed; free it before the position
+        // tables grow, so load does not hold both at its peak.
+        drop(tensors);
+        model.warm_positions();
+        let tokenizer = Tokenizer::parse(&files.read("tokenizer.json")?)?;
+        // Only token ids: the joint row holds the durations after them.
+        let vocab = model.config.vocab;
+        // The blank, the last id, has no piece.
+        if tokenizer.len() + 1 < vocab {
+            return Err(format!(
+                "the tokenizer has {} pieces; the model has {vocab} tokens",
+                tokenizer.len()
+            ));
+        }
+        let non_english: Vec<usize> = tokenizer
+            .non_english()
+            .into_iter()
+            .filter(|id| *id < vocab)
+            .collect();
+        Ok(Self {
+            terms: RwLock::new(Terms {
+                dictionary: None,
+                blocked: non_english.clone(),
+            }),
+            model,
+            frontend,
+            non_english,
+            tokenizer,
+        })
+    }
+
+    fn set_dictionary(&self, terms: &[String], weights: BiasWeights) -> Vec<String> {
+        // Only the TDT head scores terms: a CTC head favors none, so every
+        // term is skipped and the English ban stays whole.
+        if matches!(self.model.config.head, model::HeadKind::Ctc) {
+            return terms.to_vec();
+        }
+        let (dictionary, skipped) = dictionary::Dictionary::build(&self.tokenizer, terms, weights);
+        let used = dictionary.as_ref().map(|d| d.pieces()).unwrap_or_default();
+        let blocked = self
+            .non_english
+            .iter()
+            .copied()
+            .filter(|id| !used.contains(id))
+            .collect();
+        *self.terms.write() = Terms {
+            dictionary,
+            blocked,
+        };
+        skipped
+    }
+
+    /// Recordings longer than `WINDOW_SAMPLES` go through in windows cut at
+    /// quiet points: attention memory grows with the square of the length. A
+    /// cancelled call gives no text.
+    fn transcribe(&self, samples: &[f32], options: &Options) -> String {
+        self.text(&self.parts(samples, options), options)
+    }
+
+    /// The text in sentences: a segment ends at `.`, `?`, or `!`, or where
+    /// the speaker pauses for `PAUSE_SECONDS`. A token's time is the encoder
+    /// frame the decoder emitted it at.
+    fn segments(&self, samples: &[f32], options: &Options) -> Vec<Segment> {
+        let mut segments = Vec::new();
+        for part in self.parts(samples, options) {
+            let offset = part.start as f32 / crate::SAMPLE_RATE as f32;
+            let Part { tokens, frames, .. } = part;
+            let frame_seconds = self.model.config.frame_seconds();
+            let time = |frame: usize| offset + frame as f32 * frame_seconds;
+            let mut start = 0;
+            for i in 0..tokens.len() {
+                let text = self.tokenizer.decode(&tokens[i..=i]);
+                let sentence_end = text.trim_end().ends_with(['.', '?', '!']);
+                let pause = frames
+                    .get(i + 1)
+                    .is_some_and(|next| (next - frames[i]) as f32 * frame_seconds >= PAUSE_SECONDS);
+                if sentence_end || pause || i + 1 == tokens.len() {
+                    let text = self.tokenizer.decode(&tokens[start..=i]).trim().to_string();
+                    if !text.is_empty() {
+                        segments.push(Segment {
+                            start: time(frames[start]),
+                            end: time(frames[i] + 1),
+                            text,
+                        });
+                    }
+                    start = i + 1;
+                }
+            }
+        }
+        if options.cancelled() {
+            segments.clear();
+        }
+        segments
+    }
+}

@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">TDT</string>
+    <string name="bubble_service_label">TDT bubble</string>
+    <string name="bubble_service_description">Shows the TDT bubble beside your keyboard when you type in a text field. TDT reads which field has focus and its text, so it can put your dictated words at the cursor. It never shows on password fields. Speech and text stay on this phone.</string>
+</resources>

@@ -1,0 +1,173 @@
+"""Interleaved A/B of two Trit libraries on one model: time per clip and errors.
+
+usage (from the repository root):
+  uv run --no-project --python 3.12 --with numpy --with whisper-normalizer==0.1.12 --with scipy \\
+      python oploop/ab.py <model> <A trit_ffi.dll> <B trit_ffi.dll> [--rounds 3] [--sets clean]
+      [--cleanup]
+
+Each round runs side A, then side B, each in a fresh process (TRIT_LIB picks the
+library), so warm-up and drift favor neither. A side loads the model, runs one
+warm-up clip, then transcribes every clip of the sets, one call each, timed.
+Each call is also charged its CPU time (user and kernel, all threads, with
+the 3 ms that the workers spin after a call), and a side reports its private
+memory after the run and its peak working set (Windows).
+Prints per round: the median ms, the total errors, and the texts. Then the
+verdict: median of the per-round medians, their range, the median of the
+per-clip B/A ratios, a rank-sum test on the per-clip times of all rounds, a
+paired signed-rank test on the per-clip medians (the stronger test: clips of
+very different lengths do not hide the change), the errors per set, and how
+many texts differ between A and B. --save FILE writes every row as JSON.
+
+--cleanup: <model> is ignored; times S1-mini on the cleanup harness's cases.
+"""
+
+import json
+import os
+import statistics
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "bench"))
+
+
+def side(model: str, sets: list[str], cleanup: bool) -> None:
+    """One side, in its own process: prints one JSON line."""
+    sys.path.insert(0, str(ROOT / "bindings" / "python"))
+    import trit
+
+    if cleanup:
+        from cleanup_runtimes import cases
+
+        cleaner = trit.Cleaner(str(ROOT / "models" / "s1-mini"))
+        items = cases()
+        cleaner.clean(items[0][0])
+        out = []
+        for raw, target in items:
+            t0 = time.perf_counter()
+            text = cleaner.clean(raw)
+            out.append({"clip": raw[:40], "ms": (time.perf_counter() - t0) * 1000, "hyp": text,
+                        "errors": int(text.strip() != target.strip())})
+        print(json.dumps(out))
+        return
+
+    import numpy
+    import runtimes
+
+    runtimes.np = numpy  # runtimes.py imports numpy only in its own child processes
+    from runtimes import edits, read_clip
+    from whisper_normalizer.english import EnglishTextNormalizer
+
+    normalize = EnglishTextNormalizer()
+    engine = trit.Trit(model)
+    clips = [p for s in sets for p in sorted((ROOT / "bench" / "clips" / s).glob("*.wav"))]
+    engine.transcribe(read_clip(clips[0]), language="en")
+    out = []
+    for path in clips:
+        samples = read_clip(path)
+        c0 = time.process_time()
+        t0 = time.perf_counter()
+        text = engine.transcribe(samples, language="en")
+        ms = (time.perf_counter() - t0) * 1000
+        # The workers spin for 3 ms after a call before they park: that CPU
+        # time belongs to the call. The sleep itself uses none.
+        time.sleep(0.005)
+        cpu = (time.process_time() - c0) * 1000
+        ref = path.with_suffix(".txt").read_text(encoding="utf-8-sig")
+        out.append({"clip": f"{path.parent.name}/{path.stem}", "ms": ms, "cpu": cpu, "hyp": text,
+                    "errors": edits(normalize(ref).split(), normalize(text).split())})
+    out[0]["private_mb"], out[0]["peak_mb"] = memory()
+    print(json.dumps(out))
+
+
+def memory() -> tuple[float, float]:
+    """Private bytes now and the peak working set of this process, in MB (0, 0 off Windows)."""
+    if os.name != "nt":
+        return 0.0, 0.0
+    import ctypes
+    from ctypes import wintypes
+
+    class Counters(ctypes.Structure):
+        _fields_ = [("cb", wintypes.DWORD), ("faults", wintypes.DWORD)] + [
+            (name, ctypes.c_size_t) for name in (
+                "peak_working_set", "working_set", "peak_paged", "paged", "peak_nonpaged", "nonpaged",
+                "pagefile", "peak_pagefile", "private")]
+
+    counters = Counters()
+    counters.cb = ctypes.sizeof(counters)
+    kernel32 = ctypes.windll.kernel32
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    ctypes.windll.psapi.GetProcessMemoryInfo(
+        wintypes.HANDLE(kernel32.GetCurrentProcess()), ctypes.byref(counters), counters.cb)
+    return counters.private / 2**20, counters.peak_working_set / 2**20
+
+
+def run(lib: str, model: str, sets: list[str], cleanup: bool, extra: dict[str, str]) -> list[dict]:
+    env = dict(os.environ, TRIT_LIB=lib, **extra)
+    command = [sys.executable, __file__, "--side", model, ",".join(sets)] + (["--cleanup"] if cleanup else [])
+    result = subprocess.run(command, cwd=ROOT, env=env, capture_output=True, text=True, encoding="utf-8")
+    if result.returncode:
+        sys.exit(f"side failed ({lib}):\n{result.stderr[-2000:]}")
+    return json.loads(result.stdout.strip().splitlines()[-1])
+
+
+def main() -> None:
+    args = sys.argv[1:]
+    if args[0] == "--side":
+        side(args[1], args[2].split(","), "--cleanup" in args)
+        return
+    model, a, b = args[:3]
+    rounds = int(args[args.index("--rounds") + 1]) if "--rounds" in args else 3
+    sets = args[args.index("--sets") + 1].split(",") if "--sets" in args else ["clean"]
+    cleanup = "--cleanup" in args
+    # --env-a NAME=VALUE and --env-b NAME=VALUE (each can repeat): the environment of one side.
+    extra = {side: dict(args[i + 1].split("=", 1) for i, arg in enumerate(args) if arg == f"--env-{side.lower()}")
+             for side in ("A", "B")}
+    runs = {"A": [], "B": []}
+    for r in range(rounds):
+        for name, lib in (("A", a), ("B", b)):
+            rows = run(lib, model, sets, cleanup, extra[name])
+            runs[name].append(rows)
+            print(f"round {r + 1} {name}: median {statistics.median(x['ms'] for x in rows):7.1f} ms, "
+                  f"errors {sum(x['errors'] for x in rows)}", flush=True)
+    med = {k: [statistics.median(x["ms"] for x in rows) for rows in v] for k, v in runs.items()}
+    # Per clip: the median over rounds, then B/A.
+    clips = len(runs["A"][0])
+    per_clip = {k: [statistics.median(rows[i]["ms"] for rows in v) for i in range(clips)] for k, v in runs.items()}
+    ratio = statistics.median(b / a for a, b in zip(per_clip["A"], per_clip["B"]))
+    from scipy.stats import mannwhitneyu, wilcoxon
+
+    pooled = {k: [x["ms"] for rows in v for x in rows] for k, v in runs.items()}
+    p = mannwhitneyu(pooled["A"], pooled["B"]).pvalue
+    paired = wilcoxon(per_clip["A"], per_clip["B"]).pvalue
+    differ = sum(x["hyp"].strip() != y["hyp"].strip() for x, y in zip(runs["A"][0], runs["B"][0]))
+    err = {k: sum(x["errors"] for x in v[0]) for k, v in runs.items()}
+    print(f"A: median {statistics.median(med['A']):.1f} ms (rounds {min(med['A']):.1f}-{max(med['A']):.1f})")
+    print(f"B: median {statistics.median(med['B']):.1f} ms (rounds {min(med['B']):.1f}-{max(med['B']):.1f})")
+    print(f"per-clip B/A median ratio {ratio:.3f}; rank-sum p = {p:.2g}; paired signed-rank p = {paired:.2g}; "
+          f"{'significant' if paired < 0.01 else 'not significant'}")
+    if all("cpu" in rows[0] for v in runs.values() for rows in v):
+        # The clock of the CPU time has steps of 15.6 ms on Windows: sum each round.
+        cpu = {k: [sum(x["cpu"] for x in rows) / 1000 for rows in v] for k, v in runs.items()}
+        wall = {k: [sum(x["ms"] for x in rows) / 1000 for rows in v] for k, v in runs.items()}
+        print("CPU time of a round, s (rounds): " + ", ".join(
+            f"{k} {statistics.median(v):.1f} ({min(v):.1f}-{max(v):.1f})" for k, v in cpu.items())
+            + f"; B/A {statistics.median(cpu['B']) / statistics.median(cpu['A']):.3f}")
+        print("time of a round, s: " + ", ".join(f"{k} {statistics.median(v):.2f}" for k, v in wall.items())
+              + f"; B/A {statistics.median(wall['B']) / statistics.median(wall['A']):.3f}")
+        mem = {k: [(rows[0]["private_mb"], rows[0]["peak_mb"]) for rows in v] for k, v in runs.items()}
+        print("memory after the run, private / peak working set, median MB: " + ", ".join(
+            f"{k} {statistics.median(x[0] for x in v):.0f} / {statistics.median(x[1] for x in v):.0f}"
+            for k, v in mem.items()))
+    print(f"errors A {err['A']}, B {err['B']}; texts differing: {differ} of {clips}")
+    for name in dict.fromkeys(x["clip"].split("/")[0] for x in runs["A"][0]):
+        e = {k: sum(x["errors"] for x in v[0] if x["clip"].startswith(name + "/")) for k, v in runs.items()}
+        print(f"  {name}: errors A {e['A']}, B {e['B']}")
+    if "--save" in args:
+        Path(args[args.index("--save") + 1]).write_text(json.dumps(runs), encoding="utf-8")
+
+
+if __name__ == "__main__":
+    main()

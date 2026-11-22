@@ -1,0 +1,291 @@
+---
+import Base from "../layouts/Base.astro";
+import Header from "../components/Header.astro";
+import PageHead from "../components/PageHead.astro";
+import Footer from "../components/Footer.astro";
+import Cmd from "../components/Cmd.astro";
+import { DEFAULT_MODEL, catalog, downloadCommand, familyOf, languagesOf, megabytes, tritCleanup, tritRunOf } from "../lib/data";
+import { render, sections } from "../lib/markdown";
+import { links } from "../lib/links";
+import { readRepo, updatedOf } from "../lib/repo";
+import { shelf } from "../lib/sketch";
+
+// Families in the order of the catalog, each with its models.
+const families = [...new Set(catalog.map((m) => familyOf(m.kind)))].map((family) => ({
+  family,
+  models: catalog.filter((m) => familyOf(m.kind) === family),
+}));
+
+const updated = updatedOf([
+  "site/src/pages/models.astro",
+  "src/catalog.rs",
+  "docs/reference.md",
+  "bench/benchmarks.json",
+]);
+
+const largest = Math.max(...catalog.map((m) => m.mb));
+
+// From the reference's Models section: everything after its table (the download
+// and where Trit looks for a model).
+const readme = (sections(readRepo("docs/reference.md")).find((s) => s.id === "models")?.body ?? "").split("\n");
+const tableEnd = readme.findLastIndex((line) => line.startsWith("|"));
+const search = await render(readme.slice(tableEnd + 1).join("\n"), "docs/reference.md");
+---
+
+<Base
+  title="Models · Trit"
+  description="The speech models Trit runs, from Hugging Face folders and GGUF files: Parakeet, Canary, Whisper, Moonshine, Qwen3-ASR, Granite Speech, Voxtral, and more; S1-mini for cleanup. Sizes, languages, speed, and the download command."
+  updated={updated}
+>
+  <Header />
+  <main id="content">
+    <PageHead title="Models, as published." art={shelf} scene="shelf">
+      <p>
+        Trit reads <code>config.json</code> and <code>model.safetensors</code> of a Hugging Face folder, or one
+        published file (GGUF, <code>.nemo</code>), and picks the network from <code>model_type</code>. These
+        {catalog.length} models have been run. Others of the same families load the same way. This command lists them,
+        with what is on your computer:
+      </p>
+      <Cmd command="trit models" />
+    </PageHead>
+
+    <section class="grid catalog" aria-label="Catalog">
+      {
+        families.map(({ family, models }) => (
+          <div class="family">
+            <h2>{family}</h2>
+            <ul>
+              {models.map((m) => {
+                const run = tritRunOf(m.name);
+                const fact = run
+                  ? `${Math.round(run.ms)} ms a clip · ${run.clean.toFixed(2)} % clean WER`
+                  : m.kind === "cleanup" && tritCleanup
+                    ? `${Math.round(tritCleanup.ms)} ms a case · ${tritCleanup.wer.toFixed(2)} % formatted WER`
+                    : "";
+
+                return (
+                  <li class:list={["model", { default: m.name === DEFAULT_MODEL }]}>
+                    <div class="name">
+                      <span class="id">{m.name}</span>
+                      {m.name === DEFAULT_MODEL && <span class="tag">default</span>}
+                      <a class="repo" href={`https://huggingface.co/${m.repo}`} rel="noopener">
+                        {m.repo}
+                      </a>
+                    </div>
+                    <div class="facts">
+                      <span>{languagesOf(m.languages)}</span>
+                      {fact && <span>{fact}</span>}
+                    </div>
+                    <div class="size">
+                      <span class="mb">{megabytes(m.mb)}</span>
+                      <span class="bar" style={`--w:${(m.mb / largest).toFixed(3)}`} aria-hidden="true" />
+                    </div>
+                    <button
+                      class="get button quiet"
+                      type="button"
+                      data-copy={downloadCommand(m)}
+                      aria-label={`Copy the download command of ${m.name}`}
+                    >
+                      Copy download
+                    </button>
+                  </li>
+                );
+              })}
+            </ul>
+          </div>
+        ))
+      }
+      <p class="foot">
+        Times are Trit's median on 200 LibriSpeech clips (S1-mini: on {tritCleanup?.cases} cleanup cases), Ryzen 9 7950X3D. All
+        runtimes side by side on{" "}
+        <a href={links.benchmarks}>Benchmarks</a>.
+      </p>
+    </section>
+
+    <p class="sr" role="status" id="copied"></p>
+
+    <section class="grid more">
+      <div class="prose"><h2 id="where">Download, and where Trit looks</h2><Fragment set:html={search} /></div>
+    </section>
+  </main>
+  <Footer updated={updated} />
+</Base>
+
+<script>
+  // Copies the download command; the label confirms through a short blur, and
+  // the status line tells a screen reader. If the clipboard is closed to the
+  // page, a prompt shows the command, selected.
+  const status = document.getElementById("copied");
+
+  for (const button of document.querySelectorAll<HTMLButtonElement>(".get")) {
+    button.addEventListener("click", async () => {
+      const command = button.dataset.copy ?? "";
+
+      try {
+        await navigator.clipboard.writeText(command);
+      } catch {
+        prompt("Copy the download command:", command);
+
+        return;
+      }
+
+      if (status) status.textContent = `Copied: ${command}`;
+
+      button.classList.add("swap");
+      setTimeout(() => {
+        button.textContent = "Copied";
+        button.classList.remove("swap");
+      }, 120);
+      setTimeout(() => {
+        button.textContent = "Copy download";
+      }, 1600);
+    });
+  }
+</script>
+
+<style>
+  .catalog {
+    margin-top: 128px;
+  }
+  .family {
+    grid-column: 1 / -1;
+    display: grid;
+    grid-template-columns: subgrid;
+    margin-bottom: 64px;
+  }
+  h2 {
+    grid-column: 1 / span 3;
+    margin: 0;
+    padding-top: 18px;
+    font-size: 24px;
+    font-weight: 500;
+    line-height: 1.2;
+    letter-spacing: -0.02em;
+  }
+  ul {
+    grid-column: 4 / -1;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+  .model {
+    display: grid;
+    grid-template-columns: minmax(0, 5fr) minmax(0, 4fr) minmax(0, 3fr) auto;
+    gap: 8px 24px;
+    align-items: center;
+    max-width: none;
+    padding: 20px 0;
+    border-top: 1px solid var(--rule);
+  }
+  .model:last-child {
+    border-bottom: 1px solid var(--rule);
+  }
+  .name {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 4px 12px;
+  }
+  .id {
+    font-family: var(--mono);
+    font-size: 16px;
+  }
+  .tag {
+    font-size: 13px;
+    font-weight: 500;
+    letter-spacing: 0.01em;
+    text-transform: none;
+    color: var(--accent-text);
+  }
+  .repo {
+    flex-basis: 100%;
+    font-size: 14px;
+    color: var(--muted);
+    text-decoration: none;
+  }
+  .facts {
+    display: grid;
+    font-size: 15px;
+    line-height: 1.45;
+  }
+  .facts span + span {
+    color: var(--muted);
+  }
+  .size {
+    display: grid;
+    gap: 8px;
+  }
+  .mb {
+    font-size: 15px;
+    font-variant-numeric: tabular-nums;
+  }
+  .bar {
+    height: 4px;
+    background: var(--ink);
+    transform: scaleX(var(--w));
+    transform-origin: left center;
+  }
+  .default .bar {
+    background: var(--accent);
+  }
+  .get {
+    min-width: 132px;
+    transition:
+      transform 160ms var(--ease-out),
+      border-color 150ms var(--ease-out),
+      opacity 120ms var(--ease-out),
+      filter 120ms var(--ease-out);
+  }
+  .get.swap {
+    opacity: 0;
+    filter: blur(2px);
+  }
+  @media (hover: hover) and (pointer: fine) {
+    .repo:hover {
+      color: var(--ink);
+    }
+  }
+  .foot {
+    grid-column: 4 / -1;
+    margin: 0;
+    font-size: 15px;
+    color: var(--muted);
+  }
+  .foot a {
+    text-underline-offset: 4px;
+  }
+  .more {
+    margin-top: 64px;
+  }
+  .more .prose {
+    grid-column: 4 / span 8;
+  }
+  .more .prose :global(h2) {
+    margin-top: 0;
+  }
+  @media (max-width: 900px) {
+    h2,
+    ul,
+    .foot,
+    .more .prose {
+      grid-column: 1 / -1;
+    }
+    h2 {
+      margin-bottom: 16px;
+    }
+    .model {
+      grid-template-columns: minmax(0, 1fr) auto;
+    }
+    .facts {
+      grid-column: 1;
+    }
+    .size {
+      grid-column: 1;
+    }
+    .get {
+      grid-column: 2;
+      grid-row: 1 / span 3;
+      align-self: start;
+    }
+  }
+</style>

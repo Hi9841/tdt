@@ -1,0 +1,587 @@
+//! Transformer pieces that several families share: layer norm, GELU,
+//! rotary positions, multi-head attention, and layer loading.
+
+use crate::cpu::{activation, buf::Buf, fgemm, gemm::Dense, team, tensors::Tensors};
+
+const LAYER_NORM_EPS: f32 = 1e-5;
+
+/// Layers with the same input and `out` rows each, stacked by output rows
+/// (`Dense::load`: int8 where the shape allows). A missing bias is zero.
+pub fn stacked(t: &Tensors, names: &[&str], out: usize, inp: usize) -> Result<Dense, String> {
+    let parts: Vec<(&str, usize)> = names.iter().map(|name| (*name, out)).collect();
+    Dense::load(t, &parts, inp)
+}
+
+pub fn linear(t: &Tensors, name: &str, out: usize, inp: usize) -> Result<Dense, String> {
+    stacked(t, &[name], out, inp)
+}
+
+/// Layer norm over rows of `d`; the bias is optional (Moonshine has none).
+pub struct Norm {
+    weight: Vec<f32>,
+    /// Zeros when the model has no bias.
+    bias: Vec<f32>,
+    eps: f32,
+}
+
+impl Norm {
+    /// `name.weight` and `name.bias`, with epsilon 1e-5 (PyTorch's default).
+    pub fn load(t: &Tensors, name: &str, d: usize) -> Result<Self, String> {
+        let bias = format!("{name}.bias");
+        Ok(Self {
+            weight: t.f32_len(&format!("{name}.weight"), d)?,
+            bias: if t.has(&bias) {
+                t.f32_len(&bias, d)?
+            } else {
+                vec![0.0; d]
+            },
+            eps: LAYER_NORM_EPS,
+        })
+    }
+
+    pub fn new(weight: Vec<f32>, bias: Vec<f32>, eps: f32) -> Self {
+        Self { weight, bias, eps }
+    }
+
+    /// The same norm with epsilon `eps` (ALBERT and BERT use 1e-12).
+    pub fn with_eps(self, eps: f32) -> Self {
+        Self { eps, ..self }
+    }
+
+    pub fn apply(&self, x: &[f32], d: usize) -> Buf {
+        debug_assert_eq!(d, self.weight.len());
+        let _span = crate::prof::span(crate::prof::Stage::Norm);
+        let mut out = Buf::scratch(x.len());
+        team::chunks_mut(&mut out, d, |index, o| {
+            normalize_row(
+                &x[index * d..(index + 1) * d],
+                &self.weight,
+                &self.bias,
+                self.eps,
+                o,
+            );
+        });
+        out
+    }
+
+    pub fn residual(&self, x: &mut [f32], y: &[f32], scale: f32) -> Buf {
+        let size = self.weight.len();
+        let mut out = Buf::scratch(x.len());
+        let rows = team::SendPtr::new(x);
+        team::chunks_mut(&mut out, size, |index, o| {
+            // SAFETY: each row of `x` belongs to the task of the same output row.
+            let row = unsafe { rows.slice_mut(index * size, size) };
+            add_scaled(row, &y[index * size..(index + 1) * size], scale);
+            normalize_row(row, &self.weight, &self.bias, self.eps, o);
+        });
+        out
+    }
+}
+
+multiversion! {
+    fn normalize_row(row: &[f32], weight: &[f32], bias: &[f32], eps: f32, out: &mut [f32]) {
+        let (mean, var) = moments(row);
+        let inv = 1.0 / (var + eps).sqrt();
+        for (((o, v), w), b) in out.iter_mut().zip(row).zip(weight).zip(bias) {
+            *o = (v - mean) * inv * w + b;
+        }
+    }
+}
+
+multiversion! {
+    fn add_scaled(row: &mut [f32], add: &[f32], scale: f32) {
+        for (v, a) in row.iter_mut().zip(add) {
+            *v += scale * a;
+        }
+    }
+}
+
+/// Mean and variance of a row, two passes, each summed in 32 lanes so the
+/// adds do not wait on each other: eight 4-wide chains even on plain SSE2.
+/// A lane adds the same values in the same order at any vector width.
+#[inline(always)]
+fn moments(row: &[f32]) -> (f32, f32) {
+    let n = row.len() as f32;
+    let mean = lane_sum(row, |v| v) / n;
+    let var = lane_sum(row, |v| (v - mean) * (v - mean)) / n;
+    (mean, var)
+}
+
+#[inline(always)]
+fn lane_sum(row: &[f32], term: impl Fn(f32) -> f32) -> f32 {
+    let mut lanes = [0.0f32; 32];
+    let (chunks, tail) = row.as_chunks::<32>();
+    for chunk in chunks {
+        for (lane, v) in lanes.iter_mut().zip(chunk) {
+            *lane += term(*v);
+        }
+    }
+    lanes.iter().sum::<f32>() + tail.iter().map(|v| term(*v)).sum::<f32>()
+}
+
+/// RMS norm over rows of `d`: `x * weight / sqrt(mean(x^2) + eps)`.
+pub struct RmsNorm {
+    weight: Vec<f32>,
+    eps: f32,
+}
+
+impl RmsNorm {
+    pub fn load(t: &Tensors, name: &str, d: usize, eps: f32) -> Result<Self, String> {
+        Ok(Self {
+            weight: t.f32_len(&format!("{name}.weight"), d)?,
+            eps,
+        })
+    }
+
+    pub fn apply_in_place(&self, x: &mut [f32]) {
+        let d = self.weight.len();
+        for row in x.chunks_exact_mut(d) {
+            let inv = 1.0 / (row.iter().map(|v| v * v).sum::<f32>() / d as f32 + self.eps).sqrt();
+            for (v, w) in row.iter_mut().zip(&self.weight) {
+                *v *= inv * w;
+            }
+        }
+    }
+
+    pub fn apply(&self, x: &[f32]) -> Buf {
+        let d = self.weight.len();
+        let mut out = Buf::scratch(x.len());
+        out.copy_from_slice(x);
+        team::chunks_mut(&mut out, d, |_, row| self.apply_in_place(row));
+        out
+    }
+}
+
+/// The two GELU forms. The reference models (PyTorch, Transformers) use
+/// the exact one; whisper.cpp uses tanh.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Gelu {
+    /// `x * (1 + erf(x / sqrt 2)) / 2`: config `gelu`.
+    Exact,
+    /// The tanh approximation: config `gelu_new`, `gelu_pytorch_tanh`, `gelu_fast`.
+    Tanh,
+}
+
+impl Gelu {
+    pub fn parse(name: &str) -> Result<Self, String> {
+        match name {
+            "gelu" => Ok(Self::Exact),
+            "gelu_new" | "gelu_pytorch_tanh" | "gelu_fast" => Ok(Self::Tanh),
+            other => Err(format!(
+                "config.json asks for activation `{other}`; Trit runs gelu forms here"
+            )),
+        }
+    }
+
+    pub fn apply(self, values: &mut [f32], d: usize) {
+        const C: f32 = 0.797_884_6; // sqrt(2 / pi)
+        let _span = crate::prof::span(crate::prof::Stage::Gelu);
+        team::chunks_mut(values, d, |_, row| match self {
+            Self::Exact => activation::gelu(row),
+            Self::Tanh => {
+                let mut inner = [0.0f32; 256];
+                for block in row.chunks_mut(inner.len()) {
+                    let inner = &mut inner[..block.len()];
+                    for (t, x) in inner.iter_mut().zip(block.iter()) {
+                        *t = C * (x + 0.044_715 * x * x * x);
+                    }
+                    activation::tanh(inner);
+                    for (x, t) in block.iter_mut().zip(inner.iter()) {
+                        *x *= 0.5 * (1.0 + t);
+                    }
+                }
+            }
+        });
+    }
+}
+
+/// Batch norm at inference as `x * scale + shift`: `(scale, shift)`. `x_bias`
+/// is a bias the layer before the norm adds to `x`.
+pub fn folded_batch_norm(
+    weight: &[f32],
+    bias: &[f32],
+    mean: &[f32],
+    var: &[f32],
+    x_bias: &[f32],
+) -> (Vec<f32>, Vec<f32>) {
+    const EPS: f32 = 1e-5;
+    let scale: Vec<f32> = (weight.iter().zip(var))
+        .map(|(weight, var)| weight / (var + EPS).sqrt())
+        .collect();
+    let shift = (0..scale.len())
+        .map(|i| bias[i] + (x_bias[i] - mean[i]) * scale[i])
+        .collect();
+    (scale, shift)
+}
+
+pub fn add_into(x: &mut [f32], y: &[f32]) {
+    let _span = crate::prof::span(crate::prof::Stage::Add);
+    team::chunks_mut(x, 4096, |chunk, xs| {
+        for (a, b) in xs.iter_mut().zip(&y[chunk * 4096..]) {
+            *a += b;
+        }
+    });
+}
+
+/// Rotary positions on the first `dims` values of each head. Pair `i`
+/// turns by `position * base^(-2i / dims)`. Interleaved pairs are values
+/// `2i` and `2i + 1` (Moonshine); halves pairs are `i` and `i + dims / 2`
+/// (Llama, Qwen).
+pub struct Rotary {
+    dims: usize,
+    inv_freq: Vec<f32>,
+    interleaved: bool,
+}
+
+impl Rotary {
+    pub fn interleaved(dims: usize, base: f32) -> Self {
+        Self::new(dims, base, true)
+    }
+
+    pub fn halves(dims: usize, base: f32) -> Self {
+        Self::new(dims, base, false)
+    }
+
+    fn new(dims: usize, base: f32, interleaved: bool) -> Self {
+        Self {
+            dims,
+            inv_freq: (0..dims / 2)
+                .map(|i| base.powf(-((2 * i) as f32) / dims as f32))
+                .collect(),
+            interleaved,
+        }
+    }
+
+    /// Rotates every head of `rows` rows of `x` (row stride `stride`, heads
+    /// of `hd` from offset 0); row `r` is at position `first + r`.
+    pub fn apply(
+        &self,
+        x: &mut [f32],
+        (rows, stride): (usize, usize),
+        (heads, hd): (usize, usize),
+        first: usize,
+    ) {
+        let half = self.dims / 2;
+        TURNS.with(|turns| {
+            let mut turns = turns.borrow_mut();
+            for r in 0..rows {
+                let position = (first + r) as f32;
+                // The turn of a pair at this position is the same for every
+                // head. A `sin_cos` per head was 7 % of a Moonshine tiny clip.
+                turns.clear();
+                turns.extend(self.inv_freq.iter().map(|f| (position * f).sin_cos()));
+                for h in 0..heads {
+                    let head = &mut x[r * stride + h * hd..][..self.dims];
+                    for (i, (sin, cos)) in turns.iter().enumerate() {
+                        let (ia, ib) = if self.interleaved {
+                            (2 * i, 2 * i + 1)
+                        } else {
+                            (i, i + half)
+                        };
+                        let (a, b) = (head[ia], head[ib]);
+                        head[ia] = a * cos - b * sin;
+                        head[ib] = b * cos + a * sin;
+                    }
+                }
+            }
+        });
+    }
+}
+
+/// Softmax attention of `tq` queries over `tk` keys for every head.
+/// `q`, `k`, `v` are row-major with row strides `qs`, `ks`, `vs`; query head
+/// `h` uses columns `h * hd..(h + 1) * hd` of the first `d`, and key and
+/// value head `h / (heads / kv_heads)` (grouped-query attention when
+/// `kv_heads < heads`). With `causal`, query `i` sees keys up to
+/// `tk - tq + i` (the queries are the last `tq` positions). Returns `tq x d`.
+pub fn attention(
+    (q, qs): (&[f32], usize),
+    (k, ks): (&[f32], usize),
+    (v, vs): (&[f32], usize),
+    (tq, tk): (usize, usize),
+    (d, heads, kv_heads): (usize, usize, usize),
+    causal: bool,
+) -> Buf {
+    let kv = HeadMajor::new((k, ks), (v, vs), tk, (d / heads, kv_heads));
+    attention_with((q, qs), &kv, tq, (d, heads), causal)
+}
+
+/// Keys and values per key/value head, laid out for `attention_with`: K
+/// transposed (hd x tk) and V as it is (tk x hd), so both products are
+/// `matmul_nn`, whose tiles need no horizontal sums. Where the CPU has the
+/// kernel for it (`fgemm::nn_strips`), the transposed K is in strips of 32
+/// keys (`[strip][hd][32]`): a tile of the scores then reads one run of
+/// bytes. Build it once for keys that do not change (Whisper's
+/// cross-attention over one window).
+pub struct HeadMajor {
+    kt: Buf,
+    vh: Buf,
+    tk: usize,
+    hd: usize,
+    kv_heads: usize,
+    /// The values of one head in `kt`: `hd * tk`, or whole strips.
+    keys: usize,
+    strips: bool,
+}
+
+impl HeadMajor {
+    /// From `tk` rows of keys and values (row strides `ks`, `vs`).
+    pub fn new(
+        (k, ks): (&[f32], usize),
+        (v, vs): (&[f32], usize),
+        tk: usize,
+        (hd, kv_heads): (usize, usize),
+    ) -> Self {
+        let _span = crate::prof::span(crate::prof::Stage::HeadMajor);
+        let strips = fgemm::nn_strips();
+        let keys = match strips {
+            true => tk.div_ceil(fgemm::NN_STRIP) * hd * fgemm::NN_STRIP,
+            false => hd * tk,
+        };
+        // From the pool, on the calling thread: the workers allocate nothing,
+        // so their allocator heaps do not grow with every clip.
+        let (mut kt, mut vh) = (
+            Buf::scratch(kv_heads * keys),
+            Buf::scratch(kv_heads * tk * hd),
+        );
+        let (kt_ptr, vh_ptr) = (team::SendPtr::new(&mut kt), team::SendPtr::new(&mut vh));
+        team::for_each(kv_heads, |g| {
+            // SAFETY: head g owns its range of both buffers, which outlive the step.
+            let (kt, vh) = unsafe {
+                (
+                    kt_ptr.slice_mut(g * keys, keys),
+                    vh_ptr.slice_mut(g * tk * hd, tk * hd),
+                )
+            };
+            for j in 0..tk {
+                let key = &k[j * ks + g * hd..][..hd];
+                if strips {
+                    // The places of a last strip that no key takes keep what
+                    // the buffer held: the kernel does not read them.
+                    let (strip, column) = (j / fgemm::NN_STRIP, j % fgemm::NN_STRIP);
+                    let rows = &mut kt[strip * hd * fgemm::NN_STRIP..][..hd * fgemm::NN_STRIP];
+                    let (rows, _) = rows.as_chunks_mut::<{ fgemm::NN_STRIP }>();
+                    for (row, value) in rows.iter_mut().zip(key) {
+                        row[column] = *value;
+                    }
+                } else {
+                    for (e, value) in key.iter().enumerate() {
+                        kt[e * tk + j] = *value;
+                    }
+                }
+                vh[j * hd..(j + 1) * hd].copy_from_slice(&v[j * vs + g * hd..][..hd]);
+            }
+        });
+        Self {
+            kt,
+            vh,
+            tk,
+            hd,
+            kv_heads,
+            keys,
+            strips,
+        }
+    }
+
+    /// K transposed (hd x tk, or in strips) and V (tk x hd) of key/value head `g`.
+    fn head(&self, g: usize) -> (&[f32], &[f32]) {
+        let values = self.tk * self.hd;
+        (
+            &self.kt[g * self.keys..][..self.keys],
+            &self.vh[g * values..][..values],
+        )
+    }
+}
+
+pub fn attention_with(
+    (q, qs): (&[f32], usize),
+    kv: &HeadMajor,
+    tq: usize,
+    (d, heads): (usize, usize),
+    causal: bool,
+) -> Buf {
+    let _span = crate::prof::span(crate::prof::Stage::Attention);
+    let (hd, tk) = (kv.hd, kv.tk);
+    assert_eq!(hd * heads, d);
+    // No queries: nothing to split into tasks.
+    if tq == 0 {
+        return Buf::scratch(0);
+    }
+    let group = heads / kv.kv_heads;
+    let scale = 1.0 / (hd as f32).sqrt();
+    // One task per head and block of queries: 20 heads alone would leave
+    // part of a 16-thread team idle for the second round.
+    let chunk = ATTENTION_ROWS.min(tq);
+    let chunks = tq.div_ceil(chunk);
+    let mut out = Buf::scratch(tq * d);
+    let out_ptr = team::SendPtr::new(&mut out);
+    team::for_each(heads * chunks, |task| {
+        let (h, c) = (task / chunks, task % chunks);
+        let rows = c * chunk..((c + 1) * chunk).min(tq);
+        let (kt, vh) = kv.head(h / group);
+        SCRATCH.with(|scratch| {
+            let mut scratch = scratch.borrow_mut();
+            let m = rows.len();
+            let need = m * (2 * hd + tk);
+            if scratch.len() < need {
+                scratch.resize(need, 0.0);
+            }
+            let (qh, rest) = scratch.split_at_mut(m * hd);
+            let (probs, rest) = rest.split_at_mut(m * tk);
+            let heads_out = &mut rest[..m * hd];
+            for (row, i) in qh.chunks_exact_mut(hd).zip(rows.clone()) {
+                for (o, x) in row.iter_mut().zip(&q[i * qs + h * hd..][..hd]) {
+                    *o = x * scale;
+                }
+            }
+            let scores = crate::prof::span(crate::prof::Stage::Scores);
+            match kv.strips {
+                true => fgemm::matmul_nn_strips_into(qh, m, hd, kt, tk, probs),
+                false => fgemm::matmul_nn_into(qh, m, hd, kt, tk, probs),
+            }
+            scores.end();
+            let softmax = crate::prof::span(crate::prof::Stage::Softmax);
+            softmax_rows(probs, tk, |local| match causal {
+                true => tk - tq + rows.start + local + 1,
+                false => tk,
+            });
+            softmax.end();
+            let _values = crate::prof::span(crate::prof::Stage::Values);
+            fgemm::matmul_nn_into(probs, m, tk, vh, hd, heads_out);
+            for (part, i) in heads_out.chunks_exact(hd).zip(rows.clone()) {
+                // SAFETY: row i, head h belongs to this task only; `out` outlives the step.
+                unsafe { out_ptr.slice_mut(i * d + h * hd, hd) }.copy_from_slice(part);
+            }
+        });
+    });
+    out
+}
+
+/// The self-attention of one decoder step: sequence `b` asks its one query
+/// (row `b` of `q`, stride `qs`) over its own keys and values (`cache(b)`:
+/// one row of `kv_heads * hd` values for each token so far). `attention`
+/// for each sequence gives the same values, but it took two jobs and two
+/// pool buffers for each sequence and layer: 10 of the 21 jobs of a layer
+/// in a Whisper step with 5 beams. This is one job, and the head-major
+/// copy of the keys and values stays in the buffer of the thread. `out` is
+/// `sequences x d`.
+pub fn attention_steps<'a>(
+    (q, qs): (&[f32], usize),
+    cache: impl Fn(usize) -> (&'a [f32], &'a [f32]) + Sync,
+    sequences: usize,
+    (d, heads, kv_heads): (usize, usize, usize),
+    out: &mut [f32],
+) {
+    let _span = crate::prof::span(crate::prof::Stage::StepAttention);
+    let hd = d / heads;
+    let group = heads / kv_heads;
+    let stride = kv_heads * hd;
+    let scale = 1.0 / (hd as f32).sqrt();
+    assert!(out.len() >= sequences * d);
+    let out_ptr = team::SendPtr::new(out);
+    team::for_each(sequences * kv_heads, |task| {
+        let (b, g) = (task / kv_heads, task % kv_heads);
+        let (keys, values) = cache(b);
+        let tk = keys.len() / stride;
+        SCRATCH.with(|scratch| {
+            let mut scratch = scratch.borrow_mut();
+            let need = 2 * hd * tk + tk + 2 * hd;
+            if scratch.len() < need {
+                scratch.resize(need, 0.0);
+            }
+            let (kt, rest) = scratch.split_at_mut(hd * tk);
+            let (vh, rest) = rest.split_at_mut(tk * hd);
+            let (probs, rest) = rest.split_at_mut(tk);
+            let (qh, rest) = rest.split_at_mut(hd);
+            let head_out = &mut rest[..hd];
+            // The layout of `HeadMajor`: K transposed (hd x tk), V as it is.
+            for j in 0..tk {
+                for (e, value) in keys[j * stride + g * hd..][..hd].iter().enumerate() {
+                    kt[e * tk + j] = *value;
+                }
+                vh[j * hd..(j + 1) * hd].copy_from_slice(&values[j * stride + g * hd..][..hd]);
+            }
+            for h in g * group..(g + 1) * group {
+                for (o, x) in qh.iter_mut().zip(&q[b * qs + h * hd..][..hd]) {
+                    *o = x * scale;
+                }
+                fgemm::matmul_nn_into(qh, 1, hd, kt, tk, probs);
+                softmax_rows(probs, tk, |_| tk);
+                fgemm::matmul_nn_into(probs, 1, tk, vh, hd, head_out);
+                // SAFETY: head h of sequence b belongs to this task only; `out` outlives the step.
+                unsafe { out_ptr.slice_mut(b * d + h * hd, hd) }.copy_from_slice(head_out);
+            }
+        });
+    });
+}
+
+/// Softmax of each row of `scores` (rows of `width` values), in place. Row
+/// `r` sees its first `visible(r)` keys; the others get no weight. Each row
+/// adds its exponentials in the order of its values. With a pass for the
+/// maximum, one for `exp`, and one for the sum, a row of 1,500 values took
+/// 3,400 cycles, where its `exp` takes 1,800. So a group of rows (as many as
+/// `activation::exp_sums` takes side by side) gets its maximums, then one
+/// pass for `exp` and the sums.
+pub(crate) fn softmax_rows(scores: &mut [f32], width: usize, visible: impl Fn(usize) -> usize) {
+    for (g, group) in scores.chunks_mut(activation::SIDE * width).enumerate() {
+        let rows = group.len() / width;
+        let mut max = [0.0f32; activation::SIDE];
+        for (r, row) in group.chunks_exact_mut(width).enumerate() {
+            // A key with no weight is minus infinity and leaves a maximum as it is.
+            row[visible(g * activation::SIDE + r)..].fill(f32::NEG_INFINITY);
+            max[r] = activation::max(row);
+        }
+        let mut sum = [0.0f32; activation::SIDE];
+        activation::exp_sums(group, width, &max[..rows], &mut sum[..rows]);
+        for (row, sum) in group.chunks_exact_mut(width).zip(sum) {
+            let inv = 1.0 / sum;
+            row.iter_mut().for_each(|x| *x *= inv);
+        }
+    }
+}
+
+thread_local! {
+    /// The sine and cosine of each pair of `Rotary::apply` for one row. It
+    /// grows once per thread, so a task allocates nothing.
+    static TURNS: std::cell::RefCell<Vec<(f32, f32)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+thread_local! {
+    /// One attention task's queries, probabilities, and head output. It grows
+    /// to the largest task once per thread and is then reused.
+    static SCRATCH: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+const ATTENTION_ROWS: usize = 128;
+
+/// Index of the largest value; the first one wins a tie.
+pub fn argmax(values: &[f32]) -> usize {
+    let mut best = 0;
+    for (i, v) in values.iter().enumerate() {
+        if *v > values[best] {
+            best = i;
+        }
+    }
+    best
+}
+
+/// Im2col for a 1-D convolution over time-major `x` (`frames x channels`):
+/// output row `t` holds `x[t * stride + tap - pad][c]` at `c * kernel + tap`,
+/// the order of a `[out][in][kernel]` weight. Positions outside are zero.
+pub fn conv_columns(
+    x: &[f32],
+    (frames, channels): (usize, usize),
+    (kernel, stride, pad): (usize, usize, usize),
+    out_frames: usize,
+) -> Buf {
+    let mut cols = Buf::scratch(out_frames * channels * kernel);
+    team::chunks_mut(&mut cols, channels * kernel, |t, row| {
+        for tap in 0..kernel {
+            let src = (t * stride + tap).checked_sub(pad).filter(|s| *s < frames);
+            for c in 0..channels {
+                row[c * kernel + tap] = src.map_or(0.0, |s| x[s * channels + c]);
+            }
+        }
+    });
+    cols
+}

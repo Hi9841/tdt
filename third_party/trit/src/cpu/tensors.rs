@@ -1,0 +1,595 @@
+//! Reads `.safetensors` files: a little-endian u64 header length, a JSON
+//! header with dtype, shape, and byte range per tensor, then the raw data.
+//! A large model comes in shards that `model.safetensors.index.json` lists.
+//! Tensors are read from the files one at a time. Reading the whole 178 MB
+//! file into one buffer kept that memory in the process after load.
+
+use super::gemm::{Blocks, Precision};
+use super::ggml_quants::Q8_0_BYTES;
+use crate::Device;
+use std::collections::HashMap;
+use std::fs::File;
+use std::path::Path;
+
+/// The weight file of a model folder, or the index of its shards.
+pub const WEIGHTS: &str = "model.safetensors";
+pub const SHARD_INDEX: &str = "model.safetensors.index.json";
+
+pub struct Tensors {
+    files: Vec<File>,
+    entries: HashMap<String, Entry>,
+    precision: Precision,
+    device: Device,
+    /// A GGUF file: under `Precision::Auto` each tensor keeps the type it is
+    /// stored in (`precision_of`), as the runtime that wrote it runs it.
+    native: bool,
+}
+
+struct Entry {
+    dtype: String,
+    /// Index into `files`.
+    file: usize,
+    /// Byte range in the file.
+    start: usize,
+    end: usize,
+    /// `rows x cols` of a Fermion record (`super::fermion`), which `f32`
+    /// expands; `dtype` is its kind.
+    matrix: Option<(usize, usize)>,
+}
+
+impl Tensors {
+    /// Opens the weights of a model folder (`WEIGHTS`, or the shards that
+    /// `SHARD_INDEX` lists); `Dense::load` stores its dense layers as
+    /// `precision` says. `device` is `Cpu` or `Gpu` after `Auto` is resolved;
+    /// `Dense::load` and `Ternary::from_base3` upload a GPU copy when it is `Gpu`.
+    pub fn open_dir(dir: &Path, precision: Precision, device: Device) -> Result<Self, String> {
+        let single = dir.join(WEIGHTS);
+        if single.is_file() {
+            return Self::open_files(&[single.as_path()], precision, device);
+        }
+        let index = dir.join(SHARD_INDEX);
+        let text = match std::fs::read_to_string(&index) {
+            Ok(text) => text,
+            // A missing index names the index. A present file that cannot be
+            // read keeps the `model.safetensors` path.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(format!("Could not read {}: {e}", index.display()));
+            }
+            Err(e) => return Err(format!("Could not read {}: {e}", single.display())),
+        };
+        let json: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|e| format!("{} is not JSON: {e}", index.display()))?;
+        let mut shards: Vec<&str> = json["weight_map"]
+            .as_object()
+            .ok_or_else(|| format!("{} has no weight_map", index.display()))?
+            .values()
+            .filter_map(serde_json::Value::as_str)
+            .collect();
+        shards.sort_unstable();
+        shards.dedup();
+        let paths: Vec<_> = shards.iter().map(|shard| dir.join(shard)).collect();
+        let paths: Vec<&Path> = paths.iter().map(|p| p.as_path()).collect();
+        Self::open_files(&paths, precision, device)
+    }
+
+    /// Opens PyTorch checkpoints (`.pth`, `.pt`): `(path, prefix)` pairs,
+    /// where each tensor's name starts with the prefix (`"voices.af_heart"`).
+    /// Dense layers are stored as `precision` says.
+    pub fn open_torch(files: &[(&Path, &str)], precision: Precision) -> Result<Self, String> {
+        let mut opened = Vec::with_capacity(files.len());
+        let mut entries = HashMap::new();
+        for (path, prefix) in files {
+            let error = |e: std::io::Error| format!("Could not read {}: {e}", path.display());
+            let file = File::open(path).map_err(error)?;
+            let total = file.metadata().map_err(error)?.len() as usize;
+            let found = super::torch_file::tensors(&file, total)
+                .map_err(|e| format!("{}: {e}", path.display()))?;
+            for tensor in found {
+                let name = match (prefix.is_empty(), tensor.name.is_empty()) {
+                    (true, _) => tensor.name,
+                    (false, true) => prefix.to_string(),
+                    (false, false) => format!("{prefix}.{}", tensor.name),
+                };
+                entries.insert(
+                    name,
+                    Entry {
+                        dtype: tensor.dtype.to_string(),
+                        file: opened.len(),
+                        start: tensor.start,
+                        end: tensor.end,
+                        matrix: None,
+                    },
+                );
+            }
+            opened.push(file);
+        }
+        Ok(Self {
+            files: opened,
+            entries,
+            precision,
+            device: Device::Cpu,
+            native: false,
+        })
+    }
+
+    /// Opens the PyTorch checkpoint at `base..base + len` of `path` (the
+    /// `model_weights.ckpt` of a `.nemo` archive). `rename` gives each
+    /// tensor its Trit name, or `None` to leave it out.
+    pub fn open_torch_in(
+        path: &Path,
+        (base, len): (usize, usize),
+        rename: impl Fn(&str) -> Option<String>,
+        precision: Precision,
+        device: Device,
+    ) -> Result<Self, String> {
+        let error = |e: std::io::Error| format!("Could not read {}: {e}", path.display());
+        let file = File::open(path).map_err(error)?;
+        super::store::will_read(len as u64);
+        let found = super::torch_file::tensors_in(&file, base, len)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        let entries = found
+            .into_iter()
+            .filter_map(|tensor| {
+                let name = rename(&tensor.name)?;
+                Some((
+                    name,
+                    Entry {
+                        dtype: tensor.dtype.to_string(),
+                        file: 0,
+                        start: tensor.start,
+                        end: tensor.end,
+                        matrix: None,
+                    },
+                ))
+            })
+            .collect();
+        Ok(Self {
+            files: vec![file],
+            entries,
+            precision,
+            device,
+            native: false,
+        })
+    }
+
+    fn open_files(paths: &[&Path], precision: Precision, device: Device) -> Result<Self, String> {
+        let mut files = Vec::with_capacity(paths.len());
+        let mut entries = HashMap::new();
+        for path in paths {
+            let error = |e: std::io::Error| format!("Could not read {}: {e}", path.display());
+            let file = File::open(path).map_err(error)?;
+            let total = file.metadata().map_err(error)?.len() as usize;
+            super::store::will_read(total as u64);
+            let mut length = [0u8; 8];
+            read_at(&file, &mut length, 0).map_err(error)?;
+            let header_len = u64::from_le_bytes(length) as usize;
+            let data_start = 8usize
+                .checked_add(header_len)
+                .filter(|end| *end <= total)
+                .ok_or("safetensors header runs past the end of the file")?;
+            let mut header = vec![0u8; header_len];
+            read_at(&file, &mut header, 8).map_err(error)?;
+            parse_header(&header, (files.len(), data_start, total), &mut entries)?;
+            files.push(file);
+        }
+        Ok(Self {
+            files,
+            entries,
+            precision,
+            device,
+            native: false,
+        })
+    }
+
+    /// Opens a GGUF file's tensors: `(name, dtype, start, end)`, byte ranges
+    /// of `path`. Its types are kept under `Precision::Auto`.
+    pub fn open_gguf(
+        path: &Path,
+        tensors: Vec<(String, String, usize, usize)>,
+        precision: Precision,
+        device: Device,
+    ) -> Result<Self, String> {
+        let error = |e: std::io::Error| format!("Could not read {}: {e}", path.display());
+        let file = File::open(path).map_err(error)?;
+        let total: usize = tensors.iter().map(|(_, _, start, end)| end - start).sum();
+        super::store::will_read(total as u64);
+        let entries = tensors
+            .into_iter()
+            .map(|(name, dtype, start, end)| {
+                (
+                    name,
+                    Entry {
+                        dtype,
+                        file: 0,
+                        start,
+                        end,
+                        matrix: None,
+                    },
+                )
+            })
+            .collect();
+        Ok(Self {
+            files: vec![file],
+            entries,
+            precision,
+            device,
+            native: true,
+        })
+    }
+
+    /// Opens the records of a Fermion container, byte ranges of `path`. An
+    /// `fp16` record is read as F16; the other kinds are expanded as they
+    /// are read.
+    pub fn open_fermion(
+        path: &Path,
+        records: &[super::fermion::Record],
+        precision: Precision,
+        device: Device,
+    ) -> Result<Self, String> {
+        let error = |e: std::io::Error| format!("Could not read {}: {e}", path.display());
+        let file = File::open(path).map_err(error)?;
+        let total: usize = records.iter().map(|r| r.end - r.start).sum();
+        super::store::will_read(total as u64);
+        let entries = records
+            .iter()
+            .map(|r| {
+                let (dtype, matrix) = match super::fermion::dtype(&r.kind) {
+                    Some("F16") => ("F16".to_string(), None),
+                    Some(kind) => (kind.to_string(), Some(r.matrix)),
+                    None => (r.kind.clone(), Some(r.matrix)),
+                };
+                let entry = Entry {
+                    dtype,
+                    file: 0,
+                    start: r.start,
+                    end: r.end,
+                    matrix,
+                };
+                (r.name.clone(), entry)
+            })
+            .collect();
+        Ok(Self {
+            files: vec![file],
+            entries,
+            precision,
+            device,
+            native: false,
+        })
+    }
+
+    /// How to store tensor `name`: the precision the caller asked for, or,
+    /// under `Precision::Auto` in a GGUF file, the type it is stored in
+    /// (Q8_0, F16, or F32; Q8_0 for ggml's other block types).
+    pub fn precision_of(&self, name: &str) -> Precision {
+        if self.precision != Precision::Auto || !self.native {
+            return self.precision;
+        }
+        match self.entries.get(name).map(|entry| entry.dtype.as_str()) {
+            // No kernel runs ggml's other block types: they are expanded at
+            // load and held as Q8_0 (`ggml_quants`).
+            Some(dtype) if super::ggml_quants::BlockType::from_name(dtype).is_some() => {
+                Precision::Q8_0
+            }
+            Some("Q8_0") => Precision::Q8_0,
+            Some("F16") => Precision::F16,
+            Some("F32") => Precision::F32,
+            _ => Precision::Auto,
+        }
+    }
+
+    /// The tensor as Q8_0 blocks of `len` values: as stored when its dtype
+    /// is Q8_0, else quantized as ggml quantizes (`Blocks::quantize`).
+    pub fn q8_0(&self, name: &str, len: usize) -> Result<Blocks, String> {
+        let entry = self.entry(name)?;
+        if entry.dtype != "Q8_0" {
+            return Ok(Blocks::quantize(&self.f32_len(name, len)?));
+        }
+        let bytes = self.raw(name, entry)?;
+        let count = bytes.len() / Q8_0_BYTES * 32;
+        if count != len || bytes.len() % Q8_0_BYTES != 0 {
+            return Err(format!("tensor {name} has {count} values, expected {len}"));
+        }
+        let mut blocks = Blocks {
+            codes: Vec::with_capacity(len),
+            scales: Vec::with_capacity(len / 32),
+        };
+        for block in bytes.as_chunks::<Q8_0_BYTES>().0 {
+            blocks
+                .scales
+                .push(f16_to_f32(u16::from_le_bytes([block[0], block[1]])));
+            blocks
+                .codes
+                .extend(block[2..].iter().map(|b| i8::from_ne_bytes([*b])));
+        }
+        Ok(blocks)
+    }
+
+    /// `Cpu`, or `Gpu` when this load uploads weight copies.
+    pub fn device(&self) -> Device {
+        self.device
+    }
+
+    pub fn has(&self, name: &str) -> bool {
+        self.entries.contains_key(name)
+    }
+
+    fn entry(&self, name: &str) -> Result<&Entry, String> {
+        self.entries
+            .get(name)
+            .ok_or_else(|| format!("model file has no tensor {name}"))
+    }
+
+    fn raw(&self, name: &str, entry: &Entry) -> Result<Vec<u8>, String> {
+        let mut bytes = vec![0u8; entry.end - entry.start];
+        read_at(&self.files[entry.file], &mut bytes, entry.start as u64)
+            .map_err(|e| format!("Could not read tensor {name}: {e}"))?;
+        Ok(bytes)
+    }
+
+    /// Calls `each` with the tensor's bytes, 1 MB at a time, so a large
+    /// tensor never exists twice in memory (raw and converted).
+    fn chunks(&self, name: &str, entry: &Entry, mut each: impl FnMut(&[u8])) -> Result<(), String> {
+        const CHUNK: usize = 1 << 20;
+        let (start, end) = (entry.start, entry.end);
+        let file = &self.files[entry.file];
+        let mut buffer = vec![0u8; CHUNK.min(end - start)];
+        let mut at = start;
+        while at < end {
+            let len = CHUNK.min(end - at);
+            read_at(file, &mut buffer[..len], at as u64)
+                .map_err(|e| format!("Could not read tensor {name}: {e}"))?;
+            each(&buffer[..len]);
+            at += len;
+        }
+        Ok(())
+    }
+
+    /// The tensor as f32 values, from F32, F16, BF16, or Q8_0 storage.
+    pub fn f32(&self, name: &str) -> Result<Vec<f32>, String> {
+        let entry = self.entry(name)?;
+        if let Some((rows, cols)) = entry.matrix {
+            return super::fermion::expand(&entry.dtype, &self.raw(name, entry)?, rows, cols)
+                .map_err(|e| format!("tensor {name}: {e}"));
+        }
+        if entry.dtype == "Q8_0" {
+            let count = (entry.end - entry.start) / Q8_0_BYTES * 32;
+            return Ok(self.q8_0(name, count)?.to_f32());
+        }
+        if let Some(block) = super::ggml_quants::BlockType::from_name(&entry.dtype) {
+            return Ok(block.expand(&self.raw(name, entry)?));
+        }
+        let width = match entry.dtype.as_str() {
+            "F32" => 4,
+            "F16" | "BF16" => 2,
+            other => return Err(format!("tensor {name} has dtype {other}, not a float")),
+        };
+        let mut values = Vec::with_capacity((entry.end - entry.start) / width);
+        let dtype = entry.dtype.as_str();
+        self.chunks(name, entry, |bytes| match dtype {
+            "F32" => values.extend(
+                bytes
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| f32::from_le_bytes(*b)),
+            ),
+            "F16" => values.extend(
+                bytes
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|b| f16_to_f32(u16::from_le_bytes(*b))),
+            ),
+            _ => values.extend(
+                bytes
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|b| f32::from_bits(u32::from(u16::from_le_bytes(*b)) << 16)),
+            ),
+        })?;
+        Ok(values)
+    }
+
+    /// Checks the element count, so a wrong config cannot index past a tensor.
+    pub fn f32_len(&self, name: &str, len: usize) -> Result<Vec<f32>, String> {
+        let values = self.f32(name)?;
+        if values.len() != len {
+            return Err(format!(
+                "tensor {name} has {} values, expected {len}",
+                values.len()
+            ));
+        }
+        Ok(values)
+    }
+
+    /// The tensor as f16 bits with `len` values. F16 is read as stored;
+    /// F32 and BF16 are rounded to the nearest f16 as they are read.
+    pub fn f16_bits(&self, name: &str, len: usize) -> Result<Vec<u16>, String> {
+        let entry = self.entry(name)?;
+        if entry.dtype == "Q8_0"
+            || entry.matrix.is_some()
+            || super::ggml_quants::BlockType::from_name(&entry.dtype).is_some()
+        {
+            return Ok(self
+                .f32_len(name, len)?
+                .into_iter()
+                .map(f32_to_f16)
+                .collect());
+        }
+        let width = match entry.dtype.as_str() {
+            "F32" => 4,
+            "F16" | "BF16" => 2,
+            other => return Err(format!("tensor {name} has dtype {other}, not a float")),
+        };
+        let count = (entry.end - entry.start) / width;
+        if count != len {
+            return Err(format!("tensor {name} has {count} values, expected {len}"));
+        }
+        let mut bits = Vec::with_capacity(len);
+        let dtype = entry.dtype.as_str();
+        self.chunks(name, entry, |bytes| match dtype {
+            "F16" => bits.extend(
+                bytes
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|b| u16::from_le_bytes(*b)),
+            ),
+            "F32" => bits.extend(
+                bytes
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| f32_to_f16(f32::from_le_bytes(*b))),
+            ),
+            _ => {
+                bits.extend(
+                    bytes.as_chunks::<2>().0.iter().map(|b| {
+                        f32_to_f16(f32::from_bits(u32::from(u16::from_le_bytes(*b)) << 16))
+                    }),
+                )
+            }
+        })?;
+        Ok(bits)
+    }
+
+    pub fn u8(&self, name: &str) -> Result<Vec<u8>, String> {
+        let entry = self.entry(name)?;
+        if entry.dtype != "U8" {
+            return Err(format!("tensor {name} has dtype {}, not U8", entry.dtype));
+        }
+        self.raw(name, entry)
+    }
+}
+
+/// Adds each tensor of one file's header: its dtype and byte range in the
+/// file, checked against the file length.
+fn parse_header(
+    header: &[u8],
+    (file, data_start, total): (usize, usize, usize),
+    entries: &mut HashMap<String, Entry>,
+) -> Result<(), String> {
+    let header: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(header)
+        .map_err(|e| format!("safetensors header is not JSON: {e}"))?;
+    for (name, value) in header {
+        if name == "__metadata__" {
+            continue;
+        }
+        let dtype = value["dtype"].as_str().unwrap_or_default().to_string();
+        let offsets: Vec<usize> = value["data_offsets"]
+            .as_array()
+            .map(|o| {
+                o.iter()
+                    .filter_map(serde_json::Value::as_u64)
+                    .map(|d| d as usize)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let [start, end] = offsets[..] else {
+            return Err(format!("tensor {name} has no data_offsets"));
+        };
+        // Checked: offsets near 2^64 wrapped past the length check.
+        let end = data_start
+            .checked_add(end)
+            .filter(|end| start <= end - data_start && *end <= total)
+            .ok_or_else(|| format!("tensor {name} points outside the file"))?;
+        let start = data_start + start;
+        entries.insert(
+            name,
+            Entry {
+                dtype,
+                file,
+                start,
+                end,
+                matrix: None,
+            },
+        );
+    }
+    Ok(())
+}
+
+/// Positional read of the whole buffer; safe to call from several threads.
+pub(crate) fn read_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    read_exact_at(file, buf, offset)?;
+    super::store::did_read(buf.len() as u64);
+    Ok(())
+}
+
+fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        let mut done = 0;
+        while done < buf.len() {
+            let read = file.seek_read(&mut buf[done..], offset + done as u64)?;
+            if read == 0 {
+                return Err(std::io::ErrorKind::UnexpectedEof.into());
+            }
+            done += read;
+        }
+        Ok(())
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        file.read_exact_at(buf, offset)
+    }
+}
+
+/// IEEE 754 half precision to single precision, including subnormals.
+/// Rounds to the nearest f16, ties to even; out of range becomes infinity.
+pub fn f32_to_f16(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exponent = ((bits >> 23) & 0xff) as i32;
+    let mantissa = bits & 0x7f_ffff;
+    if exponent == 0xff {
+        // Infinity stays infinity; NaN stays a quiet NaN.
+        return sign | 0x7c00 | if mantissa != 0 { 0x200 } else { 0 };
+    }
+    let half_exponent = exponent - 127 + 15;
+    if half_exponent >= 0x1f {
+        return sign | 0x7c00;
+    }
+    if half_exponent <= 0 {
+        // Subnormal f16, or zero when too small.
+        if half_exponent < -10 {
+            return sign;
+        }
+        let full = mantissa | 0x80_0000;
+        let shift = (14 - half_exponent) as u32;
+        let half = full >> shift;
+        let rest = full & ((1 << shift) - 1);
+        let midpoint = 1 << (shift - 1);
+        let round = rest > midpoint || (rest == midpoint && half & 1 == 1);
+        return sign | (half + u32::from(round)) as u16;
+    }
+    let half = ((half_exponent as u32) << 10) | (mantissa >> 13);
+    let rest = mantissa & 0x1fff;
+    let round = rest > 0x1000 || (rest == 0x1000 && half & 1 == 1);
+    // A carry out of the mantissa raises the exponent, which is the right result.
+    sign | (half + u32::from(round)) as u16
+}
+
+pub fn f16_to_f32(half: u16) -> f32 {
+    let sign = u32::from(half >> 15) << 31;
+    let exponent = u32::from((half >> 10) & 0x1f);
+    let mantissa = u32::from(half & 0x3ff);
+    let bits = match (exponent, mantissa) {
+        (0, 0) => sign,
+        (0, _) => {
+            // Subnormal: value is mantissa * 2^-24. Normalize it.
+            let mut exp = 127 - 15 + 1;
+            let mut m = mantissa;
+            while m & 0x400 == 0 {
+                m <<= 1;
+                exp -= 1;
+            }
+            sign | (exp << 23) | ((m & 0x3ff) << 13)
+        }
+        (0x1f, _) => sign | 0x7f80_0000 | (mantissa << 13),
+        _ => sign | ((exponent + 127 - 15) << 23) | (mantissa << 13),
+    };
+    f32::from_bits(bits)
+}

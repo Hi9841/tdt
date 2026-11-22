@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- isAccessibilityTool is false: TDT is a dictation tool, not an assistive one. Google Play needs that declared. -->
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeViewFocused|typeWindowStateChanged|typeWindowsChanged|typeViewTextSelectionChanged"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:accessibilityFlags="flagRetrieveInteractiveWindows"
+    android:canRetrieveWindowContent="true"
+    android:description="@string/bubble_service_description"
+    android:isAccessibilityTool="false"
+    android:notificationTimeout="100" />

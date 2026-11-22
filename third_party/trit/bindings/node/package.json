@@ -1,0 +1,11 @@
+{
+  "name": "trit",
+  "version": "0.1.0",
+  "description": "Trit for Node and Bun: speech to text on the CPU through the C ABI of trit-ffi",
+  "type": "module",
+  "main": "trit.mjs",
+  "license": "AGPL-3.0-only",
+  "dependencies": {
+    "koffi": "^2.9.0"
+  }
+}

@@ -1,0 +1,170 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  engine:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: ./.github/actions/cargo-fork
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # The fork keeps intermediate files here, not in ./target.
+          cache-directories: ~/.cargo/targets
+      - name: No word lists
+        shell: bash
+        # Speech to text decodes with the model alone (AGENTS.md). Text to
+        # speech (src/tts) may hold lists: text normalization and the lexicon.
+        # src/gpu holds shader code, not words.
+        run: |
+          if git grep -n 'include_str!' -- src ffi ':!src/tts' ':!src/gpu' \
+            || git ls-files -- src ':!src/tts' | grep -E '\.(txt|json|csv|tsv)$'; then
+            echo "error: a word list ships in the speech-to-text engine; it decodes with the model alone"
+            exit 1
+          fi
+      - name: C ABI
+        shell: bash
+        # include/trit.h and the bindings are written by hand. The header
+        # names every export; a binding names only exports.
+        run: |
+          exports=$(grep -A1 'no_mangle' ffi/src/lib.rs | grep -o 'trit_[a-z0-9_]*' | sort -u)
+          header=$(grep -o '\btrit_[a-z0-9_]*(' include/trit.h | tr -d '(' | sort -u)
+          bindings=$(grep -ohw 'trit_[a-z0-9_]*' bindings/python/trit.py bindings/csharp/Trit.cs bindings/node/trit.mjs | grep -v '^trit_ffi$' | sort -u)
+          if [ "$exports" != "$header" ] || [ -n "$(comm -13 <(echo "$exports") <(echo "$bindings"))" ]; then
+            diff <(echo "$exports") <(echo "$header")
+            comm -13 <(echo "$exports") <(echo "$bindings")
+            echo "error: include/trit.h or a binding does not match ffi/src/lib.rs"
+            exit 1
+          fi
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Build
+        run: cargo build --locked --release --workspace
+      - name: Clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Without the GPU
+        # In a workspace build, trit-ffi turns the gpu feature of trit on.
+        # The default build of a Rust user and the phone build have it off.
+        run: |
+          cargo clippy --locked -p trit --all-targets -- -D warnings
+          cargo check --locked -p trit-ffi --no-default-features
+      - name: Skill
+        run: target/release/trit.exe skill --check skill/SKILL.md
+      - name: Python binding
+        shell: bash
+        run: |
+          TRIT_LIB="$PWD/target/release/trit_ffi.dll" python -c "import sys; sys.path.insert(0, 'bindings/python'); import trit; assert trit.version() == '$(target/release/trit.exe --version)', trit.version(); print(trit.version())"
+      - name: Clips
+        shell: pwsh
+        # Three sentences from the Windows voices: the text check needs speech, not a fixed text.
+        run: |
+          "a|The quick brown fox jumps over the lazy dog near the river bank.", "b|Please send the report to the finance team before Friday afternoon.", "c|We moved the database to the new cluster last night." | Set-Content target/smoke.txt -Encoding utf8
+          ./bench/make-clips.ps1 -OutDir target/smoke -Corpus target/smoke.txt
+      - uses: actions/cache@v4
+        with:
+          path: models/moonshine-tiny
+          key: moonshine-tiny
+      - name: Same text on every kernel path
+        shell: bash
+        run: |
+          if [ ! -f models/moonshine-tiny/model.safetensors ]; then
+            python -m pip install --quiet huggingface_hub
+            hf download UsefulSensors/moonshine-tiny config.json tokenizer.json model.safetensors --local-dir models/moonshine-tiny
+          fi
+          python bench/paths.py target/release/trit.exe models/moonshine-tiny target/smoke/*.wav
+      - name: Damaged files
+        shell: bash
+        # A hostile checkpoint, a damaged config, tokenizer, or weight header, and a damaged
+        # WAV file must each give an error: no crash, no hang, no full memory.
+        run: python bench/hostile.py target/release/trit.exe --mutate models/moonshine-tiny --runs 60
+
+  # Apple Silicon: the NEON, sdot, and smmla kernels, the macOS thread
+  # setup, and the Metal GPU code. The home view prints the kernel paths.
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: ./.github/actions/cargo-fork
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # The fork keeps intermediate files here, not in ./target.
+          cache-directories: ~/.cargo/targets
+      - name: Build
+        run: cargo build --locked --release --workspace
+      - name: Clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Kernel paths
+        run: target/release/trit
+      - name: Clips
+        run: |
+          mkdir -p target/smoke
+          say -o target/smoke/a.wav --data-format=LEI16@16000 "The quick brown fox jumps over the lazy dog near the river bank."
+          say -o target/smoke/b.wav --data-format=LEI16@16000 "Please send the report to the finance team before Friday afternoon."
+          say -o target/smoke/c.wav --data-format=LEI16@16000 "We moved the database to the new cluster last night."
+      - uses: actions/cache@v4
+        with:
+          path: models/moonshine-tiny
+          key: moonshine-tiny
+      - name: Same text on every kernel path
+        run: |
+          if [ ! -f models/moonshine-tiny/model.safetensors ]; then
+            python3 -m pip install --quiet --break-system-packages huggingface_hub
+            hf download UsefulSensors/moonshine-tiny config.json tokenizer.json model.safetensors --local-dir models/moonshine-tiny
+          fi
+          python3 bench/paths.py target/release/trit models/moonshine-tiny target/smoke/*.wav
+
+  # x86-64 Linux: the AVX kernels, the Linux thread setup, and the Vulkan GPU
+  # code. The fork has no Linux action, so this job uses the plain cargo.
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --locked --release --workspace
+      - name: Clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Kernel paths
+        run: target/release/trit
+      - name: Clips
+        # espeak-ng writes 22.05 kHz; Trit takes 16 kHz.
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends espeak-ng sox
+          mkdir -p target/smoke
+          say() { espeak-ng -s 150 --stdout "$2" | sox -t wav - -r 16000 -c 1 -b 16 "target/smoke/$1.wav"; }
+          say a "The quick brown fox jumps over the lazy dog near the river bank."
+          say b "Please send the report to the finance team before Friday afternoon."
+          say c "We moved the database to the new cluster last night."
+      - uses: actions/cache@v4
+        with:
+          path: models/moonshine-tiny
+          key: moonshine-tiny
+      - name: Same text on every kernel path
+        run: |
+          if [ ! -f models/moonshine-tiny/model.safetensors ]; then
+            python3 -m pip install --quiet --break-system-packages huggingface_hub
+            hf download UsefulSensors/moonshine-tiny config.json tokenizer.json model.safetensors --local-dir models/moonshine-tiny
+          fi
+          python3 bench/paths.py target/release/trit models/moonshine-tiny target/smoke/*.wav
+      - name: Python binding
+        run: |
+          TRIT_LIB="$PWD/target/release/libtrit_ffi.so" python3 -c "import sys; sys.path.insert(0, 'bindings/python'); import trit; assert trit.version() == '$(target/release/trit --version)', trit.version(); print(trit.version())"
