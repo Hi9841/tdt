@@ -1,0 +1,202 @@
+//! A take longer than one window runs through the model in overlapping
+//! windows while the user still talks, so only the last window waits for the
+//! release. Quality comes first, on every machine: the windows do not depend
+//! on the speed of the CPU, so the same speech gives the same text.
+//!
+//! A window is a fast path that must prove itself. The model can drop speech
+//! near the edge of a window, so two windows share `OVERLAP_SAMPLES` of speech,
+//! and `merge` joins their text in the middle of the shared words, far from
+//! both edges. When they do not clearly hold the same words, there is no join:
+//! the whole take runs once after the release. That take waits longer and
+//! loses nothing.
+//!
+//! On 400 long LibriSpeech takes, against one run of the whole take: 16 s
+//! windows with 4 s shared added 106 errors to 1,228, 24 s with 8 s added 46,
+//! and 30 s with 8 s added 15, inside the noise.
+//!
+//! From TDT desktop (`desktop/src/stt/segment.rs`, 0.9.6), not changed: the
+//! phone must write the text that the desktop writes. Keep the two in step.
+
+/// The model reads this much speech per run. A take up to this long is one
+/// run, the same as without windows.
+pub const WINDOW_SAMPLES: usize = 30 * 16_000;
+/// Speech that two windows share.
+pub const OVERLAP_SAMPLES: usize = 8 * 16_000;
+/// Words of each text that can hold the shared speech: 8 words a second.
+const SHARED_WORDS: usize = 64;
+const MATCH_SCORE: i32 = 2;
+const SKIP_COST: i32 = 1;
+/// Normal speech puts about 20 words in the shared speech. With fewer equal
+/// words than this, a window lost speech, or the overlap is a pause.
+const MIN_MATCHED_WORDS: usize = 8;
+
+/// 10 ms at 16 kHz.
+const FRAME_SAMPLES: usize = 160;
+/// Users stop talking before they release the key: the median take ends in
+/// 375 ms of quiet. After this much quiet the model reads the take, so the
+/// text is ready when the key comes up.
+const READ_AFTER_QUIET_FRAMES: usize = 20;
+/// A frame this far over the room noise is speech. A soft word ending counts
+/// as speech: a word after the read must not be lost.
+const SPEECH_OVER_NOISE_DB: f32 = 6.0;
+/// The room noise needs some audio to measure.
+const MIN_FRAMES: usize = 60;
+const OPENING_FRAMES: usize = 8;
+
+/// Finds where the speech of a take ended, while the take grows.
+#[derive(Default)]
+pub struct EndOfSpeech {
+    levels: Vec<f32>,
+    /// `levels` in rising order. A sort of the whole take for each chunk of
+    /// audio would grow with the take.
+    sorted: Vec<f32>,
+    /// The level in the middle of the first `OPENING_FRAMES` frames.
+    opening: f32,
+    /// The frame after the last speech.
+    speech_end: usize,
+}
+
+impl EndOfSpeech {
+    /// `samples` is the whole take so far. Each frame is judged alone, with
+    /// the room noise of the take up to that frame. So the speech end does
+    /// not depend on where the capture cut the take into chunks.
+    pub fn update(&mut self, samples: &[f32]) {
+        let first = self.levels.len();
+        let (frames, _) = samples[first * FRAME_SAMPLES..].as_chunks::<FRAME_SAMPLES>();
+        for frame in frames {
+            let level = frame_db(frame);
+            let place = self
+                .sorted
+                .partition_point(|other| other.total_cmp(&level).is_le());
+            self.sorted.insert(place, level);
+            self.levels.push(level);
+            if self.levels.len() == OPENING_FRAMES {
+                let mut opening = self.levels.clone();
+                opening.sort_by(f32::total_cmp);
+                self.opening = opening[OPENING_FRAMES / 2];
+            }
+            if self.levels.len() >= MIN_FRAMES && level >= self.room_noise() + SPEECH_OVER_NOISE_DB
+            {
+                self.speech_end = self.levels.len();
+            }
+        }
+    }
+
+    /// The lower of the quietest frames of the take and the first 80 ms,
+    /// before the user talks. A short take with no pause has no quiet frames,
+    /// and its quietest frames are soft speech.
+    fn room_noise(&self) -> f32 {
+        let quietest = self.sorted[self.sorted.len() / 20];
+        quietest.min(self.opening)
+    }
+
+    /// The frame where the last speech ended, once enough quiet follows it.
+    pub fn quiet_after(&self) -> Option<usize> {
+        let quiet = self.levels.len() - self.speech_end;
+        (self.speech_end > 0 && quiet >= READ_AFTER_QUIET_FRAMES).then_some(self.speech_end)
+    }
+
+    /// The samples of the take that the read in the quiet gets for the
+    /// speech end `end`: the take up to the end of the quiet that
+    /// `quiet_after` waits for. The length comes from the audio only. A read
+    /// of all the audio so far has a length that follows the chunks of the
+    /// capture, and 10 ms more audio can change the text.
+    pub fn read_samples(end: usize) -> usize {
+        (end + READ_AFTER_QUIET_FRAMES) * FRAME_SAMPLES
+    }
+}
+
+fn frame_db(frame: &[f32]) -> f32 {
+    let power = frame.iter().map(|sample| sample * sample).sum::<f32>() / frame.len() as f32;
+    10.0 * (power + 1e-12).log10()
+}
+
+/// `next` is the text of the window after `text`. Keeps `text` up to the
+/// middle of the words that both hold, and `next` from there on. `None` when
+/// the two do not clearly hold the same speech. A window with no text next to
+/// one with text is such a case: the model can write nothing for clear speech.
+pub fn merge(text: &str, next: &str) -> Option<String> {
+    if text.is_empty() && next.is_empty() {
+        return Some(String::new());
+    }
+    let first: Vec<&str> = text.split_whitespace().collect();
+    let second: Vec<&str> = next.split_whitespace().collect();
+    let tail = first.len().saturating_sub(SHARED_WORDS);
+    let head = second.len().min(SHARED_WORDS);
+    let matched = shared_words(&first[tail..], &second[..head]);
+    if matched.len() < MIN_MATCHED_WORDS {
+        return None;
+    }
+    let (kept, from) = matched[matched.len() / 2];
+    let words = first[..tail + kept].iter().chain(&second[from..]);
+    Some(words.copied().collect::<Vec<_>>().join(" "))
+}
+
+/// The best line-up of the end of `first` with the start of `second`, as
+/// the index pairs of equal words. The text before the line-up and after it
+/// costs nothing; inside it, each skipped or different word costs. So a word
+/// that repeats far away cannot pull the two texts together and lose the
+/// speech between.
+fn shared_words(first: &[&str], second: &[&str]) -> Vec<(usize, usize)> {
+    #[derive(Clone, Copy)]
+    enum Step {
+        Both,
+        First,
+        Second,
+    }
+    let first: Vec<String> = first.iter().map(|word| plain(word)).collect();
+    let second: Vec<String> = second.iter().map(|word| plain(word)).collect();
+    let width = second.len() + 1;
+    let mut score = vec![0i32; (first.len() + 1) * width];
+    let mut step = vec![Step::Both; (first.len() + 1) * width];
+    for j in 1..width {
+        score[j] = score[j - 1] - SKIP_COST;
+        step[j] = Step::Second;
+    }
+    for i in 1..=first.len() {
+        // `score[i * width]` stays 0: the line-up can start at any word of `first`.
+        step[i * width] = Step::First;
+        for j in 1..width {
+            let same = first[i - 1] == second[j - 1];
+            let both = score[(i - 1) * width + j - 1] + if same { MATCH_SCORE } else { -SKIP_COST };
+            let skip_first = score[(i - 1) * width + j] - SKIP_COST;
+            let skip_second = score[i * width + j - 1] - SKIP_COST;
+            let cell = i * width + j;
+            (score[cell], step[cell]) = if both >= skip_first && both >= skip_second {
+                (both, Step::Both)
+            } else if skip_first >= skip_second {
+                (skip_first, Step::First)
+            } else {
+                (skip_second, Step::Second)
+            };
+        }
+    }
+    // The line-up ends with the last word of `first`, at any word of `second`.
+    let last = first.len() * width;
+    let mut j = (0..width).max_by_key(|j| score[last + j]).unwrap_or(0);
+    let mut i = first.len();
+    let mut pairs = Vec::new();
+    while i > 0 && j > 0 {
+        match step[i * width + j] {
+            Step::Both => {
+                i -= 1;
+                j -= 1;
+                if first[i] == second[j] {
+                    pairs.push((i, j));
+                }
+            }
+            Step::First => i -= 1,
+            Step::Second => j -= 1,
+        }
+    }
+    pairs.reverse();
+    pairs
+}
+
+/// A word without its case and punctuation.
+fn plain(word: &str) -> String {
+    word.chars()
+        .filter(|character| character.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}

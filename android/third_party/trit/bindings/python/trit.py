@@ -1,0 +1,488 @@
+"""Trit for Python: speech to text on the CPU or the GPU and text to speech on the CPU, through the C ABI of trit-ffi.
+
+    import trit
+    engine = trit.Trit("whisper-large-v3-turbo")   # a folder, a `trit models` name, or None
+    print(trit.gpu_info())                          # "NVIDIA GeForce RTX 4090, Dx12, f16"
+    print(engine.kind)                              # "whisper"
+    print(engine.transcribe_wav("take.wav"))        # the model detects the language
+    print(engine.transcribe(samples, language="de"))  # 16 kHz mono floats: list, array, or numpy
+    print(engine.transcribe(mic, sample_rate=48000))  # another rate: Trit resamples
+    print(engine.transcribe_wav("take.wav", task="translate"))  # into English
+    for s in engine.segments_wav("take.wav"):       # timed sentences
+        print(f"{s.start:.2f}-{s.end:.2f} {s.text}")
+
+    cleaner = trit.Cleaner()                        # Superwhisper S1-mini
+    print(cleaner.clean("so um send it friday no wait thursday"))
+
+    voice = trit.Voice()                            # Kokoro-82M, else MMS-TTS English
+    voice.speak_wav("The build passed on March 3rd.", "speech.wav", voice="bf_emma")
+    samples = voice.speak("Ship it.", speed=1.1)    # array('f') at voice.sample_rate
+    for part in voice.stream(long_text):            # each part as soon as it is made
+        play(part)
+
+The library is found at TRIT_LIB, next to this file, or in ../../target/release.
+Build it with `cargo build --release -p trit-ffi` in the trit folder.
+"""
+
+from __future__ import annotations
+
+import ctypes
+import json
+import os
+import sys
+from array import array
+from dataclasses import dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from typing import Self
+
+__all__ = [
+    "Cleaner",
+    "Segment",
+    "Trit",
+    "TritError",
+    "Voice",
+    "gpu_info",
+    "release_memory",
+    "set_log",
+    "version",
+]
+
+_NAMES = {"win32": "trit_ffi.dll", "darwin": "libtrit_ffi.dylib"}
+
+
+class TritError(RuntimeError):
+    """A failed Trit call. The message names the cause and the fix."""
+
+
+_SAMPLES_FN = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.POINTER(ctypes.c_float), ctypes.c_size_t, ctypes.c_void_p)
+_LOG_FN = ctypes.CFUNCTYPE(None, ctypes.c_char_p, ctypes.c_void_p)
+
+
+def _library() -> ctypes.CDLL:
+    name = _NAMES.get(sys.platform, "libtrit_ffi.so")
+    here = Path(__file__).resolve().parent
+    candidates = [os.environ.get("TRIT_LIB"), here / name, here.parents[1] / "target" / "release" / name]
+    for path in candidates:
+        if path and Path(path).is_file():
+            lib = ctypes.CDLL(str(path))
+            break
+    else:
+        raise TritError(f"{name} not found; build it: cargo build --release -p trit-ffi (or set TRIT_LIB=<path>)")
+    text, ptr, size = ctypes.c_char_p, ctypes.c_void_p, ctypes.c_size_t
+    floats = ctypes.POINTER(ctypes.c_float)
+    signatures = {
+        "trit_version": ([], text),
+        "trit_last_error": ([], text),
+        "trit_load_json": ([text, text], ptr),
+        "trit_load_ex": ([text, text, text], ptr),
+        "trit_cancel": ([ptr], ctypes.c_int),
+        "trit_set_log": ([_LOG_FN, ptr], None),
+        "trit_gpu_info": ([], ptr),
+        "trit_release_memory": ([], None),
+        "trit_kind": ([ptr], text),
+        "trit_free": ([ptr], None),
+        "trit_transcribe_json": ([ptr, floats, size, text], ptr),
+        "trit_transcribe_wav_json": ([ptr, text, text], ptr),
+        "trit_free_text": ([ptr], None),
+        "trit_set_dictionary": ([ptr, text], ctypes.c_int),
+        "trit_cleaner_load_ex": ([text, text, text], ptr),
+        "trit_cleaner_free": ([ptr], None),
+        "trit_clean": ([ptr, text, text, text, text], ptr),
+        "trit_voice_load": ([text], ptr),
+        "trit_voice_free": ([ptr], None),
+        "trit_voice_sample_rate": ([ptr], ctypes.c_int),
+        "trit_speak": ([ptr, text, text, ctypes.POINTER(size)], floats),
+        "trit_speak_wav": ([ptr, text, text, text], ctypes.c_int),
+        "trit_free_samples": ([floats, size], None),
+        "trit_speak_stream": ([ptr, text, text, _SAMPLES_FN, ptr], ctypes.c_int),
+        "trit_voice_list": ([ptr], ptr),
+        "trit_voice_kind": ([ptr], text),
+        "trit_phonemes": ([ptr, text, text], ptr),
+    }
+    for fn, (args, result) in signatures.items():
+        # An older library has fewer functions (an A/B of two builds, `oploop/ab.py`).
+        if hasattr(lib, fn):
+            getattr(lib, fn).argtypes = args
+            getattr(lib, fn).restype = result
+    return lib
+
+
+_lib = _library()
+
+
+def version() -> str:
+    return _lib.trit_version().decode()
+
+
+def release_memory() -> None:
+    """Return memory freed by earlier calls to the system; call it when the
+    app goes idle, not between calls."""
+    _lib.trit_release_memory()
+
+
+_log_callback = None  # the ctypes function must live as long as the library uses it
+
+
+def set_log(function) -> None:
+    """Send the engine's messages (a GPU failure and the change to the CPU) to
+    `function(message: str)`; None sends them to stderr again. The function can
+    run on any thread, and must not call Trit."""
+    global _log_callback
+    callback = _LOG_FN(lambda message, _user: function(message.decode(errors="replace"))) if function else _LOG_FN()
+    _lib.trit_set_log(callback, None)
+    _log_callback = callback
+
+
+def gpu_info() -> str:
+    """The GPU adapter, for example "NVIDIA GeForce RTX 4090, Dx12, f16".
+    Raises TritError when the computer has no adapter."""
+    return _text(_lib.trit_gpu_info())
+
+
+def _error() -> TritError:
+    return TritError(_lib.trit_last_error().decode())
+
+
+def _text(pointer: int | None) -> str:
+    if not pointer:
+        raise _error()
+    try:
+        return ctypes.string_at(pointer).decode()
+    finally:
+        _lib.trit_free_text(pointer)
+
+
+def _arg(value: str | os.PathLike | None) -> bytes | None:
+    return None if value is None else os.fsencode(value)
+
+
+@dataclass(frozen=True)
+class Segment:
+    """A stretch of the recording and its text; times in seconds from the start."""
+
+    start: float
+    end: float
+    text: str
+
+
+def _options(language, beam, task, fallback, timestamps, sample_rate=None) -> bytes:
+    options = {"language": language, "beam": beam, "timestamps": timestamps}
+    if task is not None:
+        options["task"] = task
+    if fallback is not None:
+        options["fallback"] = fallback
+    if sample_rate is not None:  # an older library does not know the key
+        options["sample_rate"] = sample_rate
+    return json.dumps(options).encode()
+
+
+def _samples(samples):
+    """A float pointer and a count for `samples`, and the buffer that holds them."""
+    if hasattr(samples, "__array_interface__"):  # numpy, without importing it
+        import numpy as np
+
+        if samples.ndim != 1:
+            # A flat copy of (frames, channels) puts the channels one after the other.
+            raise TritError(f"samples have {samples.ndim} dimensions; give mono samples (mix the channels to one)")
+        buffer = np.ascontiguousarray(samples, dtype=np.float32)
+        return buffer.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), buffer.size, buffer
+    buffer = samples if isinstance(samples, array) and samples.typecode == "f" else array("f", samples)
+    address, count = buffer.buffer_info()
+    return ctypes.cast(address, ctypes.POINTER(ctypes.c_float)), count, buffer
+
+
+class Trit:
+    """One loaded speech model. Load once and keep it."""
+
+    def __init__(
+        self,
+        model: str | os.PathLike | None = None,
+        precision: str | None = None,
+        device: str = "cpu",
+        cache: bool = False,
+    ):
+        """`model`: a folder, a `trit models` name, or None for the default.
+        `precision`: "auto" (None; int8 for layers 384 wide and more, f16
+        below; a GGUF file keeps its stored types), "int8" (least memory),
+        "f16", "f32" (as the reference), or "q8_0" (ggml's Q8_0).
+        `device`: "cpu" (default), "gpu", or "auto". "auto" uses the GPU for
+        the Parakeet models when the computer has an adapter, and the CPU for
+        the other families (they are slower on the GPU). TRIT_DEVICE overrides it.
+        `cache`: keep the converted weights in `<model>/.trit/` and map that
+        file, so they are file memory and not private memory (the first load
+        writes it; the model must be on a local disk)."""
+        self._handle = None
+        options = {"device": device, "cache": cache}
+        if precision is not None:
+            options["precision"] = precision
+        if hasattr(_lib, "trit_load_json"):
+            handle = _lib.trit_load_json(_arg(model), json.dumps(options).encode())
+        elif cache:
+            raise TritError("this trit-ffi library is older than the cache option; build it again")
+        else:
+            handle = _lib.trit_load_ex(_arg(model), _arg(precision), _arg(device))
+        if not handle:
+            raise _error()
+        self._handle = handle
+
+    @property
+    def kind(self) -> str:
+        """The `model_type` of the model, for example "parakeet_tdt"."""
+        return _lib.trit_kind(self._live()).decode()
+
+    def transcribe(self, samples, language: str | None = None, beam: int = 0,
+                   task: str | None = None, fallback: bool | None = None,
+                   sample_rate: int | None = None) -> str:
+        """Mono samples in -1..1: list, array('f'), or numpy array.
+        `sample_rate`: the rate of `samples` in Hz (None: 16000). Trit
+        resamples another rate, such as the 44100 or 48000 of a microphone.
+        Samples at another rate with no `sample_rate` give wrong text.
+        `language`: ISO 639-1 code, or None to let the model detect it.
+        `beam`: beams for Whisper, Moonshine, and Canary (0: the model's
+        default, 5 for Whisper and Moonshine; 1: greedy).
+        `task`: "transcribe" (None), or "translate" into English
+        (multilingual Whisper, Canary).
+        `fallback`: Whisper decodes a window again at higher temperatures
+        when its text repeats itself (None: on)."""
+        return self._samples(samples, _options(language, beam, task, fallback, False, sample_rate))["text"]
+
+    def transcribe_wav(self, path: str | os.PathLike, language: str | None = None, beam: int = 0,
+                       task: str | None = None, fallback: bool | None = None) -> str:
+        """A WAV file (16, 24, or 32-bit PCM, or 32-bit float; a file that is
+        not at 16 kHz is resampled); options as for `transcribe`."""
+        return self._wav(path, _options(language, beam, task, fallback, False))["text"]
+
+    def segments(self, samples, language: str | None = None, beam: int = 0,
+                 task: str | None = None, fallback: bool | None = None,
+                 sample_rate: int | None = None) -> list[Segment]:
+        """The text in timed segments: sentences or pauses for Parakeet,
+        windows of up to 30 s (40 s Canary) for the others. Options as for
+        `transcribe`."""
+        result = self._samples(samples, _options(language, beam, task, fallback, True, sample_rate))
+        return [Segment(**s) for s in result["segments"]]
+
+    def segments_wav(self, path: str | os.PathLike, language: str | None = None, beam: int = 0,
+                     task: str | None = None, fallback: bool | None = None) -> list[Segment]:
+        """`segments` for a WAV file."""
+        result = self._wav(path, _options(language, beam, task, fallback, True))
+        return [Segment(**s) for s in result["segments"]]
+
+    def _samples(self, samples, options: bytes) -> dict:
+        pointer, count, _buffer = _samples(samples)
+        return json.loads(_text(_lib.trit_transcribe_json(self._live(), pointer, count, options)))
+
+    def _wav(self, path: str | os.PathLike, options: bytes) -> dict:
+        return json.loads(_text(_lib.trit_transcribe_wav_json(self._live(), os.fsencode(path), options)))
+
+    def _live(self):
+        if not self._handle:
+            raise TritError("engine is closed")
+        return self._handle
+
+    def set_dictionary(self, terms: list[str]) -> int:
+        """Terms to favor while decoding (Parakeet). Returns how many it cannot spell.
+        An empty list clears them."""
+        skipped = _lib.trit_set_dictionary(self._live(), "\n".join(terms).encode())
+        if skipped < 0:
+            raise _error()
+        return skipped
+
+    def cancel(self) -> int:
+        """Stops the calls that run on this engine now, on other threads: each
+        raises TritError ("the call was cancelled"). Parakeet stops in a part
+        of a second, the other families at the end of their window. Returns
+        the number of calls it stopped."""
+        return _lib.trit_cancel(self._live())
+
+    def close(self) -> None:
+        """Frees the model. Do not call it while another thread is in a call on this engine."""
+        if self._handle:
+            _lib.trit_free(self._handle)
+            self._handle = None
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *_) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        self.close()
+
+
+class Cleaner:
+    """Superwhisper S1-mini: a raw transcript to clean written English."""
+
+    def __init__(
+        self,
+        model: str | os.PathLike | None = None,
+        precision: str | None = None,
+        device: str = "cpu",
+    ):
+        """`precision` and `device` as for `Trit`."""
+        self._handle = None
+        handle = _lib.trit_cleaner_load_ex(_arg(model), _arg(precision), _arg(device))
+        if not handle:
+            raise _error()
+        self._handle = handle
+
+    def clean(self, text: str, styling: str | None = None, structure: str | None = None,
+              context: str | None = None) -> str:
+        """styling: casual, semi-casual, semi-formal (default), formal;
+        structure: prose (default), lists; context: general (default), email."""
+        if not self._handle:
+            raise TritError("cleaner is closed")
+        return _text(_lib.trit_clean(self._handle, text.encode(), _arg(styling), _arg(structure), _arg(context)))
+
+    def close(self) -> None:
+        if self._handle:
+            _lib.trit_cleaner_free(self._handle)
+            self._handle = None
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *_) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        self.close()
+
+
+class Voice:
+    """A voice: Kokoro-82M (24 kHz, 28 English voices; reads numbers and
+    symbols) or a VITS voice (Meta MMS-TTS, 16 kHz; reads letters only)."""
+
+    def __init__(self, model: str | os.PathLike | None = None):
+        """`model`: a folder, a `trit models` name ("kokoro-82m", "mms-tts-eng"),
+        or None for the default (Kokoro, then MMS-TTS)."""
+        self._handle = None
+        handle = _lib.trit_voice_load(_arg(model))
+        if not handle:
+            raise _error()
+        self._handle = handle
+
+    @property
+    def sample_rate(self) -> int:
+        """The rate of the samples of `speak` (24000 for Kokoro, 16000 for MMS-TTS)."""
+        return _lib.trit_voice_sample_rate(self._live())
+
+    @property
+    def kind(self) -> str:
+        """"kokoro" or "vits"."""
+        return _lib.trit_voice_kind(self._live()).decode()
+
+    @property
+    def voices(self) -> list[str]:
+        """The voices of a Kokoro folder: af_/am_ American, bf_/bm_ British ([] for VITS)."""
+        text = _text(_lib.trit_voice_list(self._live()))
+        return text.split("\n") if text else []
+
+    def phonemes(self, text: str, voice: str | None = None) -> str:
+        """The phonemes Kokoro speaks for `text`, one line per pass, in the accent of `voice`."""
+        return _text(_lib.trit_phonemes(self._live(), text.encode(), _voicing(voice=voice)))
+
+    def speak(self, text: str, voice: str | None = None, speed: float | None = None, noise: float | None = None,
+              noise_duration: float | None = None, seed: int = 0, phonemes: bool = False) -> array:
+        """Mono samples in -1..1 at `sample_rate`, as array('f').
+        `voice`: Kokoro voice (None: af_heart; "af_bella,af_sky" blends two).
+        `speed`: 1 is the voice's pace, 1.25 faster, from 0.25 to 4 (None: the voice's own).
+        `noise`: how much the voice varies; `noise_duration`: VITS timing.
+        One text and one `seed` give the same audio. `phonemes`: Kokoro,
+        the text is phonemes (one pass per line)."""
+        count = ctypes.c_size_t()
+        options = _voicing(voice, speed, noise, noise_duration, seed, phonemes)
+        pointer = _lib.trit_speak(self._live(), text.encode(), options, ctypes.byref(count))
+        if not pointer:
+            raise _error()
+        try:
+            samples = array("f")
+            samples.frombytes(ctypes.string_at(pointer, count.value * 4))
+            return samples
+        finally:
+            _lib.trit_free_samples(pointer, count)
+
+    def speak_wav(self, text: str, path: str | os.PathLike, voice: str | None = None, speed: float | None = None,
+                  noise: float | None = None, noise_duration: float | None = None, seed: int = 0,
+                  phonemes: bool = False) -> None:
+        """`speak` into a 16-bit mono WAV file."""
+        options = _voicing(voice, speed, noise, noise_duration, seed, phonemes)
+        if _lib.trit_speak_wav(self._live(), text.encode(), os.fsencode(path), options) < 0:
+            raise _error()
+
+    def stream(self, text: str, voice: str | None = None, speed: float | None = None, noise: float | None = None,
+               noise_duration: float | None = None, seed: int = 0, phonemes: bool = False):
+        """`speak`, part by part: yields array('f') for each part (a sentence
+        for VITS, a line or a 510-phoneme pass for Kokoro) as soon as it is
+        made. Stop iterating to stop speaking."""
+        import queue
+        import threading
+
+        parts: queue.Queue = queue.Queue(maxsize=4)
+        done = object()
+        stop = threading.Event()
+        failure: list[TritError] = []
+
+        @_SAMPLES_FN
+        def on_part(samples, count, _user):
+            if stop.is_set():
+                return 0
+            chunk = array("f")
+            chunk.frombytes(ctypes.string_at(samples, count * 4))
+            parts.put(chunk)
+            return 0 if stop.is_set() else 1
+
+        options = _voicing(voice, speed, noise, noise_duration, seed, phonemes)
+
+        def run():
+            try:
+                if _lib.trit_speak_stream(self._live(), text.encode(), options, on_part, None) < 0:
+                    failure.append(_error())
+            finally:
+                parts.put(done)
+
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        try:
+            while (item := parts.get()) is not done:
+                yield item
+        finally:
+            stop.set()
+            while worker.is_alive():
+                try:
+                    parts.get(timeout=0.05)
+                except queue.Empty:
+                    pass
+            worker.join()
+        if failure:
+            raise failure[0]
+
+    def _live(self):
+        if not self._handle:
+            raise TritError("voice is closed")
+        return self._handle
+
+    def close(self) -> None:
+        if self._handle:
+            _lib.trit_voice_free(self._handle)
+            self._handle = None
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *_) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        self.close()
+
+
+def _voicing(voice=None, speed=None, noise=None, noise_duration=None, seed=0, phonemes=False) -> bytes:
+    options = {"seed": seed, "phonemes": phonemes}
+    for key, value in (("voice", voice), ("speed", speed), ("noise", noise), ("noise_duration", noise_duration)):
+        if value is not None:
+            options[key] = value
+    return json.dumps(options).encode()

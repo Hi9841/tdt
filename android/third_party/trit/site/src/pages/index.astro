@@ -1,0 +1,265 @@
+---
+import Base from "../layouts/Base.astro";
+import Header from "../components/Header.astro";
+import Cmd from "../components/Cmd.astro";
+import Race from "../components/Race.astro";
+import Stats from "../components/Stats.astro";
+import Footer from "../components/Footer.astro";
+import { docsHref } from "../lib/docs";
+import { links } from "../lib/links";
+import { megabytes, redux } from "../lib/data";
+import { stat, tagline, whatIs } from "../lib/facts";
+import { updatedOf } from "../lib/repo";
+import { crank, suitcase } from "../lib/sketch";
+
+// The quick start: `cargo install` puts `trit` on the PATH, and Trit finds a
+// model in the Hugging Face cache, so `hf download` needs no folder.
+const quickStart = [
+  "cargo install --git https://github.com/Hi9841/trit",
+  "hf download moondream/parakeet-redux",
+  "trit transcribe take.wav",
+].join("\n");
+
+const speakStart = ["hf download hexgrad/Kokoro-82M", 'trit speak "Good morning." --out hi.wav'].join("\n");
+
+const updated = updatedOf([
+  "site/src/pages/index.astro",
+  "site/src/lib/facts.ts",
+  "bench/benchmarks.json",
+  "src/catalog.rs",
+]);
+---
+
+<Base
+  title={`Trit · ${tagline}`}
+  description={whatIs}
+  updated={updated}
+>
+  <Header />
+  <main id="content">
+    <section class="grid hero">
+      <div class="words">
+        <h1 class="display xl">
+          <span class="line">Speech to text,</span><span class="line">text to speech,</span><span class="line"
+            >no GPU.</span
+          >
+        </h1>
+        <p class="lead">
+          Parakeet, Canary, Whisper and Moonshine models, and the Kokoro and MMS-TTS voices, from Hugging Face on
+          Trit's own Rust kernels. No Python, no PyTorch.
+        </p>
+        <Cmd command={quickStart} />
+        <p class="needs">
+          Needs Rust and the Hugging Face CLI. Free for noncommercial use; for a product,{" "}
+          <a href={links.pricing}>ask for a license</a>.
+        </p>
+        <div class="more">
+          <a href={links.docs}>Read the docs</a>
+          <a href={links.benchmarks}>See the benchmarks</a>
+        </div>
+      </div>
+      <figure class="art draw" data-scene="crank"><Fragment set:html={crank} /></figure>
+    </section>
+
+    <section class="grid proof">
+      <div class="intro">
+        <h2 class="display l">
+          <span class="line">Done before</span><span class="line">you blink.</span>
+        </h2>
+        <p class="lead">
+          Each bar is one runtime turning a clip into text with the same Parakeet Redux weights.
+        </p>
+      </div>
+      <Race />
+      <p class="stat">
+        {stat.text} <a href={links.benchmarks}>The results</a>, {stat.date}.
+      </p>
+    </section>
+
+    <section class="grid pack">
+      <figure class="art" data-scene="suitcase">
+        <Fragment set:html={suitcase} />
+        <figcaption>
+          Same weights, same clips, same computer. After the last clip, Transformers holds {
+            megabytes(redux.transformers.run_mb)
+          } of memory and Trit {megabytes(redux.trit.run_mb)}.
+        </figcaption>
+      </figure>
+      <div class="numbers"><Stats /></div>
+    </section>
+
+    <section class="grid speak" aria-labelledby="speak">
+      <h2 class="display l" id="speak">
+        <span class="line">Text in,</span><span class="line">speech out.</span>
+      </h2>
+      <div class="how">
+        <p class="lead">
+          Kokoro-82M reads English text aloud in 28 American and British voices, at 24 kHz. It reads words, numbers,
+          money, times, dates and symbols.
+        </p>
+        <Cmd command={speakStart} />
+        <p class="stat">
+          MMS-TTS is the second voice: 16 kHz, letters only. <a href={docsHref("text-to-speech")}>Text to
+          speech</a> in the docs.
+        </p>
+      </div>
+    </section>
+  </main>
+  <Footer updated={updated} />
+</Base>
+
+<script>
+  // The crank drawing draws itself once, after the handwriting font is ready;
+  // its story (motion.ts) starts as the draw-in ends.
+  document.fonts.ready.then(() => {
+    for (const art of document.querySelectorAll(".art.draw")) {
+      requestAnimationFrame(() => art.classList.add("go"));
+    }
+  });
+</script>
+
+<style>
+  /* Two columns of equal weight, centred on the same axis: the words on
+     six, the drawing on six (its own margin keeps them apart). */
+  .hero {
+    align-items: center;
+    padding-top: 96px;
+  }
+  .words {
+    grid-column: 1 / span 6;
+  }
+  .hero .lead {
+    max-width: 34ch;
+    margin: 36px 0 0;
+    color: var(--muted);
+  }
+  .words :global(.cmd) {
+    max-width: 560px;
+    margin-top: 32px;
+  }
+  .needs {
+    margin: 12px 0 0;
+    font-size: 15px;
+    line-height: 1.55;
+    color: var(--muted);
+  }
+  .needs a {
+    color: var(--ink);
+    text-decoration: underline;
+    text-decoration-color: var(--rule);
+    text-underline-offset: 4px;
+  }
+  .more {
+    display: flex;
+    gap: 24px;
+    margin-top: 16px;
+    font-size: 15px;
+  }
+  .more a {
+    padding-block: 8px;
+    text-decoration: underline;
+    text-decoration-color: var(--rule);
+    text-underline-offset: 4px;
+    transition: text-decoration-color 150ms var(--ease-out);
+  }
+  @media (hover: hover) and (pointer: fine) {
+    .more a:hover {
+      text-decoration-color: var(--ink);
+    }
+  }
+  .hero .art {
+    grid-column: 7 / -1;
+  }
+
+  .proof {
+    margin-top: 192px;
+    align-items: start;
+  }
+  .intro {
+    grid-column: 1 / span 5;
+  }
+  .intro .lead {
+    margin: 32px 0 0;
+  }
+  .proof :global(.race) {
+    grid-column: 7 / -1;
+  }
+  /* The benchmark's finding, in a sentence that can be quoted. */
+  .stat {
+    grid-column: 7 / -1;
+    max-width: var(--measure);
+    margin: 32px 0 0;
+    font-size: 15px;
+    line-height: 1.55;
+    color: var(--muted);
+  }
+  .stat a {
+    color: var(--ink);
+    text-decoration: underline;
+    text-decoration-color: var(--rule);
+    text-underline-offset: 4px;
+  }
+
+  .pack {
+    margin-top: 160px;
+    align-items: center;
+  }
+  .pack .art {
+    grid-column: 1 / span 6;
+  }
+  .numbers {
+    grid-column: 8 / -1;
+  }
+
+  /* Text to speech: the heading on the left, how to try it on the right. */
+  .speak {
+    margin-top: 160px;
+    align-items: start;
+  }
+  .speak h2 {
+    grid-column: 1 / span 5;
+  }
+  .how {
+    grid-column: 7 / -1;
+  }
+  .how .lead {
+    margin: 8px 0 32px;
+  }
+  .how .stat {
+    margin-top: 20px;
+  }
+
+  @media (max-width: 900px) {
+    .words,
+    .hero .art,
+    .intro,
+    .proof :global(.race),
+    .stat,
+    .pack .art,
+    .numbers,
+    .speak h2,
+    .how {
+      grid-column: 1 / -1;
+      grid-row: auto;
+    }
+    .how {
+      margin-top: 32px;
+    }
+    .hero {
+      padding-top: 56px;
+    }
+    .hero .art {
+      margin-top: 56px;
+    }
+    .proof :global(.race),
+    .numbers {
+      margin-top: 64px;
+    }
+  }
+  @media (max-width: 600px) {
+    .proof,
+    .speak {
+      margin-top: 128px;
+    }
+  }
+</style>

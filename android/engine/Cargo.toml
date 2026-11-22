@@ -1,0 +1,33 @@
+[package]
+name = "tdt-speech"
+version = "0.6.0"
+edition = "2021"
+description = "The speech path of TDT for Android: the take path of TDT desktop on Trit, behind a C ABI"
+license = "PolyForm-Noncommercial-1.0.0"
+publish = false
+
+[lib]
+name = "tdt_speech"
+# staticlib: CMake links it into libtdt_engine.so. rlib: examples/takes.rs.
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+# Without the `gpu` feature: TDT runs speech on the CPU.
+trit = { path = "../third_party/trit" }
+parking_lot = "0.12"
+mimalloc = { version = "0.1", default-features = false }
+
+# Android apps load this library with dlopen, and bionic refuses initial-exec TLS
+# (mimalloc's default) in a library loaded that way.
+[target.'cfg(target_os = "android")'.dependencies]
+mimalloc = { version = "0.1", default-features = false, features = ["local_dynamic_tls"] }
+
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"
+
+# The profile of Trit's own release build. A profile comes from the package
+# that is built, so Trit's Cargo.toml does not set it here.
+[profile.release]
+codegen-units = 1
+lto = "fat"
+strip = "symbols"
