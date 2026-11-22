@@ -1,6 +1,6 @@
 pub mod hook;
 pub use hook::{
-    begin_capture, current_binding, end_capture, input_appeared, input_held, input_mask,
-    note_user_typed, poll_capture_timeout, poll_missed_release, reset_user_typed, set_binding,
-    user_typed, wake_loop, HotkeyAction, HotkeyBinding, HotkeyListener,
+    begin_capture, current_binding, end_capture, input_held, note_user_typed, poll_capture_timeout,
+    poll_missed_release, set_binding, typed_generation, user_typed_since, wake_loop, HotkeyAction,
+    HotkeyBinding, HotkeyListener,
 };

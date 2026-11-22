@@ -11,7 +11,7 @@ const INPUT_READY_BUDGET: Duration = Duration::from_millis(60);
 /// still caught early, large enough not to spin.
 const INPUT_READY_STEP: Duration = Duration::from_millis(4);
 
-/// Characters in one `SendInput` call. A short pause follows each call but
+/// UTF-16 units in one `SendInput` call. A short pause follows each call but
 /// the last, so the app can read its input before more comes.
 const TYPED_AT_ONCE: usize = 256;
 const PAUSE_BETWEEN_CALLS: Duration = Duration::from_millis(1);
@@ -40,7 +40,6 @@ impl std::fmt::Display for DeliverySteps {
 
 #[derive(Debug, PartialEq)]
 pub enum DeliveryOutcome {
-    NoSpeech,
     Copied,
     Pasted,
     /// The text is in the app, but the clipboard did not take it.
@@ -93,9 +92,10 @@ impl std::fmt::Display for NotTyped {
     }
 }
 
-/// True once the window's input focus is live, meaning synthesized keystrokes
-/// will land in a real edit control rather than being dropped.
-fn has_input_focus(hwnd: windows::Win32::Foundation::HWND) -> bool {
+/// Returns the focused control HWND of `hwnd`'s GUI thread, if the app reports one.
+fn focused_control(
+    hwnd: windows::Win32::Foundation::HWND,
+) -> Option<windows::Win32::Foundation::HWND> {
     use windows::Win32::UI::WindowsAndMessaging::{
         GetGUIThreadInfo, GetWindowThreadProcessId, GUITHREADINFO,
     };
@@ -103,7 +103,7 @@ fn has_input_focus(hwnd: windows::Win32::Foundation::HWND) -> bool {
     unsafe {
         let thread = GetWindowThreadProcessId(hwnd, None);
         if thread == 0 {
-            return false;
+            return None;
         }
         let mut info = GUITHREADINFO {
             cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
@@ -111,15 +111,21 @@ fn has_input_focus(hwnd: windows::Win32::Foundation::HWND) -> bool {
         };
         // hwndFocus is the window itself when it owns focus directly, so this
         // also covers apps with no child edit control.
-        GetGUIThreadInfo(thread, &mut info).is_ok() && !info.hwndFocus.is_invalid()
+        (GetGUIThreadInfo(thread, &mut info).is_ok() && !info.hwndFocus.is_invalid())
+            .then_some(info.hwndFocus)
     }
 }
 
-fn wait_for_input_focus(hwnd: windows::Win32::Foundation::HWND) {
+fn wait_for_input_focus(
+    hwnd: windows::Win32::Foundation::HWND,
+) -> Option<windows::Win32::Foundation::HWND> {
     let started = Instant::now();
-    while started.elapsed() < INPUT_READY_BUDGET {
-        if has_input_focus(hwnd) {
-            break;
+    loop {
+        if let Some(focus) = focused_control(hwnd) {
+            return Some(focus);
+        }
+        if started.elapsed() >= INPUT_READY_BUDGET {
+            return None;
         }
         thread::sleep(INPUT_READY_STEP);
     }
@@ -167,61 +173,31 @@ impl PasteInjector {
         Err(last_err)
     }
 
-    /// Puts the final transcript on the clipboard, and types it into
-    /// `target_hwnd` when auto-paste is on. `user_typed` keeps TDT from typing
-    /// over keys that the user pressed while the transcript was finishing.
-    pub fn deliver(
-        &self,
-        text: &str,
-        should_paste: bool,
-        target_hwnd: Option<isize>,
-        user_typed: bool,
-        steps: &mut DeliverySteps,
-    ) -> Result<DeliveryOutcome, String> {
-        if text.trim().is_empty() {
-            return Ok(DeliveryOutcome::NoSpeech);
-        }
-        if user_typed {
-            self.copy_to_clipboard(text.trim())?;
-            return Ok(DeliveryOutcome::CopiedFallback(NotTyped::UserTyped));
-        }
-        if !should_paste {
-            self.copy_timed(text, steps)?;
-            return Ok(DeliveryOutcome::Copied);
-        }
-        // The app gets the text first. A clipboard manager can hold the copy for
-        // a time, and the user does not wait for the clipboard.
-        let typed = self.insert_text(text, target_hwnd, steps);
-        let copied = self.copy_timed(text, steps);
-        match (typed, copied) {
-            (Ok(()), Ok(())) => Ok(DeliveryOutcome::Pasted),
-            (Ok(()), Err(error)) => Ok(DeliveryOutcome::PastedNotCopied(error)),
-            (Err(reason), Ok(())) => Ok(DeliveryOutcome::CopiedFallback(reason)),
-            (Err(_), Err(error)) => Err(error),
-        }
-    }
-
-    fn copy_timed(&self, text: &str, steps: &mut DeliverySteps) -> Result<(), String> {
+    pub fn copy_timed(&self, text: &str, steps: &mut DeliverySteps) -> Result<(), String> {
         let started = Instant::now();
         let copied = self.copy_to_clipboard(text);
         steps.copy = started.elapsed();
         copied
     }
 
-    fn insert_text(
+    /// Focuses `target_hwnd` and types `text`, re-checking `user_typed` and
+    /// target focus before each `SendInput` batch so text cannot land in a
+    /// switched window or overwrite newly typed keys.
+    pub fn try_type(
         &self,
         text: &str,
         target_hwnd: Option<isize>,
+        user_typed: &dyn Fn() -> bool,
         steps: &mut DeliverySteps,
     ) -> Result<(), NotTyped> {
         let started = Instant::now();
-        let prepared = self.prepare_target(target_hwnd);
+        let target = self.prepare_target(target_hwnd);
         steps.focus = started.elapsed();
-        prepared?;
+        let (hwnd, focus_control) = target?;
         let started = Instant::now();
         // Unicode key events, not Ctrl+V: some apps paste a synthetic Ctrl+V
         // as an image, even when the clipboard holds text.
-        let typed = type_text_windows(text).map_err(NotTyped::Partial);
+        let typed = type_text_windows(text, hwnd, focus_control, user_typed);
         steps.typing = started.elapsed();
         if typed.is_ok() {
             steps.typed_at = Some(Instant::now());
@@ -230,7 +206,16 @@ impl PasteInjector {
     }
 
     /// Brings the window of the dictation back to the front.
-    fn prepare_target(&self, target_hwnd: Option<isize>) -> Result<(), NotTyped> {
+    fn prepare_target(
+        &self,
+        target_hwnd: Option<isize>,
+    ) -> Result<
+        (
+            windows::Win32::Foundation::HWND,
+            Option<windows::Win32::Foundation::HWND>,
+        ),
+        NotTyped,
+    > {
         use windows::Win32::Foundation::HWND;
         use windows::Win32::UI::WindowsAndMessaging::{
             BringWindowToTop, GetForegroundWindow, SetForegroundWindow,
@@ -256,8 +241,8 @@ impl PasteInjector {
             // SAFETY: GetForegroundWindow takes no arguments.
             if unsafe { GetForegroundWindow() } == hwnd {
                 // The `focus` time of the delivery line in the log holds this wait.
-                wait_for_input_focus(hwnd);
-                return Ok(());
+                let focus_control = wait_for_input_focus(hwnd);
+                return Ok((hwnd, focus_control));
             }
             thread::sleep(Duration::from_millis(15));
         }
@@ -267,6 +252,43 @@ impl PasteInjector {
             "Windows refused the focus"
         }))
     }
+}
+
+struct TypingGuard<'a> {
+    hwnd: windows::Win32::Foundation::HWND,
+    /// Focused control seen right after `prepare_target`, when the app reports
+    /// one. Apps that never report `hwndFocus` still check `GetForegroundWindow`.
+    focus_control: Option<windows::Win32::Foundation::HWND>,
+    user_typed: &'a dyn Fn() -> bool,
+}
+
+fn target_still_ready(guard: &TypingGuard<'_>, batches_sent: usize) -> Result<(), NotTyped> {
+    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+    if (guard.user_typed)() {
+        return Err(if batches_sent == 0 {
+            NotTyped::UserTyped
+        } else {
+            NotTyped::Partial("stopped typing because a key was pressed".to_string())
+        });
+    }
+    // SAFETY: GetForegroundWindow takes no arguments.
+    if unsafe { GetForegroundWindow() } != guard.hwnd {
+        return Err(if batches_sent == 0 {
+            NotTyped::NoFocus("the window lost focus before typing")
+        } else {
+            NotTyped::Partial("stopped typing because the window lost focus".to_string())
+        });
+    }
+    if let Some(expected_focus) = guard.focus_control {
+        if focused_control(guard.hwnd) != Some(expected_focus) {
+            return Err(if batches_sent == 0 {
+                NotTyped::NoFocus("the focused field changed before typing")
+            } else {
+                NotTyped::Partial("stopped typing because the focused field changed".to_string())
+            });
+        }
+    }
+    Ok(())
 }
 
 fn release_physical_modifiers() {
@@ -290,22 +312,64 @@ fn release_physical_modifiers() {
             )
         })
         .collect();
-    let _ = send_inputs(&inputs);
+    let _ = send_input_batch(&inputs);
 }
 
-fn type_text_windows(text: &str) -> Result<(), String> {
+fn type_text_windows(
+    text: &str,
+    hwnd: windows::Win32::Foundation::HWND,
+    focus_control: Option<windows::Win32::Foundation::HWND>,
+    user_typed: &dyn Fn() -> bool,
+) -> Result<(), NotTyped> {
+    let guard = TypingGuard {
+        hwnd,
+        focus_control,
+        user_typed,
+    };
+    target_still_ready(&guard, 0)?;
+    release_physical_modifiers();
+    let (inputs, batch_ends) = encode_text_inputs(text)?;
+    let mut start = 0;
+    for (index, end) in batch_ends.into_iter().enumerate() {
+        if index > 0 {
+            thread::sleep(PAUSE_BETWEEN_CALLS);
+        }
+        target_still_ready(&guard, index)?;
+        send_input_batch(&inputs[start..end])?;
+        start = end;
+    }
+    Ok(())
+}
+
+fn encode_text_inputs(
+    text: &str,
+) -> Result<
+    (
+        Vec<windows::Win32::UI::Input::KeyboardAndMouse::INPUT>,
+        Vec<usize>,
+    ),
+    NotTyped,
+> {
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, VIRTUAL_KEY, VK_RETURN, VK_TAB,
     };
-
-    release_physical_modifiers();
     let mut inputs = Vec::with_capacity(text.encode_utf16().count() * 2);
+    let mut batch_ends = Vec::new();
+    let mut batch_start = 0;
     for character in text.chars() {
+        if inputs.len() - batch_start + 2 * character.len_utf16() > 2 * TYPED_AT_ONCE {
+            batch_start = inputs.len();
+            batch_ends.push(batch_start);
+        }
         match character {
             '\n' => push_key(&mut inputs, VK_RETURN),
             '\t' => push_key(&mut inputs, VK_TAB),
             '\r' => continue,
-            '\0' => return Err("Cannot type text containing a null character".to_string()),
+            '\0' => {
+                return Err(NotTyped::Partial(
+                    "Cannot type text containing a null character".to_string(),
+                ));
+            }
             _ => {
                 let mut encoded = [0_u16; 2];
                 for &unit in character.encode_utf16(&mut encoded).iter() {
@@ -319,7 +383,10 @@ fn type_text_windows(text: &str) -> Result<(), String> {
             }
         }
     }
-    send_inputs(&inputs)
+    if inputs.len() > batch_start {
+        batch_ends.push(inputs.len());
+    }
+    Ok((inputs, batch_ends))
 }
 
 fn keyboard_input(
@@ -351,24 +418,30 @@ fn push_key(
     inputs.push(keyboard_input(virtual_key, 0, KEYEVENTF_KEYUP));
 }
 
-fn send_inputs(
+fn send_input_batch(
     inputs: &[windows::Win32::UI::Input::KeyboardAndMouse::INPUT],
-) -> Result<(), String> {
+) -> Result<(), NotTyped> {
     use windows::Win32::UI::Input::KeyboardAndMouse::SendInput;
-    // Each character is a key down and a key up.
-    for (index, chunk) in inputs.chunks(2 * TYPED_AT_ONCE).enumerate() {
-        if index > 0 {
-            thread::sleep(PAUSE_BETWEEN_CALLS);
-        }
-        // SAFETY: `chunk` is a valid slice of INPUT, and the size argument is the size of one INPUT.
-        let sent = unsafe { SendInput(chunk, std::mem::size_of_val(&chunk[0]) as i32) };
-        if sent != chunk.len() as u32 {
-            return Err(format!(
-                "Windows accepted {sent} of {} text input events: {}",
-                chunk.len(),
-                std::io::Error::last_os_error()
-            ));
-        }
+    // SAFETY: `inputs` is a valid slice of INPUT and the size is for one INPUT.
+    let sent = unsafe { SendInput(inputs, std::mem::size_of_val(&inputs[0]) as i32) };
+    if sent != inputs.len() as u32 {
+        return Err(NotTyped::Partial(format!(
+            "Windows accepted {sent} of {} text input events: {}",
+            inputs.len(),
+            std::io::Error::last_os_error()
+        )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn input_batch_keeps_surrogate_pair_together() {
+        let text = format!("{}\u{1f642}", "a".repeat(TYPED_AT_ONCE - 1));
+        let (_, ends) = encode_text_inputs(&text).expect("encodes");
+        assert_eq!(ends, [2 * (TYPED_AT_ONCE - 1), 2 * (TYPED_AT_ONCE + 1)]);
+    }
 }

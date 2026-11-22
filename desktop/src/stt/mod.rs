@@ -7,7 +7,7 @@ pub mod takes;
 
 pub use engine::{
     panic_in_engine_call, ErrorKind, Latency, LiveAudio, LiveTranscript, StopTimes, SttEngine,
-    TakeError,
+    TakeDiagnostics, TakeError,
 };
 pub use fillers::remove_fillers;
 pub use models::{DownloadPhase, CATALOG, DEFAULT_MODEL_ID};

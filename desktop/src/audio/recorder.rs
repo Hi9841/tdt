@@ -3,7 +3,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use parking_lot::{Condvar, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use voice_stt_desktop::resample::Resampler;
 use voice_stt_desktop::stt::MAX_TAKE_SAMPLES;
 
@@ -16,25 +16,31 @@ const STALE_OPEN_MS: u64 = 800;
 /// limit is long because a Bluetooth microphone can start slowly.
 const STALLED_TAKE_MS: u64 = 3_000;
 /// The time between two reads of the Windows default microphone.
-const DEFAULT_INPUT_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+const DEFAULT_INPUT_POLL: Duration = Duration::from_secs(2);
+/// When the preferred Windows default failed to open and we fell back to
+/// another microphone, retry the preferred default between takes after this
+/// cooldown so a transient USB/wake failure recovers automatically.
+const FALLBACK_RETRY_AFTER: Duration = Duration::from_secs(10);
 
-/// The Windows default microphone, as the watch thread last read it. The
-/// outer `None` means no read yet. The read is a COM call that can wait on
-/// the Windows audio service, so a press of the shortcut does not make it.
+/// The Windows default microphone identity (WASAPI endpoint ID, falling back
+/// to display name), as the watch thread last read it. The outer `None` means
+/// no read yet. The read is a COM call that can wait on the Windows audio
+/// service, so a press of the shortcut does not make it.
 static DEFAULT_INPUT: Mutex<Option<Option<String>>> = Mutex::new(None);
 
 /// Starts the thread that keeps `DEFAULT_INPUT` current. A microphone that
 /// becomes the default is used from the next take, 2 seconds later at most.
 pub fn watch_default_input() {
     std::thread::spawn(|| loop {
-        let name = default_input_name(&cpal::default_host());
-        *DEFAULT_INPUT.lock() = Some(name);
+        let id = default_input_identity(&cpal::default_host());
+        *DEFAULT_INPUT.lock() = Some(id);
         std::thread::sleep(DEFAULT_INPUT_POLL);
     });
 }
 
 /// The state that the capture callback, the recorder, and the pump of a
 /// take share.
+#[derive(Default)]
 struct Capture {
     is_recording: AtomicBool,
     at_limit: AtomicBool,
@@ -48,17 +54,27 @@ struct Capture {
     /// the previous take.
     new_take: AtomicBool,
     last_callback_ms: AtomicU64,
+    /// Latest observed CPAL capture-to-callback latency, in milliseconds.
+    last_packet_age_ms: AtomicU64,
     last_error: Mutex<Option<String>>,
 }
 
 pub struct AudioRecorder {
     capture: Arc<Capture>,
     device_name: String,
-    /// The Windows default input when this stream opened.
+    /// The Windows default input display name when this stream opened.
     default_name: Option<String>,
+    /// The Windows default input endpoint ID (or display name fallback) when
+    /// this stream opened, so two devices with the same name still trigger a
+    /// reopen when the default switches between them.
+    default_id: Option<String>,
+    /// True when the preferred default could not be opened and this stream is
+    /// running on a fallback endpoint.
+    using_fallback: bool,
     /// Device rate, channels, and sample format, for the log.
     format: String,
     opened_ms: u64,
+    opened_at: Instant,
     paused: AtomicBool,
     stream: cpal::Stream,
 }
@@ -67,21 +83,50 @@ pub struct AudioRecorder {
 #[derive(Clone)]
 pub struct CaptureHandle {
     capture: Arc<Capture>,
-    /// Set by `wake`: `wait_for_audio` returns with no audio.
+    /// Capture closed while the pump can be waiting for audio.
     woken: Arc<AtomicBool>,
 }
 
 impl AudioRecorder {
     pub fn new() -> Result<Self, String> {
         let host = cpal::default_host();
-        let default_name = default_input_name(&host);
-        let names = ordered_input_names(&host, default_name.as_deref())?;
+        // Read the default endpoint ID and CPAL default device handle together,
+        // re-reading once if Windows switched the default in between so we never
+        // tag endpoint A with endpoint B's ID.
+        let (default_device, default_name, default_id) = read_default_device(&host);
         let mut last_error = "No microphone found. Connect a microphone and try again.".to_string();
-        for name in names {
-            match open_named(&host, &name, default_name.clone()) {
+        // Open the OS default device handle directly first so two devices that
+        // share a display name never pick the wrong endpoint.
+        let mut tried_default = false;
+        if let Some(device) = default_device {
+            if let Ok(name) = device.name() {
+                if input_priority(&name).is_some() {
+                    tried_default = true;
+                    match open_device(
+                        device,
+                        name,
+                        default_name.clone(),
+                        default_id.clone(),
+                        false,
+                    ) {
+                        Ok(recorder) => {
+                            *DEFAULT_INPUT.lock() = Some(default_id);
+                            return Ok(recorder);
+                        }
+                        Err(error) => last_error = error,
+                    }
+                }
+            }
+        }
+        // Keep the actual `cpal::Device` handles through priority sorting so
+        // two endpoints that share a display name are tried independently rather
+        // than collapsing onto the first matching name.
+        let candidates = ordered_input_devices(&host, default_name.as_deref(), tried_default)?;
+        for (name, device) in candidates {
+            match open_device(device, name, default_name.clone(), default_id.clone(), true) {
                 Ok(recorder) => {
                     // This read is newer than the last one of the watch thread.
-                    *DEFAULT_INPUT.lock() = Some(default_name);
+                    *DEFAULT_INPUT.lock() = Some(default_id);
                     return Ok(recorder);
                 }
                 Err(error) => last_error = error,
@@ -113,30 +158,20 @@ impl Converter {
     }
 }
 
-fn open_named(
-    host: &cpal::Host,
-    device_name: &str,
+fn open_device(
+    device: cpal::Device,
+    device_name: String,
     default_name: Option<String>,
+    default_id: Option<String>,
+    using_fallback: bool,
 ) -> Result<AudioRecorder, String> {
-    let device = find_input(host, device_name)
-        .ok_or_else(|| format!("Microphone {device_name} disappeared"))?;
     let supported_config = device
         .default_input_config()
         .map_err(|error| format!("{device_name}: {error}"))?;
     let sample_format = supported_config.sample_format();
     let config: cpal::StreamConfig = supported_config.into();
 
-    let capture = Arc::new(Capture {
-        is_recording: AtomicBool::new(false),
-        at_limit: AtomicBool::new(false),
-        buffer: Mutex::new(Vec::new()),
-        samples_ready: Condvar::new(),
-        captured: AtomicUsize::new(0),
-        envelope: Arc::new(Mutex::new(SpeechEnvelope::default())),
-        new_take: AtomicBool::new(false),
-        last_callback_ms: AtomicU64::new(0),
-        last_error: Mutex::new(None),
-    });
+    let capture = Arc::new(Capture::default());
 
     let input_sample_rate = config.sample_rate.0;
     let channels = config.channels.max(1) as usize;
@@ -169,10 +204,13 @@ fn open_named(
 
     Ok(AudioRecorder {
         capture,
-        device_name: device_name.to_string(),
+        device_name,
         default_name,
+        default_id,
+        using_fallback,
         format,
         opened_ms: now_ms(),
+        opened_at: Instant::now(),
         paused: AtomicBool::new(false),
         stream,
     })
@@ -205,11 +243,14 @@ impl AudioRecorder {
         if self.needs_reopen() {
             return Some("the stream stopped".to_string());
         }
-        let default_name = DEFAULT_INPUT.lock().clone()?;
-        if default_name != self.default_name {
+        if self.using_fallback && self.opened_at.elapsed() >= FALLBACK_RETRY_AFTER {
+            return Some("retrying the Windows default microphone".to_string());
+        }
+        let default_id = DEFAULT_INPUT.lock().clone()?;
+        if default_id != self.default_id {
             return Some(format!(
                 "the Windows default changed to {}",
-                default_name.as_deref().unwrap_or("none")
+                default_id.as_deref().unwrap_or("none")
             ));
         }
         None
@@ -276,6 +317,7 @@ impl AudioRecorder {
             let mut recorded = self.capture.buffer.lock();
             recorded.clear();
             self.capture.captured.store(0, Ordering::SeqCst);
+            self.capture.last_packet_age_ms.store(0, Ordering::Relaxed);
         }
         *self.capture.envelope.lock() = SpeechEnvelope::default();
         // A pending stream error stays: when the resume just before this
@@ -318,9 +360,17 @@ impl CaptureHandle {
         samples
     }
 
+    /// Stops accepting audio under the same lock that protects packet writes.
+    pub fn close(&self) {
+        let _guard = self.capture.buffer.lock();
+        self.capture.is_recording.store(false, Ordering::SeqCst);
+        self.woken.store(true, Ordering::SeqCst);
+        self.capture.samples_ready.notify_all();
+    }
+
     /// Ends the recording and takes the rest of the buffer.
     pub fn stop(&self) -> Vec<f32> {
-        self.capture.is_recording.store(false, Ordering::SeqCst);
+        self.close();
         *self.capture.envelope.lock() = SpeechEnvelope::default();
         self.capture.captured.store(0, Ordering::SeqCst);
         std::mem::take(&mut *self.capture.buffer.lock())
@@ -330,17 +380,12 @@ impl CaptureHandle {
         self.capture.at_limit.load(Ordering::Relaxed)
     }
 
-    /// Ends a `wait_for_audio` now. The release of the shortcut and the stop
-    /// of a take must not wait for the next buffer or for the timeout.
-    pub fn wake(&self) {
-        let _guard = self.capture.buffer.lock();
-        self.woken.store(true, Ordering::SeqCst);
-        self.capture.samples_ready.notify_all();
+    /// Latest CPAL capture-to-callback packet age, in milliseconds.
+    pub fn packet_age_ms(&self) -> u64 {
+        self.capture.last_packet_age_ms.load(Ordering::Relaxed)
     }
 
-    /// Block until new samples arrive, `wake` is called, or `timeout`. Must
-    /// not miss a wakeup: the condvar waits on the same mutex as the sample
-    /// buffer, and `wake` sets its flag under that mutex.
+    /// Waits for samples, capture closure, or the timeout.
     pub fn wait_for_audio(&self, timeout: std::time::Duration) {
         let mut guard = self.capture.buffer.lock();
         let start = std::time::Instant::now();
@@ -358,6 +403,7 @@ impl CaptureHandle {
 /// sample format needs no buffer of its own.
 fn process_samples<T: Copy>(
     data: &[T],
+    info: &cpal::InputCallbackInfo,
     to_f32: impl Fn(T) -> f32,
     converter: &mut Converter,
     capture: &Capture,
@@ -386,21 +432,30 @@ fn process_samples<T: Copy>(
         None => &converter.mono,
     };
 
+    let time = info.timestamp();
+    let age = time.callback.duration_since(&time.capture);
+    store_samples(capture, resampled, age);
+}
+
+fn store_samples(capture: &Capture, samples: &[f32], age: Option<std::time::Duration>) {
     let mut recorded = capture.buffer.lock();
     if !capture.is_recording.load(Ordering::SeqCst) {
         return;
     }
     let already = capture.captured.load(Ordering::SeqCst);
-    let take = MAX_TAKE_SAMPLES
-        .saturating_sub(already)
-        .min(resampled.len());
+    let take = MAX_TAKE_SAMPLES.saturating_sub(already).min(samples.len());
     if take == 0 {
         if already >= MAX_TAKE_SAMPLES {
             capture.at_limit.store(true, Ordering::SeqCst);
         }
         return;
     }
-    recorded.extend_from_slice(&resampled[..take]);
+    if let Some(age) = age {
+        capture
+            .last_packet_age_ms
+            .store(age.as_millis() as u64, Ordering::Relaxed);
+    }
+    recorded.extend_from_slice(&samples[..take]);
     let stored = capture.captured.fetch_add(take, Ordering::SeqCst) + take;
     if stored >= MAX_TAKE_SAMPLES {
         capture.at_limit.store(true, Ordering::SeqCst);
@@ -408,54 +463,71 @@ fn process_samples<T: Copy>(
     capture.samples_ready.notify_one();
 }
 
+fn default_input_identity(host: &cpal::Host) -> Option<String> {
+    voice_stt_desktop::default_capture_endpoint_id().or_else(|| default_input_name(host))
+}
+
 fn default_input_name(host: &cpal::Host) -> Option<String> {
     host.default_input_device()
         .and_then(|device| device.name().ok())
 }
 
-fn ordered_input_names(
+fn read_default_device(
+    host: &cpal::Host,
+) -> (Option<cpal::Device>, Option<String>, Option<String>) {
+    for _ in 0..2 {
+        let id_before = voice_stt_desktop::default_capture_endpoint_id();
+        let device = host.default_input_device();
+        let id_after = voice_stt_desktop::default_capture_endpoint_id();
+        if id_before == id_after {
+            let name = device.as_ref().and_then(|d| d.name().ok());
+            let id = id_after.or_else(|| name.clone());
+            return (device, name, id);
+        }
+    }
+    (None, None, default_input_identity(host))
+}
+
+fn ordered_input_devices(
     host: &cpal::Host,
     default_name: Option<&str>,
-) -> Result<Vec<String>, String> {
-    let available = host
+    skip_first_default: bool,
+) -> Result<Vec<(String, cpal::Device)>, String> {
+    let mut ranked = Vec::new();
+    for (index, device) in host
         .input_devices()
         .map_err(|error| format!("Could not list microphones: {error}"))?
-        .filter_map(|device| device.name().ok())
-        .collect::<Vec<_>>();
-    let names = preferred_input_names(default_name, &available);
-    if names.is_empty() {
-        Err("No microphone found. Connect a microphone and try again.".to_string())
-    } else {
-        Ok(names)
-    }
-}
-
-fn find_input(host: &cpal::Host, name: &str) -> Option<cpal::Device> {
-    host.input_devices()
-        .ok()?
-        .find(|device| device.name().is_ok_and(|device_name| device_name == name))
-}
-
-/// Default endpoint first, then other real inputs. Loopback endpoints are omitted.
-fn preferred_input_names(default_name: Option<&str>, available: &[String]) -> Vec<String> {
-    let mut ranked = Vec::new();
-    for (index, name) in available.iter().enumerate() {
-        if let Some(rank) = input_priority(name) {
-            ranked.push((rank, index, name.as_str()));
+        .enumerate()
+    {
+        let Ok(name) = device.name() else {
+            continue;
+        };
+        if let Some(rank) = input_priority(&name) {
+            ranked.push((rank, index, name, device));
         }
     }
     ranked.sort_by(|left, right| right.0.cmp(&left.0).then(left.1.cmp(&right.1)));
-    let mut names: Vec<String> = ranked
+    let mut devices: Vec<(String, cpal::Device)> = ranked
         .into_iter()
-        .map(|(_, _, name)| name.to_string())
+        .map(|(_, _, name, device)| (name, device))
         .collect();
     if let Some(default_name) = default_name {
-        if let Some(position) = names.iter().position(|name| name == default_name) {
-            let chosen = names.remove(position);
-            names.insert(0, chosen);
+        if let Some(position) = devices.iter().position(|(name, _)| name == default_name) {
+            let chosen = devices.remove(position);
+            if !skip_first_default {
+                devices.insert(0, chosen);
+            } else {
+                // Keep it at the end in case it was a transient open error, while
+                // letting any second endpoint with the same name try first.
+                devices.push(chosen);
+            }
         }
     }
-    names
+    if devices.is_empty() {
+        Err("No microphone found. Connect a microphone and try again.".to_string())
+    } else {
+        Ok(devices)
+    }
 }
 
 fn input_priority(name: &str) -> Option<u8> {
@@ -487,6 +559,7 @@ fn note_callback(last_callback_ms: &AtomicU64) {
 
 fn ingest<T: Copy>(
     samples: &[T],
+    info: &cpal::InputCallbackInfo,
     to_f32: impl Fn(T) -> f32,
     converter: &mut Converter,
     capture: &Capture,
@@ -498,7 +571,7 @@ fn ingest<T: Copy>(
                 resampler.reset();
             }
         }
-        process_samples(samples, to_f32, converter, capture);
+        process_samples(samples, info, to_f32, converter, capture);
     } else {
         *capture.envelope.lock() = SpeechEnvelope::default();
     }
@@ -517,8 +590,8 @@ fn build_stream(
         cpal::SampleFormat::F32 => device
             .build_input_stream(
                 config,
-                move |data: &[f32], _| {
-                    ingest(data, |sample| sample, &mut converter, &capture);
+                move |data: &[f32], info: &cpal::InputCallbackInfo| {
+                    ingest(data, info, |sample| sample, &mut converter, &capture);
                 },
                 on_error,
                 None,
@@ -527,9 +600,9 @@ fn build_stream(
         cpal::SampleFormat::I16 => device
             .build_input_stream(
                 config,
-                move |data: &[i16], _| {
+                move |data: &[i16], info: &cpal::InputCallbackInfo| {
                     let to_f32 = |sample: i16| sample as f32 / i16::MAX as f32;
-                    ingest(data, to_f32, &mut converter, &capture);
+                    ingest(data, info, to_f32, &mut converter, &capture);
                 },
                 on_error,
                 None,
@@ -538,9 +611,9 @@ fn build_stream(
         cpal::SampleFormat::I32 => device
             .build_input_stream(
                 config,
-                move |data: &[i32], _| {
+                move |data: &[i32], info: &cpal::InputCallbackInfo| {
                     let to_f32 = |sample: i32| sample as f32 / i32::MAX as f32;
-                    ingest(data, to_f32, &mut converter, &capture);
+                    ingest(data, info, to_f32, &mut converter, &capture);
                 },
                 on_error,
                 None,
@@ -549,14 +622,34 @@ fn build_stream(
         cpal::SampleFormat::U16 => device
             .build_input_stream(
                 config,
-                move |data: &[u16], _| {
+                move |data: &[u16], info: &cpal::InputCallbackInfo| {
                     let to_f32 = |sample: u16| (sample as f32 / u16::MAX as f32) * 2.0 - 1.0;
-                    ingest(data, to_f32, &mut converter, &capture);
+                    ingest(data, info, to_f32, &mut converter, &capture);
                 },
                 on_error,
                 None,
             )
             .map_err(|error| format!("Failed to build input stream: {error}")),
         _ => Err(unsupported()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn closing_capture_keeps_buffered_audio_and_rejects_late_packets() {
+        let capture = Arc::new(Capture::default());
+        capture.is_recording.store(true, Ordering::SeqCst);
+        let handle = CaptureHandle {
+            capture: Arc::clone(&capture),
+            woken: Arc::new(AtomicBool::new(false)),
+        };
+        store_samples(&capture, &[0.1, 0.2], None);
+        handle.close();
+        store_samples(&capture, &[0.9], None);
+
+        assert_eq!(handle.stop(), [0.1, 0.2]);
     }
 }

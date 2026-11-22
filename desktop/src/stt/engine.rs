@@ -4,56 +4,102 @@ use super::segment;
 use super::MAX_TAKE_SAMPLES;
 use crate::SAMPLE_RATE;
 use crossbeam_channel::{Receiver, RecvTimeoutError};
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use std::cell::Cell;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use trit::{BiasWeights, Cancel, LoadOptions, Trit};
 
-/// The first second of a take runs through the model once while the user
-/// still talks, and its text is dropped. After a long idle the first run
-/// pays for weights the system paged out and cores that slept; this moves
-/// that cost out of the wait after the release.
-const PRIME_SAMPLES: usize = SAMPLE_RATE;
-
-/// Dictation starts and ends so far; a release waits for this to stay the same.
-static DICTATIONS: AtomicU64 = AtomicU64::new(0);
 /// Idle time after a dictation before its memory goes back to the system.
-const IDLE_RELEASE: Duration = Duration::from_secs(5);
+/// Long enough that normal pauses between takes keep the warm buffer pool.
+const IDLE_RELEASE: Duration = Duration::from_secs(60);
 
-/// Returns the memory of the last dictation to the system once no new one
-/// has started for `IDLE_RELEASE`. During dictations the engine keeps its
-/// buffers, so a quick next one does not wait for the system to give them
-/// back.
-fn release_when_idle() {
-    let dictation = DICTATIONS.fetch_add(1, Ordering::Relaxed) + 1;
-    std::thread::spawn(move || {
-        std::thread::sleep(IDLE_RELEASE);
-        if DICTATIONS.load(Ordering::Relaxed) == dictation {
-            trit::release_memory();
+struct IdleState {
+    active: usize,
+    deadline: Option<Instant>,
+}
+
+struct IdleReleaser {
+    state: Mutex<IdleState>,
+    wake: Condvar,
+}
+
+impl IdleReleaser {
+    fn global() -> &'static Self {
+        static RELEASER: OnceLock<IdleReleaser> = OnceLock::new();
+        RELEASER.get_or_init(|| {
+            let releaser = IdleReleaser {
+                state: Mutex::new(IdleState {
+                    active: 0,
+                    deadline: None,
+                }),
+                wake: Condvar::new(),
+            };
+            std::thread::Builder::new()
+                .name("tdt-idle-release".to_string())
+                .spawn(|| Self::run_loop(Self::global()))
+                .ok();
+            releaser
+        })
+    }
+
+    fn run_loop(this: &'static Self) {
+        let mut guard = this.state.lock();
+        loop {
+            match guard.deadline {
+                None => this.wake.wait(&mut guard),
+                Some(deadline) => {
+                    let now = Instant::now();
+                    if now < deadline {
+                        this.wake.wait_for(&mut guard, deadline - now);
+                        continue;
+                    }
+                    if guard.active == 0 {
+                        guard.deadline = None;
+                        trit::release_memory();
+                    } else {
+                        guard.deadline = None;
+                    }
+                }
+            }
         }
-    });
+    }
+
+    fn start_dictation(&self) {
+        let mut guard = self.state.lock();
+        guard.active += 1;
+        guard.deadline = None;
+    }
+
+    fn end_dictation(&self) {
+        let mut guard = self.state.lock();
+        guard.active -= 1;
+        if guard.active == 0 {
+            guard.deadline = Some(Instant::now() + IDLE_RELEASE);
+            self.wake.notify_one();
+        }
+    }
 }
 
 /// One dictation, from its start to its end. A release that waits from the
-/// dictation before does not run during this one. Each end starts the wait
-/// for the next release, also the end with an error: the engine holds the
-/// buffers of a take that failed as it holds those of a take with text.
+/// dictation before does not run during this one. Each end schedules the
+/// single idle-release worker, also the end with an error: the engine holds
+/// the buffers of a take that failed as it holds those of a take with text.
 struct Dictation;
 
 impl Dictation {
     fn start() -> Self {
-        DICTATIONS.fetch_add(1, Ordering::Relaxed);
+        IdleReleaser::global().start_dictation();
         Self
     }
 }
 
 impl Drop for Dictation {
     fn drop(&mut self) {
-        release_when_idle();
+        IdleReleaser::global().end_dictation();
     }
 }
 
@@ -135,7 +181,8 @@ fn join(text: &str, part: String, start: usize) -> Option<String> {
 }
 
 /// The text of the whole take, from the windows so far and the speech
-/// from `window` on, and the samples that the model read for it.
+/// from `window` on, the samples that the model read for it, and whether
+/// a multi-window take fell back to reading the whole audio from 0.
 fn read_rest(
     engine: &Trit,
     text: &Option<String>,
@@ -143,45 +190,80 @@ fn read_rest(
     window: usize,
     end_quiet: usize,
     cancel: Option<&Cancel>,
-) -> Result<(String, usize), String> {
+) -> Result<(String, usize, bool), String> {
+    if cancel.is_some_and(Cancel::is_cancelled) {
+        return Ok((String::new(), 0, false));
+    }
     let joined = match text {
-        Some(done) => join(
-            done,
-            read_end(engine, &captured[window..], end_quiet, cancel)?,
-            window,
-        ),
+        Some(done) => {
+            let part = read_end(engine, &captured[window..], end_quiet, cancel)?;
+            if cancel.is_some_and(Cancel::is_cancelled) {
+                return Ok((String::new(), 0, false));
+            }
+            join(done, part, window)
+        }
         None => None,
     };
+    if cancel.is_some_and(Cancel::is_cancelled) {
+        return Ok((String::new(), 0, false));
+    }
     Ok(match joined {
-        Some(text) => (text, captured.len() - window),
+        Some(text) => (text, captured.len() - window, false),
         None => (
             read_end(engine, captured, end_quiet, cancel)?,
             captured.len(),
+            window > 0,
         ),
     })
 }
 
-/// A stopped read ends at the next encoder block, in milliseconds. This limit
-/// is for a read that does not end: the take must not wait for it.
-const QUIET_STOP_WAIT: Duration = Duration::from_secs(2);
+/// Upper bound when waiting on a quiet read after the user stops talking.
+/// A stalled background read must never leave the pill stuck on Transcribing.
+const QUIET_FINISH_WAIT: Duration = Duration::from_secs(15);
+/// Grace period for a previously timed-out quiet worker to finish exiting
+/// before a subsequent take refuses to block behind it on Trit's `submit` lock.
+const QUIET_RECOVERY_WAIT: Duration = Duration::from_millis(500);
 
-/// A quiet read runs now. This stays set until the thread of the read ends,
-/// also when the take that started the read has stopped waiting for it.
-static QUIET_READ_RUNS: AtomicBool = AtomicBool::new(false);
+static QUIET_SLOT: (Mutex<bool>, Condvar) = (Mutex::new(false), Condvar::new());
 
-/// The right to run the one quiet read. Dropping it gives the right back.
 struct QuietSlot;
 
 impl QuietSlot {
-    /// `None` while another read runs.
     fn claim() -> Option<Self> {
-        (!QUIET_READ_RUNS.swap(true, Ordering::AcqRel)).then_some(Self)
+        let mut running = QUIET_SLOT.0.lock();
+        if *running {
+            return None;
+        }
+        *running = true;
+        Some(Self)
+    }
+
+    fn wait_until_free(timeout: Duration) -> bool {
+        let mut running = QUIET_SLOT.0.lock();
+        let deadline = Instant::now() + timeout;
+        while *running {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            QUIET_SLOT.1.wait_for(&mut running, remaining);
+        }
+        true
     }
 }
 
 impl Drop for QuietSlot {
     fn drop(&mut self) {
-        QUIET_READ_RUNS.store(false, Ordering::Release);
+        *QUIET_SLOT.0.lock() = false;
+        QUIET_SLOT.1.notify_all();
+    }
+}
+
+fn await_quiet_worker() -> Result<(), TakeError> {
+    if QuietSlot::wait_until_free(QUIET_RECOVERY_WAIT) {
+        Ok(())
+    } else {
+        Err("The previous speech job is still finishing. Wait a moment and try again.".into())
     }
 }
 
@@ -216,14 +298,19 @@ impl QuietPoint {
 
 /// A read of the take in the quiet after the speech, on its own thread: new
 /// audio must reach the capture loop during the read, so the loop can stop a
-/// read that new speech made useless. Dropping the read stops it and waits
-/// for its end, for `QUIET_STOP_WAIT` at most, so the next read does not run
-/// next to it. A read that does not end keeps its `QuietSlot`: no other quiet
-/// read starts, and the take reads the same audio after the release.
+/// read that new speech made useless. Dropping cancels the read immediately
+/// without blocking the capture loop; `QuietSlot` stays held until the
+/// cancelled thread exits, preventing overlapping quiet reads.
 struct QuietRead {
     point: QuietPoint,
     cancel: Cancel,
-    result: Receiver<Result<String, String>>,
+    result: Receiver<Result<(String, bool), String>>,
+}
+
+enum QuietWait {
+    Finished(Result<(String, bool), String>),
+    Disconnected,
+    TimedOut,
 }
 
 impl QuietRead {
@@ -242,6 +329,9 @@ impl QuietRead {
         let flag = cancel.clone();
         let (engine, text, samples) = (Arc::clone(engine), text.clone(), heard.to_vec());
         std::thread::spawn(move || {
+            // Count the quiet worker's full lifetime in `IdleReleaser` so the
+            // 60 s idle trim cannot fire while a quiet read is still active.
+            let _active = Dictation::start();
             let read = read_rest(
                 &engine,
                 &text,
@@ -252,7 +342,7 @@ impl QuietRead {
             );
             // First the slot: a wait that ends at the send can start a read.
             drop(slot);
-            let _ = done.send(read.map(|(text, _)| text));
+            let _ = done.send(read.map(|(text, _, fallback)| (text, fallback)));
         });
         Some(Self {
             point,
@@ -261,21 +351,29 @@ impl QuietRead {
         })
     }
 
-    /// Waits for the text; `None` when the read died.
-    fn wait(self) -> Option<Result<String, String>> {
-        self.result.recv().ok()
+    /// Cancels the worker if it cannot finish by the deadline.
+    fn wait_for(self, timeout: Duration) -> QuietWait {
+        match self.result.recv_timeout(timeout) {
+            Ok(result) => QuietWait::Finished(result),
+            Err(RecvTimeoutError::Timeout) => {
+                self.cancel.cancel();
+                crate::log::note(&format!(
+                    "A read in the quiet did not finish in {timeout:?}; aborting this take."
+                ));
+                QuietWait::TimedOut
+            }
+            Err(RecvTimeoutError::Disconnected) => QuietWait::Disconnected,
+        }
+    }
+
+    fn wait(self) -> QuietWait {
+        self.wait_for(QUIET_FINISH_WAIT)
     }
 }
 
 impl Drop for QuietRead {
     fn drop(&mut self) {
         self.cancel.cancel();
-        // After `wait` the channel is empty and closes at once.
-        if let Err(RecvTimeoutError::Timeout) = self.result.recv_timeout(QUIET_STOP_WAIT) {
-            crate::log::note(&format!(
-                "A stopped read in the quiet did not end in {QUIET_STOP_WAIT:?}."
-            ));
-        }
     }
 }
 
@@ -326,8 +424,14 @@ pub struct StopTimes {
     /// The user asked the take to stop: a hold came up, a stopping tap went
     /// down, or TDT stopped the take itself. The latency starts here.
     pub asked: Instant,
-    /// The microphone closed, after the last word ended.
+    /// The UI loop dispatched the stop request to the capture pump.
+    pub dispatched: Instant,
+    /// Capture stopped accepting audio.
     pub closed: Instant,
+    /// Audio captured after `dispatched`, in milliseconds of 16 kHz samples.
+    pub tail_audio_ms: u64,
+    /// Latest CPAL capture-to-callback packet age observed during the take.
+    pub packet_age_ms: u64,
 }
 
 impl StopTimes {
@@ -336,9 +440,77 @@ impl StopTimes {
         let now = Instant::now();
         Self {
             asked: now,
+            dispatched: now,
             closed: now,
+            tail_audio_ms: 0,
+            packet_age_ms: 0,
         }
     }
+}
+
+/// Per-take timing and fault signals logged whenever a take is unusually slow.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TakeDiagnostics {
+    /// Time between `asked` (hook event) and UI dispatch (`begin_stop`).
+    pub dispatch_ms: u64,
+    /// Milliseconds of 16 kHz audio captured after `begin_stop`.
+    pub tail_audio_ms: u64,
+    /// Latest CPAL capture-to-callback packet age in milliseconds.
+    pub packet_age_ms: u64,
+    /// Time spent waiting for model preparation before capture processing began.
+    pub wait_prepare_ms: u64,
+    /// Time spent waiting on an in-flight `QuietRead` after key release.
+    pub quiet_wait_ms: u64,
+    /// True if a multi-window take fell back to transcribing the whole audio.
+    pub whole_fallback: bool,
+    /// True if an empty take was retried with amplified quiet speech.
+    pub boost_retry: bool,
+    /// Process page faults observed during this take (`None` if OS query failed).
+    pub page_faults: Option<u32>,
+}
+
+impl std::fmt::Display for TakeDiagnostics {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "dispatch {} ms, tail_audio {} ms, pkt_age {} ms, prepare {} ms, quiet_wait {} ms, faults ",
+            self.dispatch_ms,
+            self.tail_audio_ms,
+            self.packet_age_ms,
+            self.wait_prepare_ms,
+            self.quiet_wait_ms,
+        )?;
+        match self.page_faults {
+            Some(faults) => write!(f, "{faults}")?,
+            None => f.write_str("n/a")?,
+        }
+        write!(
+            f,
+            ", whole_fallback {}, boost_retry {}",
+            self.whole_fallback, self.boost_retry
+        )
+    }
+}
+
+#[cfg(windows)]
+fn process_page_faults() -> Option<u32> {
+    use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    use windows::Win32::System::Threading::GetCurrentProcess;
+    let mut counters = PROCESS_MEMORY_COUNTERS::default();
+    let size = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+    // SAFETY: `GetCurrentProcess` returns the current process pseudo-handle and
+    // `counters` is valid for `size` bytes.
+    let ok = unsafe { GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, size) }.is_ok();
+    ok.then_some(counters.PageFaultCount)
+}
+
+#[cfg(not(windows))]
+fn process_page_faults() -> Option<u32> {
+    None
+}
+
+fn page_fault_delta(before: Option<u32>, after: Option<u32>) -> Option<u32> {
+    Some(after?.saturating_sub(before?))
 }
 
 pub struct LiveTranscript {
@@ -352,6 +524,7 @@ pub struct LiveTranscript {
     pub stop: StopTimes,
     /// The model's text was ready.
     pub transcribed: Instant,
+    pub diagnostics: TakeDiagnostics,
 }
 
 impl LiveTranscript {
@@ -439,18 +612,53 @@ impl SttEngine {
         }
         // The cache maps the converted weights from a file next to the
         // model, so they count as file memory, not TDT's private memory.
+        let started = Instant::now();
         let options = LoadOptions {
             cache: true,
             precision: self.precision,
             ..LoadOptions::default()
         };
         let engine = Trit::load_reporting(&self.model_dir, &options, progress)?;
-        *self.native.lock() = Some(Arc::new(engine));
+        let cache_state = if engine.loaded_from_cache() {
+            "hit"
+        } else {
+            "rebuilt"
+        };
+        crate::log::note(&format!(
+            "Speech model ready in {} ms (cache {cache_state}).",
+            started.elapsed().as_millis()
+        ));
+        let engine = Arc::new(engine);
+        *self.native.lock() = Some(Arc::clone(&engine));
         // Loading converts weights through buffers that are freed again.
         trit::release_memory();
+        // Fault mapped weight pages into the working set in the background so
+        // startup stays fast and the first take does not stall on PTE faults.
+        std::thread::spawn(move || engine.prefetch_weights());
         // A fresh engine has no dictionary yet.
         *self.dictionary.lock() = dictionary::Watch::default();
         Ok(())
+    }
+
+    /// True when the loaded engine mapped an existing weight cache directly.
+    pub fn loaded_from_cache(&self) -> bool {
+        self.native
+            .lock()
+            .as_ref()
+            .is_some_and(|engine| engine.loaded_from_cache())
+    }
+
+    /// Hints to the OS to fault mapped weight pages into RAM sequentially.
+    pub fn prefetch_weights(&self) {
+        if let Some(engine) = self.native.lock().clone() {
+            engine.prefetch_weights();
+        }
+    }
+
+    /// True when this model appends digital quiet context after the final
+    /// audio (used to select the guarded post-release tail stop).
+    pub fn has_end_quiet(&self) -> bool {
+        self.end_quiet > 0
     }
 
     /// Applies the user's dictionary file when it changed.
@@ -478,12 +686,28 @@ impl SttEngine {
         rx: &Receiver<LiveAudio>,
     ) -> Result<LiveTranscript, TakeError> {
         let _dictation = Dictation::start();
+        await_quiet_worker()?;
+        let faults_before = process_page_faults();
+        let prepare_start = Instant::now();
+        let was_loaded = self.native.lock().is_some();
         self.prepare().map_err(|error| {
             format!("Could not load the speech model. Choose another model in Settings. {error}")
         })?;
+        let wait_prepare_ms = if was_loaded {
+            0
+        } else {
+            prepare_start.elapsed().as_millis() as u64
+        };
         self.refresh_dictionary();
         let native = self.native.lock().clone();
         let engine = native.ok_or("The speech model is not loaded.")?;
+        // Prefetch mapped weights sequentially at t = 0 on a helper thread so
+        // evicted weight pages return to RAM while the user speaks, covering
+        // takes shorter than 1 s without blocking `rx`.
+        {
+            let prefetch_engine = Arc::clone(&engine);
+            std::thread::spawn(move || prefetch_engine.prefetch_weights());
+        }
         let mut captured: Vec<f32> = Vec::new();
         // The windows so far are in `text`, `None` once two did not join; the
         // next one starts at `window`.
@@ -492,7 +716,6 @@ impl SttEngine {
         let mut windows_end = 0;
         let mut text = Some(String::new());
         let mut last_any = Instant::now();
-        let mut primed = false;
         let mut speech = segment::EndOfSpeech::default();
         // The audio of the final text while the user stays quiet, and the
         // read of that audio.
@@ -508,10 +731,6 @@ impl SttEngine {
                     if captured.len() < MAX_TAKE_SAMPLES {
                         let room = MAX_TAKE_SAMPLES - captured.len();
                         captured.extend_from_slice(&samples[..samples.len().min(room)]);
-                        if !primed && captured.len() >= PRIME_SAMPLES {
-                            primed = true;
-                            transcribe_samples(&engine, &captured[..PRIME_SAMPLES], None)?;
-                        }
                         // Read full windows while the user still talks. New
                         // chunks wait in the channel meanwhile.
                         while captured.len() - window >= segment::WINDOW_SAMPLES {
@@ -520,6 +739,7 @@ impl SttEngine {
                             };
                             // The next window makes the read old.
                             quiet = None;
+                            await_quiet_worker()?;
                             let end = window + segment::WINDOW_SAMPLES;
                             let part = transcribe_samples(&engine, &captured[window..end], None)?;
                             text = join(done, part, window);
@@ -528,17 +748,22 @@ impl SttEngine {
                         }
                         speech.update(&captured);
                         point = QuietPoint::of(&speech, window, windows_end);
-                        // New speech or a window made the read old. It ends
-                        // before the next one starts.
+                        // New speech or a window made the read old.
                         if quiet.as_ref().is_some_and(|read| Some(read.point) != point) {
                             quiet = None;
                         }
                         if let Some(point) = point {
                             if read_point != Some(point) {
-                                read_point = Some(point);
                                 let heard = &captured[..point.heard];
-                                quiet =
-                                    QuietRead::start(&engine, &text, heard, point, self.end_quiet);
+                                if let Some(started) =
+                                    QuietRead::start(&engine, &text, heard, point, self.end_quiet)
+                                {
+                                    // Record `read_point` only once the slot is claimed, so a
+                                    // busy slot retries on the next chunk instead of skipping
+                                    // pre-transcription for this pause permanently.
+                                    read_point = Some(point);
+                                    quiet = Some(started);
+                                }
                             }
                         }
                     }
@@ -566,6 +791,11 @@ impl SttEngine {
         // capture cap truncated it.
         let duration_secs = captured.len() as f32 / SAMPLE_RATE as f32;
 
+        let dispatch_ms = stop
+            .dispatched
+            .saturating_duration_since(stop.asked)
+            .as_millis() as u64;
+
         if captured.is_empty() {
             return Ok(LiveTranscript {
                 text: String::new(),
@@ -574,6 +804,14 @@ impl SttEngine {
                 last_part_secs: 0.0,
                 stop,
                 transcribed: Instant::now(),
+                diagnostics: TakeDiagnostics {
+                    dispatch_ms,
+                    tail_audio_ms: stop.tail_audio_ms,
+                    packet_age_ms: stop.packet_age_ms,
+                    wait_prepare_ms,
+                    page_faults: page_fault_delta(faults_before, process_page_faults()),
+                    ..TakeDiagnostics::default()
+                },
             });
         }
 
@@ -581,24 +819,53 @@ impl SttEngine {
         // the audio up to that point, with or without a read that ran before
         // the release. The read only moves the work to the time before the
         // release. A read that new speech or a window made old has stopped.
-        let (mut text, last_part) = match point {
-            Some(point) => match quiet.and_then(QuietRead::wait) {
-                Some(read) => (read?, 0),
-                None => read_rest(
-                    &engine,
-                    &text,
-                    &captured[..point.heard],
-                    window,
-                    self.end_quiet,
-                    None,
-                )?,
-            },
-            None => read_rest(&engine, &text, &captured, window, self.end_quiet, None)?,
+        let mut quiet_wait_ms = 0u64;
+        let (mut text, last_part, whole_fallback) = match point {
+            Some(point) => {
+                let quiet_result = if let Some(read) = quiet {
+                    let wait_start = Instant::now();
+                    let result = read.wait();
+                    quiet_wait_ms = wait_start.elapsed().as_millis() as u64;
+                    Some(result)
+                } else {
+                    None
+                };
+                match quiet_result {
+                    Some(QuietWait::Finished(read)) => {
+                        let (text, fallback) = read?;
+                        (text, 0, fallback)
+                    }
+                    Some(QuietWait::TimedOut) => {
+                        return Err(
+                            "The speech engine took too long to finish this take. Try again."
+                                .into(),
+                        );
+                    }
+                    Some(QuietWait::Disconnected) | None => {
+                        await_quiet_worker()?;
+                        read_rest(
+                            &engine,
+                            &text,
+                            &captured[..point.heard],
+                            window,
+                            self.end_quiet,
+                            None,
+                        )?
+                    }
+                }
+            }
+            None => {
+                drop(quiet);
+                await_quiet_worker()?;
+                read_rest(&engine, &text, &captured, window, self.end_quiet, None)?
+            }
         };
         let last_part_secs = last_part as f32 / SAMPLE_RATE as f32;
 
+        let mut boost_retry = false;
         if text.is_empty() {
             if let Some(boosted) = boost_quiet_speech(&captured) {
+                boost_retry = true;
                 if let Ok(boosted_text) = read_end(&engine, &boosted, self.end_quiet, None) {
                     text = boosted_text;
                 }
@@ -606,6 +873,16 @@ impl SttEngine {
         }
 
         let transcribed = Instant::now();
+        let diagnostics = TakeDiagnostics {
+            dispatch_ms,
+            tail_audio_ms: stop.tail_audio_ms,
+            packet_age_ms: stop.packet_age_ms,
+            wait_prepare_ms,
+            quiet_wait_ms,
+            whole_fallback,
+            boost_retry,
+            page_faults: page_fault_delta(faults_before, process_page_faults()),
+        };
         Ok(LiveTranscript {
             text,
             audio: captured,
@@ -613,6 +890,7 @@ impl SttEngine {
             last_part_secs,
             stop,
             transcribed,
+            diagnostics,
         })
     }
 
@@ -694,4 +972,74 @@ pub(crate) fn boost_quiet_speech(samples: &[f32]) -> Option<Vec<f32>> {
 fn frame_rms(frame: &[f32]) -> f32 {
     let sum = frame.iter().map(|sample| sample * sample).sum::<f32>();
     (sum / frame.len() as f32).sqrt()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quiet_read_drop_cancels_without_blocking() {
+        let cancel = Cancel::new();
+        let (_tx, rx) = crossbeam_channel::bounded::<Result<(String, bool), String>>(1);
+        let read = QuietRead {
+            point: QuietPoint {
+                end: 100,
+                window: 0,
+                heard: 1600,
+            },
+            cancel: cancel.clone(),
+            result: rx,
+        };
+        let started = Instant::now();
+        drop(read);
+        assert!(cancel.is_cancelled(), "dropping QuietRead must cancel it");
+        assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "dropping QuietRead must not block the capture loop: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn quiet_read_wait_timeout_cancels_and_returns_timed_out() {
+        let cancel = Cancel::new();
+        let (_tx, rx) = crossbeam_channel::bounded::<Result<(String, bool), String>>(1);
+        let read = QuietRead {
+            point: QuietPoint {
+                end: 100,
+                window: 0,
+                heard: 1600,
+            },
+            cancel: cancel.clone(),
+            result: rx,
+        };
+        let started = Instant::now();
+        let outcome = read.wait_for(Duration::from_millis(20));
+        assert!(matches!(outcome, QuietWait::TimedOut));
+        assert!(
+            cancel.is_cancelled(),
+            "timeout must cancel the quiet worker"
+        );
+        assert!(started.elapsed() < Duration::from_millis(250));
+    }
+
+    #[test]
+    fn quiet_slot_waits_for_cancelled_worker_to_release() {
+        let slot = QuietSlot::claim().expect("claim slot");
+        assert!(QuietSlot::claim().is_none());
+        assert!(
+            !QuietSlot::wait_until_free(Duration::from_millis(20)),
+            "recovery must report false while the worker holds the slot"
+        );
+        let holder = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            drop(slot);
+        });
+        assert!(
+            QuietSlot::wait_until_free(Duration::from_millis(250)),
+            "recovery must unblock as soon as the worker drops its slot"
+        );
+        holder.join().expect("holder exits");
+    }
 }

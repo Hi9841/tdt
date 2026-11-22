@@ -14,9 +14,11 @@ fn log_file() -> PathBuf {
 
 const MAX_LOG_BYTES: u64 = 512 * 1024;
 
+static LOG_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
 pub fn append(message: &str) {
-    let path = log_file();
-    let mut path = path;
+    let _guard = LOG_LOCK.lock();
+    let mut path = log_file();
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
@@ -27,16 +29,26 @@ pub fn append(message: &str) {
             path = std::env::temp_dir().join("tdt.log");
             OpenOptions::new().create(true).append(true).open(&path)
         });
-    if let Ok(ref mut file) = file {
-        if let Ok(metadata) = file.metadata() {
-            if metadata.len() > MAX_LOG_BYTES {
-                // Keep the latest half rather than growing forever.
-                if let Ok(contents) = std::fs::read(&path) {
-                    let keep = &contents[contents.len() / 2..];
-                    let _ = std::fs::write(&path, keep);
-                }
+    if let Ok(existing) = file {
+        let needs_rotate = existing
+            .metadata()
+            .is_ok_and(|meta| meta.len() > MAX_LOG_BYTES);
+        if needs_rotate {
+            drop(existing);
+            if let Ok(contents) = std::fs::read(&path) {
+                let half = contents.len() / 2;
+                let start = contents[half..]
+                    .iter()
+                    .position(|&b| b == b'\n')
+                    .map_or(contents.len(), |offset| half + offset + 1);
+                let _ = std::fs::write(&path, &contents[start..]);
             }
+            file = OpenOptions::new().create(true).append(true).open(&path);
+        } else {
+            file = Ok(existing);
         }
+    }
+    if let Ok(ref mut file) = file {
         let _ = writeln!(file, "{} {message}", crate::clock::local_hms());
     }
 }

@@ -65,14 +65,18 @@ fn write_json_atomic<T: Serialize>(
     path: &std::path::Path,
     value: &T,
 ) -> Result<(), std::io::Error> {
+    static WRITE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     let json = serde_json::to_string_pretty(value).map_err(std::io::Error::other)?;
-    let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, json)?;
-    fs::rename(&tmp, path)?;
-    Ok(())
+    let seq = WRITE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_extension(format!("json.{}.{seq}.tmp", std::process::id()));
+    let write_res = fs::write(&tmp, json).and_then(|()| fs::rename(&tmp, path));
+    if write_res.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    write_res
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -144,7 +148,7 @@ impl AppConfig {
         }
     }
 
-    pub fn save(&self) -> Result<(), std::io::Error> {
+    fn save(&self) -> Result<(), std::io::Error> {
         write_json_atomic(&Self::config_path(), self)
     }
 }
@@ -159,6 +163,8 @@ pub struct Settings {
     persist: bool,
 }
 
+static CONFIG_FILE_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
 impl Settings {
     pub fn new(config: AppConfig, persist: bool) -> Self {
         Self {
@@ -169,6 +175,7 @@ impl Settings {
 
     /// Writes the settings of this run to the file.
     pub fn save(&self) -> Result<(), std::io::Error> {
+        let _file = CONFIG_FILE_LOCK.lock();
         if self.persist {
             self.live.lock().save()?;
         }
@@ -183,6 +190,7 @@ impl Settings {
     /// again first, so a change keeps the other values in the file. When the
     /// file cannot be written, this run keeps its settings.
     pub fn update(&self, change: impl Fn(&mut AppConfig)) -> Result<(), std::io::Error> {
+        let _file = CONFIG_FILE_LOCK.lock();
         if self.persist {
             let mut file = AppConfig::load();
             change(&mut file);

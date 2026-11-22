@@ -1,12 +1,12 @@
 use async_channel::{Receiver, Sender};
 use parking_lot::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HotkeyAction {
-    PressStarted,
+    PressStarted(u64),
     /// A hold came up. The `Instant` is the key-up: a hold asks the take to
     /// stop when the user lets go.
     HoldReleased(Instant),
@@ -238,23 +238,22 @@ fn send_action(action: HotkeyAction) {
     }
 }
 
-/// The key that last counted as typing, for the delivery log. 0 is none.
-static TYPED_KEY: AtomicU16 = AtomicU16::new(0);
+// The upper bits count key events. The lower 16 bits hold the latest key.
+static TYPED_EVENT: AtomicU64 = AtomicU64::new(0);
 
-/// Forget earlier keys. Called when the shortcut goes down, and when a click
-/// starts or stops a dictation.
-pub fn reset_user_typed() {
-    TYPED_KEY.store(0, Ordering::SeqCst);
+pub fn typed_generation() -> u64 {
+    TYPED_EVENT.load(Ordering::SeqCst) >> 16
 }
 
-/// A physical non-modifier key arrived, or a key was already down at release.
 pub fn note_user_typed(vk: u16) {
-    TYPED_KEY.store(vk.max(1), Ordering::SeqCst);
+    let _ = TYPED_EVENT.try_update(Ordering::SeqCst, Ordering::SeqCst, |event| {
+        Some(((event & !0xffff).wrapping_add(1 << 16)) | u64::from(vk))
+    });
 }
 
-/// The key the user pressed since the dictation started, if any.
-pub fn user_typed() -> Option<u16> {
-    Some(TYPED_KEY.load(Ordering::SeqCst)).filter(|&vk| vk != 0)
+pub fn user_typed_since(generation: u64) -> Option<u16> {
+    let event = TYPED_EVENT.load(Ordering::SeqCst);
+    (event >> 16 != generation).then_some(event as u16)
 }
 
 /// Mouse buttons are 0x01 through 0x06. The shortcut key and modifiers are not typing.
@@ -276,8 +275,7 @@ fn start_press() {
     let mut start_guard = PRESS_START.lock();
     if start_guard.is_none() {
         *start_guard = Some(Instant::now());
-        reset_user_typed();
-        send_action(HotkeyAction::PressStarted);
+        send_action(HotkeyAction::PressStarted(typed_generation()));
     }
 }
 
@@ -611,24 +609,6 @@ fn key_down(vk: i32) -> bool {
     use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
     // SAFETY: GetAsyncKeyState takes no pointers.
     unsafe { GetAsyncKeyState(vk) as u16 & 0x8000 != 0 }
-}
-
-/// Keys and mouse buttons that are down right now. Index is the virtual-key code.
-pub fn input_mask() -> [bool; 256] {
-    let mut mask = [false; 256];
-    for (vk, slot) in mask.iter_mut().enumerate().skip(1) {
-        *slot = key_down(vk as i32);
-    }
-    mask
-}
-
-/// A key or button that was up when `baseline` was taken and is down now.
-/// Modifiers are ignored so the shortcut's Ctrl can stay held.
-pub fn input_appeared(baseline: &[bool; 256]) -> Option<u16> {
-    let now = input_mask();
-    (0..now.len())
-        .find(|&vk| now[vk] && !baseline[vk] && !crate::keys::is_modifier(vk as u16))
-        .map(|vk| vk as u16)
 }
 
 /// A key or mouse button, other than the shortcut, that is down now.

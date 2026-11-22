@@ -1166,6 +1166,16 @@ impl HudView {
                     latency_ms,
                     notice,
                 } => self.show_success(text, auto_pasted, latency_ms, notice),
+                ViewChange::PostDelivery { clipboard_failed } => {
+                    self.stats = AppStats::load();
+                    if clipboard_failed && matches!(self.status, HudStatus::Success { .. }) {
+                        self.recovery = Some(Recovery {
+                            message: "TDT typed the text, but could not copy it to the clipboard."
+                                .into(),
+                            kind: ErrorKind::Other,
+                        });
+                    }
+                }
                 ViewChange::TakeError(error) => self.show_take_error(error),
                 ViewChange::NoSpeech => self.show_no_speech(),
                 ViewChange::MicrophoneReady => self.microphone_ready(),

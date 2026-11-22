@@ -1,6 +1,6 @@
 [package]
 name = "voice-stt-desktop"
-version = "0.9.10"
+version = "0.9.11"
 edition = "2021"
 description = "TDT (Talk Don't Type), native offline speech-to-text built with Rust and GPUI, with its own Parakeet speech engine"
 license = "PolyForm-Noncommercial-1.0.0"
@@ -28,6 +28,10 @@ path = "src/bin/bench_asr.rs"
 name = "download-model"
 path = "src/bin/download_model.rs"
 
+[[bin]]
+name = "test-stability"
+path = "src/bin/test_stability.rs"
+
 [dependencies]
 # Ely pins this Zed revision. A crates.io gpui would be a different type universe.
 gpui = { git = "https://github.com/zed-industries/zed", rev = "1a28cff4b409169bac058bca40dfbfeb7621d19b", default-features = false, features = ["stacker"] }
@@ -41,7 +45,7 @@ crossbeam-channel = "0.5"
 # The hotkey channel: the UI loop awaits it, so a key press wakes the loop at once.
 async-channel = "2.5"
 parking_lot = "0.12"
-trit = { git = "https://github.com/Hi9841/trit", rev = "090c4b3792640cd8c07e91071e5b725162159748" }
+trit = { git = "https://github.com/Hi9841/trit", rev = "20184e14b4bc2b46575536220f04c180c3cbb147" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 directories = "5.0"
@@ -67,7 +71,8 @@ windows = { version = "0.58", features = [
     "Win32_System_Registry",
     "Win32_System_TaskScheduler",
     "Win32_UI_Shell",
-    "Win32_Storage_FileSystem"
+    "Win32_Storage_FileSystem",
+    "Win32_System_ProcessStatus"
 ] }
 
 [build-dependencies]

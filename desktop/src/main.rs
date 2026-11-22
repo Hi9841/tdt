@@ -448,7 +448,9 @@ fn main() {
                                         cx.notify();
                                     });
                                 }
-                                HotkeyAction::PressStarted => input.push(Input::Press),
+                                HotkeyAction::PressStarted(generation) => {
+                                    input.push(Input::Press(generation))
+                                }
                                 HotkeyAction::HoldReleased(asked) => {
                                     input.push(Input::HoldReleased(asked))
                                 }
