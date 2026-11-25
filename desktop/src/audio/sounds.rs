@@ -31,6 +31,7 @@ pub fn prewarm() {
     }
 }
 
+#[cfg(windows)]
 pub fn play_sound(effect: SoundEffect) {
     let wav_bytes: &'static [u8] = wav_for(effect);
 
@@ -51,6 +52,29 @@ pub fn play_sound(effect: SoundEffect) {
         );
     }
 }
+
+#[cfg(target_os = "macos")]
+pub fn play_sound(effect: SoundEffect) {
+    let name = match effect {
+        SoundEffect::StartListening => "tdt-start.wav",
+        SoundEffect::StopListening => "tdt-stop.wav",
+        SoundEffect::Success => "tdt-success.wav",
+        SoundEffect::Error => "tdt-error.wav",
+    };
+    let path = std::env::temp_dir().join(name);
+    if !path.exists() {
+        let _ = std::fs::write(&path, wav_for(effect));
+    }
+    let _ = std::process::Command::new("/usr/bin/afplay")
+        .arg(&path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+pub fn play_sound(_effect: SoundEffect) {}
 
 fn wav_for(effect: SoundEffect) -> &'static [u8] {
     match effect {

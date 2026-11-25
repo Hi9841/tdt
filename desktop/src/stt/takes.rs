@@ -21,7 +21,7 @@ pub fn save(samples: &[f32], text: &str) -> Result<(), String> {
     if samples.is_empty() {
         return Ok(());
     }
-    let dir = folder().ok_or("LOCALAPPDATA is not set")?;
+    let dir = folder().ok_or("TDT data directory is not set")?;
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("Could not create {}: {e}", dir.display()))?;
     let stamp = std::time::SystemTime::now()

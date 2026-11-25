@@ -1,14 +1,19 @@
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
-#[cfg(not(target_os = "windows"))]
-compile_error!("TDT desktop is a Windows-only build.");
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+compile_error!("TDT desktop supports Windows and macOS.");
 
 mod audio;
+#[cfg(windows)]
+mod autostart;
+#[cfg(target_os = "macos")]
+#[path = "autostart_macos.rs"]
 mod autostart;
 mod clock;
 mod config;
 mod dictation;
 mod hotkey;
+#[cfg(windows)]
 mod integrity;
 mod keys;
 mod logfile;
@@ -169,6 +174,8 @@ fn main() {
     let stt_for_view = stt_engine.clone();
 
     app.run(move |cx: &mut App| {
+        #[cfg(target_os = "macos")]
+        ui::window_util::configure_accessory_app();
         ely_gpui_component::init(cx);
         ui::theme::install(cx);
         // Windows requires the event loop to exist before creating the tray icon.
@@ -282,8 +289,13 @@ fn main() {
                 .detach();
                 // Alt+F4 or another close message closes the panel. TDT lives
                 // in the tray, so only Quit in the tray menu ends it.
+                let quitting_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let quitting_for_close = Arc::clone(&quitting_flag);
                 let hud = cx.weak_entity();
                 window.on_window_should_close(cx, move |_, cx| {
+                    if quitting_for_close.load(std::sync::atomic::Ordering::SeqCst) {
+                        return true;
+                    }
                     let _ = hud.update(cx, |view, cx| view.close_stats_settings(cx));
                     false
                 });
@@ -355,6 +367,7 @@ fn main() {
                         while let Ok(event) = menu_rx.try_recv() {
                             if let Some(ref tray) = tray {
                                 if event.id == tray.quit_item.id() {
+                                    quitting_flag.store(true, std::sync::atomic::Ordering::SeqCst);
                                     let _ = this.update(cx, |_, cx| {
                                         cx.quit();
                                     });
@@ -387,6 +400,7 @@ fn main() {
                         // Setup replaces TDT.exe, so TDT quits like the Quit
                         // item and removes its tray icon first.
                         if !quitting && *update_phase.lock() == UpdatePhase::Installing {
+                            quitting_flag.store(true, std::sync::atomic::Ordering::SeqCst);
                             let _ = this.update(cx, |_, cx| cx.quit());
                             quitting = true;
                         }
@@ -611,6 +625,7 @@ impl Live {
 /// Ends the process without DLL and thread-local teardown. Teardown runs
 /// after Windows stops every other thread, so a step that waits on one, as a
 /// COM release into Explorer did, keeps a windowless TDT alive forever.
+#[cfg(windows)]
 fn exit_now(code: u32) -> ! {
     // SAFETY: TerminateProcess on this process's own pseudo-handle.
     unsafe {
@@ -620,10 +635,17 @@ fn exit_now(code: u32) -> ! {
     std::process::exit(code as i32)
 }
 
+#[cfg(not(windows))]
+fn exit_now(code: u32) -> ! {
+    std::process::exit(code as i32)
+}
+
 /// The single-instance mutex. Setup (`packaging/tdt-setup`, `INSTANCE_MUTEX`)
 /// waits on this name for TDT to quit: change both together.
+#[cfg(windows)]
 const INSTANCE_MUTEX: windows::core::PCWSTR = windows::core::w!("Local\\TDT-TalkDontType");
 /// A second start sets this event, and the running TDT opens its panel.
+#[cfg(windows)]
 const SHOW_EVENT: windows::core::PCWSTR = windows::core::w!("Local\\TDT-ShowOverlay");
 
 enum InstanceClaim {
@@ -632,11 +654,13 @@ enum InstanceClaim {
     Failed(String),
 }
 
+#[cfg(windows)]
 struct InstanceGuard {
     mutex: windows::Win32::Foundation::HANDLE,
     show_event: windows::Win32::Foundation::HANDLE,
 }
 
+#[cfg(windows)]
 impl Drop for InstanceGuard {
     fn drop(&mut self) {
         // SAFETY: both handles come from `claim_instance` and are closed once, here. The slot is cleared first,
@@ -649,11 +673,13 @@ impl Drop for InstanceGuard {
     }
 }
 
+#[cfg(windows)]
 fn show_event_slot() -> &'static Mutex<Option<isize>> {
     static SLOT: Mutex<Option<isize>> = Mutex::new(None);
     &SLOT
 }
 
+#[cfg(windows)]
 fn take_show_request() -> bool {
     use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
     use windows::Win32::System::Threading::WaitForSingleObject;
@@ -667,6 +693,7 @@ fn take_show_request() -> bool {
     unsafe { WaitForSingleObject(HANDLE(raw as _), 0) == WAIT_OBJECT_0 }
 }
 
+#[cfg(windows)]
 fn signal_running_instance() {
     use windows::Win32::System::Threading::{OpenEventW, SetEvent, EVENT_MODIFY_STATE};
     // SAFETY: the name is a static null-terminated string, and the opened handle is closed after use.
@@ -681,6 +708,7 @@ fn signal_running_instance() {
 /// Windows starts an exe at low integrity when the file carries a low-rights
 /// label (files saved into a folder with that label inherit it). A low process
 /// cannot read keys from, or paste into, normal apps.
+#[cfg(windows)]
 fn low_rights_message() -> Option<String> {
     if integrity::own()? >= integrity::MEDIUM {
         return None;
@@ -694,6 +722,12 @@ fn low_rights_message() -> Option<String> {
     ))
 }
 
+#[cfg(not(windows))]
+fn low_rights_message() -> Option<String> {
+    None
+}
+
+#[cfg(windows)]
 fn claim_instance() -> InstanceClaim {
     use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
     use windows::Win32::System::Threading::{CreateEventW, CreateMutexW};
@@ -737,6 +771,63 @@ fn claim_instance() -> InstanceClaim {
     }
 }
 
+#[cfg(not(windows))]
+struct InstanceGuard {
+    _file: std::fs::File,
+    lock_path: std::path::PathBuf,
+}
+
+#[cfg(not(windows))]
+impl Drop for InstanceGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.lock_path);
+    }
+}
+
+#[cfg(not(windows))]
+fn show_signal_path() -> std::path::PathBuf {
+    std::env::temp_dir().join("tdt-show-overlay.flag")
+}
+
+#[cfg(not(windows))]
+fn take_show_request() -> bool {
+    let path = show_signal_path();
+    if path.exists() {
+        let _ = std::fs::remove_file(path);
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(not(windows))]
+fn claim_instance() -> InstanceClaim {
+    use std::os::fd::AsRawFd;
+    let lock_path = std::env::temp_dir().join("tdt-talkdonttype.lock");
+    let file = match std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+    {
+        Ok(file) => file,
+        Err(error) => return InstanceClaim::Failed(format!("Could not start TDT: {error}")),
+    };
+    // SAFETY: `flock` operates on a valid file descriptor owned by `file`.
+    let locked = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 };
+    if locked {
+        let _ = std::fs::remove_file(show_signal_path());
+        InstanceClaim::Owned(InstanceGuard {
+            _file: file,
+            lock_path,
+        })
+    } else {
+        let _ = std::fs::write(show_signal_path(), b"1");
+        InstanceClaim::AlreadyRunning
+    }
+}
+
 fn lock_working_directory() {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
@@ -745,6 +836,7 @@ fn lock_working_directory() {
     }
 }
 
+#[cfg(windows)]
 fn show_error(message: &str) {
     use windows::core::HSTRING;
     use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
@@ -757,4 +849,21 @@ fn show_error(message: &str) {
             MB_OK | MB_ICONERROR,
         );
     }
+}
+
+#[cfg(target_os = "macos")]
+fn show_error(message: &str) {
+    eprintln!("TDT error: {message}");
+    let escaped = message.replace('\\', "\\\\").replace('"', "\\\"");
+    let _ = std::process::Command::new("/usr/bin/osascript")
+        .arg("-e")
+        .arg(format!(
+            "display alert \"TDT\" message \"{escaped}\" as critical"
+        ))
+        .status();
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn show_error(message: &str) {
+    eprintln!("TDT error: {message}");
 }

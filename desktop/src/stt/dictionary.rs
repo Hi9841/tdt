@@ -19,7 +19,7 @@ pub fn user_file() -> Option<PathBuf> {
 
 /// The user file, created with a short explanation when it does not exist.
 pub fn ensure_user_file() -> Result<PathBuf, String> {
-    let path = user_file().ok_or("LOCALAPPDATA is not set")?;
+    let path = user_file().ok_or("TDT data directory is not set")?;
     if !path.exists() {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)

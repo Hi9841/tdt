@@ -257,7 +257,11 @@ impl Dictation {
                 vec![ViewChange::MicrophoneReady]
             }
             Err(error) => vec![ViewChange::Error(
-                format!("Could not open the microphone. Check Windows microphone access and try again. {error}"),
+                if cfg!(target_os = "macos") {
+                    format!("Could not open the microphone. Check macOS Microphone permission and try again. {error}")
+                } else {
+                    format!("Could not open the microphone. Check Windows microphone access and try again. {error}")
+                },
                 ErrorKind::Microphone,
             )],
         }

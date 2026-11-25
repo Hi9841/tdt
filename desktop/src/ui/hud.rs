@@ -1111,10 +1111,13 @@ impl HudView {
                     "Could not change the start with Windows: {error}"
                 ));
                 self.autostart_enabled = crate::autostart::is_enabled();
-                self.settings_error = Some(
+                self.settings_error = Some(if cfg!(target_os = "macos") {
+                    "Could not change login startup. Check ~/Library/LaunchAgents permissions and try again."
+                        .into()
+                } else {
                     "Could not change startup. Check Windows startup permissions and try again."
-                        .into(),
-                );
+                        .into()
+                });
             }
         }
     }
@@ -2298,8 +2301,13 @@ impl HudView {
                 cx.notify();
             }),
         );
+        let startup_label = if cfg!(target_os = "macos") {
+            "Start at login"
+        } else {
+            "Start with Windows"
+        };
         let startup_row = settings_row(
-            "Start with Windows",
+            startup_label,
             "Opens TDT when you sign in.".to_string(),
             startup_switch.into_any_element(),
         )
@@ -2422,11 +2430,19 @@ impl HudView {
         let takes_row = settings_row(
             "Save takes for testing",
             if self.save_takes() {
-                format!(
-                    "Audio and text go to LOCALAPPDATA\\{}\\{}.",
-                    voice_stt_desktop::DATA_DIR_NAME,
-                    voice_stt_desktop::stt::takes::FOLDER_NAME
-                )
+                if cfg!(target_os = "macos") {
+                    format!(
+                        "Audio and text go to ~/Library/Application Support/{}/{}.",
+                        voice_stt_desktop::DATA_DIR_NAME,
+                        voice_stt_desktop::stt::takes::FOLDER_NAME
+                    )
+                } else {
+                    format!(
+                        "Audio and text go to LOCALAPPDATA\\{}\\{}.",
+                        voice_stt_desktop::DATA_DIR_NAME,
+                        voice_stt_desktop::stt::takes::FOLDER_NAME
+                    )
+                }
             } else {
                 "Off. Nothing is kept.".to_string()
             },

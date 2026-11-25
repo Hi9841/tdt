@@ -1,7 +1,9 @@
 fn main() {
-    println!("cargo:rerun-if-changed=assets/tdt.ico");
-    println!("cargo:rerun-if-changed=assets/tdt.rc");
-    embed_resource::compile("assets/tdt.rc", embed_resource::NONE)
-        .manifest_optional()
-        .ok();
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        println!("cargo:rerun-if-changed=assets/tdt.ico");
+        println!("cargo:rerun-if-changed=assets/tdt.rc");
+        embed_resource::compile("assets/tdt.rc", embed_resource::NONE)
+            .manifest_optional()
+            .ok();
+    }
 }

@@ -3,6 +3,7 @@ use tray_icon::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
 /// Ordinal of the icon in `desktop/assets/tdt.rc`. Same image as the exe icon.
+#[cfg(windows)]
 const APP_ICON_ID: u16 = 1;
 
 pub struct SystemTray {
@@ -88,17 +89,53 @@ impl SystemTray {
     }
 }
 
+#[cfg(windows)]
 fn app_icon() -> Result<Icon, String> {
     let side = tray_icon_px();
     Icon::from_resource(APP_ICON_ID, Some((side, side)))
         .map_err(|error| format!("Failed to load the app icon: {error}"))
 }
 
+#[cfg(windows)]
 fn tray_icon_px() -> u32 {
     use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSMICON};
     // SAFETY: GetSystemMetrics takes no pointers.
     let side = unsafe { GetSystemMetrics(SM_CXSMICON) };
     side.max(16) as u32
+}
+
+#[cfg(target_os = "macos")]
+fn app_icon() -> Result<Icon, String> {
+    static ICON_PNG: &[u8] = include_bytes!("../../assets/orb.png");
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(ICON_PNG));
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let mut reader = decoder
+        .read_info()
+        .map_err(|error| format!("Failed to decode the app icon: {error}"))?;
+    let mut buf = vec![0u8; reader.output_buffer_size()];
+    let info = reader
+        .next_frame(&mut buf)
+        .map_err(|error| format!("Failed to read the app icon frame: {error}"))?;
+    let bytes = &buf[..info.buffer_size()];
+    let rgba = match info.color_type {
+        png::ColorType::Rgba => bytes.to_vec(),
+        png::ColorType::Rgb => bytes
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .flat_map(|&[r, g, b]| [r, g, b, 255])
+            .collect(),
+        png::ColorType::GrayscaleAlpha => bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .flat_map(|&[g, a]| [g, g, g, a])
+            .collect(),
+        png::ColorType::Grayscale => bytes.iter().flat_map(|&g| [g, g, g, 255]).collect(),
+        other => return Err(format!("Unsupported icon color type: {other:?}")),
+    };
+    Icon::from_rgba(rgba, info.width, info.height)
+        .map_err(|error| format!("Failed to build the menu bar icon: {error}"))
 }
 
 pub fn tooltip_text(hotkey_label: &str) -> String {

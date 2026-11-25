@@ -2,11 +2,21 @@
 /// bench all give it audio at this rate.
 pub const SAMPLE_RATE: usize = 16_000;
 
-/// `%LOCALAPPDATA%\TDT`: the models, the dictionary, and the test takes.
-/// Setup installs TDT.exe here too, and uninstall keeps `models` and
-/// `dictionary.txt` (`packaging/tdt-setup`, `USER_DATA`).
+/// Per-user TDT data directory: `%LOCALAPPDATA%\TDT` on Windows, or
+/// `~/Library/Application Support/TDT` on macOS (with `LOCALAPPDATA` honored
+/// as a test override). Holds `models`, `dictionary.txt`, and `takes`.
 pub fn data_dir() -> Option<std::path::PathBuf> {
-    std::env::var_os("LOCALAPPDATA").map(|dir| std::path::PathBuf::from(dir).join(DATA_DIR_NAME))
+    if let Some(dir) = std::env::var_os("LOCALAPPDATA") {
+        return Some(std::path::PathBuf::from(dir).join(DATA_DIR_NAME));
+    }
+    #[cfg(not(windows))]
+    {
+        directories::BaseDirs::new().map(|dirs| dirs.data_local_dir().join(DATA_DIR_NAME))
+    }
+    #[cfg(windows)]
+    {
+        None
+    }
 }
 
 /// The name of the data folder in `%LOCALAPPDATA%`.
