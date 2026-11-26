@@ -34,6 +34,9 @@ const SETTINGS_SURFACE_HEIGHT: f32 = 28.0;
 const WAVE_BARS: usize = VIS_BARS;
 /// Width of the Settings scrollbar lane, taken from the panel padding.
 const SCROLL_GUTTER: f32 = 8.0;
+const HISTORY_ROW_PADDING: f32 = 10.0;
+const HISTORY_ROW_BORDER: f32 = 1.0;
+const HISTORY_INSET: f32 = HISTORY_ROW_PADDING + HISTORY_ROW_BORDER;
 /// Two clamped lines at 12px in this panel hold about this many characters.
 const HISTORY_EXPAND_CHARS: usize = 88;
 /// The latest row clamps four lines at 14px, so it holds about twice as much.
@@ -2029,10 +2032,10 @@ impl HudView {
                         .flex_col()
                         .w_full()
                         .gap(px(4.0))
-                        .px(px(10.0))
+                        .px(px(HISTORY_ROW_PADDING))
                         .py(px(10.0))
                         .rounded(r_chip())
-                        .border_1()
+                        .border(px(HISTORY_ROW_BORDER))
                         .border_color(theme::transparent())
                         .group("history_row")
                         .when(can_expand, |row| {
@@ -2108,6 +2111,7 @@ impl HudView {
             .justify_between()
             .w_full()
             .min_h(px(28.0))
+            .px(px(HISTORY_INSET))
             .child(controls::group_label("Recent"));
         if has_recents && !self.clear_history_pending {
             history_header = history_header.child(
@@ -2124,7 +2128,8 @@ impl HudView {
                 .flex_col()
                 .w_full()
                 .gap(px(8.0))
-                .p(px(12.0))
+                .px(px(HISTORY_INSET))
+                .py(px(12.0))
                 .rounded(r_section())
                 .bg(well())
                 .child(
