@@ -6393,7 +6393,7 @@ dependencies = [
 [[package]]
 name = "trit"
 version = "0.16.1"
-source = "git+https://github.com/Hi9841/trit?rev=ac71cef0a0776b68a030f3b09f70291fc7173f6e#ac71cef0a0776b68a030f3b09f70291fc7173f6e"
+source = "git+https://github.com/Hi9841/trit?rev=da68f743a5aa368901ae4ad858c65d34ff3f3185#da68f743a5aa368901ae4ad858c65d34ff3f3185"
 dependencies = [
  "libc",
  "libmimalloc-sys",
