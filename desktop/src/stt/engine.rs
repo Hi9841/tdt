@@ -3,7 +3,7 @@ use super::models::ModelSpec;
 use super::segment;
 use super::MAX_TAKE_SAMPLES;
 use crate::SAMPLE_RATE;
-use crossbeam_channel::{Receiver, RecvTimeoutError};
+use crossbeam_channel::{Receiver, RecvTimeoutError, TryRecvError};
 use parking_lot::{Condvar, Mutex};
 use std::cell::Cell;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -223,6 +223,22 @@ const QUIET_FINISH_WAIT: Duration = Duration::from_secs(15);
 /// Grace period for a previously timed-out quiet worker to finish exiting
 /// before a subsequent take refuses to block behind it on Trit's `submit` lock.
 const QUIET_RECOVERY_WAIT: Duration = Duration::from_millis(500);
+/// Minimum captured audio before starting rolling background reads while
+/// the user is still speaking (400 ms).
+const ROLLING_MIN_SAMPLES: usize = 400 * SAMPLE_RATE / 1000;
+/// Minimum new audio between rolling background passes (30 ms).
+const ROLLING_STEP_SAMPLES: usize = 30 * SAMPLE_RATE / 1000;
+/// Maximum staleness of a rolling read used at key-up (120 ms). Older reads
+/// fall back to a full decode so stalls do not drop whole phrases.
+const ROLLING_MAX_STALE_SAMPLES: usize = 120 * SAMPLE_RATE / 1000;
+/// When the last completed rolling pass is within this window (60 ms) and the
+/// in-flight pass is not expected to finish inside `ROLLING_FINISH_WAIT`,
+/// return the completed pass immediately instead of waiting for a timeout.
+const ROLLING_IMMEDIATE_STALE_SAMPLES: usize = 60 * SAMPLE_RATE / 1000;
+/// Small post-release wait budget for a fresher in-flight rolling read.
+const ROLLING_FINISH_WAIT: Duration = Duration::from_millis(10);
+/// Post-release wait budget when no completed rolling pass is fresh enough.
+const ROLLING_SOLO_WAIT: Duration = Duration::from_millis(18);
 
 static QUIET_SLOT: (Mutex<bool>, Condvar) = (Mutex::new(false), Condvar::new());
 
@@ -291,9 +307,200 @@ impl QuietPoint {
     /// chunk, the window is read first.
     fn of(speech: &segment::EndOfSpeech, window: usize, windows_end: usize) -> Option<Self> {
         let end = speech.quiet_after()?;
-        let heard = segment::EndOfSpeech::read_samples(end);
+        let heard = speech.read_samples(end);
         (heard >= windows_end).then_some(Self { end, window, heard })
     }
+}
+
+struct CaptureState {
+    captured: Vec<f32>,
+    /// The windows so far are in `text`, `None` once two did not join; the
+    /// next one starts at `window`.
+    window: usize,
+    /// The end of the last window that the model read.
+    windows_end: usize,
+    text: Option<String>,
+    speech: segment::EndOfSpeech,
+}
+
+impl CaptureState {
+    fn new(end_quiet: usize) -> Self {
+        let speech = if end_quiet > 0 {
+            segment::EndOfSpeech::for_padded_end()
+        } else {
+            segment::EndOfSpeech::new()
+        };
+        Self {
+            captured: Vec::new(),
+            window: 0,
+            windows_end: 0,
+            text: Some(String::new()),
+            speech,
+        }
+    }
+
+    fn ingest(
+        &mut self,
+        samples: &[f32],
+        engine: &Trit,
+        active: &mut Option<ActiveRead>,
+        latest_rolling: &mut Option<CompletedRolling>,
+        last_rolling_heard: &mut usize,
+    ) -> Result<(), TakeError> {
+        if self.captured.len() >= MAX_TAKE_SAMPLES {
+            return Ok(());
+        }
+        let room = MAX_TAKE_SAMPLES - self.captured.len();
+        self.captured
+            .extend_from_slice(&samples[..samples.len().min(room)]);
+        // Read full windows while the user still talks. New chunks wait in the
+        // channel meanwhile.
+        while self.captured.len() - self.window >= segment::WINDOW_SAMPLES {
+            let Some(done) = &self.text else {
+                break;
+            };
+            // The next window makes any background read old.
+            *active = None;
+            *latest_rolling = None;
+            *last_rolling_heard = 0;
+            await_quiet_worker()?;
+            let end = self.window + segment::WINDOW_SAMPLES;
+            let part = transcribe_samples(engine, &self.captured[self.window..end], None)?;
+            self.text = join(done, part, self.window);
+            self.window = end - segment::OVERLAP_SAMPLES;
+            self.windows_end = end;
+        }
+        self.speech.update(&self.captured);
+        Ok(())
+    }
+}
+
+enum ActiveRead {
+    Quiet(QuietRead),
+    Rolling(RollingRead),
+}
+
+struct RollingRead {
+    window: usize,
+    heard: usize,
+    started_at: Instant,
+    cancel: Cancel,
+    result: Receiver<Result<(String, bool), String>>,
+}
+
+struct CompletedRolling {
+    window: usize,
+    heard: usize,
+    text: String,
+    fallback: bool,
+}
+
+impl RollingRead {
+    fn start(
+        engine: &Arc<Trit>,
+        text: &Option<String>,
+        heard: &[f32],
+        window: usize,
+        end_quiet: usize,
+    ) -> Option<Self> {
+        let slot = QuietSlot::claim()?;
+        let (done, result) = crossbeam_channel::bounded(1);
+        let cancel = Cancel::new();
+        let flag = cancel.clone();
+        let heard_len = heard.len();
+        let (engine, text, samples) = (Arc::clone(engine), text.clone(), heard.to_vec());
+        std::thread::spawn(move || {
+            let _active = Dictation::start();
+            let read = read_rest(&engine, &text, &samples, window, end_quiet, Some(&flag));
+            drop(slot);
+            let _ = done.send(read.map(|(text, _, fallback)| (text, fallback)));
+        });
+        Some(Self {
+            window,
+            heard: heard_len,
+            started_at: Instant::now(),
+            cancel,
+            result,
+        })
+    }
+
+    fn wait_for(self, timeout: Duration) -> QuietWait {
+        match self.result.recv_timeout(timeout) {
+            Ok(result) => QuietWait::Finished(result),
+            Err(RecvTimeoutError::Timeout) => {
+                self.cancel.cancel();
+                QuietWait::TimedOut
+            }
+            Err(RecvTimeoutError::Disconnected) => QuietWait::Disconnected,
+        }
+    }
+}
+
+impl Drop for RollingRead {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+
+fn is_fresh(read_window: usize, heard: usize, window: usize, captured_len: usize) -> bool {
+    read_window == window && captured_len.saturating_sub(heard) <= ROLLING_MAX_STALE_SAMPLES
+}
+
+/// Resolves a mid-speech release from an in-flight or recently completed
+/// rolling read within a small post-release wait budget. Returns `None` when
+/// no fresh non-empty rolling transcript is ready, so the caller falls back
+/// to a full decode.
+fn finish_rolling_read(
+    active: Option<ActiveRead>,
+    latest: Option<CompletedRolling>,
+    last_duration: Duration,
+    window: usize,
+    captured_len: usize,
+    quiet_wait_ms: &mut u64,
+) -> Option<(String, bool)> {
+    let latest = latest
+        .filter(|r| is_fresh(r.window, r.heard, window, captured_len) && !r.text.trim().is_empty());
+    let rolling = match active {
+        Some(ActiveRead::Rolling(rolling))
+            if is_fresh(rolling.window, rolling.heard, window, captured_len) =>
+        {
+            Some(rolling)
+        }
+        other => {
+            drop(other);
+            None
+        }
+    };
+    if let Some(rolling) = rolling {
+        if let Ok(Ok((text, fallback))) = rolling.result.try_recv() {
+            if !text.trim().is_empty() {
+                return Some((text, fallback));
+            }
+        }
+        let skip_wait = latest.as_ref().is_some_and(|ready| {
+            let stale = captured_len.saturating_sub(ready.heard);
+            let remaining = last_duration.saturating_sub(rolling.started_at.elapsed());
+            stale <= ROLLING_IMMEDIATE_STALE_SAMPLES && remaining > ROLLING_FINISH_WAIT
+        });
+        if skip_wait {
+            drop(rolling);
+            return latest.map(|ready| (ready.text, ready.fallback));
+        }
+        let budget = if latest.is_some() {
+            ROLLING_FINISH_WAIT
+        } else {
+            ROLLING_SOLO_WAIT
+        };
+        let wait_start = Instant::now();
+        let outcome = rolling.wait_for(budget);
+        *quiet_wait_ms = wait_start.elapsed().as_millis() as u64;
+        if let QuietWait::Finished(Ok((text, fallback))) = outcome {
+            if !text.trim().is_empty() {
+                return Some((text, fallback));
+            }
+        }
+    }
+    latest.map(|ready| (ready.text, ready.fallback))
 }
 
 /// A read of the take in the quiet after the speech, on its own thread: new
@@ -708,68 +915,90 @@ impl SttEngine {
             let prefetch_engine = Arc::clone(&engine);
             std::thread::spawn(move || prefetch_engine.prefetch_weights());
         }
-        let mut captured: Vec<f32> = Vec::new();
-        // The windows so far are in `text`, `None` once two did not join; the
-        // next one starts at `window`.
-        let mut window = 0;
-        // The end of the last window that the model read.
-        let mut windows_end = 0;
-        let mut text = Some(String::new());
+        let mut state = CaptureState::new(self.end_quiet);
         let mut last_any = Instant::now();
-        let mut speech = segment::EndOfSpeech::default();
         // The audio of the final text while the user stays quiet, and the
-        // read of that audio.
+        // active background read (either a lossless quiet read or a rolling
+        // speculative read while speaking).
         let mut point: Option<QuietPoint> = None;
-        let mut quiet: Option<QuietRead> = None;
-        // Each point gets one read.
+        let mut active: Option<ActiveRead> = None;
+        // Each quiet point gets one read.
         let mut read_point = None;
+        let mut latest_rolling: Option<CompletedRolling> = None;
+        let mut last_rolling_heard = 0usize;
+        let mut last_rolling_duration = Duration::ZERO;
+
+        let poll_rolling = |active: &mut Option<ActiveRead>,
+                            latest: &mut Option<CompletedRolling>,
+                            last_dur: &mut Duration| {
+            let finished = match active {
+                Some(ActiveRead::Rolling(rolling)) => match rolling.result.try_recv() {
+                    Ok(res) => Some((rolling.window, rolling.heard, rolling.started_at, res)),
+                    Err(TryRecvError::Empty) => None,
+                    Err(TryRecvError::Disconnected) => {
+                        *active = None;
+                        None
+                    }
+                },
+                _ => None,
+            };
+            if let Some((window, heard, started_at, res)) = finished {
+                *last_dur = started_at.elapsed();
+                if let Ok((text, fallback)) = res {
+                    if !text.trim().is_empty() {
+                        *latest = Some(CompletedRolling {
+                            window,
+                            heard,
+                            text,
+                            fallback,
+                        });
+                    }
+                }
+                *active = None;
+            }
+        };
 
         let stop = loop {
+            let mut finished = None;
             match rx.recv_timeout(Duration::from_millis(20)) {
                 Ok(LiveAudio::Chunk(samples)) => {
                     last_any = Instant::now();
-                    if captured.len() < MAX_TAKE_SAMPLES {
-                        let room = MAX_TAKE_SAMPLES - captured.len();
-                        captured.extend_from_slice(&samples[..samples.len().min(room)]);
-                        // Read full windows while the user still talks. New
-                        // chunks wait in the channel meanwhile.
-                        while captured.len() - window >= segment::WINDOW_SAMPLES {
-                            let Some(done) = &text else {
+                    state.ingest(
+                        &samples,
+                        &engine,
+                        &mut active,
+                        &mut latest_rolling,
+                        &mut last_rolling_heard,
+                    )?;
+                    // Drain any chunks or Finish already waiting in the channel
+                    // before starting a background read so stale pauses do not
+                    // spawn workers that must be cancelled on the next chunk.
+                    loop {
+                        match rx.try_recv() {
+                            Ok(LiveAudio::Chunk(more)) => {
+                                last_any = Instant::now();
+                                state.ingest(
+                                    &more,
+                                    &engine,
+                                    &mut active,
+                                    &mut latest_rolling,
+                                    &mut last_rolling_heard,
+                                )?;
+                            }
+                            Ok(LiveAudio::Finish(times)) => {
+                                finished = Some(times);
                                 break;
-                            };
-                            // The next window makes the read old.
-                            quiet = None;
-                            await_quiet_worker()?;
-                            let end = window + segment::WINDOW_SAMPLES;
-                            let part = transcribe_samples(&engine, &captured[window..end], None)?;
-                            text = join(done, part, window);
-                            window = end - segment::OVERLAP_SAMPLES;
-                            windows_end = end;
-                        }
-                        speech.update(&captured);
-                        point = QuietPoint::of(&speech, window, windows_end);
-                        // New speech or a window made the read old.
-                        if quiet.as_ref().is_some_and(|read| Some(read.point) != point) {
-                            quiet = None;
-                        }
-                        if let Some(point) = point {
-                            if read_point != Some(point) {
-                                let heard = &captured[..point.heard];
-                                if let Some(started) =
-                                    QuietRead::start(&engine, &text, heard, point, self.end_quiet)
-                                {
-                                    // Record `read_point` only once the slot is claimed, so a
-                                    // busy slot retries on the next chunk instead of skipping
-                                    // pre-transcription for this pause permanently.
-                                    read_point = Some(point);
-                                    quiet = Some(started);
-                                }
+                            }
+                            Err(TryRecvError::Empty) => break,
+                            Err(TryRecvError::Disconnected) => {
+                                return Err("The recording stopped too early. Try again.".into());
                             }
                         }
                     }
                 }
                 Ok(LiveAudio::Finish(times)) => break times,
                 Err(RecvTimeoutError::Timeout) => {
+                    poll_rolling(&mut active, &mut latest_rolling, &mut last_rolling_duration);
                     // A stalled producer must not hang transcription forever.
                     if last_any.elapsed() > Duration::from_secs(120) {
                         return Err(TakeError {
@@ -778,6 +1007,7 @@ impl SttEngine {
                             kind: ErrorKind::Microphone,
                         });
                     }
+                    continue;
                 }
                 // The pump always ends a take with `Finish`, so audio may be
                 // missing: text from a part of the take must not look whole.
@@ -785,7 +1015,65 @@ impl SttEngine {
                     return Err("The recording stopped too early. Try again.".into());
                 }
             }
+
+            poll_rolling(&mut active, &mut latest_rolling, &mut last_rolling_duration);
+            point = QuietPoint::of(&state.speech, state.window, state.windows_end);
+            match point {
+                Some(point) => {
+                    // A lossless quiet read supersedes any rolling or stale read.
+                    if !matches!(&active, Some(ActiveRead::Quiet(read)) if read.point == point) {
+                        active = None;
+                    }
+                    if let Some(times) = finished {
+                        break times;
+                    }
+                    if read_point != Some(point) {
+                        let heard = &state.captured[..point.heard];
+                        if let Some(started) =
+                            QuietRead::start(&engine, &state.text, heard, point, self.end_quiet)
+                        {
+                            // Record `read_point` only once the slot is claimed, so a
+                            // busy slot retries on the next chunk instead of skipping
+                            // pre-transcription for this pause permanently.
+                            read_point = Some(point);
+                            active = Some(ActiveRead::Quiet(started));
+                        }
+                    }
+                }
+                None => {
+                    // New speech made any prior quiet read old.
+                    if matches!(active, Some(ActiveRead::Quiet(_))) {
+                        active = None;
+                    }
+                    if let Some(times) = finished {
+                        break times;
+                    }
+                    if active.is_none()
+                        && state.captured.len() >= ROLLING_MIN_SAMPLES
+                        && state.captured.len().saturating_sub(last_rolling_heard)
+                            >= ROLLING_STEP_SAMPLES
+                    {
+                        if let Some(started) = RollingRead::start(
+                            &engine,
+                            &state.text,
+                            &state.captured,
+                            state.window,
+                            self.end_quiet,
+                        ) {
+                            last_rolling_heard = state.captured.len();
+                            active = Some(ActiveRead::Rolling(started));
+                        }
+                    }
+                }
+            }
         };
+
+        let CaptureState {
+            captured,
+            window,
+            text,
+            ..
+        } = state;
 
         // Duration actually fed to the model, not the full take when the
         // capture cap truncated it.
@@ -822,12 +1110,13 @@ impl SttEngine {
         let mut quiet_wait_ms = 0u64;
         let (mut text, last_part, whole_fallback) = match point {
             Some(point) => {
-                let quiet_result = if let Some(read) = quiet {
+                let quiet_result = if let Some(ActiveRead::Quiet(read)) = active {
                     let wait_start = Instant::now();
                     let result = read.wait();
                     quiet_wait_ms = wait_start.elapsed().as_millis() as u64;
                     Some(result)
                 } else {
+                    drop(active);
                     None
                 };
                 match quiet_result {
@@ -855,9 +1144,19 @@ impl SttEngine {
                 }
             }
             None => {
-                drop(quiet);
-                await_quiet_worker()?;
-                read_rest(&engine, &text, &captured, window, self.end_quiet, None)?
+                if let Some((rolling_text, fallback)) = finish_rolling_read(
+                    active,
+                    latest_rolling,
+                    last_rolling_duration,
+                    window,
+                    captured.len(),
+                    &mut quiet_wait_ms,
+                ) {
+                    (rolling_text, 0, fallback)
+                } else {
+                    await_quiet_worker()?;
+                    read_rest(&engine, &text, &captured, window, self.end_quiet, None)?
+                }
             }
         };
         let last_part_secs = last_part as f32 / SAMPLE_RATE as f32;
@@ -1041,5 +1340,95 @@ mod tests {
             "recovery must unblock as soon as the worker drops its slot"
         );
         holder.join().expect("holder exits");
+    }
+
+    #[test]
+    fn rolling_read_returns_fresher_in_flight_within_budget() {
+        let cancel = Cancel::new();
+        let (tx, rx) = crossbeam_channel::bounded::<Result<(String, bool), String>>(1);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(2));
+            let _ = tx.send(Ok(("full sentence".to_string(), false)));
+        });
+        let active = Some(ActiveRead::Rolling(RollingRead {
+            window: 0,
+            heard: 16_000,
+            started_at: Instant::now(),
+            cancel,
+            result: rx,
+        }));
+        let latest = Some(CompletedRolling {
+            window: 0,
+            heard: 15_200,
+            text: "full".to_string(),
+            fallback: false,
+        });
+        let mut wait_ms = 0;
+        let out = finish_rolling_read(
+            active,
+            latest,
+            Duration::from_millis(5),
+            0,
+            16_160,
+            &mut wait_ms,
+        );
+        assert_eq!(out, Some(("full sentence".to_string(), false)));
+    }
+
+    #[test]
+    fn rolling_read_skips_wait_when_completed_is_fresh_and_in_flight_is_slow() {
+        let cancel = Cancel::new();
+        let (_tx, rx) = crossbeam_channel::bounded::<Result<(String, bool), String>>(1);
+        let active = Some(ActiveRead::Rolling(RollingRead {
+            window: 0,
+            heard: 16_000,
+            started_at: Instant::now(),
+            cancel: cancel.clone(),
+            result: rx,
+        }));
+        let latest = Some(CompletedRolling {
+            window: 0,
+            heard: 15_600, // 35 ms stale (<= 60 ms)
+            text: "ready text".to_string(),
+            fallback: false,
+        });
+        let mut wait_ms = 0;
+        let out = finish_rolling_read(
+            active,
+            latest,
+            Duration::from_millis(40),
+            0,
+            16_160,
+            &mut wait_ms,
+        );
+        assert_eq!(out, Some(("ready text".to_string(), false)));
+        assert_eq!(wait_ms, 0);
+        assert!(cancel.is_cancelled());
+    }
+
+    #[test]
+    fn rolling_read_falls_back_when_stale_or_empty() {
+        let latest = Some(CompletedRolling {
+            window: 0,
+            heard: 10_000, // > 120 ms stale
+            text: "old".to_string(),
+            fallback: false,
+        });
+        let mut wait_ms = 0;
+        assert_eq!(
+            finish_rolling_read(None, latest, Duration::ZERO, 0, 16_000, &mut wait_ms),
+            None
+        );
+
+        let empty = Some(CompletedRolling {
+            window: 0,
+            heard: 15_900,
+            text: "   ".to_string(),
+            fallback: false,
+        });
+        assert_eq!(
+            finish_rolling_read(None, empty, Duration::ZERO, 0, 16_000, &mut wait_ms),
+            None
+        );
     }
 }

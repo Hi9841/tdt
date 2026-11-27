@@ -5,7 +5,7 @@ use crate::audio::recorder::CaptureHandle;
 use crate::audio::{play_sound, AudioRecorder, LiveWave, SoundEffect};
 use crate::config::{AppStats, Settings};
 use crate::hotkey::{
-    current_binding, input_held, note_user_typed, typed_generation, user_typed_since,
+    current_binding, input_held, note_user_typed, typed_generation, user_typed_since, wake_loop,
 };
 use crate::paste::{DeliveryOutcome, DeliverySteps, NotTyped, PasteInjector};
 use crate::priority;
@@ -469,9 +469,7 @@ impl Dictation {
                         deliver_transcript(result, injector, events, &settings, delivery);
                     }
                     // The engine's errors are written for the user.
-                    Err(error) => {
-                        let _ = events.send(InternalEvent::TranscribeError(error));
-                    }
+                    Err(error) => emit_event(&events, InternalEvent::TranscribeError(error)),
                 }
             },
         ));
@@ -619,6 +617,13 @@ struct PostDeliveryJob {
     events: crossbeam_channel::Sender<InternalEvent>,
 }
 
+fn emit_event(tx: &crossbeam_channel::Sender<InternalEvent>, event: InternalEvent) {
+    let _ = tx.send(event);
+    // Wake the UI loop so the pill and success sound do not wait up to 25 ms
+    // for the next busy poll tick after delivery completes.
+    wake_loop();
+}
+
 fn enqueue_post_delivery(job: PostDeliveryJob) {
     static SUBMIT: Mutex<()> = Mutex::new(());
     static TX: std::sync::OnceLock<crossbeam_channel::Sender<PostDeliveryJob>> =
@@ -636,12 +641,15 @@ fn enqueue_post_delivery(job: PostDeliveryJob) {
     // Keep the queue order even if the UI starts the next take as soon as it sees success.
     let _submit = SUBMIT.lock();
     if let CopyPlan::Typed(latency) = job.plan {
-        let _ = job.events.send(InternalEvent::TranscribeSuccess {
-            text: job.result.text.clone(),
-            auto_pasted: true,
-            notice: None,
-            latency_ms: latency.total_ms(),
-        });
+        emit_event(
+            &job.events,
+            InternalEvent::TranscribeSuccess {
+                text: job.result.text.clone(),
+                auto_pasted: true,
+                notice: None,
+                latency_ms: latency.total_ms(),
+            },
+        );
     }
     let _ = tx.send(job);
 }
@@ -696,7 +704,7 @@ impl PostDeliveryJob {
                     .into(),
             ),
         };
-        let _ = self.events.send(event);
+        emit_event(&self.events, event);
     }
 }
 
@@ -723,7 +731,7 @@ fn deliver_transcript(
         result.text = remove_fillers(&result.text);
     }
     if result.text.trim().is_empty() {
-        let _ = tx.send(InternalEvent::NoSpeech);
+        emit_event(&tx, InternalEvent::NoSpeech);
         return;
     }
 
